@@ -1,6 +1,7 @@
 //! HTTP router assembly for the application.
 
 mod antigravity_hook;
+mod board_host;
 mod clipboard_writer;
 mod fs_monitor;
 mod health;

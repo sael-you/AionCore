@@ -11,6 +11,7 @@ use aionui_assistant::{
     AssistantAgentCatalogPort, AssistantError, AssistantRouterState, AssistantService, BuiltinAssistantRegistry,
 };
 use aionui_auth::extract_token_from_ws_headers;
+use aionui_board::BoardRouterState;
 use aionui_channel::ChannelRouterState;
 use aionui_common::AgentKillReason;
 use aionui_conversation::{ConversationRouterState, ConversationService};
@@ -137,6 +138,7 @@ pub struct ModuleStates {
     pub file: FileRouterState,
     pub project: ProjectRouterState,
     pub sidebar: SidebarRouterState,
+    pub board: BoardRouterState,
     pub mcp: McpRouterState,
     pub extension: ExtensionRouterState,
     pub hub: HubRouterState,
@@ -315,6 +317,7 @@ pub async fn build_module_states(
         file: build_module_state_phase(&boot, "file", || build_file_state(services))?,
         project: build_module_state_phase(&boot, "project", || build_project_state(services)),
         sidebar: build_module_state_phase(&boot, "sidebar", || build_sidebar_state(services)),
+        board: build_module_state_phase(&boot, "board", || build_board_state(services)),
         mcp: build_module_state_phase(&boot, "mcp", || build_mcp_state(services)),
         extension: ext_state,
         hub: hub_state,
@@ -349,6 +352,29 @@ pub async fn build_module_states(
             conversation: services.conversation_service.clone(),
             team: states.team.service.clone(),
             project: services.project_service.clone(),
+            board: services.board_service.clone(),
+        }));
+    states
+        .sidebar
+        .service
+        .set_project_board_ports(Arc::new(ProjectBoardAdapter {
+            board: services.board_service.clone(),
+        }));
+    // Same late injection for the board's host port (assign, Board Keeper,
+    // lazy project bind): it needs the team and assistant services.
+    services
+        .board_service
+        .set_host_port(Arc::new(super::board_host::BoardHostAdapter {
+            conversation: services.conversation_service.clone(),
+            project: services.project_service.clone(),
+            assistant: states.assistant.service.clone(),
+            team: states.team.service.clone(),
+            skill_repo: services.skill_repo.clone(),
+            agent_metadata: Arc::new(aionui_db::SqliteAgentMetadataRepository::new(
+                services.database.pool().clone(),
+            )),
+            task_manager: services.worker_task_manager.clone(),
+            skill_paths: services.skill_paths.clone(),
         }));
     // Same late-injection as above: the archive paths release the agent runtime
     // via the worker task manager (per-conversation kill) and the team service
@@ -595,6 +621,37 @@ pub fn build_sidebar_state(services: &AppServices) -> SidebarRouterState {
     }
 }
 
+/// Build the board user-router state. The host port (conversations, teams,
+/// assistants) is wired later in `build_module_states`, once the team and
+/// assistant services exist.
+pub fn build_board_state(services: &AppServices) -> BoardRouterState {
+    BoardRouterState {
+        service: services.board_service.clone(),
+    }
+}
+
+/// The board side of the project lifecycle (archive flag, remove preview).
+struct ProjectBoardAdapter {
+    board: aionui_board::BoardService,
+}
+
+#[async_trait::async_trait]
+impl aionui_sidebar::ProjectBoardPorts for ProjectBoardAdapter {
+    async fn set_board_archived(&self, user_id: &str, project_id: &str, archived: bool) -> Result<(), String> {
+        self.board
+            .set_board_archived(user_id, project_id, archived)
+            .await
+            .map_err(|err| err.to_string())
+    }
+
+    async fn count_board_cards(&self, user_id: &str, project_id: &str) -> Result<i64, String> {
+        self.board
+            .count_cards(user_id, project_id)
+            .await
+            .map_err(|err| err.to_string())
+    }
+}
+
 /// Adapts the concrete conversation / team / project services to the sidebar's
 /// [`aionui_sidebar::RemoveProjectPorts`] trait so `remove_project` (BR-19) can
 /// reuse the existing per-unit delete paths (`ConversationService::delete`,
@@ -604,6 +661,7 @@ struct RemoveProjectAdapter {
     conversation: ConversationService,
     team: Arc<TeamSessionService>,
     project: ProjectService,
+    board: aionui_board::BoardService,
 }
 
 #[async_trait::async_trait]
@@ -619,6 +677,14 @@ impl aionui_sidebar::RemoveProjectPorts for RemoveProjectAdapter {
         self.team
             .remove_team(user_id, team_id)
             .await
+            .map_err(|err| err.to_string())
+    }
+
+    async fn delete_board(&self, user_id: &str, project_id: &str) -> Result<i64, String> {
+        self.board
+            .delete_board(user_id, project_id)
+            .await
+            .map(|cards| cards as i64)
             .map_err(|err| err.to_string())
     }
 
