@@ -174,7 +174,14 @@ async fn fixture() -> Fixture {
             json!({ "card_id": "A", "conversation_id": "conv-old" }),
         )
         .await;
-        event(pool, "e8", Some("B"), "gate_approved", json!({ "from": "decision", "to": "planned" })).await;
+        event(
+            pool,
+            "e8",
+            Some("B"),
+            "gate_approved",
+            json!({ "from": "decision", "to": "planned" }),
+        )
+        .await;
         exec(
             pool,
             "INSERT INTO board_deploy_jobs (id, card_id, project_id, user_id, idempotency_key, state, created_at, \
@@ -221,18 +228,27 @@ async fn recover_copies_kept_writes_with_new_seqs_and_renumbers_collisions() {
     assert_eq!(e3["recovered_from_seq"], 4, "payload records the kept seq");
 
     // Untouched A: the higher kept version is applied.
-    assert_eq!(scalar_str(pool, "SELECT title FROM board_cards WHERE id = 'A'").await, "kept edit");
+    assert_eq!(
+        scalar_str(pool, "SELECT title FROM board_cards WHERE id = 'A'").await,
+        "kept edit"
+    );
     assert_eq!(report.cards_updated, 1);
     // B was absent; TASK-2 is taken by C → B becomes TASK-3 with an event.
     assert_eq!(report.cards_inserted, 1);
-    assert_eq!(scalar_i64(pool, "SELECT number FROM board_cards WHERE id = 'B'").await, 3);
+    assert_eq!(
+        scalar_i64(pool, "SELECT number FROM board_cards WHERE id = 'B'").await,
+        3
+    );
     assert_eq!(report.cards_renumbered.len(), 1);
     assert_eq!((report.cards_renumbered[0].old, report.cards_renumbered[0].new), (2, 3));
     let renumbered: Value = serde_json::from_str(
         &scalar_str(pool, "SELECT payload FROM board_events WHERE kind = 'card_renumbered'").await,
     )
     .unwrap();
-    assert_eq!((renumbered["old"].as_i64(), renumbered["new"].as_i64()), (Some(2), Some(3)));
+    assert_eq!(
+        (renumbered["old"].as_i64(), renumbered["new"].as_i64()),
+        (Some(2), Some(3))
+    );
     assert_eq!(scalar_i64(pool, "SELECT next_number FROM board_settings").await, 4);
 
     // Review and question rows absent here are inserted.
@@ -243,11 +259,19 @@ async fn recover_copies_kept_writes_with_new_seqs_and_renumbers_collisions() {
     assert_eq!(report.deps_added, 1);
     assert_eq!(report.links_to_missing_conversations, vec!["conv-gone".to_owned()]);
     assert_eq!(
-        scalar_i64(pool, "SELECT COUNT(*) FROM board_card_links WHERE conversation_id = 'conv-old'").await,
+        scalar_i64(
+            pool,
+            "SELECT COUNT(*) FROM board_card_links WHERE conversation_id = 'conv-old'"
+        )
+        .await,
         0
     );
     assert_eq!(
-        scalar_i64(pool, "SELECT COUNT(*) FROM board_card_deps WHERE card_id = 'B' AND depends_on_card_id = 'A'").await,
+        scalar_i64(
+            pool,
+            "SELECT COUNT(*) FROM board_card_deps WHERE card_id = 'B' AND depends_on_card_id = 'A'"
+        )
+        .await,
         1
     );
     // Gate decisions and deploy jobs are listed, never re-executed.
@@ -259,7 +283,11 @@ async fn recover_copies_kept_writes_with_new_seqs_and_renumbers_collisions() {
     assert_eq!(report.cursors.len(), 1);
     assert_eq!(report.cursors[0].last_seq, report.max_inserted_seq);
     assert_eq!(
-        scalar_i64(pool, "SELECT last_seq FROM board_supervisor_cursor WHERE project_id = 'proj-r'").await,
+        scalar_i64(
+            pool,
+            "SELECT last_seq FROM board_supervisor_cursor WHERE project_id = 'proj-r'"
+        )
+        .await,
         report.max_inserted_seq
     );
     assert_eq!(
@@ -312,7 +340,10 @@ async fn touched_entities_with_a_higher_kept_version_are_conflicts() {
     assert!(entities.contains(&("card", "A")), "{entities:?}");
     assert!(entities.contains(&("settings", PROJECT)), "{entities:?}");
     let card_conflict = report.conflicts.iter().find(|c| c.entity == "card").unwrap();
-    assert_eq!((card_conflict.kept_version, card_conflict.current_version), (Some(3), Some(2)));
+    assert_eq!(
+        (card_conflict.kept_version, card_conflict.current_version),
+        (Some(3), Some(2))
+    );
     assert_eq!(
         scalar_str(pool, "SELECT title FROM board_cards WHERE id = 'A'").await,
         "current edit",
@@ -342,16 +373,34 @@ async fn review_and_question_versions_follow_the_untouched_rule() {
     )
     .await;
     // The question was answered here after the restore (touched).
-    event(pool, "e12", Some("A"), "commented", json!({ "question": { "id": "Q1" } })).await;
+    event(
+        pool,
+        "e12",
+        Some("A"),
+        "commented",
+        json!({ "question": { "id": "Q1" } }),
+    )
+    .await;
     {
         let kept = open(&fx.kept_path).await;
-        exec(kept.pool(), "UPDATE board_card_reviews SET verdict = 'reject', version = 2").await;
-        exec(kept.pool(), "UPDATE board_card_questions SET answered_by_event = 'eX', version = 2").await;
+        exec(
+            kept.pool(),
+            "UPDATE board_card_reviews SET verdict = 'reject', version = 2",
+        )
+        .await;
+        exec(
+            kept.pool(),
+            "UPDATE board_card_questions SET answered_by_event = 'eX', version = 2",
+        )
+        .await;
         kept.close().await;
     }
     let report = recover_board(pool, &fx.kept_path, false).await.unwrap();
     assert_eq!(report.reviews_updated, 1, "untouched review takes the kept v2");
-    assert_eq!(scalar_str(pool, "SELECT verdict FROM board_card_reviews").await, "reject");
+    assert_eq!(
+        scalar_str(pool, "SELECT verdict FROM board_card_reviews").await,
+        "reject"
+    );
     assert_eq!(report.questions_updated, 0);
     assert!(
         report.conflicts.iter().any(|c| c.entity == "question" && c.key == "Q1"),
@@ -394,11 +443,20 @@ async fn a_dry_run_reports_without_writing() {
     assert!(report.dry_run);
     assert_eq!(report.cards_inserted, 1);
     assert!(report.events_inserted > 0);
-    assert_eq!(scalar_i64(pool, "SELECT COUNT(*) FROM board_events").await, events_before);
+    assert_eq!(
+        scalar_i64(pool, "SELECT COUNT(*) FROM board_events").await,
+        events_before
+    );
     assert_eq!(scalar_i64(pool, "SELECT COUNT(*) FROM board_cards").await, 1);
-    assert_eq!(scalar_i64(pool, "SELECT COUNT(*) FROM board_supervisor_cursor").await, 0);
+    assert_eq!(
+        scalar_i64(pool, "SELECT COUNT(*) FROM board_supervisor_cursor").await,
+        0
+    );
     // The pooled connection is detached again and usable.
-    assert_eq!(scalar_i64(pool, "SELECT COUNT(*) FROM pragma_database_list WHERE name = 'kept'").await, 0);
+    assert_eq!(
+        scalar_i64(pool, "SELECT COUNT(*) FROM pragma_database_list WHERE name = 'kept'").await,
+        0
+    );
 }
 
 #[tokio::test]

@@ -192,8 +192,9 @@ async fn recover_attached(conn: &mut SqliteConnection, dry_run: bool) -> Result<
         ..Default::default()
     };
     let present: i64 = {
-        let mut builder =
-            sqlx::QueryBuilder::<Sqlite>::new("SELECT COUNT(*) FROM kept.sqlite_master WHERE type = 'table' AND name IN (");
+        let mut builder = sqlx::QueryBuilder::<Sqlite>::new(
+            "SELECT COUNT(*) FROM kept.sqlite_master WHERE type = 'table' AND name IN (",
+        );
         let mut separated = builder.separated(", ");
         for table in REQUIRED_KEPT_TABLES {
             separated.push_bind(table);
@@ -264,14 +265,12 @@ async fn touched_set(tx: &mut Transaction<'_, Sqlite>, restore_point: i64) -> Re
             touched.questions.insert(question.to_owned());
         }
         if let Some(card_id) = card_id {
-            if let Some(conversation) =
-                payload_str(&payload, &[&["link", "conversation_id"], &["conversation_id"]])
+            if let Some(conversation) = payload_str(&payload, &[&["link", "conversation_id"], &["conversation_id"]])
                 && kind.starts_with("link_")
             {
                 touched.links.insert((card_id.clone(), conversation.to_owned()));
             }
-            if let Some(target) =
-                payload_str(&payload, &[&["dep", "depends_on_card_id"], &["depends_on_card_id"]])
+            if let Some(target) = payload_str(&payload, &[&["dep", "depends_on_card_id"], &["depends_on_card_id"]])
                 && kind.starts_with("dep_")
             {
                 touched.deps.insert((card_id.clone(), target.to_owned()));
@@ -578,10 +577,11 @@ async fn recover_versioned(
     report: &mut BoardRecoverReport,
 ) -> Result<(u64, u64), DbError> {
     let table = spec.table;
-    let kept: Vec<(String, String, i64)> =
-        sqlx::query_as(&format!("SELECT id, card_id, version FROM kept.{table} ORDER BY created_at, id"))
-            .fetch_all(&mut **tx)
-            .await?;
+    let kept: Vec<(String, String, i64)> = sqlx::query_as(&format!(
+        "SELECT id, card_id, version FROM kept.{table} ORDER BY created_at, id"
+    ))
+    .fetch_all(&mut **tx)
+    .await?;
     let (mut inserted, mut updated) = (0u64, 0u64);
     for (id, card_id, kept_version) in kept {
         let current: Option<i64> = sqlx::query_scalar(&format!("SELECT version FROM main.{table} WHERE id = ?"))
@@ -590,13 +590,18 @@ async fn recover_versioned(
             .await?;
         match current {
             None => {
-                let card_exists: i64 =
-                    sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM main.board_cards WHERE id = ?)")
-                        .bind(&card_id)
-                        .fetch_one(&mut **tx)
-                        .await?;
+                let card_exists: i64 = sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM main.board_cards WHERE id = ?)")
+                    .bind(&card_id)
+                    .fetch_one(&mut **tx)
+                    .await?;
                 if card_exists == 0 {
-                    report.conflicts.push(conflict(spec.entity, &id, "its card does not exist here", Some(kept_version), None));
+                    report.conflicts.push(conflict(
+                        spec.entity,
+                        &id,
+                        "its card does not exist here",
+                        Some(kept_version),
+                        None,
+                    ));
                     continue;
                 }
                 if let Some(check) = spec.duplicate_check {
@@ -704,12 +709,13 @@ async fn replay_set_operations(
                 if event.kind == "link_added" {
                     replay_link_added(tx, event, card_id, conversation_id, &payload, report).await?;
                 } else {
-                    let removed = sqlx::query("DELETE FROM main.board_card_links WHERE card_id = ? AND conversation_id = ?")
-                        .bind(card_id)
-                        .bind(conversation_id)
-                        .execute(&mut **tx)
-                        .await?
-                        .rows_affected();
+                    let removed =
+                        sqlx::query("DELETE FROM main.board_card_links WHERE card_id = ? AND conversation_id = ?")
+                            .bind(card_id)
+                            .bind(conversation_id)
+                            .execute(&mut **tx)
+                            .await?
+                            .rows_affected();
                     report.links_removed += removed;
                 }
             }
@@ -768,11 +774,12 @@ async fn replay_link_added(
     }
     let role = payload_str(payload, &[&["link", "role"]]).unwrap_or("other");
     if role == "lead" {
-        let lead: i64 =
-            sqlx::query_scalar("SELECT EXISTS(SELECT 1 FROM main.board_card_links WHERE card_id = ? AND role = 'lead')")
-                .bind(card_id)
-                .fetch_one(&mut **tx)
-                .await?;
+        let lead: i64 = sqlx::query_scalar(
+            "SELECT EXISTS(SELECT 1 FROM main.board_card_links WHERE card_id = ? AND role = 'lead')",
+        )
+        .bind(card_id)
+        .fetch_one(&mut **tx)
+        .await?;
         if lead != 0 {
             report.conflicts.push(conflict(
                 "link",
@@ -829,9 +836,13 @@ async fn replay_dep_added(
         .fetch_one(&mut **tx)
         .await?;
     if both != 2 {
-        report
-            .conflicts
-            .push(conflict("dep", &key, "a card of the dependency does not exist here", None, None));
+        report.conflicts.push(conflict(
+            "dep",
+            &key,
+            "a card of the dependency does not exist here",
+            None,
+            None,
+        ));
         return Ok(());
     }
     let edges: Vec<(String, String)> =

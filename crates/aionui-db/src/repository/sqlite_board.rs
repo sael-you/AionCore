@@ -16,8 +16,7 @@ use crate::repository::board::{
 };
 use crate::repository::sqlite_board_tx::SqliteBoardTx;
 
-pub(crate) const SETTINGS_COLS: &str =
-    "project_id, user_id, enabled, template, next_number, version, settings, archived_at, keeper_conversation_id, \
+pub(crate) const SETTINGS_COLS: &str = "project_id, user_id, enabled, template, next_number, version, settings, archived_at, keeper_conversation_id, \
      created_at, updated_at";
 pub(crate) const COLUMN_COLS: &str = "id, project_id, user_id, key, name, category, kind, resolution, agent_move, \
      wip_limit, exit_rule, gate, position, archived";
@@ -34,8 +33,7 @@ pub(crate) const DEP_COLS: &str = "card_id, depends_on_card_id, project_id, user
 pub(crate) const IDEMPOTENCY_COLS: &str = "user_id, project_id, key, request_hash, state, assignment_id, response, \
      claim_token, packet_message_id, created_at, updated_at";
 /// The 901 index expression (lookups must use it verbatim to hit the index).
-pub(crate) const ASSIGNMENT_EXPR: &str =
-    "json_extract(extra, '$.board_assignment_id')";
+pub(crate) const ASSIGNMENT_EXPR: &str = "json_extract(extra, '$.board_assignment_id')";
 
 pub(crate) async fn fetch_idempotency<'e, E: Executor<'e, Database = Sqlite>>(
     executor: E,
@@ -251,11 +249,12 @@ impl IBoardStore for SqliteBoardStore {
     }
 
     async fn team_project_id(&self, user_id: &str, team_id: &str) -> Result<Option<String>, DbError> {
-        let row: Option<(Option<String>,)> = sqlx::query_as("SELECT project_id FROM teams WHERE user_id = ? AND id = ?")
-            .bind(user_id)
-            .bind(team_id)
-            .fetch_optional(&self.pool)
-            .await?;
+        let row: Option<(Option<String>,)> =
+            sqlx::query_as("SELECT project_id FROM teams WHERE user_id = ? AND id = ?")
+                .bind(user_id)
+                .bind(team_id)
+                .fetch_optional(&self.pool)
+                .await?;
         Ok(row.and_then(|(project_id,)| project_id).filter(|id| !id.is_empty()))
     }
 
@@ -287,7 +286,11 @@ impl IBoardStore for SqliteBoardStore {
         project_id: &str,
         include_archived: bool,
     ) -> Result<Vec<BoardCardRow>, DbError> {
-        let archived = if include_archived { "" } else { " AND archived_at IS NULL" };
+        let archived = if include_archived {
+            ""
+        } else {
+            " AND archived_at IS NULL"
+        };
         Ok(sqlx::query_as::<_, BoardCardRow>(&format!(
             "SELECT {CARD_COLS} FROM board_cards WHERE user_id = ? AND project_id = ?{archived} \
              ORDER BY column_key ASC, position ASC, id ASC"
@@ -435,7 +438,8 @@ impl IBoardStore for SqliteBoardStore {
     }
 
     async fn events(&self, user_id: &str, query: &BoardEventQuery<'_>) -> Result<Vec<BoardEventRow>, DbError> {
-        let mut builder = QueryBuilder::<Sqlite>::new(format!("SELECT {EVENT_COLS} FROM board_events WHERE user_id = "));
+        let mut builder =
+            QueryBuilder::<Sqlite>::new(format!("SELECT {EVENT_COLS} FROM board_events WHERE user_id = "));
         builder.push_bind(user_id.to_owned());
         match query.scope {
             BoardEventScope::Project(id) => builder.push(" AND project_id = ").push_bind(id.to_owned()),

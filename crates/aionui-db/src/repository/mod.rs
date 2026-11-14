@@ -49,8 +49,8 @@ pub use assistant::{
     IAssistantPreferenceRepository, IAssistantRepository,
 };
 pub use board::{
-    BOARD_POSITION_GAP, BoardCallerRow, BoardCardCursor, BoardCardFilter, BoardConversationInfo, BoardEventQuery, BoardEventScope,
-    BoardPlacement, BoardPlacementOutcome, BoardProjectRow, IBoardStore, IBoardTx, NewBoardEvent,
+    BOARD_POSITION_GAP, BoardCallerRow, BoardCardCursor, BoardCardFilter, BoardConversationInfo, BoardEventQuery,
+    BoardEventScope, BoardPlacement, BoardPlacementOutcome, BoardProjectRow, IBoardStore, IBoardTx, NewBoardEvent,
 };
 pub use channel::IChannelRepository;
 pub use client_preference::IClientPreferenceRepository;

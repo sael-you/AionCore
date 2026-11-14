@@ -32,7 +32,11 @@ async fn pool(path: &Path) -> SqlitePool {
         .unwrap()
         .create_if_missing(true)
         .foreign_keys(true);
-    SqlitePoolOptions::new().max_connections(1).connect_with(options).await.unwrap()
+    SqlitePoolOptions::new()
+        .max_connections(1)
+        .connect_with(options)
+        .await
+        .unwrap()
 }
 
 /// Run a staged migrator with the connection PRAGMAs `run_migrations` uses
@@ -90,16 +94,20 @@ async fn a_database_at_044_and_900_upgrades_to_901_through_the_startup_path() {
         let versions = applied_versions(&pool).await;
         assert!(versions.contains(&44) && versions.contains(&900) && !versions.contains(&901));
         assert!(!table_exists(&pool, "board_cards").await);
-        sqlx::query("INSERT INTO users (id, username, password_hash, created_at, updated_at) VALUES ('u', 'u', 'x', 0, 0)")
-            .execute(&pool)
-            .await
-            .unwrap();
+        sqlx::query(
+            "INSERT INTO users (id, username, password_hash, created_at, updated_at) VALUES ('u', 'u', 'x', 0, 0)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
         // An existing assignment-free conversation is unaffected by 901.
         insert_conversation(&pool, "legacy", "u", "{}").await.unwrap();
         pool.close().await;
     }
 
-    let db = aionui_db::init_database(&db_path).await.expect("901 applies on top of 900");
+    let db = aionui_db::init_database(&db_path)
+        .await
+        .expect("901 applies on top of 900");
     let versions = applied_versions(db.pool()).await;
     assert_eq!(versions.last(), Some(&901));
     for table in [
@@ -178,8 +186,12 @@ async fn the_board_assignment_index_is_a_per_user_find_or_create_guard() {
         duplicate.to_string().to_lowercase().contains("unique"),
         "second conversation for the same assignment is refused: {duplicate}"
     );
-    insert_conversation(pool, "c", "u2", assigned).await.expect("scoped per user");
-    insert_conversation(pool, "d", "u1", "{}").await.expect("no assignment id → unconstrained");
+    insert_conversation(pool, "c", "u2", assigned)
+        .await
+        .expect("scoped per user");
+    insert_conversation(pool, "d", "u1", "{}")
+        .await
+        .expect("no assignment id → unconstrained");
     insert_conversation(pool, "e", "u1", "{}").await.unwrap();
 
     // The lookup expression hits the index.
@@ -194,7 +206,8 @@ async fn the_board_assignment_index_is_a_per_user_find_or_create_guard() {
     .map(|row| row.get::<String, _>("detail"))
     .collect();
     assert!(
-        plan.iter().any(|detail| detail.contains("idx_conversations_board_assignment")),
+        plan.iter()
+            .any(|detail| detail.contains("idx_conversations_board_assignment")),
         "{plan:?}"
     );
 }

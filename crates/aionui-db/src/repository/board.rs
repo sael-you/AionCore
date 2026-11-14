@@ -160,8 +160,12 @@ pub trait IBoardStore: Send + Sync {
     async fn columns(&self, user_id: &str, project_id: &str) -> Result<Vec<BoardColumnRow>, DbError>;
 
     /// All cards of a board ordered by `(column_key, position, id)`.
-    async fn cards(&self, user_id: &str, project_id: &str, include_archived: bool)
-    -> Result<Vec<BoardCardRow>, DbError>;
+    async fn cards(
+        &self,
+        user_id: &str,
+        project_id: &str,
+        include_archived: bool,
+    ) -> Result<Vec<BoardCardRow>, DbError>;
 
     /// One keyset page of cards ordered by `(column_key, position, id)`.
     async fn cards_page(
@@ -204,12 +208,8 @@ pub trait IBoardStore: Send + Sync {
     async fn events(&self, user_id: &str, query: &BoardEventQuery<'_>) -> Result<Vec<BoardEventRow>, DbError>;
 
     /// The newest `limit` events of a card, returned in ascending `seq`.
-    async fn recent_card_events(
-        &self,
-        user_id: &str,
-        card_id: &str,
-        limit: i64,
-    ) -> Result<Vec<BoardEventRow>, DbError>;
+    async fn recent_card_events(&self, user_id: &str, card_id: &str, limit: i64)
+    -> Result<Vec<BoardEventRow>, DbError>;
 
     async fn supervisor_cursor(
         &self,
@@ -230,8 +230,12 @@ pub trait IBoardStore: Send + Sync {
         conversation_id: &str,
     ) -> Result<Option<BoardConversationInfo>, DbError>;
 
-    async fn idempotency(&self, user_id: &str, project_id: &str, key: &str)
-    -> Result<Option<BoardIdempotencyRow>, DbError>;
+    async fn idempotency(
+        &self,
+        user_id: &str,
+        project_id: &str,
+        key: &str,
+    ) -> Result<Option<BoardIdempotencyRow>, DbError>;
 
     /// Id (`msg_id`, else row id) of the conversation's first user message.
     async fn first_user_message(&self, user_id: &str, conversation_id: &str) -> Result<Option<String>, DbError>;
@@ -322,8 +326,12 @@ pub trait IBoardTx: Send {
         depends_on_card_id: &str,
     ) -> Result<bool, DbError>;
 
-    async fn link(&mut self, user_id: &str, card_id: &str, conversation_id: &str)
-    -> Result<Option<BoardLinkRow>, DbError>;
+    async fn link(
+        &mut self,
+        user_id: &str,
+        card_id: &str,
+        conversation_id: &str,
+    ) -> Result<Option<BoardLinkRow>, DbError>;
 
     async fn insert_link(&mut self, row: &BoardLinkRow) -> Result<(), DbError>;
 
@@ -381,8 +389,13 @@ pub trait IBoardTx: Send {
     /// The card's deploy job that is not terminal (`requested|running`).
     async fn active_deploy_job(&mut self, user_id: &str, card_id: &str) -> Result<Option<BoardDeployJobRow>, DbError>;
 
-    async fn update_deploy_job_detail(&mut self, user_id: &str, job_id: &str, detail: &str, now: i64)
-    -> Result<(), DbError>;
+    async fn update_deploy_job_detail(
+        &mut self,
+        user_id: &str,
+        job_id: &str,
+        detail: &str,
+        now: i64,
+    ) -> Result<(), DbError>;
 
     /// Highest event `seq` of a project (0 when none).
     async fn last_seq(&mut self, user_id: &str, project_id: &str) -> Result<i64, DbError>;

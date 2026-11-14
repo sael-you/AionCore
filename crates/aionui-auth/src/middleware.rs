@@ -219,7 +219,9 @@ async fn runtime_token_channel(state: &AuthState, mut request: Request, next: Ne
         user_type: user.user_type,
         status: user.status,
     });
-    request.extensions_mut().insert(AuthChannel::RuntimeToken { conversation_id });
+    request
+        .extensions_mut()
+        .insert(AuthChannel::RuntimeToken { conversation_id });
 
     Ok(next.run(request).await)
 }

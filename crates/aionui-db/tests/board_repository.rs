@@ -139,8 +139,10 @@ async fn task_numbers_stay_unique_under_concurrent_writers() {
         handles.push(tokio::spawn(async move {
             let mut tx = store.begin().await.unwrap();
             let number = tx.claim_number(USER, PROJECT).await.unwrap().unwrap();
-            let BoardPlacementOutcome::Placed(position) =
-                tx.place(USER, PROJECT, "todo", None, BoardPlacement::Tail).await.unwrap()
+            let BoardPlacementOutcome::Placed(position) = tx
+                .place(USER, PROJECT, "todo", None, BoardPlacement::Tail)
+                .await
+                .unwrap()
             else {
                 panic!("tail placement");
             };
@@ -175,25 +177,38 @@ async fn placement_uses_midpoints_and_rebalances_an_exhausted_gap() {
     let mut tx = store.begin().await.unwrap();
     tx.insert_card(&card(USER, PROJECT, "a", 1, "todo", 10)).await.unwrap();
     tx.insert_card(&card(USER, PROJECT, "b", 2, "todo", 11)).await.unwrap();
-    tx.insert_card(&card(USER, PROJECT, "c", 3, "todo", 2000)).await.unwrap();
-    tx.insert_card(&card(USER, PROJECT, "m", 4, "done", 1024)).await.unwrap();
+    tx.insert_card(&card(USER, PROJECT, "c", 3, "todo", 2000))
+        .await
+        .unwrap();
+    tx.insert_card(&card(USER, PROJECT, "m", 4, "done", 1024))
+        .await
+        .unwrap();
 
     // Room between b (11) and c (2000): integer midpoint, no renumbering.
     assert_eq!(
-        tx.place(USER, PROJECT, "todo", Some("m"), BoardPlacement::After("b")).await.unwrap(),
+        tx.place(USER, PROJECT, "todo", Some("m"), BoardPlacement::After("b"))
+            .await
+            .unwrap(),
         BoardPlacementOutcome::Placed(1005)
     );
     // Head insert: first - 1024.
     assert_eq!(
-        tx.place(USER, PROJECT, "todo", Some("m"), BoardPlacement::Before("a")).await.unwrap(),
+        tx.place(USER, PROJECT, "todo", Some("m"), BoardPlacement::Before("a"))
+            .await
+            .unwrap(),
         BoardPlacementOutcome::Placed(10 - BOARD_POSITION_GAP)
     );
     // a (10) / b (11): gap < 2 → the column is renumbered first.
-    let outcome = tx.place(USER, PROJECT, "todo", Some("m"), BoardPlacement::After("a")).await.unwrap();
+    let outcome = tx
+        .place(USER, PROJECT, "todo", Some("m"), BoardPlacement::After("a"))
+        .await
+        .unwrap();
     assert_eq!(outcome, BoardPlacementOutcome::Placed(1024 + 512));
     // An anchor outside the target column is reported, not guessed.
     assert_eq!(
-        tx.place(USER, PROJECT, "todo", Some("m"), BoardPlacement::After("m")).await.unwrap(),
+        tx.place(USER, PROJECT, "todo", Some("m"), BoardPlacement::After("m"))
+            .await
+            .unwrap(),
         BoardPlacementOutcome::AnchorNotFound
     );
     tx.commit().await.unwrap();
@@ -202,7 +217,11 @@ async fn placement_uses_midpoints_and_rebalances_an_exhausted_gap() {
         vec![("a".into(), 1024), ("b".into(), 2048), ("c".into(), 3072)],
         "rebalanced to 1024 spacing in (position, id) order"
     );
-    assert_eq!(positions(&store, "done").await, vec![("m".into(), 1024)], "other columns untouched");
+    assert_eq!(
+        positions(&store, "done").await,
+        vec![("m".into(), 1024)],
+        "other columns untouched"
+    );
 }
 
 #[tokio::test]
@@ -214,7 +233,9 @@ async fn equal_positions_tie_break_by_id_and_force_a_rebalance() {
     tx.insert_card(&card(USER, PROJECT, "y", 1, "todo", 5)).await.unwrap();
     tx.insert_card(&card(USER, PROJECT, "x", 2, "todo", 5)).await.unwrap();
     assert_eq!(
-        tx.place(USER, PROJECT, "todo", None, BoardPlacement::After("x")).await.unwrap(),
+        tx.place(USER, PROJECT, "todo", None, BoardPlacement::After("x"))
+            .await
+            .unwrap(),
         BoardPlacementOutcome::Placed(1536)
     );
     tx.commit().await.unwrap();
@@ -230,13 +251,18 @@ async fn versions_guard_cards_settings_and_questions() {
     let store = SqliteBoardStore::new(db.pool().clone());
     board(&store, USER, PROJECT).await;
     let mut tx = store.begin().await.unwrap();
-    tx.insert_card(&card(USER, PROJECT, "a", 1, "todo", 1024)).await.unwrap();
+    tx.insert_card(&card(USER, PROJECT, "a", 1, "todo", 1024))
+        .await
+        .unwrap();
     let mut row = tx.card(USER, "a").await.unwrap().unwrap();
     row.title = "renamed".into();
     row.version = 2;
     assert!(!tx.update_card(&row, 7).await.unwrap(), "stale version rejected");
     assert!(tx.update_card(&row, 1).await.unwrap());
-    assert!(!tx.update_card(&row, 1).await.unwrap(), "the same base version cannot win twice");
+    assert!(
+        !tx.update_card(&row, 1).await.unwrap(),
+        "the same base version cannot win twice"
+    );
 
     let mut header = tx.settings(USER, PROJECT).await.unwrap().unwrap();
     header.enabled = false;
@@ -276,8 +302,12 @@ async fn reads_and_writes_are_scoped_to_the_owner() {
     let store = SqliteBoardStore::new(db.pool().clone());
     board(&store, USER, PROJECT).await;
     let mut tx = store.begin().await.unwrap();
-    tx.insert_card(&card(USER, PROJECT, "a", 1, "todo", 1024)).await.unwrap();
-    tx.insert_event(&event(USER, PROJECT, Some("a"), "card_created", "e1")).await.unwrap();
+    tx.insert_card(&card(USER, PROJECT, "a", 1, "todo", 1024))
+        .await
+        .unwrap();
+    tx.insert_event(&event(USER, PROJECT, Some("a"), "card_created", "e1"))
+        .await
+        .unwrap();
     tx.commit().await.unwrap();
 
     assert!(store.settings(OTHER, PROJECT).await.unwrap().is_none());
@@ -295,11 +325,17 @@ async fn reads_and_writes_are_scoped_to_the_owner() {
     assert_eq!(store.events(USER, &query).await.unwrap().len(), 1);
 
     let mut tx = store.begin().await.unwrap();
-    assert!(tx.claim_number(OTHER, PROJECT).await.unwrap().is_none(), "no foreign counter");
+    assert!(
+        tx.claim_number(OTHER, PROJECT).await.unwrap().is_none(),
+        "no foreign counter"
+    );
     let mut foreign = card(USER, PROJECT, "a", 1, "todo", 1024);
     foreign.user_id = OTHER.into();
     foreign.title = "hijacked".into();
-    assert!(!tx.update_card(&foreign, 1).await.unwrap(), "foreign owner matches no row");
+    assert!(
+        !tx.update_card(&foreign, 1).await.unwrap(),
+        "foreign owner matches no row"
+    );
     tx.commit().await.unwrap();
     assert_eq!(store.card(USER, "a").await.unwrap().unwrap().title, "card 1");
     assert_eq!(store.delete_board(OTHER, PROJECT).await.unwrap(), 0);
@@ -313,7 +349,10 @@ async fn event_pages_are_keyset_by_seq_and_filterable_by_kind() {
     board(&store, USER, PROJECT).await;
     let mut tx = store.begin().await.unwrap();
     let mut seqs = Vec::new();
-    for (i, kind) in ["card_created", "commented", "card_moved", "commented"].iter().enumerate() {
+    for (i, kind) in ["card_created", "commented", "card_moved", "commented"]
+        .iter()
+        .enumerate()
+    {
         seqs.push(
             tx.insert_event(&event(USER, PROJECT, Some("a"), kind, &format!("e{i}")))
                 .await
@@ -333,13 +372,14 @@ async fn event_pages_are_keyset_by_seq_and_filterable_by_kind() {
     assert_eq!(first.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(), ["e0", "e1"]);
     let second = store.events(USER, &page(first[1].seq, None)).await.unwrap();
     assert_eq!(second.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(), ["e2", "e3"]);
-    let comments = store
-        .events(USER, &page(0, Some(&["commented"])))
-        .await
-        .unwrap();
+    let comments = store.events(USER, &page(0, Some(&["commented"]))).await.unwrap();
     assert_eq!(comments.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(), ["e1", "e3"]);
     let recent = store.recent_card_events(USER, "a", 2).await.unwrap();
-    assert_eq!(recent.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(), ["e2", "e3"], "newest, ascending");
+    assert_eq!(
+        recent.iter().map(|e| e.id.as_str()).collect::<Vec<_>>(),
+        ["e2", "e3"],
+        "newest, ascending"
+    );
 
     let mut tx = store.begin().await.unwrap();
     let duplicate = tx.insert_event(&event(USER, PROJECT, None, "commented", "e0")).await;
@@ -353,9 +393,15 @@ async fn delete_board_removes_every_board_row_of_the_project_only() {
     board(&store, USER, PROJECT).await;
     board(&store, USER, "proj-keep").await;
     let mut tx = store.begin().await.unwrap();
-    tx.insert_card(&card(USER, PROJECT, "a", 1, "todo", 1024)).await.unwrap();
-    tx.insert_card(&card(USER, "proj-keep", "k", 1, "todo", 1024)).await.unwrap();
-    tx.insert_event(&event(USER, PROJECT, Some("a"), "card_created", "e1")).await.unwrap();
+    tx.insert_card(&card(USER, PROJECT, "a", 1, "todo", 1024))
+        .await
+        .unwrap();
+    tx.insert_card(&card(USER, "proj-keep", "k", 1, "todo", 1024))
+        .await
+        .unwrap();
+    tx.insert_event(&event(USER, PROJECT, Some("a"), "card_created", "e1"))
+        .await
+        .unwrap();
     tx.commit().await.unwrap();
 
     assert_eq!(store.count_cards(USER, PROJECT, true).await.unwrap(), 1);
@@ -378,7 +424,14 @@ async fn paged_cards_filter_by_label_and_resume_from_the_cursor() {
     board(&store, USER, PROJECT).await;
     let mut tx = store.begin().await.unwrap();
     for (i, column) in ["todo", "todo", "done"].iter().enumerate() {
-        let mut row = card(USER, PROJECT, &format!("c{i}"), i as i64 + 1, column, 1024 * (i as i64 + 1));
+        let mut row = card(
+            USER,
+            PROJECT,
+            &format!("c{i}"),
+            i as i64 + 1,
+            column,
+            1024 * (i as i64 + 1),
+        );
         if i == 1 {
             row.labels = r#"["api"]"#.into();
         }
@@ -387,14 +440,21 @@ async fn paged_cards_filter_by_label_and_resume_from_the_cursor() {
     tx.commit().await.unwrap();
     let filter = aionui_db::BoardCardFilter::default();
     let first = store.cards_page(USER, PROJECT, &filter, None, 2).await.unwrap();
-    assert_eq!(first.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(), ["c2", "c0"], "(column, position, id)");
+    assert_eq!(
+        first.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(),
+        ["c2", "c0"],
+        "(column, position, id)"
+    );
     let last = &first[1];
     let cursor = aionui_db::BoardCardCursor {
         column_key: last.column_key.clone(),
         position: last.position,
         id: last.id.clone(),
     };
-    let next = store.cards_page(USER, PROJECT, &filter, Some(&cursor), 2).await.unwrap();
+    let next = store
+        .cards_page(USER, PROJECT, &filter, Some(&cursor), 2)
+        .await
+        .unwrap();
     assert_eq!(next.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(), ["c1"]);
     let labelled = aionui_db::BoardCardFilter {
         label: Some("api".into()),

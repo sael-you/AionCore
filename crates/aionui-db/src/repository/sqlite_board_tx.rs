@@ -13,12 +13,11 @@ use crate::models::{
     BoardCardRow, BoardColumnRow, BoardDepRow, BoardDeployJobRow, BoardIdempotencyRow, BoardLinkRow, BoardQuestionRow,
     BoardReviewRow, BoardSettingsRow,
 };
-use crate::repository::board::{
-    BOARD_POSITION_GAP, BoardPlacement, BoardPlacementOutcome, IBoardTx, NewBoardEvent,
-};
+use crate::repository::board::{BOARD_POSITION_GAP, BoardPlacement, BoardPlacementOutcome, IBoardTx, NewBoardEvent};
 use crate::repository::sqlite_board::{
-    IDEMPOTENCY_COLS, QUESTION_COLS, REVIEW_COLS, fetch_card, fetch_cards_by_ids, fetch_columns, fetch_count_cards, fetch_dependencies,
-    fetch_dependents, fetch_idempotency, fetch_last_seq, fetch_project_dependencies, fetch_settings,
+    IDEMPOTENCY_COLS, QUESTION_COLS, REVIEW_COLS, fetch_card, fetch_cards_by_ids, fetch_columns, fetch_count_cards,
+    fetch_dependencies, fetch_dependents, fetch_idempotency, fetch_last_seq, fetch_project_dependencies,
+    fetch_settings,
 };
 
 /// One open board write transaction.
@@ -470,35 +469,35 @@ impl IBoardTx for SqliteBoardTx {
     }
 
     async fn upsert_review(&mut self, row: &BoardReviewRow, expected_version: Option<i64>) -> Result<bool, DbError> {
-        let result = match expected_version {
-            None => {
-                sqlx::query(&format!(
-                    "INSERT INTO board_card_reviews ({REVIEW_COLS}) \
+        let result =
+            match expected_version {
+                None => {
+                    sqlx::query(&format!(
+                        "INSERT INTO board_card_reviews ({REVIEW_COLS}) \
                      VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) \
                      ON CONFLICT (card_id, department) DO NOTHING"
-                ))
-                .bind(&row.id)
-                .bind(&row.card_id)
-                .bind(&row.project_id)
-                .bind(&row.user_id)
-                .bind(&row.department)
-                .bind(&row.reviewer_ref)
-                .bind(&row.conversation_id)
-                .bind(&row.verdict)
-                .bind(&row.summary)
-                .bind(&row.findings)
-                .bind(&row.recommendation)
-                .bind(&row.assumptions)
-                .bind(row.confidence)
-                .bind(row.tokens_used)
-                .bind(row.version)
-                .bind(row.created_at)
-                .bind(row.updated_at)
-                .execute(self.conn())
-                .await?
-            }
-            Some(expected) => {
-                sqlx::query(
+                    ))
+                    .bind(&row.id)
+                    .bind(&row.card_id)
+                    .bind(&row.project_id)
+                    .bind(&row.user_id)
+                    .bind(&row.department)
+                    .bind(&row.reviewer_ref)
+                    .bind(&row.conversation_id)
+                    .bind(&row.verdict)
+                    .bind(&row.summary)
+                    .bind(&row.findings)
+                    .bind(&row.recommendation)
+                    .bind(&row.assumptions)
+                    .bind(row.confidence)
+                    .bind(row.tokens_used)
+                    .bind(row.version)
+                    .bind(row.created_at)
+                    .bind(row.updated_at)
+                    .execute(self.conn())
+                    .await?
+                }
+                Some(expected) => sqlx::query(
                     "UPDATE board_card_reviews SET reviewer_ref = ?, conversation_id = ?, verdict = ?, summary = ?, \
                      findings = ?, recommendation = ?, assumptions = ?, confidence = ?, tokens_used = ?, version = ?, \
                      updated_at = ? WHERE user_id = ? AND id = ? AND version = ?",
@@ -518,9 +517,8 @@ impl IBoardTx for SqliteBoardTx {
                 .bind(&row.id)
                 .bind(expected)
                 .execute(self.conn())
-                .await?
-            }
-        };
+                .await?,
+            };
         Ok(result.rows_affected() == 1)
     }
 
@@ -751,6 +749,9 @@ mod tests {
 
     #[test]
     fn an_unknown_anchor_is_reported() {
-        assert_eq!(compute_position(&rows(&[("a", 1)]), BoardPlacement::After("x")), Slot::AnchorMissing);
+        assert_eq!(
+            compute_position(&rows(&[("a", 1)]), BoardPlacement::After("x")),
+            Slot::AnchorMissing
+        );
     }
 }
