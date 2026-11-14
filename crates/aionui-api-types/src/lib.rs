@@ -10,6 +10,8 @@ mod antigravity_hook;
 mod ask;
 mod assistant;
 mod auth;
+mod board;
+mod board_tools;
 mod channel;
 mod chat_file;
 mod confirmation;
@@ -82,6 +84,21 @@ pub use auth::{
     RevokeExternalSessionResponse, UserInfoResponse, WebuiChangePasswordRequest, WebuiChangeUsernameRequest,
     WebuiChangeUsernameResponse, WebuiGenerateQrTokenResponse, WebuiResetPasswordResponse, WsTokenResponse,
 };
+pub use board::{
+    AgentBlockBoardCardRequest, AgentLinkBoardCardRequest, AgentMove, AgentMoveBoardCardRequest,
+    AgentShowBoardCardQuery, AgentUpdateBoardCardRequest, AssigneeKind, BOARD_ACTOR_HEADER, BOARD_ACTOR_SUPERVISOR,
+    BOARD_CHANGED_EVENT, BOARD_TOOLS_SCHEMA_VERSION, BoardActorKind, BoardAssignRequest, BoardAssignResponse,
+    BoardBrainstormRequest, BoardCardDetail, BoardCardDto, BoardCardListQuery, BoardCardPage, BoardCardSummaryDto,
+    BoardChangedPayload, BoardCliEnvelope, BoardCliError, BoardCliMeta, BoardColumnDto, BoardColumnInput,
+    BoardColumnsResponse, BoardCommentRequest, BoardDependencyDto, BoardEmptyRequest, BoardEventDto, BoardEventPage,
+    BoardEventsQuery, BoardFinding, BoardGateRequest, BoardKeeperResponse, BoardLinkDto, BoardLinkRequest,
+    BoardLinkStatus, BoardPacketDto, BoardQuestionDto, BoardReviewDto, BoardReviewRequest, BoardReviewResult,
+    BoardSettingsDto, BoardStatusResponse, BoardTemplate, BoardVerdictQuestion, BoardView, BoardViewQuery,
+    CardPriority, CardSize, CardTier, CardType, ColumnCategory, ColumnKind, ColumnResolution, CreateBoardCardRequest,
+    FindingSeverity, GateDecision, LinkRole, MoveBoardCardRequest, ParentFallback, ReviewVerdict,
+    UpdateBoardCardRequest, UpdateBoardColumnsRequest, UpdateBoardSettingsRequest,
+};
+pub use board_tools::{BoardToolDescriptor, board_tool_descriptors, board_tool_for_cli_command};
 pub use channel::{
     ApprovePairingRequest, BridgeResponse, ChannelAssistantSettingRequest, ChannelAssistantSettingResponse,
     ChannelDefaultModelSetting, ChannelPlatformSettingsResponse, ChannelSessionResponse, ChannelUserResponse,

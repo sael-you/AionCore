@@ -120,6 +120,10 @@ pub struct RemoveProjectResult {
     pub teams_deleted: i64,
     /// Independent conversations classified into the project's group.
     pub conversations_deleted: i64,
+    /// Board cards (archived included) removed with the project's board.
+    /// On a `dry_run` the count that *would* be removed.
+    #[serde(default)]
+    pub board_cards: i64,
     /// The named units in the delete set, so a `dry_run` preview can list *which*
     /// items go — not just how many. Pinned members live in the top pinned group
     /// (B1 double-render: a project's pinned rows are anti-joined out of its own
