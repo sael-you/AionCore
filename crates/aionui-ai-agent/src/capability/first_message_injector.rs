@@ -94,15 +94,30 @@ mod tests {
         AcpSkillManager::new(paths)
     }
 
+    /// Serialises every test that points `BUILTIN_SKILLS_ENV_VAR` somewhere:
+    /// the variable is process-wide and tests run in parallel, so without this
+    /// one test's `Drop` could remove the variable while another test is still
+    /// resolving skills (flaky "assertion failed: out.contains(..)").
+    fn builtin_env_lock() -> &'static std::sync::Mutex<()> {
+        static LOCK: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        LOCK.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
     /// Point the embedded corpus at an empty dir so tests don't pick up
-    /// real auto-inject builtin skills.
-    struct EmptyBuiltinGuard;
+    /// real auto-inject builtin skills. Holds [`builtin_env_lock`] for its
+    /// whole lifetime.
+    struct EmptyBuiltinGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
     impl EmptyBuiltinGuard {
         fn new(empty_path: &std::path::Path) -> Self {
+            let lock = builtin_env_lock()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             unsafe {
                 std::env::set_var(BUILTIN_SKILLS_ENV_VAR, empty_path);
             }
-            Self
+            Self { _lock: lock }
         }
     }
     impl Drop for EmptyBuiltinGuard {
