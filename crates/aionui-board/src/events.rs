@@ -64,6 +64,7 @@ impl BoardEventEmitter {
             user_id: user_id.to_owned(),
             project_id: event.project_id.clone(),
             seq: event.seq,
+            prev_seq: event.prev_seq,
             event: event.clone(),
             card: card.cloned(),
             review: review.cloned(),

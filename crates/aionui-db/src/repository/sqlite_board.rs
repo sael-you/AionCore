@@ -16,15 +16,14 @@ use crate::repository::board::{
 };
 use crate::repository::sqlite_board_tx::SqliteBoardTx;
 
-pub(crate) const SETTINGS_COLS: &str = "project_id, user_id, enabled, template, next_number, version, settings, archived_at, keeper_conversation_id, \
-     created_at, updated_at";
+pub(crate) const SETTINGS_COLS: &str = "project_id, user_id, enabled, template, next_number, version, settings, \
+     archived_at, keeper_conversation_id, last_event_seq, created_at, updated_at";
 pub(crate) const COLUMN_COLS: &str = "id, project_id, user_id, key, name, category, kind, resolution, agent_move, \
      wip_limit, exit_rule, gate, position, archived";
 pub(crate) const CARD_COLS: &str = "id, project_id, user_id, number, title, description, type, priority, size, tier, \
      column_key, position, labels, skills, routing, creator_kind, creator_ref, assignee_kind, assignee_ref, blocked, \
      blocked_reason, change_id, metadata, version, archived_at, created_at, updated_at";
-pub(crate) const EVENT_COLS: &str =
-    "seq, id, card_id, project_id, user_id, actor_kind, actor_ref, conversation_id, kind, payload, created_at";
+pub(crate) const EVENT_COLS: &str = "seq, id, card_id, project_id, user_id, actor_kind, actor_ref, conversation_id, kind, payload, prev_seq, created_at";
 pub(crate) const REVIEW_COLS: &str = "id, card_id, project_id, user_id, department, reviewer_ref, conversation_id, \
      verdict, summary, findings, recommendation, assumptions, confidence, tokens_used, version, created_at, updated_at";
 pub(crate) const QUESTION_COLS: &str = "id, card_id, project_id, user_id, from_department, to_department, text, \
@@ -56,13 +55,13 @@ pub(crate) async fn fetch_last_seq<'e, E: Executor<'e, Database = Sqlite>>(
     user_id: &str,
     project_id: &str,
 ) -> Result<i64, DbError> {
-    Ok(
-        sqlx::query_scalar("SELECT COALESCE(MAX(seq), 0) FROM board_events WHERE user_id = ? AND project_id = ?")
-            .bind(user_id)
-            .bind(project_id)
-            .fetch_one(executor)
-            .await?,
+    Ok(sqlx::query_scalar(
+        "SELECT COALESCE((SELECT last_event_seq FROM board_settings WHERE user_id = ? AND project_id = ?), 0)",
     )
+    .bind(user_id)
+    .bind(project_id)
+    .fetch_one(executor)
+    .await?)
 }
 
 /// Every board table, child tables first; used by project deletion.

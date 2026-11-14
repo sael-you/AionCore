@@ -11,7 +11,8 @@
 
 -- Board header: on/off switch, template, TASK-N counter, settings version.
 -- `next_number` is claimed with UPDATE … RETURNING inside the card-create
--- transaction; `version` guards settings and the columns collection.
+-- transaction; `version` guards settings and the columns collection;
+-- `last_event_seq` is the head of the project's event chain.
 -- Every board uses the department (`studio`) flow (D39); the column stays so a
 -- later template needs no table rebuild. `keeper_conversation_id` is the
 -- project's pinned Board Keeper conversation (D40), NULL until created.
@@ -25,6 +26,7 @@ CREATE TABLE IF NOT EXISTS board_settings (
     settings    TEXT    NOT NULL DEFAULT '{}',
     archived_at INTEGER,
     keeper_conversation_id TEXT,
+    last_event_seq INTEGER NOT NULL DEFAULT 0,
     created_at  INTEGER NOT NULL,
     updated_at  INTEGER NOT NULL
 );
@@ -193,8 +195,10 @@ CREATE TABLE IF NOT EXISTS board_card_links (
 CREATE UNIQUE INDEX IF NOT EXISTS idx_board_card_links_single_lead ON board_card_links (card_id) WHERE role = 'lead';
 CREATE INDEX IF NOT EXISTS idx_board_card_links_conversation ON board_card_links (conversation_id);
 
--- Append-only history. `seq` is the replay order (never reused, never copied
--- by recover); `id` is the stable identity used for de-duplication.
+-- Append-only history. `seq` is the global replay order (never reused, never
+-- copied by recover); `id` is the stable identity used for de-duplication;
+-- `prev_seq` chains a project's events (the project's previous `seq`, 0 for
+-- the first) so a client detects a gap per project.
 CREATE TABLE IF NOT EXISTS board_events (
     seq             INTEGER PRIMARY KEY AUTOINCREMENT,
     id              TEXT    NOT NULL UNIQUE,
@@ -206,6 +210,7 @@ CREATE TABLE IF NOT EXISTS board_events (
     conversation_id TEXT,
     kind            TEXT    NOT NULL,
     payload         TEXT    NOT NULL DEFAULT '{}',
+    prev_seq        INTEGER NOT NULL DEFAULT 0,
     created_at      INTEGER NOT NULL
 );
 CREATE INDEX IF NOT EXISTS idx_board_events_project_seq ON board_events (project_id, seq);

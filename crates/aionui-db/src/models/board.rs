@@ -24,6 +24,8 @@ pub struct BoardSettingsRow {
     pub archived_at: Option<TimestampMs>,
     /// The project's Board Keeper conversation (D40).
     pub keeper_conversation_id: Option<String>,
+    /// `seq` of the project's newest event (head of its chain).
+    pub last_event_seq: i64,
     pub created_at: TimestampMs,
     pub updated_at: TimestampMs,
 }
@@ -185,6 +187,8 @@ pub struct BoardEventRow {
     pub kind: String,
     /// JSON object.
     pub payload: String,
+    /// The project's previous event `seq` (0 for its first event).
+    pub prev_seq: i64,
     pub created_at: TimestampMs,
 }
 

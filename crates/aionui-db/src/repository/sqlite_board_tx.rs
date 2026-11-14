@@ -13,7 +13,9 @@ use crate::models::{
     BoardCardRow, BoardColumnRow, BoardDepRow, BoardDeployJobRow, BoardIdempotencyRow, BoardLinkRow, BoardQuestionRow,
     BoardReviewRow, BoardSettingsRow,
 };
-use crate::repository::board::{BOARD_POSITION_GAP, BoardPlacement, BoardPlacementOutcome, IBoardTx, NewBoardEvent};
+use crate::repository::board::{
+    BOARD_POSITION_GAP, BoardEventSeq, BoardPlacement, BoardPlacementOutcome, IBoardTx, NewBoardEvent,
+};
 use crate::repository::sqlite_board::{
     IDEMPOTENCY_COLS, QUESTION_COLS, REVIEW_COLS, fetch_card, fetch_cards_by_ids, fetch_columns, fetch_count_cards,
     fetch_dependencies, fetch_dependents, fetch_idempotency, fetch_last_seq, fetch_project_dependencies,
@@ -33,6 +35,49 @@ impl SqliteBoardTx {
     fn conn(&mut self) -> &mut SqliteConnection {
         &mut self.tx
     }
+}
+
+/// Append `event` to its project's chain in `schema` (`main` here; recover
+/// writes through the same function): read the project's newest `seq`, insert
+/// with it as `prev_seq`, move `board_settings.last_event_seq`. Callers hold a
+/// `BEGIN IMMEDIATE` transaction, so the read-insert-update is atomic.
+pub(crate) async fn insert_chained_event(
+    conn: &mut SqliteConnection,
+    schema: &str,
+    event: &NewBoardEvent,
+) -> Result<BoardEventSeq, DbError> {
+    let prev_seq: i64 = sqlx::query_scalar(&format!(
+        "SELECT COALESCE(MAX(seq), 0) FROM {schema}.board_events WHERE project_id = ?"
+    ))
+    .bind(&event.project_id)
+    .fetch_one(&mut *conn)
+    .await?;
+    let seq: i64 = sqlx::query_scalar(&format!(
+        "INSERT INTO {schema}.board_events \
+         (id, card_id, project_id, user_id, actor_kind, actor_ref, conversation_id, kind, payload, prev_seq, created_at) \
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING seq"
+    ))
+    .bind(&event.id)
+    .bind(&event.card_id)
+    .bind(&event.project_id)
+    .bind(&event.user_id)
+    .bind(&event.actor_kind)
+    .bind(&event.actor_ref)
+    .bind(&event.conversation_id)
+    .bind(&event.kind)
+    .bind(&event.payload)
+    .bind(prev_seq)
+    .bind(event.created_at)
+    .fetch_one(&mut *conn)
+    .await?;
+    sqlx::query(&format!(
+        "UPDATE {schema}.board_settings SET last_event_seq = ? WHERE project_id = ?"
+    ))
+    .bind(seq)
+    .bind(&event.project_id)
+    .execute(&mut *conn)
+    .await?;
+    Ok(BoardEventSeq { seq, prev_seq })
 }
 
 /// Where a placement lands among a column's current positions.
@@ -116,8 +161,8 @@ impl IBoardTx for SqliteBoardTx {
         sqlx::query(
             "INSERT INTO board_settings \
              (project_id, user_id, enabled, template, next_number, version, settings, archived_at, \
-              keeper_conversation_id, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+              keeper_conversation_id, last_event_seq, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&row.project_id)
         .bind(&row.user_id)
@@ -128,6 +173,7 @@ impl IBoardTx for SqliteBoardTx {
         .bind(&row.settings)
         .bind(row.archived_at)
         .bind(&row.keeper_conversation_id)
+        .bind(row.last_event_seq)
         .bind(row.created_at)
         .bind(row.updated_at)
         .execute(self.conn())
@@ -680,24 +726,8 @@ impl IBoardTx for SqliteBoardTx {
         fetch_last_seq(self.conn(), user_id, project_id).await
     }
 
-    async fn insert_event(&mut self, event: &NewBoardEvent) -> Result<i64, DbError> {
-        Ok(sqlx::query_scalar(
-            "INSERT INTO board_events \
-             (id, card_id, project_id, user_id, actor_kind, actor_ref, conversation_id, kind, payload, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING seq",
-        )
-        .bind(&event.id)
-        .bind(&event.card_id)
-        .bind(&event.project_id)
-        .bind(&event.user_id)
-        .bind(&event.actor_kind)
-        .bind(&event.actor_ref)
-        .bind(&event.conversation_id)
-        .bind(&event.kind)
-        .bind(&event.payload)
-        .bind(event.created_at)
-        .fetch_one(self.conn())
-        .await?)
+    async fn insert_event(&mut self, event: &NewBoardEvent) -> Result<BoardEventSeq, DbError> {
+        insert_chained_event(self.conn(), "main", event).await
     }
 
     async fn commit(self: Box<Self>) -> Result<(), DbError> {

@@ -122,6 +122,14 @@ pub enum BoardPlacementOutcome {
     AnchorNotFound,
 }
 
+/// Where an appended event landed: its global `seq` and the project's
+/// previous `seq` (the chain link).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BoardEventSeq {
+    pub seq: i64,
+    pub prev_seq: i64,
+}
+
 /// A `board_events` row to append; `seq` is assigned by SQLite.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NewBoardEvent {
@@ -217,7 +225,8 @@ pub trait IBoardStore: Send + Sync {
         project_id: &str,
     ) -> Result<Option<BoardSupervisorCursorRow>, DbError>;
 
-    /// Highest event `seq` of a project (0 when none).
+    /// Head of the project's event chain (`board_settings.last_event_seq`,
+    /// 0 when none).
     async fn last_seq(&self, user_id: &str, project_id: &str) -> Result<i64, DbError>;
 
     /// The user's conversation created for an assignment
@@ -400,8 +409,9 @@ pub trait IBoardTx: Send {
     /// Highest event `seq` of a project (0 when none).
     async fn last_seq(&mut self, user_id: &str, project_id: &str) -> Result<i64, DbError>;
 
-    /// Append an event; returns the assigned `seq`.
-    async fn insert_event(&mut self, event: &NewBoardEvent) -> Result<i64, DbError>;
+    /// Append an event to its project's chain: `prev_seq` = the project's
+    /// newest `seq`, and `board_settings.last_event_seq` moves to the new one.
+    async fn insert_event(&mut self, event: &NewBoardEvent) -> Result<BoardEventSeq, DbError>;
 
     async fn commit(self: Box<Self>) -> Result<(), DbError>;
 }

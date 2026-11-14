@@ -1008,3 +1008,40 @@ async fn paged_card_list_resolves_assignee_me_for_agents_only() {
         "board_invalid"
     );
 }
+
+#[tokio::test]
+async fn interleaved_projects_each_keep_a_gapless_event_chain() {
+    let mut env = env().await;
+    enable(&env.service, PROJECT).await;
+    enable(&env.service, PROJECT_B).await;
+    for i in 0..3 {
+        env.service
+            .create_card(&owner(), PROJECT, create(&format!("a{i}")))
+            .await
+            .unwrap();
+        env.service
+            .create_card(&owner(), PROJECT_B, create(&format!("b{i}")))
+            .await
+            .unwrap();
+    }
+    let mut heads = std::collections::HashMap::new();
+    for message in env.drain() {
+        let project = message.data["project_id"].as_str().unwrap().to_owned();
+        let seq = message.data["seq"].as_i64().unwrap();
+        let prev = message.data["prev_seq"].as_i64().unwrap();
+        assert_eq!(message.data["event"]["prev_seq"].as_i64(), Some(prev));
+        let last = heads.insert(project.clone(), seq).unwrap_or(0);
+        assert_eq!(prev, last, "{project}: the WS chain has no gap");
+    }
+    for project in [PROJECT, PROJECT_B] {
+        let page = env.service.project_events(&owner(), project, None, None).await.unwrap();
+        assert_eq!(page.items.len(), 4);
+        assert_eq!(page.items[0].prev_seq, 0);
+        for pair in page.items.windows(2) {
+            assert_eq!(pair[1].prev_seq, pair[0].seq);
+        }
+        let view = env.service.board_view(&owner(), project, false).await.unwrap();
+        assert_eq!(view.last_seq, page.items[3].seq);
+        assert_eq!(heads[project], view.last_seq);
+    }
+}

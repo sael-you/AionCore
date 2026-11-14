@@ -165,6 +165,7 @@ pub fn card_summary(
 pub fn event_dto(row: &BoardEventRow) -> BoardEventDto {
     BoardEventDto {
         seq: row.seq,
+        prev_seq: row.prev_seq,
         id: row.id.clone(),
         card_id: row.card_id.clone(),
         project_id: row.project_id.clone(),

@@ -29,6 +29,7 @@ fn settings(user: &str, project: &str) -> BoardSettingsRow {
         enabled: true,
         template: "studio".into(),
         keeper_conversation_id: None,
+        last_event_seq: 0,
         next_number: 1,
         version: 1,
         settings: "{}".into(),
@@ -356,7 +357,8 @@ async fn event_pages_are_keyset_by_seq_and_filterable_by_kind() {
         seqs.push(
             tx.insert_event(&event(USER, PROJECT, Some("a"), kind, &format!("e{i}")))
                 .await
-                .unwrap(),
+                .unwrap()
+                .seq,
         );
     }
     tx.commit().await.unwrap();
@@ -462,4 +464,45 @@ async fn paged_cards_filter_by_label_and_resume_from_the_cursor() {
     };
     let api = store.cards_page(USER, PROJECT, &labelled, None, 10).await.unwrap();
     assert_eq!(api.iter().map(|c| c.id.as_str()).collect::<Vec<_>>(), ["c1"]);
+}
+
+#[tokio::test]
+async fn each_project_chains_its_events_without_gaps_when_interleaved() {
+    let db = init_database_memory().await.unwrap();
+    let store = SqliteBoardStore::new(db.pool().clone());
+    board(&store, USER, PROJECT).await;
+    board(&store, USER, "proj-other").await;
+    let mut tx = store.begin().await.unwrap();
+    for i in 0..6 {
+        let project = if i % 2 == 0 { PROJECT } else { "proj-other" };
+        tx.insert_event(&event(USER, project, None, "commented", &format!("x{i}")))
+            .await
+            .unwrap();
+    }
+    tx.commit().await.unwrap();
+    for project in [PROJECT, "proj-other"] {
+        let rows = store
+            .events(
+                USER,
+                &BoardEventQuery {
+                    scope: BoardEventScope::Project(project),
+                    after_seq: 0,
+                    limit: 100,
+                    kinds: None,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].prev_seq, 0, "first event of the project");
+        for pair in rows.windows(2) {
+            assert_eq!(pair[1].prev_seq, pair[0].seq, "{project}: chain has no gap");
+        }
+        assert_ne!(rows[1].seq, rows[0].seq + 1, "global seq is interleaved");
+        assert_eq!(
+            store.last_seq(USER, project).await.unwrap(),
+            rows[2].seq,
+            "head = last_event_seq"
+        );
+    }
 }

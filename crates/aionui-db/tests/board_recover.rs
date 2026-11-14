@@ -294,6 +294,20 @@ async fn recover_copies_kept_writes_with_new_seqs_and_renumbers_collisions() {
         report.max_inserted_seq,
         scalar_i64(pool, "SELECT MAX(seq) FROM board_events").await
     );
+    // Recovered events extend the project's chain without a gap.
+    let chain: Vec<(i64, i64)> = sqlx::query_as("SELECT seq, prev_seq FROM board_events WHERE seq > ? ORDER BY seq")
+        .bind(c_seq)
+        .fetch_all(pool)
+        .await
+        .unwrap();
+    assert_eq!(chain[0].1, c_seq);
+    for pair in chain.windows(2) {
+        assert_eq!(pair[1].1, pair[0].0);
+    }
+    assert_eq!(
+        scalar_i64(pool, "SELECT last_event_seq FROM board_settings").await,
+        report.max_inserted_seq
+    );
 }
 
 #[tokio::test]

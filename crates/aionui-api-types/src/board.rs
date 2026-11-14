@@ -223,7 +223,8 @@ pub struct BoardView {
     pub settings: BoardSettingsDto,
     pub columns: Vec<BoardColumnDto>,
     pub cards: Vec<BoardCardSummaryDto>,
-    /// Highest event `seq` of the board (resume point for the events API).
+    /// `seq` of the board's newest event (head of its chain; resume point for
+    /// the events API).
     pub last_seq: i64,
 }
 
@@ -305,7 +306,11 @@ pub struct BoardDependencyDto {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BoardEventDto {
+    /// Global replay order.
     pub seq: i64,
+    /// The project's previous event `seq` (0 for its first): a client whose
+    /// last seen `seq` for the project differs has missed events.
+    pub prev_seq: i64,
     pub id: String,
     pub card_id: Option<String>,
     pub project_id: String,
@@ -372,6 +377,8 @@ pub struct BoardChangedPayload {
     pub user_id: String,
     pub project_id: String,
     pub seq: i64,
+    /// Chain link of the project (see [`BoardEventDto::prev_seq`]).
+    pub prev_seq: i64,
     pub event: BoardEventDto,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub card: Option<BoardCardDto>,

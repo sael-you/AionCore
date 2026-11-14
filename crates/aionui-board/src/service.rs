@@ -148,9 +148,10 @@ impl BoardService {
             payload: payload.to_string(),
             created_at: now_ms(),
         };
-        let seq = tx.insert_event(&event).await?;
+        let placed = tx.insert_event(&event).await?;
         Ok(event_dto(&aionui_db::BoardEventRow {
-            seq,
+            seq: placed.seq,
+            prev_seq: placed.prev_seq,
             id: event.id,
             card_id: event.card_id,
             project_id: event.project_id,
@@ -432,6 +433,7 @@ impl BoardService {
                         settings: settings_json.clone().unwrap_or_else(|| json!({})).to_string(),
                         archived_at: None,
                         keeper_conversation_id: keeper.clone(),
+                        last_event_seq: 0,
                         created_at: now,
                         updated_at: now,
                     };

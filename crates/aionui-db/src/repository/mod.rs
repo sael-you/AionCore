@@ -50,7 +50,8 @@ pub use assistant::{
 };
 pub use board::{
     BOARD_POSITION_GAP, BoardCallerRow, BoardCardCursor, BoardCardFilter, BoardConversationInfo, BoardEventQuery,
-    BoardEventScope, BoardPlacement, BoardPlacementOutcome, BoardProjectRow, IBoardStore, IBoardTx, NewBoardEvent,
+    BoardEventScope, BoardEventSeq, BoardPlacement, BoardPlacementOutcome, BoardProjectRow, IBoardStore, IBoardTx,
+    NewBoardEvent,
 };
 pub use channel::IChannelRepository;
 pub use client_preference::IClientPreferenceRepository;

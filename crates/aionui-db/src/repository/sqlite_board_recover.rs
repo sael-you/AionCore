@@ -12,7 +12,8 @@
 //!   computed before anything is inserted, and events written by recover
 //!   itself never count.
 //! - **Events** absent by `id` are appended in kept-`seq` order with a new
-//!   `seq`; the payload gains `recovered_from_seq`.
+//!   `seq`, chained to their project (`prev_seq`, `last_event_seq`); the
+//!   payload gains `recovered_from_seq`.
 //! - **Settings/columns, cards, reviews, questions** absent by id are
 //!   inserted; present in both, the kept row is applied only when its
 //!   `version` is higher and the entity is untouched — a higher kept version
@@ -40,7 +41,9 @@ use sqlx::{Sqlite, SqliteConnection, SqlitePool, Transaction};
 
 use crate::error::DbError;
 use crate::models::{BoardEventRow, BoardSettingsRow};
+use crate::repository::board::NewBoardEvent;
 use crate::repository::sqlite_board::{CARD_COLS, COLUMN_COLS, EVENT_COLS, QUESTION_COLS, REVIEW_COLS, SETTINGS_COLS};
+use crate::repository::sqlite_board_tx::insert_chained_event;
 
 /// Actor recorded on the events recover writes itself.
 const RECOVER_ACTOR: &str = "recover";
@@ -298,23 +301,24 @@ async fn copy_events(
             payload = json!({ "value": payload });
         }
         payload["recovered_from_seq"] = json!(event.seq);
-        let seq: i64 = sqlx::query_scalar(
-            "INSERT INTO main.board_events \
-             (id, card_id, project_id, user_id, actor_kind, actor_ref, conversation_id, kind, payload, created_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?) RETURNING seq",
+        let seq = insert_chained_event(
+            tx,
+            "main",
+            &NewBoardEvent {
+                id: event.id.clone(),
+                card_id: event.card_id.clone(),
+                project_id: event.project_id.clone(),
+                user_id: event.user_id.clone(),
+                actor_kind: event.actor_kind.clone(),
+                actor_ref: event.actor_ref.clone(),
+                conversation_id: event.conversation_id.clone(),
+                kind: event.kind.clone(),
+                payload: payload.to_string(),
+                created_at: event.created_at,
+            },
         )
-        .bind(&event.id)
-        .bind(&event.card_id)
-        .bind(&event.project_id)
-        .bind(&event.user_id)
-        .bind(&event.actor_kind)
-        .bind(&event.actor_ref)
-        .bind(&event.conversation_id)
-        .bind(&event.kind)
-        .bind(payload.to_string())
-        .bind(event.created_at)
-        .fetch_one(&mut **tx)
-        .await?;
+        .await?
+        .seq;
         report.events_inserted += 1;
         report.max_inserted_seq = report.max_inserted_seq.max(seq);
         report
@@ -511,20 +515,24 @@ async fn renumbered_event(
     report: &mut BoardRecoverReport,
 ) -> Result<(), DbError> {
     let payload = json!({ "card_id": card_id, "old": old, "new": new, RECOVER_MARKER: "board recover" });
-    let seq: i64 = sqlx::query_scalar(
-        "INSERT INTO main.board_events \
-         (id, card_id, project_id, user_id, actor_kind, actor_ref, conversation_id, kind, payload, created_at) \
-         VALUES (?, ?, ?, ?, 'system', ?, NULL, 'card_renumbered', ?, ?) RETURNING seq",
+    let seq = insert_chained_event(
+        tx,
+        "main",
+        &NewBoardEvent {
+            id: generate_id(),
+            card_id: Some(card_id.to_owned()),
+            project_id: project_id.to_owned(),
+            user_id: user_id.to_owned(),
+            actor_kind: "system".to_owned(),
+            actor_ref: RECOVER_ACTOR.to_owned(),
+            conversation_id: None,
+            kind: "card_renumbered".to_owned(),
+            payload: payload.to_string(),
+            created_at: now_ms(),
+        },
     )
-    .bind(generate_id())
-    .bind(card_id)
-    .bind(project_id)
-    .bind(user_id)
-    .bind(RECOVER_ACTOR)
-    .bind(payload.to_string())
-    .bind(now_ms())
-    .fetch_one(&mut **tx)
-    .await?;
+    .await?
+    .seq;
     report.events_inserted += 1;
     report.max_inserted_seq = report.max_inserted_seq.max(seq);
     report
@@ -896,6 +904,14 @@ fn reaches(edges: &[(String, String)], from: &str, to: &str) -> bool {
 }
 
 async fn raise_next_numbers(tx: &mut Transaction<'_, Sqlite>) -> Result<(), DbError> {
+    // Settings copied from the kept DB carry the kept chain head; the head is
+    // this DB's newest event of the project.
+    sqlx::query(
+        "UPDATE main.board_settings SET last_event_seq = \
+            COALESCE((SELECT MAX(seq) FROM main.board_events e WHERE e.project_id = main.board_settings.project_id), 0)",
+    )
+    .execute(&mut **tx)
+    .await?;
     sqlx::query(
         "UPDATE main.board_settings SET next_number = MAX(next_number, \
             COALESCE((SELECT MAX(number) FROM main.board_cards c WHERE c.project_id = main.board_settings.project_id), 0) + 1)",
