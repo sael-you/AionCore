@@ -84,6 +84,8 @@ async fn seed_sqlite_conversations(db: &aionui_db::Database, conversation_ids: &
             project_id: None,
             folder_id: None,
             name_source: None,
+            parent_conversation_id: None,
+            depth: 0,
         })
         .await
         .unwrap();
@@ -228,6 +230,8 @@ impl StubConvRepo {
                 project_id: None,
                 folder_id: None,
                 name_source: None,
+                parent_conversation_id: None,
+                depth: 0,
             });
         row.extra = extra.to_string();
     }
@@ -283,6 +287,8 @@ impl IConversationRepository for StubConvRepo {
                 project_id: None,
                 folder_id: None,
                 name_source: None,
+                parent_conversation_id: None,
+                depth: 0,
             }
         } else if id == "conv_mode_hermes" {
             aionui_db::models::ConversationRow {
@@ -316,6 +322,8 @@ impl IConversationRepository for StubConvRepo {
                 project_id: None,
                 folder_id: None,
                 name_source: None,
+                parent_conversation_id: None,
+                depth: 0,
             }
         } else if id == "conv_mode_default" {
             aionui_db::models::ConversationRow {
@@ -349,6 +357,8 @@ impl IConversationRepository for StubConvRepo {
                 project_id: None,
                 folder_id: None,
                 name_source: None,
+                parent_conversation_id: None,
+                depth: 0,
             }
         } else if id == "conv_mode_codex" {
             aionui_db::models::ConversationRow {
@@ -382,6 +392,8 @@ impl IConversationRepository for StubConvRepo {
                 project_id: None,
                 folder_id: None,
                 name_source: None,
+                parent_conversation_id: None,
+                depth: 0,
             }
         } else if id == "conv_mode_claude" {
             aionui_db::models::ConversationRow {
@@ -415,6 +427,8 @@ impl IConversationRepository for StubConvRepo {
                 project_id: None,
                 folder_id: None,
                 name_source: None,
+                parent_conversation_id: None,
+                depth: 0,
             }
         } else if id == "conv_mode_stale_backend" {
             aionui_db::models::ConversationRow {
@@ -448,6 +462,8 @@ impl IConversationRepository for StubConvRepo {
                 project_id: None,
                 folder_id: None,
                 name_source: None,
+                parent_conversation_id: None,
+                depth: 0,
             }
         } else if id == "conv_mode_aionrs" {
             aionui_db::models::ConversationRow {
@@ -481,6 +497,8 @@ impl IConversationRepository for StubConvRepo {
                 project_id: None,
                 folder_id: None,
                 name_source: None,
+                parent_conversation_id: None,
+                depth: 0,
             }
         } else if id == "conv_mode_assistant_stale_backend" {
             aionui_db::models::ConversationRow {
@@ -507,6 +525,8 @@ impl IConversationRepository for StubConvRepo {
                 project_id: None,
                 folder_id: None,
                 name_source: None,
+                parent_conversation_id: None,
+                depth: 0,
             }
         } else if id == "conv_mode_missing_assistant_stale_backend" {
             aionui_db::models::ConversationRow {
@@ -532,6 +552,8 @@ impl IConversationRepository for StubConvRepo {
                 project_id: None,
                 folder_id: None,
                 name_source: None,
+                parent_conversation_id: None,
+                depth: 0,
             }
         } else if id == "conv_mode_assistant_snapshot" {
             aionui_db::models::ConversationRow {
@@ -556,6 +578,8 @@ impl IConversationRepository for StubConvRepo {
                 project_id: None,
                 folder_id: None,
                 name_source: None,
+                parent_conversation_id: None,
+                depth: 0,
             }
         } else {
             aionui_db::models::ConversationRow {
@@ -575,6 +599,8 @@ impl IConversationRepository for StubConvRepo {
                 project_id: None,
                 folder_id: None,
                 name_source: None,
+                parent_conversation_id: None,
+                depth: 0,
             }
         };
 
@@ -672,6 +698,8 @@ impl IConversationRepository for StubConvRepo {
                 project_id: None,
                 folder_id: None,
                 name_source: None,
+                parent_conversation_id: None,
+                depth: 0,
             });
         if let Some(extra) = &updates.extra {
             row.extra = extra.clone();
@@ -2587,6 +2615,8 @@ async fn oc2b_rejects_existing_jobs_with_cross_user_conversation_code() {
             project_id: None,
             folder_id: None,
             name_source: None,
+            parent_conversation_id: None,
+            depth: 0,
         })
         .await
         .unwrap();

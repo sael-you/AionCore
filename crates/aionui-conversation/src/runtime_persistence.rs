@@ -39,6 +39,10 @@ impl RuntimePersistenceCoordinator {
         Self { runtime_state }
     }
 
+    pub(crate) fn child_result_delivery(&self) -> Option<std::sync::Arc<dyn aionui_common::ChildResultDelivery>> {
+        self.runtime_state.child_result_delivery()
+    }
+
     pub fn lifecycle_for(&self, conversation_id: &str) -> RuntimeLifecycleState {
         self.runtime_state.lifecycle_for(conversation_id)
     }

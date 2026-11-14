@@ -4,20 +4,22 @@ use axum::Router;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Extension, Json, Path, Query, State};
 use axum::http::StatusCode;
-use axum::routing::{get, patch, post};
+use axum::routing::{get, patch, post, put};
 
 use aionui_api_types::{
     ActiveCountResponse, ApiResponse, ApprovalCheckQuery, ApprovalCheckResponse, CancelConversationRequest,
     CancelConversationResponse, CloneConversationRequest, ConfirmRequest, ConfirmationListResponse,
     ConversationArtifactListResponse, ConversationArtifactResponse, ConversationListResponse, ConversationResponse,
     CreateConversationRequest, EnsureConversationRuntimeResponse, ForkConversationRequest, ListConversationsQuery,
-    ListMessagesQuery, MessageListResponse, MessageResponse, MessageSearchResponse, SearchMessagesQuery,
-    SendMessageRequest, SendMessageResponse, UpdateConversationArtifactRequest, UpdateConversationRequest,
+    ListMessagesQuery, MessageListResponse, MessageResponse, MessageSearchResponse, ReparentConversationRequest,
+    SearchMessagesQuery, SendMessageRequest, SendMessageResponse, UpdateConversationArtifactRequest,
+    UpdateConversationRequest,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
 
 use crate::ConversationError;
+use crate::hierarchy::HierarchyViolation;
 use crate::state::ConversationRouterState;
 
 impl From<ConversationError> for ApiError {
@@ -107,6 +109,18 @@ impl From<ConversationError> for ApiError {
                 })),
             ),
             ConversationError::Acp(_) => ApiError::BadGateway("Agent protocol error".into()),
+            ConversationError::Hierarchy { violation, reason } => ApiError::coded(
+                match violation {
+                    HierarchyViolation::ParentNotFound => StatusCode::NOT_FOUND,
+                    HierarchyViolation::ParentCycle => StatusCode::CONFLICT,
+                    HierarchyViolation::ParentDepthExceeded | HierarchyViolation::ParentFanoutExceeded => {
+                        StatusCode::UNPROCESSABLE_ENTITY
+                    }
+                },
+                violation.code(),
+                reason,
+                None,
+            ),
         }
     }
 }
@@ -120,6 +134,7 @@ pub fn conversation_routes(state: ConversationRouterState) -> Router {
         .route("/api/conversations/{id}", get(get_one).patch(update).delete(delete_one))
         .route("/api/conversations/{id}/reset", post(reset))
         .route("/api/conversations/{id}/fork", post(fork))
+        .route("/api/conversations/{id}/parent", put(reparent))
         .route("/api/conversations/{id}/associated", get(associated))
         .route("/api/conversations/{id}/messages", get(list_msg).post(send_msg))
         // MUST precede the `{messageId}` wildcard below: registered after it,
@@ -233,6 +248,21 @@ async fn fork(
     let Json(req) = body.map_err(ApiError::from)?;
     let conversation = state.service.fork(&user.id, &id, req).await.map_err(ApiError::from)?;
     Ok((StatusCode::CREATED, Json(ApiResponse::ok(conversation))))
+}
+
+async fn reparent(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    body: Result<Json<ReparentConversationRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<ConversationResponse>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    let conversation = state
+        .service
+        .reparent(&user.id, &id, req.parent_conversation_id.as_deref())
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(conversation)))
 }
 
 async fn associated(

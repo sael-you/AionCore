@@ -22,7 +22,7 @@ use aionui_api_types::{
     RemoveProjectItemKind, RemoveProjectResult, SidebarGroup, SidebarItem, SidebarItemsResponse, SidebarResponse,
     SidebarScope, SidebarTeamItem,
 };
-use aionui_common::now_ms;
+use aionui_common::{ConversationStatus, now_ms};
 use aionui_conversation::{is_temp_session_workspace, row_to_response_with_extra};
 use aionui_db::models::ConversationRow;
 use aionui_db::{
@@ -31,6 +31,7 @@ use aionui_db::{
 };
 use aionui_project::canonical;
 
+use crate::hierarchy::{Hierarchy, fold_hierarchy, subtree_ids};
 use crate::ports::{ArchiveTeardownPorts, RemoveProjectPorts};
 use crate::types::{
     Cursor, DEFAULT_ITEMS_LIMIT, DEFAULT_LIMIT, ScopeToken, SidebarError, canonical_to_dir_key, validate_limit,
@@ -94,6 +95,21 @@ impl SidebarService {
     pub async fn pin(&self, user_id: &str, scene: &str, item_type: &str, item_id: &str) -> Result<(), SidebarError> {
         let scene = parse_scene(scene)?;
         let item = OrderItemRef::new(parse_item_type(item_type)?, item_id.to_owned());
+        // Hierarchical conversations: pin is root-only. A child follows its
+        // root, so pinning it would create a pinned row the read side has to
+        // hide. Orphans (parent not in the active slice) are roots and pinnable.
+        if scene == OrderScene::Pinned && item.item_type == OrderItemType::Conversation {
+            let convs = self
+                .sidebar
+                .list_conversations_thin(user_id, ArchiveScope::Active)
+                .await?;
+            let (_roots, hierarchy) = fold_hierarchy(convs);
+            if hierarchy.is_descendant(item_id) {
+                return Err(SidebarError::BadRequest(
+                    "only root conversations can be pinned; a child follows its root".into(),
+                ));
+            }
+        }
         self.user_order.pin(user_id, scene, &item).await?;
         Ok(())
     }
@@ -112,27 +128,63 @@ impl SidebarService {
     /// pinned row (D6 — an archived item is never pinned). A missing / foreign id
     /// is `ScopeGone` (404); the flip is otherwise idempotent for the slice.
     pub async fn archive_conversation(&self, user_id: &str, id: &str) -> Result<(), SidebarError> {
-        if !self
-            .sidebar
-            .set_conversation_archived(user_id, id, Some(now_ms()))
-            .await?
-        {
+        // Hierarchical conversations: archiving cascades to the whole subtree.
+        // Resolved BEFORE the flip, from the slice the subtree currently lives in.
+        let subtree = subtree_ids(
+            &self
+                .sidebar
+                .list_conversations_thin(user_id, ArchiveScope::Active)
+                .await?,
+            id,
+        );
+        let now = now_ms();
+        if !self.sidebar.set_conversation_archived(user_id, id, Some(now)).await? {
             return Err(SidebarError::ScopeGone);
         }
         // The archive flip is now committed; release the agent process the same
         // way delete does (best-effort — the row already moved slice).
         self.stop_conversation_best_effort(user_id, id).await;
+        self.cascade_archive_flag(user_id, &subtree, Some(now)).await;
         self.unpin_item(user_id, OrderItemType::Conversation, id).await
     }
 
     /// Unarchive a conversation back into the active slice. Missing id →
     /// `ScopeGone`. No re-pin: the pinned row was dropped at archive time (D6) and
-    /// is not restored.
+    /// is not restored. Cascades to the whole subtree (hierarchical conversations).
     pub async fn unarchive_conversation(&self, user_id: &str, id: &str) -> Result<(), SidebarError> {
+        let subtree = subtree_ids(
+            &self
+                .sidebar
+                .list_conversations_thin(user_id, ArchiveScope::Archived)
+                .await?,
+            id,
+        );
         if !self.sidebar.set_conversation_archived(user_id, id, None).await? {
             return Err(SidebarError::ScopeGone);
         }
+        self.cascade_archive_flag(user_id, &subtree, None).await;
         Ok(())
+    }
+
+    /// Apply the archive flag to descendants of an archived / unarchived root
+    /// (hierarchical conversations). Best-effort per child: a failure is logged
+    /// and skipped. Archiving also releases each child's agent process and drops
+    /// any pinned row; unarchiving never re-pins.
+    async fn cascade_archive_flag(&self, user_id: &str, ids: &[String], at: Option<i64>) {
+        for child in ids {
+            match self.sidebar.set_conversation_archived(user_id, child, at).await {
+                Ok(true) => {
+                    if at.is_some() {
+                        self.stop_conversation_best_effort(user_id, child).await;
+                        if let Err(err) = self.unpin_item(user_id, OrderItemType::Conversation, child).await {
+                            tracing::warn!(conversation_id = %child, error = %err, "archive: child unpin failed");
+                        }
+                    }
+                }
+                Ok(false) => tracing::warn!(conversation_id = %child, "archive: child vanished before flag flip"),
+                Err(err) => tracing::warn!(conversation_id = %child, error = %err, "archive: child flag flip failed"),
+            }
+        }
     }
 
     /// Archive a team. The store cascades the flip to the team's member
@@ -247,7 +299,7 @@ impl SidebarService {
         user_id: &str,
         project_id: &str,
         scope: ArchiveScope,
-    ) -> Result<(Vec<SidebarTeamThin>, Vec<SidebarConversationThin>), SidebarError> {
+    ) -> Result<(Vec<SidebarTeamThin>, Vec<SidebarConversationThin>, Hierarchy), SidebarError> {
         let convs = self.sidebar.list_conversations_thin(user_id, scope).await?;
         let teams = self.sidebar.list_teams_thin(user_id, scope).await?;
         // Projects are never archived; the full enumeration drives both id→meta
@@ -268,6 +320,8 @@ impl SidebarService {
         }
 
         let (team_by_id, independents) = aggregate_teams(convs, teams.clone());
+        // Children follow their root: the unit set is roots only.
+        let (independents, hierarchy) = fold_hierarchy(independents);
         let target = GroupKey::Project(project_id.to_owned());
 
         let mut member_teams: Vec<SidebarTeamThin> = Vec::new();
@@ -300,7 +354,7 @@ impl SidebarService {
             }
         }
 
-        Ok((member_teams, member_convs))
+        Ok((member_teams, member_convs, hierarchy))
     }
 
     /// Remove a standard project: delete every unit that renders into its group,
@@ -327,7 +381,7 @@ impl SidebarService {
     ) -> Result<RemoveProjectResult, SidebarError> {
         // Project removal operates on the active universe; archived rows are not
         // enumerated here (their deletion is the archive page's own batch path).
-        let (member_teams, member_convs) = self
+        let (member_teams, member_convs, _hierarchy) = self
             .collect_project_units(user_id, project_id, ArchiveScope::Active)
             .await?;
         let team_ids: Vec<String> = member_teams.iter().map(|t| t.id.clone()).collect();
@@ -423,7 +477,7 @@ impl SidebarService {
     /// Best-effort per unit; a vanished / failed unit is logged and skipped.
     /// Non-standard / foreign project → `ScopeGone`.
     pub async fn archive_project(&self, user_id: &str, project_id: &str) -> Result<(), SidebarError> {
-        let (teams, convs) = self
+        let (teams, convs, hierarchy) = self
             .collect_project_units(user_id, project_id, ArchiveScope::Active)
             .await?;
         let now = now_ms();
@@ -450,6 +504,12 @@ impl SidebarService {
                     if let Err(err) = self.unpin_item(user_id, OrderItemType::Conversation, &conv.id).await {
                         tracing::warn!(conversation_id = %conv.id, error = %err, "archive_project: conversation unpin failed")
                     }
+                    let subtree: Vec<String> = hierarchy
+                        .descendants_of(&conv.id)
+                        .iter()
+                        .map(|d| d.id.clone())
+                        .collect();
+                    self.cascade_archive_flag(user_id, &subtree, Some(now)).await;
                 }
                 Ok(false) => {
                     tracing::warn!(conversation_id = %conv.id, "archive_project: conversation vanished before archive")
@@ -474,7 +534,7 @@ impl SidebarService {
     /// members). Best-effort per unit. Non-standard / foreign project →
     /// `ScopeGone`. No re-pin (D6 dropped the pinned rows at archive time).
     pub async fn unarchive_project(&self, user_id: &str, project_id: &str) -> Result<(), SidebarError> {
-        let (teams, convs) = self
+        let (teams, convs, hierarchy) = self
             .collect_project_units(user_id, project_id, ArchiveScope::Archived)
             .await?;
 
@@ -487,6 +547,12 @@ impl SidebarService {
             if let Err(err) = self.sidebar.set_conversation_archived(user_id, &conv.id, None).await {
                 tracing::warn!(conversation_id = %conv.id, error = %err, "unarchive_project: conversation unarchive failed")
             }
+            let subtree: Vec<String> = hierarchy
+                .descendants_of(&conv.id)
+                .iter()
+                .map(|d| d.id.clone())
+                .collect();
+            self.cascade_archive_flag(user_id, &subtree, None).await;
         }
 
         tracing::info!(
@@ -512,7 +578,7 @@ impl SidebarService {
         user_id: &str,
         project_id: &str,
     ) -> Result<ArchiveDeleteResult, SidebarError> {
-        let (teams, convs) = self
+        let (teams, convs, _hierarchy) = self
             .collect_project_units(user_id, project_id, ArchiveScope::Archived)
             .await?;
 
@@ -577,6 +643,8 @@ impl SidebarService {
         // *not* in the archived slice downgrades to an independent here (BR-8) and
         // is deleted directly rather than left dangling.
         let (team_by_id, independents) = aggregate_teams(convs, teams.clone());
+        // Children are removed by their root's delete cascade; only roots count.
+        let (independents, _hierarchy) = fold_hierarchy(independents);
         let team_ids: Vec<&str> = teams
             .iter()
             .filter(|t| team_by_id.contains_key(&t.id))
@@ -628,6 +696,7 @@ impl SidebarService {
             .await?;
         let teams = self.sidebar.list_teams_thin(user_id, ArchiveScope::Archived).await?;
         let (_team_by_id, independents) = aggregate_teams(convs, teams);
+        let (independents, _hierarchy) = fold_hierarchy(independents);
         if !independents.iter().any(|c| c.id == id) {
             return Err(SidebarError::ScopeGone);
         }
@@ -686,7 +755,7 @@ impl SidebarService {
         if scope == ArchiveScope::Active {
             let pinned_limit = win_map.get("pinned").copied().unwrap_or(default_limit);
             let pinned = self
-                .page_pinned(user_id, None, pinned_limit, &snapshot.team_by_id)
+                .page_pinned(user_id, None, pinned_limit, &snapshot.team_by_id, &snapshot.hierarchy)
                 .await?;
             if !pinned.items.is_empty() {
                 groups.push(SidebarGroup {
@@ -712,6 +781,7 @@ impl SidebarService {
             for item in &group.items[..take] {
                 if let GroupItemRef::Conv { id, .. } = item {
                     conv_ids.push(id.clone());
+                    conv_ids.extend(snapshot.hierarchy.descendants_of(id).iter().map(|d| d.id.clone()));
                 }
             }
             windows.push((group, take, has_more));
@@ -720,7 +790,13 @@ impl SidebarService {
         let hydrated = self.hydrate(user_id, &conv_ids, scope).await?;
 
         for (group, take, has_more) in windows {
-            let items = assemble_items(&group.items[..take], &hydrated, &snapshot.team_by_id, false);
+            let items = assemble_items(
+                &group.items[..take],
+                &hydrated,
+                &snapshot.team_by_id,
+                &snapshot.hierarchy,
+                false,
+            );
             let next_cursor = has_more
                 .then(|| {
                     group
@@ -767,8 +843,10 @@ impl SidebarService {
                 Some(raw) => Some(to_pinned_cursor(Cursor::decode(raw, &token)?)?),
                 None => None,
             };
-            let team_by_id = self.load_team_aggregates(user_id, ArchiveScope::Active).await?;
-            let page = self.page_pinned(user_id, after.as_ref(), limit, &team_by_id).await?;
+            let (team_by_id, hierarchy) = self.load_team_aggregates(user_id, ArchiveScope::Active).await?;
+            let page = self
+                .page_pinned(user_id, after.as_ref(), limit, &team_by_id, &hierarchy)
+                .await?;
             return Ok(SidebarItemsResponse {
                 items: page.items,
                 has_more: page.has_more,
@@ -790,7 +868,8 @@ impl SidebarService {
             Some(raw) => Some(Cursor::decode(raw, &token)?),
             None => None,
         };
-        self.page_natural(user_id, group, cursor.as_ref(), limit, archive).await
+        self.page_natural(user_id, group, &snapshot.hierarchy, cursor.as_ref(), limit, archive)
+            .await
     }
 
     /// Window a natural group after `cursor`, hydrate, and assemble.
@@ -798,6 +877,7 @@ impl SidebarService {
         &self,
         user_id: &str,
         group: &NaturalGroup,
+        hierarchy: &Hierarchy,
         cursor: Option<&Cursor>,
         limit: i64,
         scope: ArchiveScope,
@@ -807,17 +887,17 @@ impl SidebarService {
         let take = (limit as usize).min(after.len());
         let has_more = after.len() > limit as usize;
 
-        let conv_ids: Vec<String> = after[..take]
-            .iter()
-            .filter_map(|i| match i {
-                GroupItemRef::Conv { id, .. } => Some(id.clone()),
-                GroupItemRef::Team { .. } => None,
-            })
-            .collect();
+        let mut conv_ids: Vec<String> = Vec::new();
+        for item in &after[..take] {
+            if let GroupItemRef::Conv { id, .. } = item {
+                conv_ids.push(id.clone());
+                conv_ids.extend(hierarchy.descendants_of(id).iter().map(|d| d.id.clone()));
+            }
+        }
         let hydrated = self.hydrate(user_id, &conv_ids, scope).await?;
 
         let window: Vec<GroupItemRef> = after[..take].iter().map(|i| (*i).clone()).collect();
-        let items = assemble_items(&window, &hydrated, &group.team_by_id_ref(), false);
+        let items = assemble_items(&window, &hydrated, &group.team_by_id_ref(), hierarchy, false);
         let next_cursor = has_more
             .then(|| window.last().map(|i| i.activity_cursor().encode(&group.token)))
             .flatten();
@@ -835,6 +915,7 @@ impl SidebarService {
         after: Option<&PinnedCursor>,
         limit: i64,
         team_by_id: &HashMap<String, TeamAgg>,
+        hierarchy: &Hierarchy,
     ) -> Result<PinnedPage, SidebarError> {
         let rows = self
             .user_order
@@ -858,7 +939,13 @@ impl SidebarService {
         let conv_ids: Vec<String> = window
             .iter()
             .filter(|r| r.item_type == OrderItemType::Conversation.as_str() && !member_ids.contains(r.item_id.as_str()))
-            .map(|r| r.item_id.clone())
+            // Pin is root-only: a stray pinned row on a child stays hidden (the
+            // child renders under its root). Roots bring their descendants.
+            .filter(|r| !hierarchy.is_descendant(&r.item_id))
+            .flat_map(|r| {
+                std::iter::once(r.item_id.clone())
+                    .chain(hierarchy.descendants_of(&r.item_id).iter().map(|d| d.id.clone()))
+            })
             .collect();
         // The pinned scene is active-only (D6: archiving unpins), so its members
         // always hydrate from the active slice.
@@ -867,8 +954,10 @@ impl SidebarService {
         let mut items: Vec<SidebarItem> = Vec::with_capacity(window.len());
         for row in window {
             if row.item_type == OrderItemType::Conversation.as_str() {
-                if let Some(resp) = hydrated.get(&row.item_id) {
-                    items.push(conversation_item(resp.clone(), true));
+                if !hierarchy.is_descendant(&row.item_id)
+                    && let Some(resp) = hydrated.get(&row.item_id)
+                {
+                    items.push(conversation_item(resp.clone(), true, hierarchy, &hydrated));
                 }
             } else if let Some(agg) = team_by_id.get(&row.item_id) {
                 items.push(team_item(agg, true));
@@ -926,17 +1015,20 @@ impl SidebarService {
 
     // -- Classification ------------------------------------------------------
 
-    /// Build team aggregates only (used by the pinned items path, which needs no
-    /// group classification). Members are folded into their team; orphan members
-    /// downgrade to independents (BR-8) but independents are discarded here.
+    /// Build team aggregates and the conversation hierarchy only (used by the
+    /// pinned items path, which needs no group classification). Members are
+    /// folded into their team; orphan members downgrade to independents (BR-8)
+    /// but independents are discarded here.
     async fn load_team_aggregates(
         &self,
         user_id: &str,
         scope: ArchiveScope,
-    ) -> Result<HashMap<String, TeamAgg>, SidebarError> {
+    ) -> Result<(HashMap<String, TeamAgg>, Hierarchy), SidebarError> {
         let convs = self.sidebar.list_conversations_thin(user_id, scope).await?;
         let teams = self.sidebar.list_teams_thin(user_id, scope).await?;
-        Ok(aggregate_teams(convs, teams).0)
+        let (team_by_id, independents) = aggregate_teams(convs, teams);
+        let (_roots, hierarchy) = fold_hierarchy(independents);
+        Ok((team_by_id, hierarchy))
     }
 
     /// Full classification snapshot: team aggregates, independents + teams sorted
@@ -971,6 +1063,9 @@ impl SidebarService {
             .collect();
 
         let (team_by_id, independents) = aggregate_teams(convs, teams.clone());
+        // Hierarchical conversations: children attach to their root and the root
+        // carries the subtree's activity; classification below sees roots only.
+        let (independents, hierarchy) = fold_hierarchy(independents);
 
         let mut builder = GroupBuilder::new();
 
@@ -1035,6 +1130,7 @@ impl SidebarService {
             chats,
             has_more_groups,
             team_by_id,
+            hierarchy,
         })
     }
 
@@ -1089,6 +1185,8 @@ struct Snapshot {
     chats: NaturalGroup,
     has_more_groups: bool,
     team_by_id: HashMap<String, TeamAgg>,
+    /// Root → descendants index (empty when the user has no hierarchy).
+    hierarchy: Hierarchy,
 }
 
 /// A team collapsed into one sidebar row.
@@ -1424,6 +1522,7 @@ fn assemble_items(
     window: &[GroupItemRef],
     hydrated: &HashMap<String, ConversationResponse>,
     team_by_id: &HashMap<String, TeamAgg>,
+    hierarchy: &Hierarchy,
     pinned: bool,
 ) -> Vec<SidebarItem> {
     let mut out = Vec::with_capacity(window.len());
@@ -1431,7 +1530,7 @@ fn assemble_items(
         match item {
             GroupItemRef::Conv { id, .. } => {
                 if let Some(resp) = hydrated.get(id) {
-                    out.push(conversation_item(resp.clone(), pinned));
+                    out.push(conversation_item(resp.clone(), pinned, hierarchy, hydrated));
                 }
             }
             GroupItemRef::Team { team_id, .. } => {
@@ -1444,10 +1543,40 @@ fn assemble_items(
     out
 }
 
-fn conversation_item(mut resp: ConversationResponse, pinned: bool) -> SidebarItem {
+/// A root conversation item. Its descendants (flat, all levels, `created_at`
+/// ascending) ride along so the client builds the tree from each one's
+/// `parent_conversation_id` / `depth`; unhydratable descendants are skipped.
+fn conversation_item(
+    mut resp: ConversationResponse,
+    pinned: bool,
+    hierarchy: &Hierarchy,
+    hydrated: &HashMap<String, ConversationResponse>,
+) -> SidebarItem {
     resp.pinned = pinned;
     resp.pinned_at = None;
-    SidebarItem::Conversation { conversation: resp }
+    let descendants: Vec<ConversationResponse> = hierarchy
+        .descendants_of(&resp.id)
+        .iter()
+        .filter_map(|d| hydrated.get(&d.id))
+        .cloned()
+        .map(|mut child| {
+            // Children are never pinned: pin is root-only.
+            child.pinned = false;
+            child.pinned_at = None;
+            child
+        })
+        .collect();
+    let descendant_count = descendants.len() as u32;
+    let running_descendant_count = descendants
+        .iter()
+        .filter(|d| d.status == ConversationStatus::Running)
+        .count() as u32;
+    SidebarItem::Conversation {
+        conversation: resp,
+        descendants,
+        descendant_count,
+        running_descendant_count,
+    }
 }
 
 fn team_item(agg: &TeamAgg, pinned: bool) -> SidebarItem {

@@ -65,6 +65,7 @@ impl ISidebarStore for SqliteSidebarStore {
                     NULLIF(project_id, '') AS project_id, \
                     json_extract(extra, '$.workspace') AS workspace, \
                     COALESCE(NULLIF(json_extract(extra, '$.team_id'), ''), NULLIF(json_extract(extra, '$.teamId'), '')) AS team_id, \
+                    NULLIF(parent_conversation_id, '') AS parent_conversation_id, \
                     updated_at, created_at \
              FROM conversations \
              WHERE user_id = ? AND {archived} AND {HEALTH_CHECK_KEEP}"
@@ -78,6 +79,7 @@ impl ISidebarStore for SqliteSidebarStore {
                 project_id: non_blank(row.get("project_id")),
                 workspace: non_blank(row.get("workspace")),
                 team_id: non_blank(row.get("team_id")),
+                parent_conversation_id: non_blank(row.get("parent_conversation_id")),
                 updated_at: row.get("updated_at"),
                 created_at: row.get("created_at"),
             })

@@ -1,6 +1,8 @@
 use aionui_ai_agent::{AcpError, AgentError};
 use aionui_db::DbError;
 
+use crate::hierarchy::HierarchyViolation;
+
 /// Application-level error contract for the conversation domain.
 ///
 /// This type may preserve structured lower-layer errors for domain decisions,
@@ -86,6 +88,14 @@ pub enum ConversationError {
     #[error("OpenClaw Gateway is not reachable: {detail}")]
     OpenClawGatewayUnreachable { detail: String },
 
+    /// A hierarchical-conversation rule was broken (missing / cyclic / too deep
+    /// / too wide parent). Carries a distinct snake_case wire code.
+    #[error("Conversation hierarchy: {reason}")]
+    Hierarchy {
+        violation: HierarchyViolation,
+        reason: String,
+    },
+
     #[error("ACP error")]
     Acp(#[from] AcpError),
 }
@@ -101,6 +111,13 @@ impl ConversationError {
 
     pub(crate) fn not_found_reason(reason: impl Into<String>) -> Self {
         Self::NotFoundReason { reason: reason.into() }
+    }
+
+    pub(crate) fn hierarchy(violation: HierarchyViolation, reason: impl Into<String>) -> Self {
+        Self::Hierarchy {
+            violation,
+            reason: reason.into(),
+        }
     }
 
     pub(crate) fn to_agent_error(&self) -> AgentError {
@@ -136,6 +153,13 @@ impl ConversationError {
             }
             Self::OpenClawGatewayUnreachable { detail } => AgentError::bad_gateway(detail.clone()),
             Self::Acp(err) => AgentError::bad_gateway(err.to_string()),
+            Self::Hierarchy { violation, reason } => match violation {
+                HierarchyViolation::ParentNotFound => AgentError::not_found(reason.clone()),
+                HierarchyViolation::ParentCycle => AgentError::conflict(reason.clone()),
+                HierarchyViolation::ParentDepthExceeded | HierarchyViolation::ParentFanoutExceeded => {
+                    AgentError::bad_request(reason.clone())
+                }
+            },
         }
     }
 
@@ -163,6 +187,7 @@ impl ConversationError {
             Self::WorkspacePathUnavailable { .. } => "WORKSPACE_PATH_UNAVAILABLE",
             Self::WorkspacePathRuntimeUnavailable { .. } => "WORKSPACE_PATH_RUNTIME_UNAVAILABLE",
             Self::OpenClawGatewayUnreachable { .. } => "USER_AGENT_OPENCLAW_GATEWAY_UNREACHABLE",
+            Self::Hierarchy { violation, .. } => violation.code(),
         }
     }
 }

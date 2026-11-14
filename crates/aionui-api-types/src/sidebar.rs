@@ -85,7 +85,22 @@ pub enum SidebarScope {
 pub enum SidebarItem {
     /// A conversation row, reusing the shared conversation DTO. Its `pinned`
     /// flag is derived from `user_order` row existence, not any table column.
-    Conversation { conversation: ConversationResponse },
+    ///
+    /// Hierarchical conversations: only ROOT conversations are items. Every
+    /// descendant (all levels, flat) rides along in `descendants`, ordered by
+    /// `created_at` ascending then `id`; each carries `parent_conversation_id` /
+    /// `depth` so the client builds the tree. All three extra fields are omitted
+    /// / zero when the conversation has no descendants, keeping non-hierarchy
+    /// payloads byte-identical.
+    Conversation {
+        conversation: ConversationResponse,
+        #[serde(default, skip_serializing_if = "Vec::is_empty")]
+        descendants: Vec<ConversationResponse>,
+        #[serde(default, skip_serializing_if = "is_zero_u32")]
+        descendant_count: u32,
+        #[serde(default, skip_serializing_if = "is_zero_u32")]
+        running_descendant_count: u32,
+    },
     /// An aggregated team row (server-side aggregate; the frontend does not
     /// reconstruct it from member conversations).
     Team(SidebarTeamItem),
@@ -182,4 +197,8 @@ pub struct SidebarTeamItem {
     pub pinned: bool,
     /// Active member conversation ids, `created_at` ascending.
     pub member_conversation_ids: Vec<String>,
+}
+
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
 }

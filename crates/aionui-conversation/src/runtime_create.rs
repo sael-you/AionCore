@@ -19,6 +19,7 @@ use tracing::{info, warn};
 
 use crate::convert::string_to_enum;
 use crate::error::ConversationError;
+use crate::hierarchy::HierarchyViolation;
 use crate::service::ConversationService;
 use crate::session_mentions::{team_id_from_extra_str, workspace_from_extra};
 use crate::task_options::provider_model_from_conversation_row;
@@ -52,6 +53,13 @@ pub enum ConversationCreateError {
         model_id: Option<String>,
     },
 
+    /// A hierarchy rule refused the parent (missing, too deep, too wide).
+    #[error("{reason}")]
+    Hierarchy {
+        violation: HierarchyViolation,
+        reason: String,
+    },
+
     #[error("request does not match the schema: {reason}")]
     SchemaValidation { reason: String },
 
@@ -70,6 +78,12 @@ impl ConversationCreateError {
             Self::AssistantModelUnresolved { .. } => ConversationToolErrorCode::AssistantModelUnresolved,
             Self::SchemaValidation { .. } => ConversationToolErrorCode::SchemaValidationFailed,
             Self::TransportUnavailable { .. } => ConversationToolErrorCode::TransportUnavailable,
+            Self::Hierarchy { violation, .. } => match violation {
+                HierarchyViolation::ParentNotFound => ConversationToolErrorCode::ParentNotFound,
+                HierarchyViolation::ParentDepthExceeded => ConversationToolErrorCode::ParentDepthExceeded,
+                HierarchyViolation::ParentFanoutExceeded => ConversationToolErrorCode::ParentFanoutExceeded,
+                HierarchyViolation::ParentCycle => ConversationToolErrorCode::ParentCycle,
+            },
         }
     }
 
@@ -82,6 +96,11 @@ impl ConversationCreateError {
             | Self::AssistantDisabled { .. }
             | Self::AssistantModelUnresolved { .. } => 422,
             Self::AssistantNotFound { .. } => 404,
+            Self::Hierarchy { violation, .. } => match violation {
+                HierarchyViolation::ParentNotFound => 404,
+                HierarchyViolation::ParentCycle => 409,
+                HierarchyViolation::ParentDepthExceeded | HierarchyViolation::ParentFanoutExceeded => 422,
+            },
             Self::SchemaValidation { .. } => 400,
             Self::TransportUnavailable { .. } => 503,
         }
@@ -242,6 +261,8 @@ impl ConversationService {
         let mut extra = Map::new();
         extra.insert("workspace".to_owned(), Value::String(workspace.clone()));
         extra.insert("custom_workspace".to_owned(), Value::Bool(true));
+        // Stored on the child so the turn-completion report can honour it.
+        extra.insert("report_to_parent".to_owned(), Value::Bool(req.report_to_parent));
         for (key, value) in plan.legacy_triple.iter() {
             extra.insert(key.clone(), value.clone());
         }
@@ -257,6 +278,9 @@ impl ConversationService {
             source: Some(ConversationSource::Aionui),
             channel_chat_id: None,
             extra: Value::Object(extra),
+            // Default: a child of the caller (validated inside `create`).
+            // `detached` makes it an independent root.
+            parent_conversation_id: (!req.detached).then(|| caller_conversation_id.to_owned()),
         };
 
         let created = self
@@ -495,6 +519,7 @@ fn map_create_error(error: ConversationError, workspace: &str) -> ConversationCr
         ConversationError::WorkspacePathRuntimeUnavailable { .. } => ConversationCreateError::WorkspaceUnavailable {
             path: workspace.to_owned(),
         },
+        ConversationError::Hierarchy { violation, reason } => ConversationCreateError::Hierarchy { violation, reason },
         other => ConversationCreateError::transport(other),
     }
 }
@@ -545,6 +570,38 @@ mod tests {
                 ConversationCreateError::SchemaValidation { reason: "r".into() },
                 ConversationToolErrorCode::SchemaValidationFailed,
                 400,
+            ),
+            (
+                ConversationCreateError::Hierarchy {
+                    violation: HierarchyViolation::ParentNotFound,
+                    reason: "r".into(),
+                },
+                ConversationToolErrorCode::ParentNotFound,
+                404,
+            ),
+            (
+                ConversationCreateError::Hierarchy {
+                    violation: HierarchyViolation::ParentDepthExceeded,
+                    reason: "r".into(),
+                },
+                ConversationToolErrorCode::ParentDepthExceeded,
+                422,
+            ),
+            (
+                ConversationCreateError::Hierarchy {
+                    violation: HierarchyViolation::ParentFanoutExceeded,
+                    reason: "r".into(),
+                },
+                ConversationToolErrorCode::ParentFanoutExceeded,
+                422,
+            ),
+            (
+                ConversationCreateError::Hierarchy {
+                    violation: HierarchyViolation::ParentCycle,
+                    reason: "r".into(),
+                },
+                ConversationToolErrorCode::ParentCycle,
+                409,
             ),
             (
                 ConversationCreateError::TransportUnavailable { reason: "r".into() },

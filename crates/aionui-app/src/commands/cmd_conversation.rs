@@ -298,6 +298,23 @@ mod tests {
     }
 
     #[test]
+    fn create_accepts_the_hierarchy_flags_and_still_rejects_other_unknown_fields() {
+        let tool = ConversationToolName::ConversationCreate;
+        assert!(
+            validate_against_descriptor(
+                "conversation create",
+                tool,
+                json!({ "name": "x", "detached": true, "report_to_parent": false })
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_against_descriptor("conversation create", tool, json!({ "name": "x", "parent": "c1" })).is_err(),
+            "the parent is the token-bound caller; it cannot be named in stdin"
+        );
+    }
+
+    #[test]
     fn the_cli_path_this_file_hard_codes_is_the_registrys() {
         assert_eq!(
             tool_name_for_conversation_cli_path(&["create".to_owned()]),

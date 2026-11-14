@@ -610,6 +610,7 @@ impl JobExecutor {
             source: None,
             channel_chat_id: None,
             extra,
+            parent_conversation_id: None,
         };
 
         let response = self
@@ -2969,6 +2970,8 @@ mod tests {
                 project_id: None,
                 folder_id: None,
                 name_source: None,
+                parent_conversation_id: None,
+                depth: 0,
             }))
         }
 
@@ -3123,6 +3126,8 @@ mod tests {
                     project_id: None,
                     folder_id: None,
                     name_source: None,
+                    parent_conversation_id: None,
+                    depth: 0,
                 },
                 updates: Mutex::new(Vec::new()),
                 inserted_messages: Mutex::new(Vec::new()),

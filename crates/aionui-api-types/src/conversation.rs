@@ -85,6 +85,20 @@ pub struct CreateConversationRequest {
     pub source: Option<ConversationSource>,
     pub channel_chat_id: Option<String>,
     pub extra: serde_json::Value,
+    /// Optional parent conversation: the new conversation becomes its child
+    /// (hierarchical conversations). Omitted/`null` creates a root.
+    #[serde(default)]
+    pub parent_conversation_id: Option<String>,
+}
+
+/// Body for `PUT /api/conversations/{id}/parent`.
+///
+/// `parent_conversation_id: null` detaches the conversation (and its subtree)
+/// to a root.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ReparentConversationRequest {
+    #[serde(default)]
+    pub parent_conversation_id: Option<String>,
 }
 
 /// Body for `POST /api/conversations/{id}/fork`.
@@ -336,6 +350,12 @@ pub struct ConversationResponse {
     pub assistant: Option<ConversationAssistantIdentityResponse>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_id: Option<String>,
+    /// Parent conversation id (hierarchical conversations); absent for roots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent_conversation_id: Option<String>,
+    /// Nesting depth: root = 0, deepest child = 3. Always serialized.
+    #[serde(default)]
+    pub depth: u32,
     /// Service-layer post-fill on the DETAIL path only (like `runtime`);
     /// `None` on list responses. See [`ForkCapabilityView`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -760,6 +780,8 @@ mod tests {
             extra: json!({ "workspace": "/project" }),
             fork_capability: None,
             prompt_capability: None,
+            parent_conversation_id: None,
+            depth: 0,
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert_eq!(json["id"], "conv_1");
@@ -802,6 +824,8 @@ mod tests {
             extra: json!({}),
             fork_capability: None,
             prompt_capability: None,
+            parent_conversation_id: None,
+            depth: 0,
         };
         let json = serde_json::to_value(&resp).unwrap();
         assert!(json.get("model").is_none(), "model None should be omitted");
@@ -838,6 +862,8 @@ mod tests {
             extra: json!({}),
             fork_capability: None,
             prompt_capability: None,
+            parent_conversation_id: None,
+            depth: 0,
         };
         let serialized = serde_json::to_string(&resp).unwrap();
         let deserialized: ConversationResponse = serde_json::from_str(&serialized).unwrap();
@@ -928,6 +954,8 @@ mod tests {
                 extra: json!({}),
                 fork_capability: None,
                 prompt_capability: None,
+                parent_conversation_id: None,
+                depth: 0,
             },
         };
         let json = serde_json::to_value(&item).unwrap();
@@ -969,6 +997,8 @@ mod tests {
                 extra: json!({}),
                 fork_capability: None,
                 prompt_capability: None,
+                parent_conversation_id: None,
+                depth: 0,
             },
         };
         let serialized = serde_json::to_string(&item).unwrap();
@@ -1062,6 +1092,8 @@ mod tests {
                 extra: json!({}),
                 fork_capability: None,
                 prompt_capability: None,
+                parent_conversation_id: None,
+                depth: 0,
             }],
             total: 1,
             has_more: false,
@@ -1118,6 +1150,8 @@ mod tests {
                     extra: json!({}),
                     fork_capability: None,
                     prompt_capability: None,
+                    parent_conversation_id: None,
+                    depth: 0,
                 },
             }],
             total: 1,

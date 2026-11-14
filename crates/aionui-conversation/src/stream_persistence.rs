@@ -12,6 +12,7 @@ use aionui_realtime::EventBroadcaster;
 use serde_json::json;
 use tracing::{debug, error, warn};
 
+use crate::hierarchy::ChildResultStatus;
 use crate::runtime_completion::RuntimeCompletionPublisher;
 use crate::runtime_persistence::{RuntimePersistenceCoordinator, RuntimeWriteKind};
 use crate::service::ConversationService;
@@ -115,11 +116,25 @@ impl StreamPersistenceAdapter {
     }
 
     #[tracing::instrument(skip_all, fields(conversation_id = %self.conversation_id))]
+    #[cfg_attr(not(test), allow(dead_code))]
     pub async fn complete_conversation(
         &self,
         broadcaster: &Arc<dyn EventBroadcaster>,
         turn_id: &str,
         runtime: Option<ConversationRuntimeSummary>,
+    ) {
+        self.complete_conversation_with_outcome(broadcaster, turn_id, runtime, ChildResultStatus::Finished)
+            .await;
+    }
+
+    /// [`Self::complete_conversation`] carrying how the turn ended (see
+    /// `RuntimeCompletionPublisher::publish_with_outcome`).
+    pub async fn complete_conversation_with_outcome(
+        &self,
+        broadcaster: &Arc<dyn EventBroadcaster>,
+        turn_id: &str,
+        runtime: Option<ConversationRuntimeSummary>,
+        outcome: ChildResultStatus,
     ) {
         if let Some(persistence) = &self.persistence {
             RuntimeCompletionPublisher::new(
@@ -128,7 +143,7 @@ impl StreamPersistenceAdapter {
                 broadcaster.clone(),
                 persistence.clone(),
             )
-            .publish(&self.conversation_id, turn_id, runtime)
+            .publish_with_outcome(&self.conversation_id, turn_id, runtime, outcome)
             .await;
             return;
         }

@@ -58,13 +58,44 @@ fn the_skill_carries_a_copyable_create_example_with_every_field() {
     assert!(body.contains("\"name\":"), "{body}");
     assert!(body.contains("\"workspace\":"), "{body}");
     assert!(body.contains("\"assistant_id\":"), "{body}");
+    assert!(body.contains("\"detached\":"), "{body}");
+    assert!(body.contains("\"report_to_parent\":"), "{body}");
+}
+
+#[test]
+fn the_skill_documents_hierarchy_defaults_limits_and_the_child_result_block() {
+    let body = skill_prose();
+    assert!(body.contains("it is a CHILD of this conversation"), "{body}");
+    assert!(body.contains("`detached` (default false)"), "{body}");
+    assert!(body.contains("`report_to_parent` (default true)"), "{body}");
+    assert!(
+        body.contains("at most 3 levels of nesting and 12 children per parent"),
+        "{body}"
+    );
+    for code in [
+        "parent_depth_exceeded",
+        "parent_fanout_exceeded",
+        "parent_not_found",
+        "parent_cycle",
+    ] {
+        assert!(body.contains(code), "the skill must name error code {code}");
+    }
+    assert!(
+        body.contains("[[AION_CHILD_RESULT child_id=<id> name=<name> status=<finished|error|cancelled>]]"),
+        "{body}"
+    );
+    assert!(body.contains("[[/AION_CHILD_RESULT]]"), "{body}");
+    assert!(body.contains("at most 4000 characters"), "{body}");
 }
 
 #[test]
 fn the_skill_states_the_non_negotiable_rules() {
     let body = skill_prose();
-    // Rule 1 — only on request.
-    assert!(body.contains("Never create one on your own initiative"), "{body}");
+    // Rule 1 — on request, or for delegated / parallel sub-work the user asked for.
+    assert!(
+        body.contains("asked for parallel / delegated sub-work. Never create one on your own initiative otherwise"),
+        "{body}"
+    );
     // Rule 2 — name required, in the user's language.
     assert!(body.contains("`name` is required"), "{body}");
     assert!(body.contains("in the user's language"), "{body}");

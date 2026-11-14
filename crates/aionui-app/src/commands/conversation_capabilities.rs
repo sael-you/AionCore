@@ -31,7 +31,9 @@ pub(crate) fn data() -> Value {
         "semantics": {
             "synchronous": "when success=true the conversation exists and can immediately be addressed by id",
             "does_not": ["send a first message", "open the conversation", "switch the user's current conversation"],
-            "inheritance": "workspace and assistant default to THIS conversation's; the new conversation is a clean instance of the same assistant, not a copy of this conversation's runtime state"
+            "inheritance": "workspace and assistant default to THIS conversation's; the new conversation is a clean instance of the same assistant, not a copy of this conversation's runtime state",
+            "hierarchy": "by default the new conversation is a CHILD of this one (detached=true makes it a root); limits: depth <= 3 (root = 0), 12 children per parent",
+            "child_result": "when a child's turn ends and report_to_parent != false, this conversation receives [[AION_CHILD_RESULT child_id=<id> name=<name> status=<finished|error|cancelled>]] + the child's final answer (<= 4000 chars) + [[/AION_CHILD_RESULT]] via cross-session messaging"
         },
         "tools": tools,
         "errors": [
@@ -43,7 +45,11 @@ pub(crate) fn data() -> Value {
             "assistant_model_unresolved",
             "runtime_auth_failed",
             "schema_validation_failed",
-            "transport_unavailable"
+            "transport_unavailable",
+            "parent_not_found",
+            "parent_depth_exceeded",
+            "parent_fanout_exceeded",
+            "parent_cycle"
         ]
     })
 }
@@ -99,6 +105,10 @@ mod tests {
             Code::RuntimeAuthFailed,
             Code::SchemaValidationFailed,
             Code::TransportUnavailable,
+            Code::ParentNotFound,
+            Code::ParentDepthExceeded,
+            Code::ParentFanoutExceeded,
+            Code::ParentCycle,
         ] {
             assert!(
                 documented.contains(&code.as_str().to_owned()),
@@ -106,6 +116,6 @@ mod tests {
                 code.as_str()
             );
         }
-        assert_eq!(documented.len(), 9, "no stray codes: {documented:?}");
+        assert_eq!(documented.len(), 13, "no stray codes: {documented:?}");
     }
 }

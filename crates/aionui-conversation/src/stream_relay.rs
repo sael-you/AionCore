@@ -8,6 +8,7 @@ use crate::skill_resolver::{LoadedAgentSkill, SkillResolver};
 use aionui_api_types::{AgentErrorCode, WebSocketMessage};
 use aionui_common::{ErrorChain, normalize_keys_to_snake_case, now_ms};
 
+use crate::hierarchy::ChildResultStatus;
 use crate::runtime_persistence::RuntimePersistenceCoordinator;
 use crate::runtime_state::ConversationRuntimeStateService;
 use crate::service::ConversationService;
@@ -568,8 +569,13 @@ impl StreamRelay {
                                 outcome.attempt.persisted_assistant_output = true;
                             }
                             if self.complete_turn && !deleting {
+                                let report_status = if outcome.terminal.is_error() {
+                                    ChildResultStatus::Error
+                                } else {
+                                    ChildResultStatus::Finished
+                                };
                                 self.adapter
-                                    .complete_conversation(&self.broadcaster, &self.turn_id, None)
+                                    .complete_conversation_with_outcome(&self.broadcaster, &self.turn_id, None, report_status)
                                     .await;
                             }
                             break outcome;
@@ -769,7 +775,14 @@ impl StreamRelay {
                     }
                     if self.complete_turn && !deleting {
                         self.adapter
-                            .complete_conversation(&self.broadcaster, &self.turn_id, None)
+                            .complete_conversation_with_outcome(
+                                &self.broadcaster,
+                                &self.turn_id,
+                                None,
+                                // The agent's stream closed without a terminal
+                                // event: the turn did not finish cleanly.
+                                ChildResultStatus::Error,
+                            )
                             .await;
                     }
                     break outcome;
@@ -1232,6 +1245,8 @@ mod tests {
             project_id: None,
             folder_id: None,
             name_source: name_source.map(str::to_owned),
+            parent_conversation_id: None,
+            depth: 0,
         }
     }
 

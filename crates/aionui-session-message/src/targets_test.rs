@@ -88,6 +88,8 @@ impl TargetsCtx {
             project_id: new.project_id.map(str::to_owned),
             folder_id: None,
             name_source: None,
+            parent_conversation_id: None,
+            depth: 0,
         };
         self.repo.create(&row).await.unwrap();
     }
@@ -123,6 +125,8 @@ impl TargetsCtx {
                 project_id: None,
                 folder_id: None,
                 name_source: None,
+                parent_conversation_id: None,
+                depth: 0,
             };
             self.repo.create(&row).await.unwrap();
         }
@@ -744,6 +748,8 @@ async fn a_page_stays_full_when_hard_filtered_rows_fill_the_scan_window() {
             project_id: None,
             folder_id: None,
             name_source: None,
+            parent_conversation_id: None,
+            depth: 0,
         };
         ctx.repo.create(&row).await.unwrap();
     }

@@ -21,10 +21,10 @@ use aionui_db::{
 };
 use aionui_project::ProjectService;
 use aionui_realtime::{BroadcastEventBus, WebSocketManager};
-use aionui_session_message::QueueClearingCancelHook;
 use aionui_session_message::queue::{DeliveryQueue, SystemClock};
 use aionui_session_message::rate_limit::RateLimiter;
 use aionui_session_message::service::{SessionMessageDeps, SessionMessageService};
+use aionui_session_message::{QueueClearingCancelHook, SessionChildResultDelivery};
 use aionui_sidebar::UserOrderDeleteHook;
 use tokio::sync::Notify;
 
@@ -423,6 +423,11 @@ impl AppServices {
         // crate (see `OnConversationTurnCancelled`).
         conversation_service
             .with_turn_cancelled_hook(Arc::new(QueueClearingCancelHook::new(session_message_queue.clone())));
+        // Hierarchical conversations: a finished child reports to its parent
+        // through the cross-session message path (toggle + rate limit apply).
+        conversation_service.with_child_result_delivery(Arc::new(SessionChildResultDelivery::new(
+            session_message_service.clone(),
+        )));
 
         Ok(Self {
             database,

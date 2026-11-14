@@ -4,7 +4,7 @@ use std::{
 };
 
 use aionui_api_types::{ConversationRuntimeStateKind, ConversationRuntimeSummary};
-use aionui_common::ConversationStatus;
+use aionui_common::{ChildResultDelivery, ConversationStatus};
 use tokio::sync::Notify;
 use tracing::{info, warn};
 
@@ -14,6 +14,19 @@ use crate::ConversationError;
 pub struct ConversationRuntimeStateService {
     state: Mutex<ConversationRuntimeState>,
     release_notify: Notify,
+    /// Port that carries a finished child's result report to its parent. Lives
+    /// here because this service is the one object every turn-completion path
+    /// (relay adapter and `ConversationService`) already shares.
+    child_result_delivery: ChildResultDeliverySlot,
+}
+
+#[derive(Default)]
+struct ChildResultDeliverySlot(std::sync::RwLock<Option<Arc<dyn ChildResultDelivery>>>);
+
+impl std::fmt::Debug for ChildResultDeliverySlot {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("ChildResultDeliverySlot")
+    }
 }
 
 #[derive(Debug, Default)]
@@ -62,6 +75,17 @@ pub enum RuntimeLifecycleState {
 }
 
 impl ConversationRuntimeStateService {
+    /// Install the child-result delivery port (set once at startup).
+    pub fn set_child_result_delivery(&self, delivery: Arc<dyn ChildResultDelivery>) {
+        if let Ok(mut slot) = self.child_result_delivery.0.write() {
+            *slot = Some(delivery);
+        }
+    }
+
+    pub(crate) fn child_result_delivery(&self) -> Option<Arc<dyn ChildResultDelivery>> {
+        self.child_result_delivery.0.read().ok().and_then(|slot| slot.clone())
+    }
+
     pub fn try_claim_turn(
         self: &Arc<Self>,
         conversation_id: &str,

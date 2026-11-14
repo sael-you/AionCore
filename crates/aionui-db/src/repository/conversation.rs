@@ -108,6 +108,54 @@ pub trait IConversationRepository: Send + Sync {
         Ok(Vec::new())
     }
 
+    // ── Hierarchy (parent / child conversations) ────────────────────
+
+    /// Direct children of `parent_id`, `created_at ASC, id ASC`.
+    ///
+    /// Defaults to none so the repository stubs in this workspace that never
+    /// model a hierarchy need no body.
+    async fn list_children(&self, _user_id: &str, _parent_id: &str) -> Result<Vec<ConversationRow>, DbError> {
+        Ok(Vec::new())
+    }
+
+    /// Every descendant of `id` (children, grandchildren, …), excluding `id`
+    /// itself, `created_at ASC, id ASC`. The default walks [`Self::list_children`]
+    /// breadth-first with a visited set, so a corrupted cycle terminates.
+    async fn list_descendants(&self, user_id: &str, id: &str) -> Result<Vec<ConversationRow>, DbError> {
+        let mut seen = std::collections::HashSet::new();
+        seen.insert(id.to_owned());
+        let mut out: Vec<ConversationRow> = Vec::new();
+        let mut frontier = vec![id.to_owned()];
+        while let Some(current) = frontier.pop() {
+            for child in self.list_children(user_id, &current).await? {
+                if seen.insert(child.id.clone()) {
+                    frontier.push(child.id.clone());
+                    out.push(child);
+                }
+            }
+        }
+        out.sort_by(|a, b| a.created_at.cmp(&b.created_at).then_with(|| a.id.cmp(&b.id)));
+        Ok(out)
+    }
+
+    /// Re-parents `id` and rewrites `depth` for the moved subtree in ONE
+    /// transaction. `depth_updates` carries `(conversation_id, new_depth)` for
+    /// `id` itself and every descendant. `new_parent = None` detaches to a root.
+    /// Returns `DbError::NotFound` when `id` is missing for the user.
+    ///
+    /// Default is unsupported so test doubles that never reparent can skip it.
+    async fn reparent_subtree(
+        &self,
+        _user_id: &str,
+        _id: &str,
+        _new_parent: Option<&str>,
+        _depth_updates: &[(String, i64)],
+    ) -> Result<(), DbError> {
+        Err(DbError::Init(
+            "reparent_subtree is not supported by this repository".into(),
+        ))
+    }
+
     /// Returns the persisted assistant snapshot for a conversation, if any.
     async fn get_assistant_snapshot(
         &self,

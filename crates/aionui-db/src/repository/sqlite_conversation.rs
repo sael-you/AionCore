@@ -317,8 +317,9 @@ impl IConversationRepository for SqliteConversationRepository {
         sqlx::query(
             "INSERT INTO conversations \
                 (id, user_id, name, type, extra, model, status, source, \
-                 channel_chat_id, pinned, pinned_at, created_at, updated_at, project_id, folder_id) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                 channel_chat_id, pinned, pinned_at, created_at, updated_at, project_id, folder_id, \
+                 parent_conversation_id, depth) \
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&row.id)
         .bind(&row.user_id)
@@ -335,6 +336,8 @@ impl IConversationRepository for SqliteConversationRepository {
         .bind(row.updated_at)
         .bind(&row.project_id)
         .bind(&row.folder_id)
+        .bind(&row.parent_conversation_id)
+        .bind(row.depth)
         .execute(&self.pool)
         .await?;
 
@@ -653,6 +656,69 @@ impl IConversationRepository for SqliteConversationRepository {
         .await?;
 
         Ok(rows)
+    }
+
+    async fn list_children(&self, user_id: &str, parent_id: &str) -> Result<Vec<ConversationRow>, DbError> {
+        let rows = sqlx::query_as::<_, ConversationRow>(
+            "SELECT * FROM conversations \
+             WHERE user_id = ? AND parent_conversation_id = ? \
+             ORDER BY created_at ASC, id ASC",
+        )
+        .bind(user_id)
+        .bind(parent_id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    async fn list_descendants(&self, user_id: &str, id: &str) -> Result<Vec<ConversationRow>, DbError> {
+        // `UNION` (not `UNION ALL`) dedups visited ids, so a corrupted cycle
+        // still terminates.
+        let rows = sqlx::query_as::<_, ConversationRow>(
+            "WITH RECURSIVE sub(id) AS ( \
+                 SELECT id FROM conversations WHERE user_id = ?1 AND parent_conversation_id = ?2 \
+                 UNION \
+                 SELECT c.id FROM conversations c JOIN sub ON c.parent_conversation_id = sub.id \
+                     WHERE c.user_id = ?1 \
+             ) \
+             SELECT c.* FROM conversations c \
+             WHERE c.user_id = ?1 AND c.id IN (SELECT id FROM sub) AND c.id != ?2 \
+             ORDER BY c.created_at ASC, c.id ASC",
+        )
+        .bind(user_id)
+        .bind(id)
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows)
+    }
+
+    async fn reparent_subtree(
+        &self,
+        user_id: &str,
+        id: &str,
+        new_parent: Option<&str>,
+        depth_updates: &[(String, i64)],
+    ) -> Result<(), DbError> {
+        let mut tx = self.pool.begin().await?;
+        let moved = sqlx::query("UPDATE conversations SET parent_conversation_id = ? WHERE user_id = ? AND id = ?")
+            .bind(new_parent)
+            .bind(user_id)
+            .bind(id)
+            .execute(&mut *tx)
+            .await?;
+        if moved.rows_affected() == 0 {
+            return Err(DbError::NotFound(format!("Conversation '{id}' not found")));
+        }
+        for (conversation_id, depth) in depth_updates {
+            sqlx::query("UPDATE conversations SET depth = ? WHERE user_id = ? AND id = ?")
+                .bind(depth)
+                .bind(user_id)
+                .bind(conversation_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(())
     }
 
     async fn get_assistant_snapshot(
@@ -1635,6 +1701,8 @@ mod tests {
             project_id: None,
             folder_id: None,
             name_source: None,
+            parent_conversation_id: None,
+            depth: 0,
         }
     }
 

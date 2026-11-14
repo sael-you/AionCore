@@ -7,7 +7,10 @@ use aionui_realtime::EventBroadcaster;
 use serde_json::json;
 use tracing::{debug, error};
 
+use crate::child_report::report_child_result;
+use crate::hierarchy::ChildResultStatus;
 use crate::runtime_persistence::{RuntimePersistenceCoordinator, RuntimeWriteKind};
+use crate::runtime_state::RuntimeLifecycleState;
 
 #[derive(Clone)]
 pub struct RuntimeCompletionPublisher {
@@ -32,8 +35,23 @@ impl RuntimeCompletionPublisher {
         }
     }
 
-    #[tracing::instrument(skip_all, fields(conversation_id = %conversation_id, turn_id = %turn_id))]
     pub async fn publish(&self, conversation_id: &str, turn_id: &str, runtime: Option<ConversationRuntimeSummary>) {
+        self.publish_with_outcome(conversation_id, turn_id, runtime, ChildResultStatus::Finished)
+            .await;
+    }
+
+    /// Same as [`Self::publish`], but records how the turn ended so a child
+    /// conversation's result report (hierarchical conversations) carries the
+    /// right status. The persisted / broadcast status stays `finished` — only
+    /// the report header distinguishes `error` / `cancelled`.
+    #[tracing::instrument(skip_all, fields(conversation_id = %conversation_id, turn_id = %turn_id))]
+    pub async fn publish_with_outcome(
+        &self,
+        conversation_id: &str,
+        turn_id: &str,
+        runtime: Option<ConversationRuntimeSummary>,
+        outcome: ChildResultStatus,
+    ) {
         if !self
             .persistence
             .allows(conversation_id, RuntimeWriteKind::ConversationFinished)
@@ -93,5 +111,28 @@ impl RuntimeCompletionPublisher {
             .broadcast(WebSocketMessage::new("turn.completed", payload));
 
         debug!(conversation_id, turn_id, status = "finished", "Turn completed");
+
+        self.spawn_child_result_report(conversation_id, outcome);
+    }
+
+    /// Fire-and-forget: the report must never delay or fail turn completion.
+    fn spawn_child_result_report(&self, conversation_id: &str, outcome: ChildResultStatus) {
+        let Some(delivery) = self.persistence.child_result_delivery() else {
+            return;
+        };
+        // A turn that ended because the user pressed stop is `cancelled`
+        // whatever the relay's terminal said.
+        let status = if self.persistence.lifecycle_for(conversation_id) == RuntimeLifecycleState::Cancelling {
+            ChildResultStatus::Cancelled
+        } else {
+            outcome
+        };
+        tokio::spawn(report_child_result(
+            self.repo.clone(),
+            delivery,
+            self.user_id.clone(),
+            conversation_id.to_owned(),
+            status,
+        ));
     }
 }

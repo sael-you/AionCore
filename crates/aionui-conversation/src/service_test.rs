@@ -60,6 +60,9 @@ mod acp_error_recovery_test;
 #[path = "service_test/runtime_create_test.rs"]
 mod runtime_create_test;
 
+#[path = "service_test/hierarchy_test.rs"]
+mod hierarchy_test;
+
 #[derive(Clone, Debug)]
 struct RecordedViewSync {
     user_id: String,
@@ -319,6 +322,41 @@ impl IConversationRepository for MockRepo {
         }
         if let Some(name_source) = &updates.name_source {
             row.name_source = Some(name_source.clone());
+        }
+        Ok(())
+    }
+
+    async fn list_children(&self, user_id: &str, parent_id: &str) -> Result<Vec<ConversationRow>, aionui_db::DbError> {
+        let rows = self.rows.lock().unwrap();
+        let mut children: Vec<ConversationRow> = rows
+            .iter()
+            .filter(|r| r.user_id == user_id && r.parent_conversation_id.as_deref() == Some(parent_id))
+            .cloned()
+            .collect();
+        children.sort_by(|a, b| a.created_at.cmp(&b.created_at).then_with(|| a.id.cmp(&b.id)));
+        Ok(children)
+    }
+
+    async fn reparent_subtree(
+        &self,
+        user_id: &str,
+        id: &str,
+        new_parent: Option<&str>,
+        depth_updates: &[(String, i64)],
+    ) -> Result<(), aionui_db::DbError> {
+        let mut rows = self.rows.lock().unwrap();
+        let moved = rows
+            .iter_mut()
+            .find(|r| r.user_id == user_id && r.id == id)
+            .ok_or_else(|| aionui_db::DbError::NotFound(format!("Conversation {id}")))?;
+        moved.parent_conversation_id = new_parent.map(str::to_owned);
+        for (conversation_id, depth) in depth_updates {
+            if let Some(row) = rows
+                .iter_mut()
+                .find(|r| r.user_id == user_id && &r.id == conversation_id)
+            {
+                row.depth = *depth;
+            }
         }
         Ok(())
     }
@@ -1650,6 +1688,8 @@ async fn insert_conversation_with_type(repo: &Arc<MockRepo>, user_id: &str, agen
         project_id: None,
         folder_id: None,
         name_source: None,
+        parent_conversation_id: None,
+        depth: 0,
     };
     repo.create(&row).await.unwrap();
     row
@@ -9054,6 +9094,8 @@ async fn get_backfills_legacy_row_and_persists() {
         project_id: None,
         folder_id: None,
         name_source: None,
+        parent_conversation_id: None,
+        depth: 0,
     };
     repo.create(&legacy_row).await.unwrap();
 
@@ -9105,6 +9147,8 @@ async fn list_backfills_mixed_rows() {
         project_id: None,
         folder_id: None,
         name_source: None,
+        parent_conversation_id: None,
+        depth: 0,
     };
     // Row 2: already migrated.
     let modern = ConversationRow {
@@ -9128,6 +9172,8 @@ async fn list_backfills_mixed_rows() {
         project_id: None,
         folder_id: None,
         name_source: None,
+        parent_conversation_id: None,
+        depth: 0,
     };
     repo.create(&legacy).await.unwrap();
     repo.create(&modern).await.unwrap();
@@ -9249,6 +9295,8 @@ async fn seed_aionrs_conversation_with_snapshot(
         project_id: None,
         folder_id: None,
         name_source: None,
+        parent_conversation_id: None,
+        depth: 0,
     };
     repo.create(&row).await.unwrap();
     repo.upsert_assistant_snapshot(
@@ -9646,6 +9694,8 @@ mod session_mentions_integration {
             project_id: None,
             folder_id: None,
             name_source: None,
+            parent_conversation_id: None,
+            depth: 0,
         };
         repo.create(&row).await.unwrap();
     }

@@ -190,7 +190,7 @@ fn conv_ids(items: &[SidebarItem]) -> Vec<String> {
     let mut ids: Vec<String> = items
         .iter()
         .filter_map(|i| match i {
-            SidebarItem::Conversation { conversation } => Some(conversation.id.clone()),
+            SidebarItem::Conversation { conversation, .. } => Some(conversation.id.clone()),
             SidebarItem::Team(_) => None,
         })
         .collect();
@@ -521,7 +521,7 @@ async fn pinned_item_leaves_its_natural_group() {
     let pinned = find_pinned(&after).expect("pinned group present");
     assert_eq!(conv_ids(&pinned.items), vec!["c4"]);
     let is_pinned = pinned.items.iter().any(
-        |i| matches!(i, SidebarItem::Conversation { conversation } if conversation.id == "c4" && conversation.pinned),
+        |i| matches!(i, SidebarItem::Conversation { conversation, .. } if conversation.id == "c4" && conversation.pinned),
     );
     assert!(is_pinned, "DTO pinned flag overridden to true");
     // B1: c4 no longer double-renders in its natural (dir) group. The dir group
@@ -1733,4 +1733,286 @@ async fn delete_archived_project_on_missing_or_nonstandard_scope_is_scope_gone()
 
     assert!(ports.deleted_teams.lock().unwrap().is_empty(), "no team port hit");
     assert!(ports.deleted_convs.lock().unwrap().is_empty(), "no conv port hit");
+}
+
+// -- Hierarchical conversations ----------------------------------------------
+
+async fn set_parent(pool: &SqlitePool, id: &str, parent: &str, depth: i64) {
+    sqlx::query("UPDATE conversations SET parent_conversation_id = ?, depth = ? WHERE id = ?")
+        .bind(parent)
+        .bind(depth)
+        .bind(id)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+async fn set_status(pool: &SqlitePool, id: &str, status: &str) {
+    sqlx::query("UPDATE conversations SET status = ? WHERE id = ?")
+        .bind(status)
+        .bind(id)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+/// The chats-group items in render order, as `(conversation id, descendants)`.
+fn chat_items(resp: &aionui_api_types::SidebarResponse) -> Vec<(String, Vec<String>, u32, u32)> {
+    find_chats(resp)
+        .items
+        .iter()
+        .filter_map(|item| match item {
+            SidebarItem::Conversation {
+                conversation,
+                descendants,
+                descendant_count,
+                running_descendant_count,
+            } => Some((
+                conversation.id.clone(),
+                descendants.iter().map(|d| d.id.clone()).collect(),
+                *descendant_count,
+                *running_descendant_count,
+            )),
+            SidebarItem::Team(_) => None,
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn children_attach_to_their_root_and_are_not_items_themselves() {
+    let fx = fixture().await;
+    let pool = fx.pool();
+    insert_conv(pool, USER, "root", None, "{}", 100).await;
+    insert_conv(pool, USER, "kid-b", None, "{}", 120).await;
+    insert_conv(pool, USER, "kid-a", None, "{}", 110).await;
+    insert_conv(pool, USER, "grand", None, "{}", 130).await;
+    set_parent(pool, "kid-a", "root", 1).await;
+    set_parent(pool, "kid-b", "root", 1).await;
+    set_parent(pool, "grand", "kid-a", 2).await;
+    set_status(pool, "grand", "running").await;
+    set_status(pool, "kid-b", "running").await;
+
+    let resp = fx
+        .service
+        .first_screen(USER, Some(50), &[], ArchiveScope::Active)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        chat_items(&resp),
+        vec![(
+            "root".to_owned(),
+            vec!["kid-a".into(), "kid-b".into(), "grand".into()],
+            3,
+            2
+        )],
+        "one root item; descendants flat, created_at ascending; 2 running"
+    );
+    let SidebarItem::Conversation { descendants, .. } = &find_chats(&resp).items[0] else {
+        panic!("root item expected")
+    };
+    let grand = descendants.iter().find(|d| d.id == "grand").unwrap();
+    assert_eq!(grand.parent_conversation_id.as_deref(), Some("kid-a"));
+    assert_eq!(grand.depth, 2);
+}
+
+#[tokio::test]
+async fn a_root_rises_with_the_activity_of_its_subtree() {
+    let fx = fixture().await;
+    let pool = fx.pool();
+    insert_conv(pool, USER, "quiet-root", None, "{}", 100).await;
+    insert_conv(pool, USER, "busy-root", None, "{}", 200).await;
+    insert_conv(pool, USER, "quiet-kid", None, "{}", 300).await;
+    set_parent(pool, "quiet-kid", "quiet-root", 1).await;
+
+    let resp = fx
+        .service
+        .first_screen(USER, Some(50), &[], ArchiveScope::Active)
+        .await
+        .unwrap();
+    let order: Vec<String> = chat_items(&resp).into_iter().map(|i| i.0).collect();
+    assert_eq!(
+        order,
+        vec!["quiet-root", "busy-root"],
+        "child activity lifts its root above"
+    );
+
+    // Keyset paging still walks the same order one item at a time.
+    let first = fx
+        .service
+        .first_screen(USER, Some(1), &[], ArchiveScope::Active)
+        .await
+        .unwrap();
+    let chats = find_chats(&first);
+    assert_eq!(conv_ids(&chats.items), vec!["quiet-root"]);
+    assert!(chats.has_more);
+    let page = fx
+        .service
+        .items(
+            USER,
+            "chats",
+            chats.next_cursor.as_deref(),
+            Some(5),
+            ArchiveScope::Active,
+        )
+        .await
+        .unwrap();
+    assert_eq!(conv_ids(&page.items), vec!["busy-root"]);
+}
+
+#[tokio::test]
+async fn orphans_whose_parent_is_missing_or_in_the_other_scope_are_roots() {
+    let fx = fixture().await;
+    let pool = fx.pool();
+    insert_conv(pool, USER, "parent", None, "{}", 100).await;
+    insert_conv(pool, USER, "kid", None, "{}", 110).await;
+    insert_conv(pool, USER, "dangling", None, "{}", 120).await;
+    set_parent(pool, "kid", "parent", 1).await;
+    set_parent(pool, "dangling", "deleted-parent", 1).await;
+    archive_conv(pool, "parent", 500).await;
+
+    let active = fx
+        .service
+        .first_screen(USER, Some(50), &[], ArchiveScope::Active)
+        .await
+        .unwrap();
+    assert_eq!(
+        conv_ids(&find_chats(&active).items),
+        vec!["dangling", "kid"],
+        "both orphans render as roots in the active slice"
+    );
+    assert!(chat_items(&active).iter().all(|i| i.1.is_empty()));
+
+    let archived = fx
+        .service
+        .first_screen(USER, Some(50), &[], ArchiveScope::Archived)
+        .await
+        .unwrap();
+    assert_eq!(chat_items(&archived), vec![("parent".to_owned(), vec![], 0, 0)]);
+}
+
+#[tokio::test]
+async fn classification_follows_the_root_not_the_child() {
+    let fx = fixture().await;
+    let pool = fx.pool();
+    insert_temp_project(pool, USER, "proj-temp").await;
+    // Root is in chats (temp project); the child carries a real directory that
+    // would otherwise open a pseudo-dir group.
+    insert_conv(pool, USER, "root", Some("proj-temp"), "{}", 100).await;
+    insert_conv_ws(pool, USER, "kid", "/srv/elsewhere/repo", 110).await;
+    set_parent(pool, "kid", "root", 1).await;
+
+    let resp = fx
+        .service
+        .first_screen(USER, Some(50), &[], ArchiveScope::Active)
+        .await
+        .unwrap();
+    assert!(
+        find_dir(&resp, "repo").is_none(),
+        "no group created for the child's own dir"
+    );
+    assert_eq!(
+        chat_items(&resp),
+        vec![("root".to_owned(), vec!["kid".to_owned()], 1, 0)]
+    );
+}
+
+#[tokio::test]
+async fn non_hierarchy_items_serialize_without_descendant_fields() {
+    let fx = fixture().await;
+    insert_conv(fx.pool(), USER, "solo", None, "{}", 100).await;
+    let resp = fx
+        .service
+        .first_screen(USER, Some(50), &[], ArchiveScope::Active)
+        .await
+        .unwrap();
+    let json = serde_json::to_value(&find_chats(&resp).items[0]).unwrap();
+    assert!(json.get("descendants").is_none(), "{json}");
+    assert!(json.get("descendant_count").is_none(), "{json}");
+    assert!(json.get("running_descendant_count").is_none(), "{json}");
+    assert_eq!(json["conversation"]["depth"], serde_json::json!(0));
+    assert!(json["conversation"].get("parent_conversation_id").is_none(), "{json}");
+}
+
+#[tokio::test]
+async fn pin_is_root_only() {
+    let fx = fixture().await;
+    let pool = fx.pool();
+    insert_conv(pool, USER, "root", None, "{}", 100).await;
+    insert_conv(pool, USER, "kid", None, "{}", 110).await;
+    set_parent(pool, "kid", "root", 1).await;
+
+    let err = fx.service.pin(USER, "pinned", "conversation", "kid").await.unwrap_err();
+    assert!(
+        matches!(err, SidebarError::BadRequest(ref m) if m.contains("only root")),
+        "{err:?}"
+    );
+    assert_eq!(user_order_count(pool, USER, "kid").await, 0);
+
+    fx.service.pin(USER, "pinned", "conversation", "root").await.unwrap();
+    let resp = fx
+        .service
+        .first_screen(USER, Some(50), &[], ArchiveScope::Active)
+        .await
+        .unwrap();
+    let pinned = find_pinned(&resp).expect("pinned group");
+    let SidebarItem::Conversation {
+        conversation,
+        descendants,
+        ..
+    } = &pinned.items[0]
+    else {
+        panic!("pinned root expected")
+    };
+    assert_eq!(conversation.id, "root");
+    assert_eq!(
+        descendants.iter().map(|d| d.id.as_str()).collect::<Vec<_>>(),
+        vec!["kid"]
+    );
+    assert!(
+        all_conv_ids(&resp).iter().filter(|id| *id == "kid").count() == 0,
+        "child is not an item"
+    );
+}
+
+#[tokio::test]
+async fn archive_and_unarchive_cascade_to_the_whole_subtree() {
+    let fx = fixture().await;
+    let pool = fx.pool();
+    insert_conv(pool, USER, "root", None, "{}", 100).await;
+    insert_conv(pool, USER, "kid", None, "{}", 110).await;
+    insert_conv(pool, USER, "grand", None, "{}", 120).await;
+    insert_conv(pool, USER, "other", None, "{}", 130).await;
+    set_parent(pool, "kid", "root", 1).await;
+    set_parent(pool, "grand", "kid", 2).await;
+    let teardown = FakeTeardownPorts::new(&[]);
+    fx.service.set_archive_teardown_ports(teardown.clone());
+
+    fx.service.archive_conversation(USER, "root").await.unwrap();
+
+    for id in ["root", "kid", "grand"] {
+        assert!(conv_archived_at(pool, id).await.is_some(), "{id} archived");
+    }
+    assert!(
+        conv_archived_at(pool, "other").await.is_none(),
+        "unrelated row untouched"
+    );
+    let mut stopped = teardown.stopped_convs.lock().unwrap().clone();
+    stopped.sort();
+    assert_eq!(stopped, vec!["grand", "kid", "root"], "every agent process is stopped");
+
+    let archived = fx
+        .service
+        .first_screen(USER, Some(50), &[], ArchiveScope::Archived)
+        .await
+        .unwrap();
+    assert_eq!(
+        chat_items(&archived),
+        vec![("root".to_owned(), vec!["kid".to_owned(), "grand".to_owned()], 2, 0)]
+    );
+
+    fx.service.unarchive_conversation(USER, "root").await.unwrap();
+    for id in ["root", "kid", "grand"] {
+        assert!(conv_archived_at(pool, id).await.is_none(), "{id} unarchived");
+    }
 }

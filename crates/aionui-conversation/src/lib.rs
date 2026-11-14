@@ -4,8 +4,11 @@
 mod acp_error_recovery;
 mod agent_health_policy;
 mod background_stream;
+mod child_report;
 mod convert;
 pub mod error;
+pub mod hierarchy;
+mod hierarchy_ops;
 pub(crate) mod message_cursor;
 mod message_persistence;
 pub mod response_middleware;

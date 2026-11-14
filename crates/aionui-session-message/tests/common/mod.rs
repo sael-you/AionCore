@@ -380,6 +380,8 @@ impl Ctx {
             project_id: None,
             folder_id: None,
             name_source: None,
+            parent_conversation_id: None,
+            depth: 0,
         };
         self.conversation_repo.create(&row).await.unwrap();
         row

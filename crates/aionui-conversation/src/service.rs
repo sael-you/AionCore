@@ -1044,6 +1044,21 @@ impl ConversationService {
         let now = now_ms();
         let source = req.source.unwrap_or(ConversationSource::Aionui);
 
+        // Hierarchy: validate the parent BEFORE any side effect so a rejection
+        // never leaves a half-built conversation behind.
+        let (parent_conversation_id, depth) = match req
+            .parent_conversation_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            Some(parent_id) => {
+                let depth = self.validate_new_parent(user_id, parent_id).await?;
+                (Some(parent_id.to_owned()), depth)
+            }
+            None => (None, 0),
+        };
+
         let mut extra = req.extra;
         strip_request_owner_user_id(&mut extra);
         // `extra.fork` is server-minted by the fork API only. A client-supplied
@@ -1447,6 +1462,8 @@ impl ConversationService {
             // is the frontend's first-message placeholder, so agents may
             // replace it later (spec 2026-08-04).
             name_source: None,
+            parent_conversation_id,
+            depth,
         };
 
         self.conversation_repo.create(&row).await?;
@@ -2573,8 +2590,20 @@ impl ConversationService {
     /// Delete a conversation (messages cascade via FK).
     ///
     /// Broadcasts `conversation.listChanged(deleted)`.
+    ///
+    /// Hierarchical conversations: every descendant is deleted first (deepest
+    /// first) through [`Self::delete_single`], so hooks, runtime teardown and
+    /// the workspace guard all run per child. A child that fails to delete is
+    /// logged and skipped; the requested conversation is still deleted.
     #[tracing::instrument(skip_all, fields(user_id = %user_id, conversation_id = %id))]
     pub async fn delete(&self, user_id: &str, id: &str) -> Result<(), ConversationError> {
+        self.delete_descendants_best_effort(user_id, id).await;
+        self.delete_single(user_id, id).await
+    }
+
+    /// Delete exactly one conversation row and its runtime / workspace state.
+    #[tracing::instrument(skip_all, fields(user_id = %user_id, conversation_id = %id))]
+    pub(crate) async fn delete_single(&self, user_id: &str, id: &str) -> Result<(), ConversationError> {
         // Get existing to retrieve source for broadcast and verify ownership
         let existing = self
             .conversation_repo
@@ -2879,6 +2908,8 @@ impl ConversationService {
             // workspace, which is shared anyway — copying is exact and cheap).
             project_id: parent.project_id.clone(),
             folder_id: parent.folder_id.clone(),
+            parent_conversation_id: None,
+            depth: 0,
         };
         self.conversation_repo.create(&row).await?;
 
@@ -6111,6 +6142,8 @@ mod tests {
             created_at: 0,
             modified_at: 0,
             extra: json!({}),
+            parent_conversation_id: None,
+            depth: 0,
         }
     }
 

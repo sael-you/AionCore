@@ -6,6 +6,7 @@
 //! path — so "cross-session delivery ≡ a human pressing send" is a structural
 //! guarantee rather than two code paths kept in sync by hand.
 
+pub mod child_result;
 pub mod drainer;
 pub mod error;
 pub mod hook;
@@ -16,6 +17,7 @@ pub mod service;
 pub mod state;
 pub mod targets;
 
+pub use child_result::SessionChildResultDelivery;
 pub use error::SessionMessageError;
 pub use hook::QueueClearingCancelHook;
 pub use routes::{session_message_routes, session_message_user_routes};

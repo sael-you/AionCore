@@ -84,6 +84,8 @@ pub fn row_to_response_with_extra(
         channel_chat_id: row.channel_chat_id,
         assistant: None,
         project_id: row.project_id,
+        parent_conversation_id: row.parent_conversation_id,
+        depth: u32::try_from(row.depth.max(0)).unwrap_or(0),
         // Detail-path post-fill only (see `attach_fork_capability`); convert
         // stays a pure mapper with no repo access.
         fork_capability: None,
@@ -310,6 +312,8 @@ pub fn search_row_to_item(row: MessageSearchRow, data_dir: &Path) -> Result<Mess
         project_id: None,
         folder_id: None,
         name_source: None,
+        parent_conversation_id: None,
+        depth: 0,
     };
 
     let conversation = row_to_response(conversation_row, data_dir)?;
@@ -354,6 +358,8 @@ mod tests {
             project_id: None,
             folder_id: None,
             name_source: None,
+            parent_conversation_id: None,
+            depth: 0,
         }
     }
 
@@ -427,6 +433,8 @@ mod tests {
             project_id: None,
             folder_id: None,
             name_source: None,
+            parent_conversation_id: None,
+            depth: 0,
         };
         let err = row_to_response(row, Path::new("/tmp/data")).unwrap_err();
         assert!(matches!(err, ConversationError::Internal { .. }));
@@ -561,6 +569,8 @@ mod tests {
             project_id: None,
             folder_id: None,
             name_source: None,
+            parent_conversation_id: None,
+            depth: 0,
         };
         let resp = row_to_response(row, Path::new("/tmp/data")).unwrap();
         assert!(resp.pinned);

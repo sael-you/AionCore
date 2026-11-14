@@ -7,6 +7,7 @@
 //! `boundary-rules.md`).
 
 mod cascade;
+mod hierarchy;
 mod ports;
 mod service;
 mod types;

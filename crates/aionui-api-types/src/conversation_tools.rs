@@ -56,22 +56,27 @@ fn tool_specs() -> Vec<ConversationToolSpec> {
         name: ConversationToolName::ConversationCreate,
         description: "Create a new conversation for this user. By default it inherits this \
                        conversation's working directory and assistant; pass `workspace` or \
-                       `assistant_id` to choose another. Creating does not send a message, \
-                       does not open the new conversation, and does not switch the user's \
-                       current conversation.",
+                       `assistant_id` to choose another. By default the new conversation is a \
+                       child of this one and reports its final answer back here; pass \
+                       `detached: true` for an independent conversation. Creating does not \
+                       send a message, does not open the new conversation, and does not \
+                       switch the user's current conversation.",
         input_schema: json!({
             "type": "object",
             "properties": {
                 "name": { "type": "string", "description": "Short name describing the task, in the user's language. Required; must not be blank." },
                 "workspace": { "type": "string", "description": "Absolute path of an existing directory. Omit to reuse this conversation's workspace." },
-                "assistant_id": { "type": "string", "description": "Id of an enabled assistant. Omit to reuse this conversation's assistant." }
+                "assistant_id": { "type": "string", "description": "Id of an enabled assistant. Omit to reuse this conversation's assistant." },
+                "detached": { "type": "boolean", "description": "Default false: the new conversation is a CHILD of this conversation (nested under it, depth <= 3, at most 12 children per parent). Pass true to create an independent root conversation instead." },
+                "report_to_parent": { "type": "boolean", "description": "Default true: when the child's turn ends, its final answer is delivered back to this conversation as an [[AION_CHILD_RESULT]] block. Pass false to opt out. Ignored when detached is true." }
             },
             "required": ["name"],
             "additionalProperties": false
         }),
         cli_command: &["create"],
-        when: "The user asked you to open, start, or spin up a new conversation.",
-        input_summary: "{ name, workspace?, assistant_id? }",
+        when: "The user asked you to open, start, or spin up a new conversation, or asked for \
+               parallel / delegated work that is worth its own conversation.",
+        input_summary: "{ name, workspace?, assistant_id?, detached?, report_to_parent? }",
     }]
 }
 
@@ -112,6 +117,10 @@ pub enum ConversationToolErrorCode {
     RuntimeAuthFailed,
     SchemaValidationFailed,
     TransportUnavailable,
+    ParentNotFound,
+    ParentDepthExceeded,
+    ParentFanoutExceeded,
+    ParentCycle,
 }
 
 impl ConversationToolErrorCode {
@@ -128,6 +137,10 @@ impl ConversationToolErrorCode {
             Self::RuntimeAuthFailed => "runtime_auth_failed",
             Self::SchemaValidationFailed => "schema_validation_failed",
             Self::TransportUnavailable => "transport_unavailable",
+            Self::ParentNotFound => "parent_not_found",
+            Self::ParentDepthExceeded => "parent_depth_exceeded",
+            Self::ParentFanoutExceeded => "parent_fanout_exceeded",
+            Self::ParentCycle => "parent_cycle",
         }
     }
 }
@@ -207,6 +220,18 @@ pub struct ConversationCreateRequest {
     pub workspace: Option<String>,
     #[serde(default)]
     pub assistant_id: Option<String>,
+    /// `false` (default): the new conversation is a child of the caller.
+    /// `true`: it is created as an independent root conversation.
+    #[serde(default)]
+    pub detached: bool,
+    /// `true` (default): the child's final answer is delivered back to the
+    /// caller when its turn ends. Stored in the child's `extra`.
+    #[serde(default = "default_report_to_parent")]
+    pub report_to_parent: bool,
+}
+
+fn default_report_to_parent() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -252,13 +277,18 @@ mod tests {
     }
 
     #[test]
-    fn create_schema_accepts_only_name_workspace_and_assistant_id_with_name_required() {
+    fn create_schema_accepts_only_the_documented_keys_with_name_required() {
         // additionalProperties=false, `name` is the only required field.
         let descriptor = conversation_tool_descriptor("conversation_create").unwrap();
         let properties = descriptor.input_schema["properties"].as_object().unwrap();
         let mut keys: Vec<&str> = properties.keys().map(String::as_str).collect();
         keys.sort_unstable();
-        assert_eq!(keys, vec!["assistant_id", "name", "workspace"]);
+        assert_eq!(
+            keys,
+            vec!["assistant_id", "detached", "name", "report_to_parent", "workspace"]
+        );
+        assert_eq!(properties["detached"]["type"], serde_json::json!("boolean"));
+        assert_eq!(properties["report_to_parent"]["type"], serde_json::json!("boolean"));
         assert_eq!(descriptor.input_schema["required"], serde_json::json!(["name"]));
         assert_eq!(
             descriptor.input_schema["additionalProperties"],
@@ -279,6 +309,10 @@ mod tests {
             ConversationToolErrorCode::RuntimeAuthFailed,
             ConversationToolErrorCode::SchemaValidationFailed,
             ConversationToolErrorCode::TransportUnavailable,
+            ConversationToolErrorCode::ParentNotFound,
+            ConversationToolErrorCode::ParentDepthExceeded,
+            ConversationToolErrorCode::ParentFanoutExceeded,
+            ConversationToolErrorCode::ParentCycle,
         ];
         let mut wire: Vec<String> = codes
             .iter()
@@ -297,6 +331,16 @@ mod tests {
         wire.dedup();
         assert_eq!(wire.len(), count, "duplicate wire value in {wire:?}");
         assert_eq!(ConversationToolErrorCode::CallerIsTeam.as_str(), "caller_is_team");
+        assert_eq!(ConversationToolErrorCode::ParentNotFound.as_str(), "parent_not_found");
+        assert_eq!(
+            ConversationToolErrorCode::ParentDepthExceeded.as_str(),
+            "parent_depth_exceeded"
+        );
+        assert_eq!(
+            ConversationToolErrorCode::ParentFanoutExceeded.as_str(),
+            "parent_fanout_exceeded"
+        );
+        assert_eq!(ConversationToolErrorCode::ParentCycle.as_str(), "parent_cycle");
     }
 
     #[test]
@@ -321,6 +365,13 @@ mod tests {
         let ok: ConversationCreateRequest = serde_json::from_str(r#"{"name":"x"}"#).unwrap();
         assert_eq!(ok.name, "x");
         assert!(ok.workspace.is_none() && ok.assistant_id.is_none());
+        // Hierarchy defaults: a child of the caller that reports back.
+        assert!(!ok.detached);
+        assert!(ok.report_to_parent);
+        let opted: ConversationCreateRequest =
+            serde_json::from_str(r#"{"name":"x","detached":true,"report_to_parent":false}"#).unwrap();
+        assert!(opted.detached);
+        assert!(!opted.report_to_parent);
     }
 
     #[test]

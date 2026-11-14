@@ -41,6 +41,8 @@ fn make_conversation(suffix: &str) -> ConversationRow {
         project_id: None,
         folder_id: None,
         name_source: None,
+        parent_conversation_id: None,
+        depth: 0,
     }
 }
 
@@ -1462,4 +1464,136 @@ async fn resolve_backend_turn_anchor_is_user_scoped() {
         .await
         .unwrap();
     assert_eq!(anchor, None, "foreign conversations must resolve to nothing");
+}
+
+// -- Hierarchical conversations (migration 900) ------------------------------
+
+fn make_child(id: &str, parent: Option<&str>, depth: i64, created_at: i64) -> ConversationRow {
+    let mut row = make_conversation(id);
+    row.id = id.to_string();
+    row.parent_conversation_id = parent.map(str::to_owned);
+    row.depth = depth;
+    row.created_at = created_at;
+    row.updated_at = created_at;
+    row
+}
+
+#[tokio::test]
+async fn migration_900_adds_parent_and_depth_with_root_defaults() {
+    let (repo, db) = setup().await;
+    // A legacy-shaped insert (no hierarchy columns) reads back as a root.
+    sqlx::query(
+        "INSERT INTO conversations (id, user_id, name, type, extra, created_at, updated_at) \
+         VALUES ('legacy', ?, 'old', 'gemini', '{}', 1, 1)",
+    )
+    .bind(USER_ID)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let row = repo.get(USER_ID, "legacy").await.unwrap().unwrap();
+    assert_eq!(row.parent_conversation_id, None);
+    assert_eq!(row.depth, 0);
+
+    let index: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM sqlite_master WHERE type = 'index' AND name = 'idx_conversations_user_parent'",
+    )
+    .fetch_one(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(index, 1, "the (user_id, parent_conversation_id) index must exist");
+}
+
+#[tokio::test]
+async fn parent_and_depth_round_trip_through_create() {
+    let (repo, _db) = setup().await;
+    repo.create(&make_child("root", None, 0, 1)).await.unwrap();
+    repo.create(&make_child("kid", Some("root"), 1, 2)).await.unwrap();
+    let kid = repo.get(USER_ID, "kid").await.unwrap().unwrap();
+    assert_eq!(kid.parent_conversation_id.as_deref(), Some("root"));
+    assert_eq!(kid.depth, 1);
+}
+
+#[tokio::test]
+async fn list_children_and_descendants_are_ordered_and_user_scoped() {
+    let (repo, db) = setup().await;
+    create_user_2(&db).await;
+    repo.create(&make_child("root", None, 0, 1)).await.unwrap();
+    repo.create(&make_child("b", Some("root"), 1, 3)).await.unwrap();
+    repo.create(&make_child("a", Some("root"), 1, 2)).await.unwrap();
+    repo.create(&make_child("a1", Some("a"), 2, 4)).await.unwrap();
+    repo.create(&make_child("a1x", Some("a1"), 3, 5)).await.unwrap();
+    let mut foreign = make_child("foreign", Some("root"), 1, 6);
+    foreign.user_id = "user_2".to_string();
+    repo.create(&foreign).await.unwrap();
+
+    let children: Vec<String> = repo
+        .list_children(USER_ID, "root")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| r.id)
+        .collect();
+    assert_eq!(children, vec!["a", "b"], "created_at ascending, other users excluded");
+
+    let descendants: Vec<String> = repo
+        .list_descendants(USER_ID, "root")
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|r| r.id)
+        .collect();
+    assert_eq!(descendants, vec!["a", "b", "a1", "a1x"]);
+}
+
+#[tokio::test]
+async fn reparent_subtree_rewrites_parent_and_every_depth_atomically() {
+    let (repo, _db) = setup().await;
+    repo.create(&make_child("r1", None, 0, 1)).await.unwrap();
+    repo.create(&make_child("r2", None, 0, 2)).await.unwrap();
+    repo.create(&make_child("a", Some("r1"), 1, 3)).await.unwrap();
+    repo.create(&make_child("b", Some("a"), 2, 4)).await.unwrap();
+
+    repo.reparent_subtree(USER_ID, "a", Some("r2"), &[("a".to_string(), 1), ("b".to_string(), 2)])
+        .await
+        .unwrap();
+    let a = repo.get(USER_ID, "a").await.unwrap().unwrap();
+    assert_eq!(a.parent_conversation_id.as_deref(), Some("r2"));
+
+    // Detach to root pulls the depths up.
+    repo.reparent_subtree(USER_ID, "a", None, &[("a".to_string(), 0), ("b".to_string(), 1)])
+        .await
+        .unwrap();
+    let a = repo.get(USER_ID, "a").await.unwrap().unwrap();
+    let b = repo.get(USER_ID, "b").await.unwrap().unwrap();
+    assert_eq!((a.parent_conversation_id, a.depth), (None, 0));
+    assert_eq!((b.parent_conversation_id.as_deref(), b.depth), (Some("a"), 1));
+
+    let missing = repo.reparent_subtree(USER_ID, "nope", None, &[]).await;
+    assert!(matches!(missing, Err(DbError::NotFound(_))), "{missing:?}");
+}
+
+#[tokio::test]
+async fn list_paginated_returns_children_with_parent_and_depth() {
+    let (repo, _db) = setup().await;
+    repo.create(&make_child("root", None, 0, 1)).await.unwrap();
+    repo.create(&make_child("kid", Some("root"), 1, 2)).await.unwrap();
+
+    let page = repo
+        .list_paginated(
+            USER_ID,
+            &ConversationFilters {
+                limit: 100,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    let kid = page
+        .items
+        .iter()
+        .find(|r| r.id == "kid")
+        .expect("child must not be filtered out");
+    assert_eq!(kid.parent_conversation_id.as_deref(), Some("root"));
+    assert_eq!(kid.depth, 1);
+    assert_eq!(page.total, 2);
 }

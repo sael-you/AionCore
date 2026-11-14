@@ -40,6 +40,12 @@ pub struct ConversationRow {
     /// overwrite), "agent" = agent-generated (agent may overwrite),
     /// "user" = explicit user rename (never overwritten by agents).
     pub name_source: Option<String>,
+    /// Parent conversation id (hierarchical conversations); NULL for roots and
+    /// for orphans whose parent no longer exists.
+    pub parent_conversation_id: Option<String>,
+    /// Nesting depth: root = 0. Denormalised; rewritten for the whole subtree
+    /// on reparent.
+    pub depth: i64,
 }
 
 /// Row mapping for the `conversation_assistant_snapshots` table.

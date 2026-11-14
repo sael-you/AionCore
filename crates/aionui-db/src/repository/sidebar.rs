@@ -50,6 +50,10 @@ pub struct SidebarConversationThin {
     /// (contract §3.1). The referenced team may not be live/owned (orphan) —
     /// the service downgrades those back to independent rows (BR-8).
     pub team_id: Option<String>,
+    /// `conversations.parent_conversation_id`, empty-string folded to `None`.
+    /// The parent may sit in the other archive slice or be gone (orphan); the
+    /// service decides whether it resolves within the slice it is reading.
+    pub parent_conversation_id: Option<String>,
     pub updated_at: i64,
     pub created_at: i64,
 }

@@ -27,6 +27,7 @@ async fn conversation_workspace_uses_work_dir() {
         source: None,
         channel_chat_id: None,
         extra: serde_json::json!({}),
+        parent_conversation_id: None,
     };
     let response = state.service.create("system_default_user", request).await.unwrap();
 
@@ -67,6 +68,7 @@ async fn user_specified_workspace_is_not_overridden() {
         extra: serde_json::json!({
             "workspace": custom_workspace.path().to_str().unwrap()
         }),
+        parent_conversation_id: None,
     };
     let response = state.service.create("system_default_user", request).await.unwrap();
 
@@ -99,6 +101,7 @@ async fn workspace_defaults_to_data_dir_when_work_dir_equals_data_dir() {
         source: None,
         channel_chat_id: None,
         extra: serde_json::json!({}),
+        parent_conversation_id: None,
     };
     let response = state.service.create("system_default_user", request).await.unwrap();
 

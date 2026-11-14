@@ -15,6 +15,8 @@ fn create_req(name: &str, workspace: Option<&str>, assistant_id: Option<&str>) -
         name: name.to_owned(),
         workspace: workspace.map(str::to_owned),
         assistant_id: assistant_id.map(str::to_owned),
+        detached: false,
+        report_to_parent: true,
     }
 }
 
@@ -44,6 +46,8 @@ async fn insert_caller(
         project_id: None,
         folder_id: None,
         name_source: None,
+        parent_conversation_id: None,
+        depth: 0,
     })
     .await
     .unwrap();
@@ -528,4 +532,111 @@ async fn an_aionrs_assistant_in_auto_mode_with_no_preference_is_model_unresolved
         .create_for_conversation_helper(USER, "caller-v", &create_req("x", None, Some("asst-auto")))
         .await;
     assert_code(result, ConversationToolErrorCode::AssistantModelUnresolved, 422);
+}
+
+// ── Hierarchy: default child / detached / limits ────────────────────
+
+#[tokio::test]
+async fn by_default_the_new_conversation_is_a_child_of_the_caller_that_reports_back() {
+    let (svc, _broadcaster, repo) = make_service_with_mock_task_manager(Arc::new(MockTaskManager::new()));
+    let workspace = ensure_test_workspace_path();
+    insert_caller(
+        &repo,
+        "caller-parent",
+        "acp",
+        json!({ "workspace": workspace, "backend": "claude", "agent_id": "a", "agent_source": "builtin" }),
+        None,
+    )
+    .await;
+
+    let created = svc
+        .create_for_conversation_helper(USER, "caller-parent", &create_req("sub task", None, None))
+        .await
+        .unwrap();
+
+    let row = repo.get(USER, &created.id).await.unwrap().unwrap();
+    assert_eq!(row.parent_conversation_id.as_deref(), Some("caller-parent"));
+    assert_eq!(row.depth, 1);
+    let extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap();
+    assert_eq!(extra["report_to_parent"], json!(true));
+}
+
+#[tokio::test]
+async fn detached_creates_a_root_and_report_to_parent_false_is_stored() {
+    let (svc, _broadcaster, repo) = make_service_with_mock_task_manager(Arc::new(MockTaskManager::new()));
+    let workspace = ensure_test_workspace_path();
+    insert_caller(
+        &repo,
+        "caller-parent",
+        "acp",
+        json!({ "workspace": workspace, "backend": "claude", "agent_id": "a", "agent_source": "builtin" }),
+        None,
+    )
+    .await;
+    let mut req = create_req("independent", None, None);
+    req.detached = true;
+    req.report_to_parent = false;
+
+    let created = svc
+        .create_for_conversation_helper(USER, "caller-parent", &req)
+        .await
+        .unwrap();
+
+    let row = repo.get(USER, &created.id).await.unwrap().unwrap();
+    assert_eq!((row.parent_conversation_id, row.depth), (None, 0));
+    let extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap();
+    assert_eq!(extra["report_to_parent"], json!(false));
+}
+
+#[tokio::test]
+async fn a_caller_at_max_depth_cannot_spawn_a_child_but_can_spawn_a_detached_root() {
+    let (svc, _broadcaster, repo) = make_service_with_mock_task_manager(Arc::new(MockTaskManager::new()));
+    let workspace = ensure_test_workspace_path();
+    insert_caller(
+        &repo,
+        "deep",
+        "acp",
+        json!({ "workspace": workspace, "backend": "claude", "agent_id": "a", "agent_source": "builtin" }),
+        None,
+    )
+    .await;
+    repo.rows.lock().unwrap().iter_mut().for_each(|r| r.depth = 3);
+
+    let err = svc
+        .create_for_conversation_helper(USER, "deep", &create_req("too deep", None, None))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), ConversationToolErrorCode::ParentDepthExceeded);
+    assert_eq!(err.http_status(), 422);
+    assert_eq!(err.code().as_str(), "parent_depth_exceeded");
+
+    let mut detached = create_req("escape hatch", None, None);
+    detached.detached = true;
+    svc.create_for_conversation_helper(USER, "deep", &detached)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_caller_with_twelve_children_hits_parent_fanout_exceeded() {
+    let (svc, _broadcaster, repo) = make_service_with_mock_task_manager(Arc::new(MockTaskManager::new()));
+    let workspace = ensure_test_workspace_path();
+    insert_caller(
+        &repo,
+        "busy",
+        "acp",
+        json!({ "workspace": workspace, "backend": "claude", "agent_id": "a", "agent_source": "builtin" }),
+        None,
+    )
+    .await;
+    for i in 0..crate::hierarchy::MAX_CHILDREN_PER_PARENT {
+        svc.create_for_conversation_helper(USER, "busy", &create_req(&format!("kid {i}"), None, None))
+            .await
+            .unwrap();
+    }
+    let err = svc
+        .create_for_conversation_helper(USER, "busy", &create_req("one too many", None, None))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), ConversationToolErrorCode::ParentFanoutExceeded);
 }

@@ -118,6 +118,8 @@ async fn empty_thinking_segment_is_dropped_before_persistence() {
         project_id: None,
         folder_id: None,
         name_source: None,
+        parent_conversation_id: None,
+        depth: 0,
     })
     .await
     .unwrap();

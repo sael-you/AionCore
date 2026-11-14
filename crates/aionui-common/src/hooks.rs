@@ -57,3 +57,24 @@ pub enum TurnCancelCause {
 pub trait OnConversationTurnCancelled: Send + Sync {
     async fn on_turn_cancelled(&self, user_id: &str, conversation_id: &str, turn_id: &str, cause: TurnCancelCause);
 }
+
+/// Delivers a finished child conversation's result report to its parent.
+///
+/// Hierarchical conversations: when a child's turn completes,
+/// `aionui-conversation` builds the `[[AION_CHILD_RESULT ...]]` report and hands
+/// it to this port, which an upper-layer crate (`aionui-session-message`)
+/// implements on top of the cross-session message path — so the feature toggle
+/// and rate limiting apply — without `aionui-conversation` depending upwards.
+///
+/// Delivery is best-effort: an `Err` is logged by the caller and never fails
+/// the child's turn completion. The flow is strictly child → parent.
+#[async_trait]
+pub trait ChildResultDelivery: Send + Sync {
+    async fn deliver_child_result(
+        &self,
+        user_id: &str,
+        child_conversation_id: &str,
+        parent_conversation_id: &str,
+        message: String,
+    ) -> Result<(), String>;
+}
