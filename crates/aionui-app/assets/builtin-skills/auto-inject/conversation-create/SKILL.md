@@ -1,6 +1,6 @@
 ---
 name: conversation-create
-description: Create a new conversation for this user with the bundled aioncore CLI. Use when the user asks to open, start, or spin up a new conversation, or asks for parallel / delegated work that deserves its own conversation.
+description: Create a new conversation with the bundled aioncore CLI. Use when the user asks to open, start, or spin up a new conversation, or for parallel / delegated work that deserves its own conversation.
 ---
 
 # Conversation Create Skill
