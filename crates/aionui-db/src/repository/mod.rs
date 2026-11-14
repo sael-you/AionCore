@@ -1,6 +1,7 @@
 pub mod acp_session;
 pub mod agent_metadata;
 pub mod assistant;
+pub mod board;
 pub mod channel;
 mod client_preference;
 pub mod conversation;
@@ -18,6 +19,9 @@ pub mod skill;
 mod sqlite_acp_session;
 mod sqlite_agent_metadata;
 mod sqlite_assistant;
+mod sqlite_board;
+pub mod sqlite_board_recover;
+mod sqlite_board_tx;
 mod sqlite_channel;
 mod sqlite_client_preference;
 mod sqlite_conversation;
@@ -44,6 +48,10 @@ pub use assistant::{
     IAssistantDefinitionRepository, IAssistantOverlayRepository, IAssistantOverrideRepository,
     IAssistantPreferenceRepository, IAssistantRepository,
 };
+pub use board::{
+    BOARD_POSITION_GAP, BoardCallerRow, BoardCardCursor, BoardCardFilter, BoardConversationInfo, BoardEventQuery, BoardEventScope,
+    BoardPlacement, BoardPlacementOutcome, BoardProjectRow, IBoardStore, IBoardTx, NewBoardEvent,
+};
 pub use channel::IChannelRepository;
 pub use client_preference::IClientPreferenceRepository;
 pub use conversation::IConversationRepository;
@@ -66,6 +74,7 @@ pub use sqlite_assistant::{
     SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository, SqliteAssistantOverrideRepository,
     SqliteAssistantPreferenceRepository, SqliteAssistantRepository,
 };
+pub use sqlite_board::SqliteBoardStore;
 pub use sqlite_channel::SqliteChannelRepository;
 pub use sqlite_client_preference::SqliteClientPreferenceRepository;
 pub use sqlite_conversation::SqliteConversationRepository;

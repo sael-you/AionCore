@@ -1,6 +1,7 @@
 mod acp_session;
 mod agent_metadata;
 mod assistant;
+mod board;
 mod channel;
 mod client_preference;
 mod conversation;
@@ -26,6 +27,10 @@ pub use assistant::{
     AssistantDefinitionRow, AssistantOverlayRow, AssistantOverrideRow, AssistantPreferenceRow, AssistantRow,
     CreateAssistantParams, UpdateAssistantParams, UpsertAssistantDefinitionParams, UpsertAssistantOverlayParams,
     UpsertAssistantPreferenceParams, UpsertOverrideParams,
+};
+pub use board::{
+    BoardCardRow, BoardColumnRow, BoardDepRow, BoardDeployJobRow, BoardEventRow, BoardIdempotencyRow, BoardLinkRow,
+    BoardLinkViewRow, BoardQuestionRow, BoardReviewRow, BoardSettingsRow, BoardSupervisorCursorRow,
 };
 pub use channel::{AssistantSessionRow, AssistantUserRow, ChannelPluginRow, PairingCodeRow};
 pub use client_preference::ClientPreference;

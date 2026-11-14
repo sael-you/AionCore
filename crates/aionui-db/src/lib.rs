@@ -25,7 +25,8 @@ pub use error::{
 };
 pub use instance_lock::{DataDirInstanceGuard, instance_lock_path};
 pub use models::{
-    AgentMetadataRow, AssistantDefinitionRow, AssistantOverlayRow, AssistantOverrideRow, AssistantPreferenceRow,
+    AgentMetadataRow, BoardCardRow, BoardColumnRow, BoardDepRow, BoardDeployJobRow, BoardEventRow, BoardIdempotencyRow,
+    BoardLinkRow, BoardLinkViewRow, BoardQuestionRow, BoardReviewRow, BoardSettingsRow, BoardSupervisorCursorRow, AssistantDefinitionRow, AssistantOverlayRow, AssistantOverrideRow, AssistantPreferenceRow,
     AssistantRow, ConversationArtifactRow, ConversationAssistantSnapshotRow, CreateAssistantParams,
     ExternalUserProjection, FolderRow, OrderItemType, OrderScene, ProjectExplorerRow, ProjectKind, ProjectRow, Role,
     SkillImportRecordRow, SkillRow, UpdateAgentAvailabilitySnapshotParams, UpdateAgentHandshakeParams,
@@ -34,6 +35,10 @@ pub use models::{
     UserStatus, UserType,
 };
 pub use repository::channel::UpdatePluginStatusParams;
+pub use repository::sqlite_board_recover::{
+    BoardRecoverConflict, BoardRecoverCursor, BoardRecoverListedEvent, BoardRecoverRenumber, BoardRecoverReport,
+    recover_board,
+};
 pub use repository::conversation::{
     ConversationFilters, ConversationRowUpdate, MentionableCandidatesParams, MessagePageCursor, MessagePageDirection,
     MessagePageParams, MessagePageResult, MessageRowUpdate, MessageSearchRow, StaleRuntimeMessageRow,
@@ -48,7 +53,10 @@ pub use repository::remote_agent::{CreateRemoteAgentParams, UpdateRemoteAgentPar
 pub use repository::skill::{CreateSkillImportRecordParams, UpsertSkillParams};
 pub use repository::team::{UpdateTaskParams, UpdateTeamParams};
 pub use repository::{
-    ActivityCursor, ArchiveScope, CreateAcpSessionParams, FeedbackDiagnosticsDbContext, FeedbackDiagnosticsProfile,
+    ActivityCursor, BOARD_POSITION_GAP, BoardCallerRow, BoardCardCursor, BoardCardFilter, BoardConversationInfo,
+    BoardEventQuery,
+    BoardEventScope, BoardPlacement, BoardPlacementOutcome, BoardProjectRow, IBoardStore, IBoardTx, NewBoardEvent,
+    SqliteBoardStore, ArchiveScope, CreateAcpSessionParams, FeedbackDiagnosticsDbContext, FeedbackDiagnosticsProfile,
     FeedbackDiagnosticsProfileResult, FeedbackDiagnosticsRequest, FeedbackDiagnosticsResult, IAcpSessionRepository,
     IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
     IAssistantOverrideRepository, IAssistantPreferenceRepository, IAssistantRepository, IChannelRepository,
