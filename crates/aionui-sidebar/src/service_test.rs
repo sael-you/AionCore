@@ -18,7 +18,7 @@ use async_trait::async_trait;
 use tempfile::TempDir;
 
 use super::{SidebarError, SidebarService};
-use crate::ports::{ArchiveTeardownPorts, RemoveProjectPorts};
+use crate::ports::{ArchiveTeardownPorts, ProjectBoardPorts, RemoveProjectPorts};
 
 const USER: &str = "user-1";
 const OTHER: &str = "user-2";
@@ -786,6 +786,7 @@ struct FakePorts {
     deleted_convs: Mutex<Vec<String>>,
     deleted_teams: Mutex<Vec<String>>,
     project_deleted: Mutex<bool>,
+    board_deleted: Mutex<bool>,
 }
 
 impl FakePorts {
@@ -797,6 +798,7 @@ impl FakePorts {
             deleted_convs: Mutex::new(Vec::new()),
             deleted_teams: Mutex::new(Vec::new()),
             project_deleted: Mutex::new(false),
+            board_deleted: Mutex::new(false),
         })
     }
 }
@@ -861,6 +863,27 @@ impl RemoveProjectPorts for FakePorts {
             .unwrap();
         self.deleted_teams.lock().unwrap().push(team_id.to_owned());
         Ok(())
+    }
+
+    async fn delete_board(&self, user_id: &str, project_id: &str) -> Result<i64, String> {
+        if self.fail.contains(&format!("board:{project_id}")) {
+            return Err(format!("forced failure deleting the board of {project_id}"));
+        }
+        let cards = sqlx::query("DELETE FROM board_cards WHERE project_id = ? AND user_id = ?")
+            .bind(project_id)
+            .bind(user_id)
+            .execute(&self.pool)
+            .await
+            .unwrap()
+            .rows_affected();
+        sqlx::query("DELETE FROM board_settings WHERE project_id = ? AND user_id = ?")
+            .bind(project_id)
+            .bind(user_id)
+            .execute(&self.pool)
+            .await
+            .unwrap();
+        *self.board_deleted.lock().unwrap() = true;
+        Ok(cards as i64)
     }
 
     async fn delete_project_record(&self, user_id: &str, project_id: &str) -> Result<(), String> {
@@ -2015,4 +2038,108 @@ async fn archive_and_unarchive_cascade_to_the_whole_subtree() {
     for id in ["root", "kid", "grand"] {
         assert!(conv_archived_at(pool, id).await.is_none(), "{id} unarchived");
     }
+}
+
+// -- Project board ports (SPEC §6) -------------------------------------------
+
+/// Records archive flips and answers the remove preview from `board_cards`.
+struct FakeBoardPorts {
+    pool: SqlitePool,
+    archived: Mutex<Vec<(String, bool)>>,
+}
+
+#[async_trait]
+impl ProjectBoardPorts for FakeBoardPorts {
+    async fn set_board_archived(&self, _user_id: &str, project_id: &str, archived: bool) -> Result<(), String> {
+        self.archived.lock().unwrap().push((project_id.to_owned(), archived));
+        Ok(())
+    }
+
+    async fn count_board_cards(&self, user_id: &str, project_id: &str) -> Result<i64, String> {
+        sqlx::query_scalar("SELECT COUNT(*) FROM board_cards WHERE project_id = ? AND user_id = ?")
+            .bind(project_id)
+            .bind(user_id)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(|err| err.to_string())
+    }
+}
+
+async fn insert_board_card(pool: &SqlitePool, user: &str, project_id: &str, number: i64) {
+    sqlx::query(
+        "INSERT INTO board_cards (id, project_id, user_id, number, title, column_key, position, creator_kind, \
+         creator_ref, created_at, updated_at) VALUES (?, ?, ?, ?, 't', 'backlog', 1024, 'user', ?, 1, 1)",
+    )
+    .bind(format!("card-{project_id}-{number}"))
+    .bind(project_id)
+    .bind(user)
+    .bind(number)
+    .bind(user)
+    .execute(pool)
+    .await
+    .unwrap();
+}
+
+/// The preview counts the board's cards; the live remove deletes the board
+/// between the units and the project record.
+#[tokio::test]
+async fn remove_project_previews_and_deletes_the_board() {
+    let fx = fixture().await;
+    let pool = fx.pool();
+    seed_project_construct(&fx).await;
+    insert_board_card(pool, USER, "proj-std", 1).await;
+    insert_board_card(pool, USER, "proj-std", 2).await;
+    let ports = FakePorts::new(pool.clone(), uo_store(pool), &[]);
+    fx.service.set_remove_project_ports(ports.clone());
+    fx.service.set_project_board_ports(Arc::new(FakeBoardPorts {
+        pool: pool.clone(),
+        archived: Mutex::new(Vec::new()),
+    }));
+
+    let preview = fx.service.remove_project(USER, "proj-std", true).await.unwrap();
+    assert_eq!(preview.board_cards, 2);
+    assert!(!*ports.board_deleted.lock().unwrap(), "dry run deletes nothing");
+
+    let result = fx.service.remove_project(USER, "proj-std", false).await.unwrap();
+    assert_eq!(result.board_cards, 2);
+    assert!(*ports.board_deleted.lock().unwrap());
+    assert!(*ports.project_deleted.lock().unwrap());
+}
+
+/// A failed board delete keeps the project record so running Remove again
+/// finishes the job.
+#[tokio::test]
+async fn remove_project_keeps_the_record_when_the_board_delete_fails() {
+    let fx = fixture().await;
+    let pool = fx.pool();
+    seed_project_construct(&fx).await;
+    let ports = FakePorts::new(pool.clone(), uo_store(pool), &["board:proj-std"]);
+    fx.service.set_remove_project_ports(ports.clone());
+
+    fx.service.remove_project(USER, "proj-std", false).await.unwrap();
+    assert!(!*ports.project_deleted.lock().unwrap(), "record kept for the retry");
+    let proj_left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM projects WHERE project_id = 'proj-std'")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    assert_eq!(proj_left, 1);
+}
+
+/// Archiving / unarchiving a project flips its board's read-only flag.
+#[tokio::test]
+async fn archive_and_unarchive_project_flip_the_board_flag() {
+    let fx = fixture().await;
+    seed_project_construct(&fx).await;
+    let board = Arc::new(FakeBoardPorts {
+        pool: fx.pool().clone(),
+        archived: Mutex::new(Vec::new()),
+    });
+    fx.service.set_project_board_ports(board.clone());
+
+    fx.service.archive_project(USER, "proj-std").await.unwrap();
+    fx.service.unarchive_project(USER, "proj-std").await.unwrap();
+    assert_eq!(
+        *board.archived.lock().unwrap(),
+        vec![("proj-std".to_owned(), true), ("proj-std".to_owned(), false)]
+    );
 }
