@@ -139,6 +139,24 @@ fn data() -> Value {
                 }
             },
             {
+                "name": "board",
+                "mode": "project-board",
+                "description": "Read and update the task board of THIS conversation's project (cards, moves, comments, blocks, links). Use only when the user, a card packet or a TASK-N reference asks for it.",
+                "contract": "agent-facing-board-cli",
+                "contract_command": "board capabilities",
+                "invocation": "aioncore board capabilities",
+                "runtime_required": ["AIONUI_BASE_URL", "AIONUI_CONVERSATION_ID", "AIONUI_USER_ID", "AIONUI_RUNTIME_TOKEN"],
+                "runtime_free_commands": ["board capabilities"],
+                "operator_commands": ["board recover"],
+                "safety": {
+                    "can_write": true,
+                    "runtime_token_required_for_context_and_call": true,
+                    "does_not_accept_identity_authority_from_stdin": true,
+                    "scoped_to_conversation_project": true,
+                    "no_gate_force_settings_or_archive": true
+                }
+            },
+            {
                 "name": "skills",
                 "mode": "read-only",
                 "description": "Read the skills enabled in THIS conversation: list them, get a skill's full body plus its absolute directory, and read its supplementary files.",
@@ -206,8 +224,8 @@ mod tests {
     use super::*;
     use crate::cli::Cli;
     use crate::commands::{
-        config_capabilities, conversation_capabilities, diagnose_capabilities, session_capabilities,
-        skills_capabilities, team_capabilities,
+        board_capabilities, config_capabilities, conversation_capabilities, diagnose_capabilities,
+        session_capabilities, skills_capabilities, team_capabilities,
     };
 
     /// `capabilities` is its own entrypoint — `data()` declares it under
@@ -290,6 +308,7 @@ mod tests {
             ("team", team_capabilities::data()),
             ("session", session_capabilities::data()),
             ("conversation", conversation_capabilities::data()),
+            ("board", board_capabilities::data()),
             ("skills", skills_capabilities::data()),
         ] {
             let entry = domains

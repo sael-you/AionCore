@@ -120,6 +120,9 @@ pub(crate) enum Command {
     /// Agent-facing conversation CLI: create a new conversation for this user
     /// that inherits (or overrides) the current conversation's setup.
     Conversation(ConversationArgs),
+    /// Agent-facing project board CLI (Kanban of this conversation's project),
+    /// plus the operator-only `board recover`.
+    Board(BoardArgs),
     /// Agent-facing read-only runtime CLI for THIS conversation's skills.
     /// Channel A of skill delivery: a normal tool call instead of the
     /// `[LOAD_SKILL]` text-protocol round trip.
@@ -164,6 +167,7 @@ impl Command {
             Self::Team(_) => "team",
             Self::Session(_) => "session",
             Self::Conversation(_) => "conversation",
+            Self::Board(_) => "board",
             Self::Skills(_) => "skills",
             Self::AntigravityHook => "antigravity-hook",
             Self::McpTeamStdio => "mcp-team-stdio",
@@ -260,6 +264,158 @@ pub(crate) enum ConversationCommand {
     Create,
     #[command(external_subcommand)]
     Unknown(Vec<OsString>),
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct BoardArgs {
+    #[command(subcommand)]
+    pub command: BoardCommand,
+}
+
+/// `aioncore board …`. Flags are selectors only (card number, filters,
+/// column, department, role); every payload is one JSON object on stdin.
+/// `board capabilities` prints the exact stdin schemas.
+#[derive(Subcommand, Debug, Clone)]
+pub(crate) enum BoardCommand {
+    /// Print the agent-readable board CLI contract (stdin schemas, errors).
+    Capabilities,
+    /// Whether this conversation's project has a board (always answers).
+    Status,
+    /// List cards (paged).
+    List(BoardListArgs),
+    /// Show one card, or its packet with --packet.
+    Show(BoardShowArgs),
+    /// Create a card. Stdin: {"title": …, …}.
+    Create,
+    /// Update a card. Stdin: {"version": …, <fields>}.
+    Update(BoardCardSelector),
+    /// Move a card to a column (Board Keeper only). Optional stdin:
+    /// {"before"|"after": N}.
+    Move(BoardMoveArgs),
+    /// Record your department's verdict. Stdin: {"verdict": …, …}.
+    Review(BoardReviewArgs),
+    /// Comment on a card. Stdin: {"body": …}.
+    Comment(BoardCommentArgs),
+    /// Block a card with a reason.
+    Block(BoardBlockArgs),
+    /// Clear a card's manual block.
+    Unblock(BoardCardSelector),
+    /// Link this conversation to a card.
+    Link(BoardLinkArgs),
+    /// Read this project's board events (paged by seq).
+    Events(BoardEventsArgs),
+    /// Operator only (AionUi stopped): copy board writes back from a kept
+    /// database after a rollback. Opens <data-dir>/aionui-backend.db directly.
+    /// On success writes the marker at $AIONUI_BOARD_RECOVER_MARKER (default
+    /// <data-dir>/board-last-recover).
+    Recover(BoardRecoverArgs),
+    #[command(external_subcommand)]
+    Unknown(Vec<OsString>),
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct BoardCardSelector {
+    /// Card number: `N` or `TASK-N`.
+    pub card: String,
+}
+
+#[derive(Args, Debug, Clone, Default)]
+pub(crate) struct BoardListArgs {
+    #[arg(long)]
+    pub column: Option<String>,
+    /// `me` (this conversation's assistant) or an assignee id.
+    #[arg(long)]
+    pub assignee: Option<String>,
+    #[arg(long = "type")]
+    pub card_type: Option<String>,
+    #[arg(long)]
+    pub label: Option<String>,
+    #[arg(long)]
+    pub skill: Option<String>,
+    #[arg(long)]
+    pub priority: Option<String>,
+    #[arg(long)]
+    pub blocked: Option<bool>,
+    #[arg(long)]
+    pub include_archived: bool,
+    #[arg(long)]
+    pub limit: Option<i64>,
+    /// `next_cursor` of the previous page.
+    #[arg(long)]
+    pub cursor: Option<String>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct BoardShowArgs {
+    /// Card number: `N` or `TASK-N`.
+    pub card: String,
+    /// Print the card packet (what an assigned agent reads) instead.
+    #[arg(long)]
+    pub packet: bool,
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct BoardMoveArgs {
+    /// Card number: `N` or `TASK-N`.
+    pub card: String,
+    /// Target column key (e.g. `in_progress`).
+    pub column: String,
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct BoardReviewArgs {
+    /// Card number: `N` or `TASK-N`.
+    pub card: String,
+    /// The department you were assigned for (e.g. `qa`).
+    pub department: String,
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct BoardCommentArgs {
+    /// Card number: `N` or `TASK-N`.
+    pub card: String,
+    /// Address the comment to a department.
+    #[arg(long = "to")]
+    pub to_department: Option<String>,
+    /// Id of the open question this comment answers (closes it).
+    #[arg(long)]
+    pub answers: Option<String>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct BoardBlockArgs {
+    /// Card number: `N` or `TASK-N`.
+    pub card: String,
+    /// Why the card is blocked.
+    #[arg(long)]
+    pub reason: String,
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct BoardLinkArgs {
+    /// Card number: `N` or `TASK-N`.
+    pub card: String,
+    /// `other` (default), `build` or `qa`.
+    #[arg(long)]
+    pub role: Option<String>,
+}
+
+#[derive(Args, Debug, Clone, Default)]
+pub(crate) struct BoardEventsArgs {
+    #[arg(long)]
+    pub after_seq: Option<i64>,
+    #[arg(long)]
+    pub limit: Option<i64>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct BoardRecoverArgs {
+    /// The kept database to recover from (e.g. backups/backend-replaced-<ts>.db).
+    #[arg(long = "from")]
+    pub from: PathBuf,
+    /// Report what would change without writing anything (no marker either).
+    #[arg(long)]
+    pub dry_run: bool,
 }
 
 #[derive(Args, Debug, Clone)]
