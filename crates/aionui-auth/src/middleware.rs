@@ -65,6 +65,23 @@ impl CurrentUser {
     }
 }
 
+/// Which credential channel authenticated a request. Inserted into the
+/// request extensions next to [`CurrentUser`] by [`auth_middleware`] and
+/// [`local_auth_middleware`], so a handler can refuse a channel it must not
+/// serve (the board's user router refuses agent runtime tokens and points
+/// them at its agent router). Handlers that depend on it must fail closed
+/// when it is missing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AuthChannel {
+    /// A JWT access token (header or session cookie).
+    Session,
+    /// The conversation-helper runtime-token channel used by agent
+    /// subprocess CLIs; carries the token-bound conversation.
+    RuntimeToken { conversation_id: String },
+    /// Local mode: no authentication, fixed default user.
+    Local,
+}
+
 /// Shared state for the authentication middleware.
 #[derive(Clone)]
 pub struct AuthState {
@@ -96,6 +113,7 @@ pub async fn auth_middleware(
     // In local mode, skip JWT verification and inject a fixed default user.
     if state.identity_mode == AuthIdentityMode::Local {
         request.extensions_mut().insert(CurrentUser::local_default());
+        request.extensions_mut().insert(AuthChannel::Local);
         return Ok(next.run(request).await);
     }
 
@@ -141,6 +159,7 @@ pub async fn auth_middleware(
         user_type: user.user_type,
         status: user.status,
     });
+    request.extensions_mut().insert(AuthChannel::Session);
 
     Ok(next.run(request).await)
 }
@@ -200,6 +219,7 @@ async fn runtime_token_channel(state: &AuthState, mut request: Request, next: Ne
         user_type: user.user_type,
         status: user.status,
     });
+    request.extensions_mut().insert(AuthChannel::RuntimeToken { conversation_id });
 
     Ok(next.run(request).await)
 }
@@ -210,6 +230,7 @@ async fn runtime_token_channel(state: &AuthState, mut request: Request, next: Ne
 /// Used when the server runs as an embedded subprocess inside Electron.
 pub async fn local_auth_middleware(mut request: Request, next: Next) -> Response {
     request.extensions_mut().insert(CurrentUser::local_default());
+    request.extensions_mut().insert(AuthChannel::Local);
     next.run(request).await
 }
 
@@ -244,5 +265,23 @@ mod tests {
             std::str::from_utf8(&body).unwrap(),
             "system_default_user:system_default_user"
         );
+    }
+
+    async fn echo_channel(request: Request<Body>) -> String {
+        format!("{:?}", request.extensions().get::<AuthChannel>())
+    }
+
+    #[tokio::test]
+    async fn local_auth_middleware_marks_the_local_channel() {
+        let app = Router::new()
+            .route("/test", get(echo_channel))
+            .route_layer(axum::middleware::from_fn(local_auth_middleware));
+
+        let response = app
+            .oneshot(Request::builder().uri("/test").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        assert_eq!(std::str::from_utf8(&body).unwrap(), "Some(Local)");
     }
 }
