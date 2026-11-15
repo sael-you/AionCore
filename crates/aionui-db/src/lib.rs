@@ -29,16 +29,17 @@ pub use models::{
     AssistantRow, BoardCardRow, BoardColumnRow, BoardDepRow, BoardDeployJobRow, BoardEventRow, BoardIdempotencyRow,
     BoardLinkRow, BoardLinkViewRow, BoardQuestionRow, BoardReviewRow, BoardSettingsRow, BoardSupervisorCursorRow,
     ConversationArtifactRow, ConversationAssistantSnapshotRow, CreateAssistantParams, ExternalUserProjection,
-    FolderRow, OrderItemType, OrderScene, ProjectExplorerRow, ProjectKind, ProjectRow, Role, SkillImportRecordRow,
-    SkillRow, UpdateAgentAvailabilitySnapshotParams, UpdateAgentHandshakeParams, UpdateAssistantParams,
-    UpsertAgentMetadataParams, UpsertAssistantDefinitionParams, UpsertAssistantOverlayParams,
+    FolderRow, IdempotentSendRow, OrderItemType, OrderScene, ProjectExplorerRow, ProjectKind, ProjectRow, Role,
+    SkillImportRecordRow, SkillRow, UpdateAgentAvailabilitySnapshotParams, UpdateAgentHandshakeParams,
+    UpdateAssistantParams, UpsertAgentMetadataParams, UpsertAssistantDefinitionParams, UpsertAssistantOverlayParams,
     UpsertAssistantPreferenceParams, UpsertConversationAssistantSnapshotParams, UpsertOverrideParams, UserOrderRow,
-    UserStatus, UserType, VoiceAuditRow, VoiceSessionRow, VoiceSettingsRow,
+    UserStatus, UserType, VoiceAuditRow, VoiceDraftRow, VoiceSessionRow, VoiceSettingsRow,
 };
 pub use repository::channel::UpdatePluginStatusParams;
 pub use repository::conversation::{
-    ConversationFilters, ConversationRowUpdate, MentionableCandidatesParams, MessagePageCursor, MessagePageDirection,
-    MessagePageParams, MessagePageResult, MessageRowUpdate, MessageSearchRow, StaleRuntimeMessageRow,
+    ConversationFilters, ConversationRowUpdate, IdempotentInsert, MentionableCandidatesParams, MessagePageCursor,
+    MessagePageDirection, MessagePageParams, MessagePageResult, MessageRowUpdate, MessageSearchRow, NewIdempotentSend,
+    StaleRuntimeMessageRow,
 };
 pub use repository::cron::{
     ClaimCronRunParams, CronRunClaimResult, FinishCronRunParams, RecoverableCronRun, UpdateCronJobParams,
@@ -54,6 +55,7 @@ pub use repository::sqlite_board_recover::{
 };
 pub use repository::team::{UpdateTaskParams, UpdateTeamParams};
 pub use repository::voice::{CreateVoiceSessionParams, NewVoiceAuditEntry, VoiceUsageDelta};
+pub use repository::voice_draft::{DraftPatch, DraftTransition, IVoiceDraftRepository, NewVoiceTranscript};
 pub use repository::{
     ActivityCursor, ArchiveScope, BOARD_POSITION_GAP, BoardCallerRow, BoardCardCursor, BoardCardFilter,
     BoardConversationInfo, BoardEventQuery, BoardEventScope, BoardEventSeq, BoardPlacement, BoardPlacementOutcome,

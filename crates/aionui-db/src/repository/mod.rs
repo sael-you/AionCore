@@ -39,10 +39,12 @@ mod sqlite_team;
 mod sqlite_user;
 mod sqlite_user_order;
 mod sqlite_voice;
+mod sqlite_voice_draft;
 pub mod team;
 mod user;
 pub mod user_order;
 pub mod voice;
+pub mod voice_draft;
 
 pub use acp_session::{CreateAcpSessionParams, IAcpSessionRepository, PersistedSessionState, SaveRuntimeStateParams};
 pub use agent_metadata::IAgentMetadataRepository;

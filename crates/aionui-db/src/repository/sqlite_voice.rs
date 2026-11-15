@@ -25,6 +25,10 @@ impl SqliteVoiceRepository {
     pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
     }
+
+    pub(crate) fn pool(&self) -> &SqlitePool {
+        &self.pool
+    }
 }
 
 #[async_trait::async_trait]

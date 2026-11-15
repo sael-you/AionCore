@@ -7,6 +7,7 @@ mod client_preference;
 mod conversation;
 mod conversation_artifact;
 mod cron_job;
+mod idempotent_send;
 mod mcp_server;
 mod message;
 mod oauth_token;
@@ -19,6 +20,7 @@ mod team;
 mod user;
 mod user_order;
 mod voice;
+mod voice_draft;
 
 pub use acp_session::AcpSessionRow;
 pub use agent_metadata::{
@@ -38,6 +40,7 @@ pub use client_preference::ClientPreference;
 pub use conversation::{ConversationAssistantSnapshotRow, ConversationRow, UpsertConversationAssistantSnapshotParams};
 pub use conversation_artifact::ConversationArtifactRow;
 pub use cron_job::CronJobRow;
+pub use idempotent_send::IdempotentSendRow;
 pub use mcp_server::McpServerRow;
 pub use message::MessageRow;
 pub use oauth_token::OAuthTokenRow;
@@ -50,3 +53,4 @@ pub use team::{MailboxMessageRow, TeamRow, TeamTaskRow};
 pub use user::{ExternalUserProjection, User, UserStatus, UserType};
 pub use user_order::{OrderItemType, OrderScene, UserOrderRow};
 pub use voice::{VoiceAuditRow, VoiceSessionRow, VoiceSettingsRow};
+pub use voice_draft::VoiceDraftRow;

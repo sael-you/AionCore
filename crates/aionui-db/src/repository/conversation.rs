@@ -3,7 +3,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::error::DbError;
 use crate::models::{
-    ConversationArtifactRow, ConversationAssistantSnapshotRow, ConversationRow, MessageRow,
+    ConversationArtifactRow, ConversationAssistantSnapshotRow, ConversationRow, IdempotentSendRow, MessageRow,
     UpsertConversationAssistantSnapshotParams,
 };
 
@@ -201,6 +201,48 @@ pub trait IConversationRepository: Send + Sync {
 
     /// Inserts a new message row.
     async fn insert_message(&self, user_id: &str, message: &MessageRow) -> Result<(), DbError>;
+
+    /// The ids a previous send with this idempotency key produced, if any.
+    ///
+    /// Default `None` for repositories without key storage (test doubles):
+    /// every keyed send is then treated as new.
+    async fn find_idempotent_send(
+        &self,
+        _user_id: &str,
+        _conversation_id: &str,
+        _idempotency_key: &str,
+    ) -> Result<Option<IdempotentSendRow>, DbError> {
+        Ok(None)
+    }
+
+    /// Insert a user message together with its idempotency key, atomically.
+    /// When the key already exists nothing is written and the original row is
+    /// returned ([`IdempotentInsert::Existing`]).
+    ///
+    /// Default: a plain [`Self::insert_message`] (no key storage).
+    async fn insert_message_idempotent(
+        &self,
+        user_id: &str,
+        message: &MessageRow,
+        key: &NewIdempotentSend<'_>,
+    ) -> Result<IdempotentInsert, DbError> {
+        let _ = key;
+        self.insert_message(user_id, message).await?;
+        Ok(IdempotentInsert::Inserted)
+    }
+
+    /// Re-point a recorded key at the turn that finally carried the message
+    /// (mid-turn delivery that fell back to a new turn).
+    async fn update_idempotent_send_turn(
+        &self,
+        _user_id: &str,
+        _conversation_id: &str,
+        _idempotency_key: &str,
+        _turn_id: &str,
+        _delivered_midturn: bool,
+    ) -> Result<(), DbError> {
+        Ok(())
+    }
 
     /// Inserts a message row, or merges mutable fields into the existing row with the same ID.
     async fn upsert_message(&self, user_id: &str, message: &MessageRow) -> Result<(), DbError> {
@@ -510,6 +552,21 @@ pub struct ConversationRowUpdate {
     /// Origin of `name` when this update also renames: `Some("user"|"agent")`
     /// sets the column, `None` leaves it untouched. Never cleared back to NULL.
     pub name_source: Option<String>,
+}
+
+/// Key record written with a keyed user message.
+#[derive(Debug, Clone, Copy)]
+pub struct NewIdempotentSend<'a> {
+    pub idempotency_key: &'a str,
+    pub turn_id: &'a str,
+    pub delivered_midturn: bool,
+}
+
+/// Result of [`IConversationRepository::insert_message_idempotent`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IdempotentInsert {
+    Inserted,
+    Existing(IdempotentSendRow),
 }
 
 /// Partial update payload for a message row.
