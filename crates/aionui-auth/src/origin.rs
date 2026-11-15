@@ -10,7 +10,9 @@
 //! browser requests (helper CLIs, the Token Pool client, hooks) and pass; the
 //! CSRF double-submit and runtime-token checks still apply to them.
 //!
-//! Local mode never installs these layers.
+//! Local mode never installs these layers, except
+//! [`require_trusted_origin_middleware`], which a route opts into in every mode
+//! (with the web host's same-origin rule in local identity, [`OriginGuard`]).
 
 use std::sync::Arc;
 
@@ -240,6 +242,123 @@ pub async fn websocket_origin_middleware(
     Ok(next.run(request).await)
 }
 
+/// Header the AionUi web host writes on every request it forwards to
+/// AionCore: the `Host` the browser sent, before the web host rewrites `Host`
+/// to the backend's loopback address.
+pub const FORWARDED_HOST_HEADER: &str = "x-forwarded-host";
+
+/// State of [`require_trusted_origin_middleware`]: which browser origins may
+/// change state on a route.
+#[derive(Debug, Clone)]
+pub struct OriginGuard {
+    /// Configured origins (`AIONUI_PUBLIC_ORIGIN`, `AIONUI_ALLOWED_ORIGINS`,
+    /// plus any route-specific additions), trusted in every identity.
+    pub policy: Arc<OriginPolicy>,
+    /// LOCAL identity only: also trust an `Origin` whose `scheme://host[:port]`
+    /// names the host the browser addressed, read from `X-Forwarded-Host`.
+    ///
+    /// Trust basis: the AionUi web host (the only way to reach AionCore, which
+    /// listens on loopback) OVERWRITES `X-Forwarded-Host` with the `Host` it
+    /// received and drops client-sent forwarded host values, on proxied
+    /// requests and on spliced WebSocket upgrades alike. There is no
+    /// unforgeable web-host marker: the guarantee rests on that overwrite, and
+    /// in front of it the Token Pool gateway refuses unsafe requests and
+    /// upgrades whose `Origin` differs from `Host`. Webui identity keeps the
+    /// configured list only (plus the global C11 CSRF layer).
+    pub same_origin_via_web_host: bool,
+}
+
+/// Why [`OriginGuard::check`] refused a request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OriginRefusal {
+    /// No `Origin` on an unsafe request or upgrade.
+    Missing,
+    /// An `Origin` that is unreadable, foreign or not same-origin.
+    Untrusted,
+}
+
+impl OriginGuard {
+    /// Unsafe requests and upgrades need a trusted `Origin`; a safe
+    /// non-upgrade request passes without one (browsers omit it on
+    /// same-origin GETs) but not with an untrusted one.
+    pub fn check(&self, method: &Method, headers: &HeaderMap) -> Result<(), OriginRefusal> {
+        let needs_origin = is_unsafe_method(method) || is_websocket_upgrade(headers);
+        let Some(value) = headers.get(header::ORIGIN) else {
+            return if needs_origin { Err(OriginRefusal::Missing) } else { Ok(()) };
+        };
+        let Ok(origin) = value.to_str() else {
+            return Err(OriginRefusal::Untrusted);
+        };
+        if self.policy.is_trusted(origin) || (self.same_origin_via_web_host && is_same_origin(origin, headers)) {
+            Ok(())
+        } else {
+            Err(OriginRefusal::Untrusted)
+        }
+    }
+}
+
+/// The browser's original host from the single `X-Forwarded-Host` value the
+/// web host writes; `None` when absent, repeated, a list or unreadable.
+fn forwarded_host(headers: &HeaderMap) -> Option<&str> {
+    let mut values = headers.get_all(FORWARDED_HOST_HEADER).iter();
+    let value = values.next()?;
+    if values.next().is_some() {
+        return None;
+    }
+    let host = value.to_str().ok()?.trim();
+    (!host.is_empty() && !host.contains(',')).then_some(host)
+}
+
+/// `origin` is a well-formed http(s) origin naming the forwarded host.
+fn is_same_origin(origin: &str, headers: &HeaderMap) -> bool {
+    let (Some(host), Ok(origin)) = (forwarded_host(headers), parse_origin(origin)) else {
+        return false;
+    };
+    let scheme = if origin.starts_with("https://") {
+        "https"
+    } else {
+        "http"
+    };
+    parse_origin(&format!("{scheme}://{host}")).is_ok_and(|expected| expected == origin)
+}
+
+/// Strict origin rule for routes that change sensitive state from a browser
+/// session in EVERY identity, local included (MCP market writes C15, voice
+/// C9): an unsafe method or a WebSocket upgrade must carry an `Origin` the
+/// [`OriginGuard`] trusts. A missing `Origin` is refused (`ORIGIN_REQUIRED`),
+/// a foreign or unreadable one too (`ORIGIN_FORBIDDEN`). Browsers send
+/// `Origin` on every unsafe request and upgrade, same-origin included, so this
+/// is the cross-site defence where no CSRF layer runs (local identity); in
+/// webui the global CSRF layer applies on top. Safe non-upgrade requests pass
+/// unless they carry an untrusted `Origin`.
+pub async fn require_trusted_origin_middleware(
+    State(guard): State<OriginGuard>,
+    request: Request,
+    next: Next,
+) -> Result<Response, ApiError> {
+    match guard.check(request.method(), request.headers()) {
+        Ok(()) => Ok(next.run(request).await),
+        Err(OriginRefusal::Untrusted) => {
+            tracing::warn!(path = %request.uri().path(), "request refused: untrusted origin");
+            Err(ApiError::coded(
+                StatusCode::FORBIDDEN,
+                "ORIGIN_FORBIDDEN",
+                "Cross-site request refused.",
+                None,
+            ))
+        }
+        Err(OriginRefusal::Missing) => {
+            tracing::warn!(path = %request.uri().path(), "request refused: missing origin");
+            Err(ApiError::coded(
+                StatusCode::FORBIDDEN,
+                "ORIGIN_REQUIRED",
+                "Origin header required.",
+                None,
+            ))
+        }
+    }
+}
+
 /// Whether a method may change state (CSRF and change 3b apply): every
 /// method except GET, HEAD and OPTIONS.
 pub fn is_unsafe_method(method: &Method) -> bool {
@@ -386,5 +505,81 @@ mod tests {
             ("origin", "https://app.example"),
             ("sec-fetch-site", "cross-site")
         ])));
+    }
+
+    fn guard(same_origin: bool) -> OriginGuard {
+        OriginGuard {
+            policy: Arc::new(OriginPolicy::new(Some("https://y.example.com"), &[])),
+            same_origin_via_web_host: same_origin,
+        }
+    }
+
+    #[test]
+    fn origin_guard_trusts_the_configured_list_in_every_identity() {
+        for same_origin in [false, true] {
+            let g = guard(same_origin);
+            assert_eq!(
+                g.check(&Method::POST, &headers(&[("origin", "https://y.example.com")])),
+                Ok(())
+            );
+            assert_eq!(g.check(&Method::POST, &headers(&[])), Err(OriginRefusal::Missing));
+            assert_eq!(
+                g.check(&Method::DELETE, &headers(&[("origin", "https://evil.example")])),
+                Err(OriginRefusal::Untrusted)
+            );
+            // Safe requests pass without an Origin, not with a foreign one;
+            // upgrades need an Origin like writes.
+            assert_eq!(g.check(&Method::GET, &headers(&[])), Ok(()));
+            assert_eq!(
+                g.check(&Method::GET, &headers(&[("origin", "https://evil.example")])),
+                Err(OriginRefusal::Untrusted)
+            );
+            assert_eq!(
+                g.check(&Method::GET, &headers(&[("upgrade", "websocket")])),
+                Err(OriginRefusal::Missing)
+            );
+        }
+    }
+
+    #[test]
+    fn same_origin_via_the_web_host_only_in_local_identity() {
+        let same = headers(&[
+            ("origin", "https://app.example:8443"),
+            ("x-forwarded-host", "APP.example:8443"),
+        ]);
+        assert_eq!(guard(true).check(&Method::PUT, &same), Ok(()));
+        assert_eq!(
+            guard(true).check(&Method::GET, &{
+                let mut h = same.clone();
+                h.insert("upgrade", HeaderValue::from_static("websocket"));
+                h
+            }),
+            Ok(())
+        );
+        // Webui identity: configured list only.
+        assert_eq!(guard(false).check(&Method::PUT, &same), Err(OriginRefusal::Untrusted));
+        // Another host, port or a forwarded list is not same-origin.
+        for (origin, forwarded) in [
+            ("https://evil.example", "app.example"),
+            ("https://app.example:9443", "app.example:8443"),
+            ("https://app.example", "app.example, evil.example"),
+            ("null", "app.example"),
+            ("https://app.example/path", "app.example"),
+        ] {
+            let h = headers(&[("origin", origin), ("x-forwarded-host", forwarded)]);
+            assert_eq!(
+                guard(true).check(&Method::POST, &h),
+                Err(OriginRefusal::Untrusted),
+                "{origin} vs {forwarded}"
+            );
+        }
+        // No forwarded host: nothing to compare with.
+        let h = headers(&[("origin", "https://app.example"), ("host", "app.example")]);
+        assert_eq!(guard(true).check(&Method::POST, &h), Err(OriginRefusal::Untrusted));
+        // Two X-Forwarded-Host values are refused.
+        let mut h = headers(&[("origin", "https://app.example")]);
+        h.append("x-forwarded-host", HeaderValue::from_static("app.example"));
+        h.append("x-forwarded-host", HeaderValue::from_static("app.example"));
+        assert_eq!(guard(true).check(&Method::POST, &h), Err(OriginRefusal::Untrusted));
     }
 }
