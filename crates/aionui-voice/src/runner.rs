@@ -64,6 +64,7 @@ pub(crate) struct CallRunner {
 }
 
 impl CallRunner {
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn new(
         inner: Arc<ServiceInner>,
         call: Arc<LiveCall>,

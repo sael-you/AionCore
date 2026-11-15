@@ -259,6 +259,7 @@ async fn recent_transcripts_and_session_rebind() {
     assert!(repo.recent_transcripts("vs_other", 10).await.unwrap().is_empty());
 
     // A pending draft is re-bound to the next call under the same CAS.
+    assert!(repo.finish(USER, "vs_1", "ended", "rotation").await.unwrap());
     repo.create_starting(CreateVoiceSessionParams {
         id: "vs_2",
         user_id: USER,
