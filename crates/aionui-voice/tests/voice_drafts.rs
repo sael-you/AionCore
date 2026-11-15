@@ -546,3 +546,148 @@ async fn agent_say_and_ask_need_a_voice_send_and_never_carry_confirm_words() {
     assert_eq!(answer.answer.as_deref(), Some("port eight thousand"));
     assert!(c.h.conversations.sends().len() == 1, "an ask answer is never a command");
 }
+
+/// Re-dial with `resume_of` and wait for the new call to pass the config gate.
+async fn resume(c: &Call, previous: &str) -> (String, String) {
+    let (status, body) =
+        c.h.send(
+            Req::browser("POST", "/api/voice/sessions", &c.user)
+                .json(json!({"sdp_offer": SDP, "device_id": "web", "resume_of": previous}))
+                .build(),
+        )
+        .await;
+    assert_eq!(status, 201, "{body}");
+    let id = body["data"]["voice_session_id"].as_str().unwrap().to_owned();
+    let row = wait_for(Duration::from_secs(5), || async {
+        let row = c.h.session_row(&c.user, &id).await;
+        row.ready_at.is_some().then_some(row)
+    })
+    .await
+    .expect("resumed call should become ready");
+    (id, row.call_id.unwrap())
+}
+
+/// Assistant context items the provider received on `call_id`.
+fn context_texts(h: &Harness, call_id: &str) -> Vec<String> {
+    received_of(h, call_id, "conversation.item.create")
+        .into_iter()
+        .filter(|e| e["item"]["role"] == "assistant")
+        .filter_map(|e| e["item"]["content"][0]["text"].as_str().map(str::to_owned))
+        .collect()
+}
+
+#[tokio::test]
+async fn pending_draft_is_reannounced_to_the_next_call_and_confirmable_by_voice() {
+    let mut c = call().await;
+    let (draft, readback) = c
+        .request_draft("tell the kanban build to run the linter", "call_p")
+        .await;
+    let (id, version) = (
+        draft["draftId"].as_str().unwrap().to_owned(),
+        draft["version"].as_i64().unwrap(),
+    );
+    let old_clip = readback["readbackId"].as_str().unwrap().to_owned();
+    let previous = c.session.clone();
+    let (session2, call2) = resume(&c, &previous).await;
+
+    // The card comes back bound to the new call, with a fresh read-back clip.
+    let again = loop {
+        let d = c.draft_in("drafted").await;
+        if d["voiceSessionId"] == session2.as_str() {
+            break d;
+        }
+    };
+    assert_eq!(again["draftId"], id.as_str());
+    assert_eq!(again["version"], version, "same version: nothing was rebuilt");
+    assert_eq!(again["spokenConfirm"], true);
+    let rb2 = c.frame("voice.readbackReady").await["data"].clone();
+    assert_eq!(rb2["voiceSessionId"], session2.as_str());
+    let new_clip = rb2["readbackId"].as_str().unwrap().to_owned();
+    assert_ne!(new_clip, old_clip);
+    let row = c.draft_row(&id, version).await;
+    assert_eq!(row.session_id.as_deref(), Some(session2.as_str()));
+
+    // The new call's model has the read-back as context.
+    let h = &c.h;
+    wait_for(Duration::from_secs(5), || async {
+        context_texts(h, &call2)
+            .iter()
+            .any(|t| t.starts_with("Message for Kanban build"))
+            .then_some(())
+    })
+    .await
+    .expect("read-back context on the new call");
+
+    // Confirm by voice on the new call.
+    c.session = session2;
+    c.call_id = call2;
+    ws_send(
+        &mut c.ws,
+        json!({"name": "voice.playbackFinished",
+        "data": {"voiceSessionId": c.session, "readbackId": new_clip, "tEnd": 20.0}}),
+    )
+    .await;
+    ws_send(
+        &mut c.ws,
+        json!({"name": "voice.speechOnset", "data": {"voiceSessionId": c.session, "t": 20.6}}),
+    )
+    .await;
+    c.draft_in("pending_transcript").await;
+    c.h.fake.push_event(
+        &c.call_id,
+        json!({"type": "input_audio_buffer.speech_started", "audio_start_ms": 100}),
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    c.say("send it");
+    c.draft_in("committing").await;
+    c.wait_state(&id, version, "sending").await;
+    assert_eq!(c.h.conversations.sends().len(), 1);
+}
+
+#[tokio::test]
+async fn a_redial_after_rotation_carries_a_short_summary_of_the_previous_call() {
+    let mut c = call().await;
+    c.say("what is the kanban build doing");
+    c.frame("voice.caption").await;
+    c.h.fake.push_event(
+        &c.call_id,
+        json!({"type": "response.output_audio_transcript.done", "transcript": "It is running the linter."}),
+    );
+    let (h, previous) = (&c.h, c.session.clone());
+    wait_for(Duration::from_secs(5), || async {
+        let turns = h.voice_repo.recent_transcripts(&previous, 8).await.unwrap();
+        (turns.len() == 2).then_some(())
+    })
+    .await
+    .expect("both sides of the call are stored");
+    // The call ends (rotation, a lost network…), then the client re-dials.
+    let (status, _) =
+        c.h.send(Req::browser("POST", &format!("/api/voice/sessions/{previous}/end"), &c.user).build())
+            .await;
+    assert_eq!(status, 200);
+    c.h.wait_ended(&c.user, &previous).await;
+    let (session2, call2) = resume(&c, &previous).await;
+    let summary = wait_for(Duration::from_secs(5), || async {
+        context_texts(h, &call2)
+            .into_iter()
+            .find(|t| t.starts_with("Summary of the previous call"))
+    })
+    .await
+    .expect("summary context on the new call");
+    assert!(summary.contains("User: what is the kanban build doing"), "{summary}");
+    assert!(summary.contains("Jarvis: It is running the linter."), "{summary}");
+
+    // A fresh call (no resume_of) starts clean.
+    let (status, _) =
+        c.h.send(Req::browser("POST", &format!("/api/voice/sessions/{session2}/end"), &c.user).build())
+            .await;
+    assert_eq!(status, 200);
+    c.h.wait_ended(&c.user, &session2).await;
+    let (_, call3) = live_session(&c.h, &c.user).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        !context_texts(&c.h, &call3)
+            .iter()
+            .any(|t| t.starts_with("Summary of the previous call"))
+    );
+}

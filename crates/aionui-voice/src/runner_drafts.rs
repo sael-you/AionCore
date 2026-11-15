@@ -437,6 +437,40 @@ impl CallRunner {
         }
     }
 
+    /// After the config gate: carry the previous call's summary into the
+    /// model context and re-announce a draft still waiting for the user.
+    pub(crate) async fn on_call_ready(&mut self, carry: Option<String>) {
+        if let Some(summary) = carry
+            && let Err(err) = self.engine_call.add_context(&summary).await
+        {
+            tracing::debug!(error = %err, "voice previous-call summary not added");
+        }
+        let drafts = self.inner.drafts.clone();
+        if let Some(row) = drafts.pending_for_user(&self.call.user_id).await {
+            self.set_manual(true).await;
+            let fresh = drafts.reannounce(&row, &self.call.session_id).await;
+            self.adopt_draft(fresh).await;
+        }
+    }
+
+    /// Store an assistant final transcript (rotation summaries use both sides).
+    pub(crate) async fn on_assistant_final(&mut self, text: &str) {
+        self.turn.turn_no += 1;
+        let _ = self
+            .inner
+            .drafts
+            .repo
+            .add_transcript(&NewVoiceTranscript {
+                session_id: &self.call.session_id,
+                user_id: &self.call.user_id,
+                turn_no: self.turn.turn_no,
+                role: "assistant",
+                text,
+                expires_at: aionui_common::now_ms() + TRANSCRIPT_TTL_MS,
+            })
+            .await;
+    }
+
     /// Whether a draft is pending (rotation waits for it).
     pub(crate) fn draft_pending(&self) -> bool {
         self.turn.active.is_some()

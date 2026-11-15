@@ -394,7 +394,7 @@ pub struct VoiceFollowUp {
 #[serde(rename_all = "camelCase")]
 pub struct VoiceWake {
     pub voice_session_id: Option<String>,
-    /// `follow_up` | `say` | `ask`.
+    /// `follow_up` (a follow-up clip) | `says` (agent `say`) | `asks` (agent `ask`).
     pub reason: String,
     pub item_id: String,
 }

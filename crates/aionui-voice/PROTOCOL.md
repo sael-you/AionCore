@@ -46,6 +46,15 @@ Notes:
   the user gets `voice.error VOICE_DISABLED` and is closed, new sessions → 403.
 - `focus_conversation_id` is the target when the user names none (a spoken name always wins).
 - `resume_of` ends that call first (`reason=resumed`), then admits the new one.
+  Re-dial with `resume_of` after a `voice.callEnded` of `rotation` (or a lost
+  network) too: the new call gets a short summary of the previous one (its last
+  8 transcript turns, ≤ 150 words, no extra model call) as model context.
+- When a call becomes ready and the user still has a draft waiting for
+  confirmation (`drafted` / `ambiguous` / `pending_transcript`, not expired),
+  it is re-announced to that call: bound to the new `voiceSessionId`, its expiry
+  reset, a fresh read-back clip (`voice.draftUpdated` + `voice.readbackReady`
+  with the new session id) and the read-back text as model context, so it can be
+  confirmed by voice there, not only by tap. Same `draftId` and `version`.
 
 ## `/api/voice/ws`
 
@@ -82,7 +91,7 @@ refused with `voice.error SESSION_MISMATCH` (frame dropped).
 | `voice.error` | `{voiceSessionId, code, message}`; codes containing `DISABLED` (e.g. `VOICE_DISABLED`) mean voice was turned off → disarm | S1a |
 | `voice.draftUpdated` | `{voiceSessionId, draftId, version, hash, state, target: {id, name, kind?}, options?, spokenConfirm, text, diff: [{op: equal\|insert\|delete, text, transform?: filler\|reference\|reorder}], delivery: new_turn\|steer\|queue_busy\|queue_approval\|new_conversation, holdRemainingMs?, holdFrozen?}` — `holdRemainingMs` = ms left in the 4 s hold (§3.3.5), `holdFrozen` = true while speech froze the deadline; the UI falls back to a local 4 s countdown when absent | S1b |
 | `voice.readbackReady` | `{voiceSessionId, draftId, version, readbackId, url}` (`url` = `/api/voice/readbacks/{id}`) | S1b |
-| `voice.wake` | `{voiceSessionId, reason, itemId}` | S1b |
+| `voice.wake` | `{voiceSessionId, reason: follow_up \| says \| asks, itemId}` — `itemId` is the clip id | S1b |
 | `voice.followUp` | `{voiceSessionId, conversationId, status, line, clipId}` (`clipId` fetched from `/api/voice/readbacks/{clipId}`) | S1b |
 
 ### Drafts (S1b)

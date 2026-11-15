@@ -51,6 +51,8 @@ pub(crate) struct CallRunner {
     cmd_rx: mpsc::Receiver<CallCommand>,
     pub(crate) meter: BudgetMeter,
     pub(crate) turn: TurnState,
+    /// Summary of the call this one resumes (rotation / re-dial).
+    carry: Option<String>,
     mode: RunMode,
     started: Instant,
     last_activity: Instant,
@@ -70,6 +72,7 @@ impl CallRunner {
         meter: BudgetMeter,
         mode: RunMode,
         started: Instant,
+        carry: Option<String>,
     ) -> Self {
         let now = Instant::now();
         Self {
@@ -87,6 +90,7 @@ impl CallRunner {
             speech_start_ms: None,
             end_waiters: Vec::new(),
             turn: TurnState::default(),
+            carry,
         }
     }
 
@@ -182,6 +186,8 @@ impl CallRunner {
             "voice call ready"
         );
         self.send_ready();
+        let carry = self.carry.take();
+        self.on_call_ready(carry).await;
         None
     }
 
@@ -265,6 +271,8 @@ impl CallRunner {
                     self.persist(&delta).await;
                 }
                 let user_final = (role == crate::engine::TranscriptRole::User && is_final).then(|| text.clone());
+                let assistant_final =
+                    (role == crate::engine::TranscriptRole::Assistant && is_final).then(|| text.clone());
                 self.send(VoiceServerFrame::Caption(VoiceCaption {
                     voice_session_id: self.call.session_id.clone(),
                     role: role.as_str().to_owned(),
@@ -275,6 +283,11 @@ impl CallRunner {
                     && !text.trim().is_empty()
                 {
                     self.on_user_final(&text).await;
+                }
+                if let Some(text) = assistant_final
+                    && !text.trim().is_empty()
+                {
+                    self.on_assistant_final(&text).await;
                 }
                 return self.check_budget();
             }

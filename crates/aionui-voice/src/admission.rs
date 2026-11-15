@@ -45,6 +45,8 @@ pub(crate) struct RunnerStart {
     /// When the call started (hard cap / rotation clocks).
     pub started: Instant,
     pub focus: Option<String>,
+    /// Summary of the call this one resumes, added to the model context.
+    pub carry: Option<String>,
 }
 
 impl VoiceService {
@@ -92,6 +94,10 @@ impl VoiceService {
         {
             self.end_live(previous, EndReason::Resumed).await;
         }
+        let carry = match req.resume_of.as_deref() {
+            Some(previous) => self.previous_call_summary(user_id, previous).await,
+            None => None,
+        };
 
         let profile = settings.call_profile();
         let tools: Vec<Value> = crate::tools::definitions();
@@ -194,6 +200,7 @@ impl VoiceService {
             mode: RunMode::Fresh,
             started: Instant::now(),
             focus: req.focus_conversation_id.clone(),
+            carry,
         });
         Ok(CreateVoiceSessionResponse {
             voice_session_id: session_id,
@@ -201,6 +208,20 @@ impl VoiceService {
             engine: engine_kind.to_owned(),
             model: profile.model,
         })
+    }
+
+    /// Short summary of a previous call of this user from its last transcript
+    /// turns (rotation / re-dial, §3.5): no extra model call.
+    async fn previous_call_summary(&self, user_id: &str, previous: &str) -> Option<String> {
+        self.inner.sessions.get(user_id, previous).await.ok().flatten()?;
+        let turns = self
+            .inner
+            .drafts
+            .repo
+            .recent_transcripts(previous, SUMMARY_TURNS)
+            .await
+            .ok()?;
+        summarize_turns(&turns)
     }
 
     /// End a call that never got a runner: hang up (if created), persist, audit.
@@ -277,6 +298,7 @@ impl VoiceService {
             start.meter,
             start.mode,
             start.started,
+            start.carry,
         );
         let (registered_tx, registered_rx) = oneshot::channel::<()>();
         let handle = tokio::spawn(async move {
@@ -383,9 +405,38 @@ impl VoiceService {
             mode: RunMode::Recovered,
             started: started_from_created_at(row.created_at),
             focus: None,
+            carry: None,
         });
         Ok(())
     }
+}
+
+const SUMMARY_TURNS: u32 = 8;
+const SUMMARY_WORDS_PER_TURN: usize = 25;
+const SUMMARY_MAX_WORDS: usize = 150;
+
+/// "Summary of the previous call: User: … Jarvis: …", bounded in words.
+pub(crate) fn summarize_turns(turns: &[(String, String)]) -> Option<String> {
+    let mut words = 0;
+    let mut parts = Vec::new();
+    for (role, text) in turns {
+        let speaker = if role == "assistant" { "Jarvis" } else { "User" };
+        let line: Vec<&str> = text.split_whitespace().take(SUMMARY_WORDS_PER_TURN).collect();
+        if line.is_empty() {
+            continue;
+        }
+        if words + line.len() > SUMMARY_MAX_WORDS {
+            break;
+        }
+        words += line.len();
+        parts.push(format!("{speaker}: {}", line.join(" ")));
+    }
+    (!parts.is_empty()).then(|| {
+        format!(
+            "Summary of the previous call (context only, not a request): {}",
+            parts.join(" ")
+        )
+    })
 }
 
 /// The call's original start on the monotonic clock, so a recovered call keeps
@@ -465,6 +516,21 @@ mod tests {
         let mut bad_device = req("v=0");
         bad_device.device_id = Some("x\u{0}".into());
         assert!(matches!(validate_create(&bad_device), Err(VoiceError::BadRequest(_))));
+    }
+
+    #[test]
+    fn summary_is_bounded_and_attributed() {
+        let turns = vec![
+            ("user".to_owned(), "tell the kanban build to rerun the tests".to_owned()),
+            ("assistant".to_owned(), "Done, it is running.".to_owned()),
+        ];
+        let summary = summarize_turns(&turns).unwrap();
+        assert!(summary.contains("User: tell the kanban build"));
+        assert!(summary.contains("Jarvis: Done"));
+        let long = vec![("user".to_owned(), "word ".repeat(400)); 10];
+        let bounded = summarize_turns(&long).unwrap();
+        assert!(bounded.split_whitespace().count() <= SUMMARY_MAX_WORDS + 20);
+        assert!(summarize_turns(&[]).is_none());
     }
 
     #[test]

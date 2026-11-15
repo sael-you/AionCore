@@ -840,6 +840,72 @@ impl DraftEngine {
             .max_by_key(|r| (r.updated_at, r.version))
     }
 
+    /// The user's newest draft still waiting for a confirmation (any session).
+    pub async fn pending_for_user(&self, user_id: &str) -> Option<VoiceDraftRow> {
+        let states = ["drafted", "ambiguous", "pending_transcript"];
+        let now = now_ms();
+        self.repo
+            .user_drafts_in_states(user_id, &states)
+            .await
+            .ok()?
+            .into_iter()
+            .filter(|r| r.expires_at.is_none_or(|t| t > now))
+            .max_by_key(|r| (r.updated_at, r.version))
+    }
+
+    /// A new call started while a draft waits: bind it to that call, read it
+    /// back again (fresh clip, new expiry) and show the card, so it can be
+    /// confirmed by voice there — not only by tap.
+    pub async fn reannounce(&self, row: &VoiceDraftRow, session_id: &str) -> Option<VoiceDraftRow> {
+        let row = if row.state == DraftState::PendingTranscript.as_str() {
+            self.back_to_drafted(row).await?
+        } else {
+            row.clone()
+        };
+        let spoken = row.readback_text.clone()?;
+        let readback_id = match self.speech.for_user(&row.user_id).await.synth {
+            Some(synth) => match synth.synthesize(&spoken, ClipVoice::Jarvis).await {
+                Ok(clip) => Some(self.clips.insert(&row.user_id, Some(session_id), clip)),
+                Err(err) => {
+                    tracing::warn!(error = %err, "voice read-back synthesis failed; tap-confirm only");
+                    None
+                }
+            },
+            None => None,
+        };
+        let applied = self
+            .transition(
+                &row,
+                None,
+                DraftPatch {
+                    session_id: Some(Some(session_id)),
+                    readback_id: Some(readback_id.as_deref()),
+                    expires_at: Some(Some(now_ms() + DRAFT_TTL_MS)),
+                    ..Default::default()
+                },
+            )
+            .await;
+        if !applied {
+            return None;
+        }
+        let fresh = self.reload(&row).await?;
+        tracing::info!(draft_id = %fresh.id, version = fresh.version, "voice draft re-announced to a new call");
+        self.emit(&fresh, None);
+        if let Some(clip_id) = &readback_id {
+            self.sockets.send_user(
+                &fresh.user_id,
+                &VoiceServerFrame::ReadbackReady(VoiceReadbackReady {
+                    voice_session_id: Some(session_id.to_owned()),
+                    draft_id: fresh.id.clone(),
+                    version: fresh.version,
+                    readback_id: clip_id.clone(),
+                    url: format!("/api/voice/readbacks/{clip_id}"),
+                }),
+            );
+        }
+        Some(fresh)
+    }
+
     /// Mark `pending_transcript` while a confirm-like utterance is evaluated.
     pub async fn mark_pending(&self, row: &VoiceDraftRow) -> Option<VoiceDraftRow> {
         self.transition_and_emit(row, DraftState::PendingTranscript, DraftPatch::default())
