@@ -426,6 +426,7 @@ dependencies = [
  "aionui-system",
  "aionui-team",
  "aionui-team-prompts",
+ "aionui-voice",
  "anyhow",
  "async-trait",
  "axum",
@@ -1076,6 +1077,36 @@ dependencies = [
  "aionui-api-types",
  "serde",
  "serde_json",
+]
+
+[[package]]
+name = "aionui-voice"
+version = "0.2.2"
+dependencies = [
+ "aionui-api-types",
+ "aionui-auth",
+ "aionui-common",
+ "aionui-db",
+ "aionui-realtime",
+ "aionui-shell",
+ "async-trait",
+ "axum",
+ "dashmap",
+ "futures-util",
+ "hex",
+ "http-body-util",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "sqlx",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-tungstenite 0.26.2",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
+ "url",
 ]
 
 [[package]]

@@ -28,6 +28,7 @@ members = [
     "crates/aionui-board",
     "crates/aionui-cron",
     "crates/aionui-assistant",
+    "crates/aionui-voice",
     "crates/aionui-app",
 ]
 
@@ -65,6 +66,7 @@ aionui-sidebar = { path = "crates/aionui-sidebar" }
 aionui-board = { path = "crates/aionui-board" }
 aionui-cron = { path = "crates/aionui-cron" }
 aionui-assistant = { path = "crates/aionui-assistant" }
+aionui-voice = { path = "crates/aionui-voice" }
 aionui-app = { path = "crates/aionui-app" }
 
 aion-agent = { git = "https://github.com/iOfficeAI/aionrs.git", tag = "v0.2.11" }

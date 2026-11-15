@@ -1,0 +1,49 @@
+[package]
+name = "aionui-voice"
+version.workspace = true
+edition.workspace = true
+
+[features]
+# Test seam (PLAN §4): honours AIONUI_VOICE_FAKE_PROVIDER_URL and builds the
+# in-process fake OpenAI Realtime provider. Never enabled in release builds.
+voice-test = []
+
+[dependencies]
+aionui-api-types.workspace = true
+aionui-auth.workspace = true
+aionui-common.workspace = true
+aionui-db.workspace = true
+# Voice sockets are registered in a dedicated WebSocketManager and written by
+# its shared send loop.
+aionui-realtime.workspace = true
+# Shared OpenAI base-URL normalisation + the rustls WebSocket connector.
+aionui-shell.workspace = true
+async-trait.workspace = true
+axum.workspace = true
+dashmap.workspace = true
+futures-util.workspace = true
+hex.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+tracing.workspace = true
+url.workspace = true
+
+[dev-dependencies]
+http-body-util.workspace = true
+sqlx.workspace = true
+tokio = { workspace = true, features = ["test-util"] }
+tower = { workspace = true, features = ["util"] }
+tracing-subscriber.workspace = true
+
+[[test]]
+name = "voice_http_e2e"
+required-features = ["voice-test"]
+
+[[test]]
+name = "voice_call_lifecycle"
+required-features = ["voice-test"]
