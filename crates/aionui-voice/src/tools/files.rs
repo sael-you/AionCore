@@ -10,6 +10,7 @@ use std::time::{Duration, Instant};
 use aionui_project::types::FileOp;
 use aionui_project::{canonical, containment};
 use ignore::WalkBuilder;
+use ignore::gitignore::Gitignore;
 
 use super::policy::{
     MAX_FILE_BYTES, MAX_READ_LINES, MAX_SEARCH_MATCHES, dir_name_allowed, file_name_allowed, looks_binary, path_allowed,
@@ -50,7 +51,7 @@ pub fn resolve_in_project(root: &Path, relative: &str) -> Result<PathBuf, FileTo
     let root_canonical = canonical::canonicalize(&root_uri).map_err(|_| FileToolError::NoRoot)?;
     let resolved = containment::resolve_relative(&root_canonical, relative.trim_start_matches("./"), FileOp::Read)
         .map_err(|_| FileToolError::OutsideProject)?;
-    if !path_allowed(Path::new(&resolved.relative_path)) {
+    if !path_allowed(Path::new(&resolved.relative_path)) || gitignored(root, Path::new(&resolved.relative_path)) {
         return Err(FileToolError::Denied);
     }
     let absolute = resolved.absolute_path.ok_or(FileToolError::OutsideProject)?;
@@ -60,10 +61,36 @@ pub fn resolve_in_project(root: &Path, relative: &str) -> Result<PathBuf, FileTo
     }
     // The symlink target itself must pass the denylist too.
     let real_relative = real.strip_prefix(root).map_err(|_| FileToolError::OutsideProject)?;
-    if !path_allowed(real_relative) {
+    if !path_allowed(real_relative) || gitignored(root, real_relative) {
         return Err(FileToolError::Denied);
     }
     Ok(real)
+}
+
+/// Whether the project's `.gitignore` files (root down to the file's folder,
+/// the deepest decisive rule wins) ignore `relative`. Ignored files are build
+/// output or local config the search never shows either.
+fn gitignored(root: &Path, relative: &Path) -> bool {
+    let target = root.join(relative);
+    let mut ignored = false;
+    let mut dir = root.to_path_buf();
+    let parents: Vec<_> = relative.parent().map(|p| p.components().collect()).unwrap_or_default();
+    for step in std::iter::once(None).chain(parents.into_iter().map(Some)) {
+        if let Some(component) = step {
+            dir.push(component);
+        }
+        let file = dir.join(".gitignore");
+        if !file.is_file() {
+            continue;
+        }
+        let (matcher, _) = Gitignore::new(&file);
+        match matcher.matched_path_or_any_parents(&target, false) {
+            ignore::Match::Ignore(_) => ignored = true,
+            ignore::Match::Whitelist(_) => ignored = false,
+            ignore::Match::None => {}
+        }
+    }
+    ignored
 }
 
 /// Up to [`MAX_READ_LINES`] lines from `start_line` (1-based).
@@ -217,6 +244,53 @@ mod tests {
             // A symlink inside the project pointing at a denied file.
             std::os::unix::fs::symlink(root.join(".env"), root.join("src/env.txt")).unwrap();
             assert_eq!(read_lines(&root, "src/env.txt", 1), Err(FileToolError::Denied));
+        }
+    }
+
+    #[test]
+    fn hidden_credential_and_gitignored_files_are_refused() {
+        let dir = project();
+        let root = project_root(dir.path().to_str().unwrap()).unwrap();
+        for (name, body) in [
+            (".mcp.json", "{\"env\": {\"TOKEN\": \"x\"}}"),
+            (".npmrc", "//registry.npmjs.org/:_authToken=x"),
+            (".netrc", "machine x login y password z"),
+            (".pgpass", "h:5432:db:u:p"),
+            ("auth.json", "{}"),
+            ("prod.tfvars", "db_password = \"x\""),
+        ] {
+            std::fs::write(root.join(name), body).unwrap();
+            assert_eq!(read_lines(&root, name, 1), Err(FileToolError::Denied), "{name}");
+        }
+        std::fs::create_dir_all(root.join(".config")).unwrap();
+        std::fs::write(root.join(".config/app.toml"), "k = 1").unwrap();
+        assert_eq!(read_lines(&root, ".config/app.toml", 1), Err(FileToolError::Denied));
+
+        // .gitignore at the root and in a subfolder; a `!` rule re-allows.
+        std::fs::write(root.join(".gitignore"), "local.yaml\ndist/\n*.log\n!keep.log\n").unwrap();
+        std::fs::create_dir_all(root.join("src/gen")).unwrap();
+        std::fs::write(root.join("src/.gitignore"), "gen/\n").unwrap();
+        for (name, body) in [
+            ("local.yaml", "token: x"),
+            ("dist/app.js", "x"),
+            ("src/debug.log", "x"),
+            ("src/keep.log", "kept"),
+            ("src/gen/out.rs", "x"),
+        ] {
+            std::fs::create_dir_all(root.join(name).parent().unwrap()).unwrap();
+            std::fs::write(root.join(name), body).unwrap();
+        }
+        for ignored in ["local.yaml", "dist/app.js", "src/debug.log", "src/gen/out.rs"] {
+            assert_eq!(read_lines(&root, ignored, 1), Err(FileToolError::Denied), "{ignored}");
+        }
+        assert!(read_lines(&root, "src/keep.log", 1).unwrap().contains("kept"));
+        assert!(read_lines(&root, "src/main.rs", 1).is_ok());
+
+        #[cfg(unix)]
+        {
+            // A visible symlink to an ignored file is refused too.
+            std::os::unix::fs::symlink(root.join("local.yaml"), root.join("src/cfg.yaml")).unwrap();
+            assert_eq!(read_lines(&root, "src/cfg.yaml", 1), Err(FileToolError::Denied));
         }
     }
 
