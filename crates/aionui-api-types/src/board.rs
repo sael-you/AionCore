@@ -185,7 +185,8 @@ pub struct BoardCardDto {
     pub updated_at: i64,
 }
 
-/// Card as listed on the board (no description/metadata).
+/// Card as listed on the board (no description; only the progress keys of
+/// `metadata`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BoardCardSummaryDto {
     pub id: String,
@@ -217,6 +218,11 @@ pub struct BoardCardSummaryDto {
     pub version: i64,
     pub archived_at: Option<i64>,
     pub updated_at: i64,
+    /// Progress keys of the card's `metadata` (`progress`, `status_note`,
+    /// `updated_at`), only those present; absent when none is set. The full
+    /// metadata stays on the card detail to keep large boards light.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub metadata: Option<Value>,
 }
 
 /// `GET /api/projects/{pid}/board`.
