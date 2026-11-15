@@ -121,7 +121,10 @@ async fn send_realtime_error_and_close(mut socket: WebSocket, error: RealtimeErr
 
 /// Reads `WsOutbound` from the per-connection channel and forwards
 /// them to the WebSocket sink.
-async fn send_loop(
+///
+/// Public so other WebSocket endpoints that register their connections in a
+/// [`crate::WebSocketManager`] (e.g. `/api/voice/ws`) reuse the same writer.
+pub async fn send_loop(
     conn_id: ConnectionId,
     mut rx: mpsc::Receiver<WsOutbound>,
     mut sender: futures_util::stream::SplitSink<WebSocket, Message>,

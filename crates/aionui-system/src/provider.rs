@@ -8,6 +8,37 @@ use serde::de::DeserializeOwned;
 
 use crate::error::SystemError;
 
+/// A provider credential for backend-internal use only. Not serializable;
+/// `Debug` never prints the key.
+#[derive(Clone)]
+pub struct ProviderSecretCredential {
+    pub provider_id: String,
+    pub platform: String,
+    pub base_url: String,
+    pub enabled: bool,
+    pub is_full_url: bool,
+    api_key: String,
+}
+
+impl ProviderSecretCredential {
+    /// The decrypted API key (empty when it could not be decrypted).
+    pub fn api_key(&self) -> &str {
+        &self.api_key
+    }
+}
+
+impl std::fmt::Debug for ProviderSecretCredential {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ProviderSecretCredential")
+            .field("provider_id", &self.provider_id)
+            .field("platform", &self.platform)
+            .field("base_url", &self.base_url)
+            .field("enabled", &self.enabled)
+            .field("api_key", &"<redacted>")
+            .finish()
+    }
+}
+
 /// Business logic for model provider CRUD with API key encryption/masking.
 #[derive(Clone)]
 pub struct ProviderService {
@@ -117,24 +148,42 @@ impl ProviderService {
         Ok(())
     }
 
+    /// Decrypted credentials of the user's providers for backend-internal
+    /// callers (e.g. the voice credential resolver).
+    ///
+    /// Unlike [`Self::list`] this never builds the HTTP response DTO, so the
+    /// plaintext key cannot be serialized by accident: [`ProviderSecretCredential`]
+    /// implements no `Serialize` and redacts the key in `Debug`. Rows whose key
+    /// cannot be decrypted come back with an empty key, like in `list`.
+    pub async fn backend_credentials(&self, user_id: &str) -> Result<Vec<ProviderSecretCredential>, SystemError> {
+        let rows = self.repo.list(user_id).await?;
+        Ok(rows
+            .into_iter()
+            .map(|row| ProviderSecretCredential {
+                api_key: self.decrypt_api_key(&row),
+                provider_id: row.id,
+                platform: row.platform,
+                base_url: row.base_url,
+                enabled: row.enabled,
+                is_full_url: row.is_full_url,
+            })
+            .collect())
+    }
+
     // -----------------------------------------------------------------------
     // Internal helpers
     // -----------------------------------------------------------------------
 
-    /// Convert a DB row into a response DTO with the plaintext API key
-    /// (decrypted) and deserialized JSON fields.
+    /// Decrypt a row's API key, leniently.
     ///
-    /// Pre-launch: the response returns the API key in plaintext so the
-    /// frontend can migrate its local store to the backend without losing
-    /// the key on re-read. Storage remains encrypted at rest.
-    fn row_to_response(&self, row: Provider) -> Result<ProviderResponse, SystemError> {
-        // Lenient on decryption: a credential encrypted under a rotated/lost
-        // key (e.g. one saved during the ELECTRON-3T0 broken session, whose
-        // in-memory-only key is gone forever) must not take the whole
-        // provider list down. Surface the row with an empty api_key so the
-        // user can see it and re-enter the key; log at warn for production
-        // diagnosability.
-        let api_key = match decrypt_string(&row.api_key_encrypted, &self.encryption_key) {
+    /// Lenient on decryption: a credential encrypted under a rotated/lost
+    /// key (e.g. one saved during the ELECTRON-3T0 broken session, whose
+    /// in-memory-only key is gone forever) must not take the whole
+    /// provider list down. Surface the row with an empty api_key so the
+    /// user can see it and re-enter the key; log at warn for production
+    /// diagnosability.
+    fn decrypt_api_key(&self, row: &Provider) -> String {
+        match decrypt_string(&row.api_key_encrypted, &self.encryption_key) {
             Ok(key) => key,
             Err(error) => {
                 tracing::warn!(
@@ -145,7 +194,17 @@ impl ProviderService {
                 );
                 String::new()
             }
-        };
+        }
+    }
+
+    /// Convert a DB row into a response DTO with the plaintext API key
+    /// (decrypted) and deserialized JSON fields.
+    ///
+    /// Pre-launch: the response returns the API key in plaintext so the
+    /// frontend can migrate its local store to the backend without losing
+    /// the key on re-read. Storage remains encrypted at rest.
+    fn row_to_response(&self, row: Provider) -> Result<ProviderResponse, SystemError> {
+        let api_key = self.decrypt_api_key(&row);
 
         let models: Vec<String> = serde_json::from_str(&row.models)
             .map_err(|e| SystemError::Internal(format!("Failed to parse models JSON: {e}")))?;
@@ -322,6 +381,20 @@ mod tests {
         let repo = Arc::new(SqliteProviderRepository::new(db.pool().clone()));
         std::mem::forget(db);
         ProviderService::new(repo, TEST_KEY)
+    }
+
+    #[tokio::test]
+    async fn backend_credentials_decrypt_and_redact_debug() {
+        let svc = setup().await;
+        let created = svc.create(TEST_USER_ID, sample_create_request()).await.unwrap();
+        let creds = svc.backend_credentials(TEST_USER_ID).await.unwrap();
+        assert_eq!(creds.len(), 1);
+        assert_eq!(creds[0].provider_id, created.id);
+        assert_eq!(creds[0].api_key(), "sk-ant-api03-test1234");
+        assert_eq!(creds[0].platform, "anthropic");
+        let debug = format!("{:?}", creds[0]);
+        assert!(!debug.contains("sk-ant"), "Debug must not print the key: {debug}");
+        assert!(svc.backend_credentials("other-user").await.unwrap().is_empty());
     }
 
     fn sample_create_request() -> CreateProviderRequest {

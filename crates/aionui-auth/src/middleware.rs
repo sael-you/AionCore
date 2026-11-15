@@ -126,9 +126,28 @@ pub async fn auth_middleware(
         return runtime_token_channel(&state, request, next).await;
     };
 
+    let user = authenticate_session_token(&state, &token).await?;
+    request.extensions_mut().insert(user);
+    request.extensions_mut().insert(AuthChannel::Session);
+
+    Ok(next.run(request).await)
+}
+
+/// Validate a session JWT exactly like [`auth_middleware`] does for a request:
+/// access-token type + signature/expiry/blacklist, the subject must be an
+/// active user, the AionPro identity rule, and the token's
+/// `session_generation` must match the user's current one (logout-everywhere
+/// and password changes bump it). The JWT secret rotation done by a password
+/// change makes old tokens fail the signature check.
+///
+/// Exposed so long-lived connections (e.g. the voice WebSocket, which
+/// re-validates every 60 s) reuse the same checks instead of copying them.
+/// `state.identity_mode` must not be [`AuthIdentityMode::Local`]: local mode
+/// skips token checks in the middleware and has no token to validate here.
+pub async fn authenticate_session_token(state: &AuthState, token: &str) -> Result<CurrentUser, ApiError> {
     // Require an *access* token here: a refresh token must never authenticate an
     // ordinary request — it is accepted only at the refresh endpoint.
-    let payload = state.jwt_service.verify_access(&token).map_err(|e| {
+    let payload = state.jwt_service.verify_access(token).map_err(|e| {
         tracing::debug!("Token verification failed: {e}");
         ApiError::Unauthorized("Invalid or expired token".into())
     })?;
@@ -156,15 +175,12 @@ pub async fn auth_middleware(
         return Err(ApiError::Unauthorized("Invalid authentication session".into()));
     }
 
-    request.extensions_mut().insert(CurrentUser {
+    Ok(CurrentUser {
         id: user.id,
         username: user.username.unwrap_or_else(|| "external_user".to_string()),
         user_type: user.user_type,
         status: user.status,
-    });
-    request.extensions_mut().insert(AuthChannel::Session);
-
-    Ok(next.run(request).await)
+    })
 }
 
 /// Authenticate a JWT-less request via the conversation-helper runtime token.
