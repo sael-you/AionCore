@@ -160,7 +160,27 @@ pub fn card_summary(
         version: card.version,
         archived_at: card.archived_at,
         updated_at: card.updated_at,
+        metadata: summary_metadata(&card.metadata),
     }
+}
+
+/// `metadata` keys the board list carries (the Board Butler's progress line).
+const SUMMARY_METADATA_KEYS: [&str; 3] = ["progress", "status_note", "updated_at"];
+
+/// The non-null [`SUMMARY_METADATA_KEYS`] in `metadata`; `None` when there is
+/// none, so the field is left out of the board JSON.
+fn summary_metadata(metadata: &Value) -> Option<Value> {
+    let source = metadata.as_object()?;
+    let picked: serde_json::Map<String, Value> = SUMMARY_METADATA_KEYS
+        .iter()
+        .filter_map(|key| {
+            source
+                .get(*key)
+                .filter(|value| !value.is_null())
+                .map(|value| ((*key).to_owned(), value.clone()))
+        })
+        .collect();
+    (!picked.is_empty()).then_some(Value::Object(picked))
 }
 
 pub fn event_dto(row: &BoardEventRow) -> BoardEventDto {
@@ -233,5 +253,87 @@ pub fn link_dto(row: &BoardLinkViewRow) -> BoardLinkDto {
         } else {
             Some("removed".to_owned())
         },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn row(metadata: &str) -> BoardCardRow {
+        BoardCardRow {
+            id: "c1".into(),
+            project_id: "p1".into(),
+            user_id: "u1".into(),
+            number: 7,
+            title: "Card".into(),
+            description: "long description".into(),
+            card_type: "task".into(),
+            priority: "medium".into(),
+            size: None,
+            tier: None,
+            column_key: "todo".into(),
+            position: 0,
+            labels: "[]".into(),
+            skills: "[]".into(),
+            routing: "[]".into(),
+            creator_kind: "user".into(),
+            creator_ref: "u1".into(),
+            assignee_kind: None,
+            assignee_ref: None,
+            blocked: false,
+            blocked_reason: None,
+            blocked_by: None,
+            change_id: None,
+            metadata: metadata.into(),
+            version: 1,
+            archived_at: None,
+            created_at: 1,
+            updated_at: 2,
+        }
+    }
+
+    #[test]
+    fn summary_carries_only_the_progress_keys_of_metadata() {
+        let raw = json!({
+            "progress": 40,
+            "status_note": "gates running",
+            "updated_at": 1_700_000_000_000_i64,
+            "packet": {"large": "x".repeat(64)},
+            "secret_note": "keep out",
+        });
+        let summary = card_summary(&row(&raw.to_string()), false, 0, false);
+        assert_eq!(
+            summary.metadata,
+            Some(json!({"progress": 40, "status_note": "gates running", "updated_at": 1_700_000_000_000_i64}))
+        );
+        let wire = serde_json::to_value(&summary).unwrap();
+        assert_eq!(wire["metadata"].as_object().unwrap().len(), 3);
+        assert!(wire["metadata"].get("packet").is_none());
+        assert!(wire["metadata"].get("secret_note").is_none());
+    }
+
+    #[test]
+    fn summary_keeps_a_partial_progress_set() {
+        let summary = card_summary(&row(r#"{"progress":100,"other":1}"#), false, 0, false);
+        assert_eq!(summary.metadata, Some(json!({"progress": 100})));
+    }
+
+    #[test]
+    fn summary_omits_metadata_without_progress_keys() {
+        for raw in ["{}", r#"{"other":1}"#, r#"{"progress":null}"#, "not json", "[1,2]"] {
+            let summary = card_summary(&row(raw), false, 0, false);
+            assert_eq!(summary.metadata, None, "metadata {raw}");
+            let wire = serde_json::to_value(&summary).unwrap();
+            assert!(wire.get("metadata").is_none(), "metadata {raw} serialized");
+        }
+    }
+
+    #[test]
+    fn summary_without_metadata_still_deserializes() {
+        let mut wire = serde_json::to_value(card_summary(&row("{}"), false, 0, false)).unwrap();
+        wire.as_object_mut().unwrap().remove("metadata");
+        let back: BoardCardSummaryDto = serde_json::from_value(wire).unwrap();
+        assert_eq!(back.metadata, None);
     }
 }
