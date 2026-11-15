@@ -102,5 +102,8 @@ pub(crate) fn market_write_auth_state(services: &AppServices) -> AuthState {
             AuthIdentityMode::UserSession
         },
         runtime_token_verifier: None,
+        // C11: the session cookie is read under the configured name
+        // (`__Host-aionui-session` in webui over HTTPS).
+        cookie_names: services.cookie_config.names,
     }
 }

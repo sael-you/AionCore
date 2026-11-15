@@ -333,8 +333,15 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
             auth_middleware,
         ));
         if services.identity_mode.is_local() {
+            // Local mode has no global CSRF layer: the market adds the C11
+            // double submit itself (cookie names from the app config; no
+            // origin rules in local mode, as the global layer). Other modes
+            // get the global `CsrfState` layer with webui's origin policy.
             router.route_layer(middleware::from_fn_with_state(
-                services.cookie_config.clone(),
+                CsrfState {
+                    cookie_config: services.cookie_config.clone(),
+                    origin_policy: None,
+                },
                 csrf_middleware,
             ))
         } else {

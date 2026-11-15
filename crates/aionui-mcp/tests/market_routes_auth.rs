@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use aionui_auth::{AuthIdentityMode, AuthState, IRuntimeTokenVerifier, JwtService, auth_middleware};
+use aionui_auth::{AuthIdentityMode, AuthState, CookieNames, IRuntimeTokenVerifier, JwtService, auth_middleware};
 use aionui_db::{
     IMcpMarketRepository, IMcpServerRepository, IUserRepository, SqliteMcpMarketRepository, SqliteMcpServerRepository,
     SqliteUserRepository, init_database_memory,
@@ -59,6 +59,7 @@ fn auth(f: &Fx, mode: AuthIdentityMode, verifier: Option<Arc<dyn IRuntimeTokenVe
         user_repo: f.users.clone(),
         identity_mode: mode,
         runtime_token_verifier: verifier,
+        cookie_names: CookieNames::LEGACY,
     }
 }
 
@@ -298,4 +299,48 @@ async fn session_writes_succeed_and_never_echo_secrets() {
     assert_eq!(status, StatusCode::BAD_REQUEST);
     assert_eq!(resp["code"], "MCP_MARKET_INVALID");
     assert!(resp.to_string().contains("R2"), "{resp}");
+}
+
+/// C11: market writes read the session cookie under the configured name and,
+/// in local mode, sit behind the shared `CsrfState` double submit (the
+/// composition in `aionui-app`), so `__Host-` names in webui work and a
+/// write without a matching CSRF header is refused.
+#[tokio::test]
+async fn writes_follow_the_c11_cookie_names_and_csrf_state() {
+    use aionui_auth::{CookieConfig, CsrfState, csrf_middleware};
+    let f = fx().await;
+    let token = f.jwt.sign(USER, USER).unwrap();
+    let names = CookieNames::PREFIXED;
+    let mut write_auth = auth(&f, AuthIdentityMode::UserSession, None);
+    write_auth.cookie_names = names;
+    let csrf = CsrfState {
+        cookie_config: Arc::new(CookieConfig::for_identity(true, true)),
+        origin_policy: None,
+    };
+    let app = mcp_market_write_routes(f.state.clone())
+        .route_layer(from_fn_with_state(write_auth, auth_middleware))
+        .route_layer(from_fn_with_state(csrf, csrf_middleware));
+    let body = create_body();
+    let write = |cookie: String, csrf_header: Option<&str>| {
+        let mut req = post("/api/mcp/market/instances", &body).header(header::COOKIE, cookie);
+        if let Some(h) = csrf_header {
+            req = req.header("x-csrf-token", h);
+        }
+        req.body(Body::from(body.to_string())).unwrap()
+    };
+
+    // Missing CSRF header → refused before the handler.
+    let cookie = format!("{}={token}; {}=c1", names.session, names.csrf);
+    let (status, resp) = send(&app, write(cookie.clone(), None)).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "{resp}");
+    assert_eq!(resp["code"], "CSRF_INVALID");
+
+    // The legacy session cookie name is not read once prefixed names are set.
+    let legacy = format!("aionui-session={token}; {}=c1", names.csrf);
+    let (status, _) = send(&app, write(legacy, Some("c1"))).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+
+    // Prefixed session cookie + matching double submit → created.
+    let (status, created) = send(&app, write(cookie, Some("c1"))).await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
 }
