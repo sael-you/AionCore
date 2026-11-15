@@ -65,11 +65,20 @@ impl CredentialPolicy {
         credentials: Vec<ProviderCredential>,
         preferred: Option<&str>,
     ) -> Result<ResolvedCredential, VoiceError> {
+        // The official base URL identifies an OpenAI key, not the platform label: AionUi's own
+        // "OpenAI" preset in Settings → Model stores `platform: "custom"` with
+        // `https://api.openai.com/v1` (modelPlatforms.ts). The key is still only ever sent to the
+        // official host (the address check), like `resolve_minimax`.
         let eligible = credentials.into_iter().filter(|cred| {
-            cred.enabled
-                && cred.platform.trim().eq_ignore_ascii_case("openai")
-                && !cred.api_key.is_empty()
-                && (self.fake_provider_url.is_some() || is_official_openai_url(&cred.base_url))
+            cred.enabled && !cred.api_key.is_empty() && {
+                let platform_openai = cred.platform.trim().eq_ignore_ascii_case("openai");
+                // A blank base URL means "the default" only for a row that says it is OpenAI;
+                // any other row must name the official host explicitly (never send another
+                // vendor's key to OpenAI because its URL was left empty).
+                let official =
+                    is_official_openai_url(&cred.base_url) && (platform_openai || !cred.base_url.trim().is_empty());
+                official || (self.fake_provider_url.is_some() && platform_openai)
+            }
         });
         let chosen = match preferred {
             Some(id) => eligible.into_iter().find(|cred| cred.provider_id == id),
@@ -242,5 +251,49 @@ mod tests {
         let creds = vec![cred("a", "OpenAI", "https://proxy.example/v1", true, "ka")];
         let resolved = policy.resolve_openai(creds, None).unwrap();
         assert_eq!(resolved.base_url, "http://127.0.0.1:9");
+    }
+
+    /// Settings → Model's "OpenAI" preset saves platform "custom" + https://api.openai.com/v1:
+    /// voice must accept it (2026-11-15: "No voice provider is set up" with a valid key).
+    #[test]
+    fn model_page_openai_preset_with_custom_platform_resolves() {
+        let policy = CredentialPolicy::default();
+        let creds = vec![ProviderCredential {
+            api_key: ApiKey::new("sk-test"),
+            provider_id: "p1".into(),
+            platform: "custom".into(),
+            base_url: "https://api.openai.com/v1".into(),
+            enabled: true,
+        }];
+        let resolved = policy
+            .resolve_openai(creds, None)
+            .expect("custom + official URL resolves");
+        assert_eq!(resolved.provider_id, "p1");
+        assert_eq!(resolved.base_url, OPENAI_OFFICIAL_BASE_URL);
+    }
+
+    /// The address still decides: a "custom" or even "openai" row pointing anywhere else is refused.
+    #[test]
+    fn non_official_host_is_refused_whatever_the_platform() {
+        let policy = CredentialPolicy::default();
+        for (platform, url) in [
+            ("custom", "https://proxy.example.com/v1"),
+            ("openai", "https://api.openai.com.evil.example/v1"),
+            // another vendor's row with an empty URL must never resolve to OpenAI
+            ("anthropic", ""),
+            ("custom", "   "),
+        ] {
+            let creds = vec![ProviderCredential {
+                api_key: ApiKey::new("sk-test"),
+                provider_id: "p1".into(),
+                platform: platform.into(),
+                base_url: url.into(),
+                enabled: true,
+            }];
+            assert!(
+                policy.resolve_openai(creds, None).is_err(),
+                "{platform} {url} must be refused"
+            );
+        }
     }
 }
