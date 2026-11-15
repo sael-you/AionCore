@@ -19,19 +19,35 @@ pub const MAX_RESULT_CHARS: usize = 16 * 1024;
 /// Directory names that are never entered.
 const DENIED_DIRS: &[&str] = &[".git", ".ssh", "secrets", "node_modules", "target"];
 
+/// Credential files by exact name (dot names are refused anyway; listed so the
+/// rule stays explicit if that ever changes).
+const DENIED_NAMES: &[&str] = &[
+    ".mcp.json",
+    ".npmrc",
+    ".netrc",
+    ".pgpass",
+    "auth.json",
+    ".pypirc",
+    ".git-credentials",
+];
+
 /// Binary / key material extensions.
 const DENIED_EXTENSIONS: &[&str] = &[
     "pem", "key", "p12", "pfx", "der", "crt", "jks", "keystore", "png", "jpg", "jpeg", "gif", "webp", "ico", "pdf",
     "zip", "gz", "tgz", "xz", "bz2", "7z", "tar", "jar", "class", "so", "dylib", "dll", "exe", "bin", "o", "a", "wasm",
-    "mp3", "mp4", "wav", "ogg", "webm", "sqlite", "db",
+    "mp3", "mp4", "wav", "ogg", "webm", "sqlite", "db", "tfvars", "tfstate",
 ];
 
-/// Whether a project-relative path may be read or searched.
+/// Whether a project-relative path may be read or searched. Any hidden
+/// (dot) component is refused, like the search that skips hidden entries.
 pub fn path_allowed(relative: &Path) -> bool {
     let mut components = relative.components().peekable();
     while let Some(component) = components.next() {
         let name = component.as_os_str().to_string_lossy().to_ascii_lowercase();
         let is_last = components.peek().is_none();
+        if name.starts_with('.') {
+            return false;
+        }
         if !is_last && DENIED_DIRS.contains(&name.as_str()) {
             return false;
         }
@@ -42,9 +58,13 @@ pub fn path_allowed(relative: &Path) -> bool {
     true
 }
 
-/// File-name rules: `.env*`, `id_*`, `*credential*`, key/binary extensions.
+/// File-name rules: hidden names, credential files, `id_*`, `*credential*`,
+/// key/binary/terraform-variable extensions.
 pub fn file_name_allowed(lower_name: &str) -> bool {
-    if DENIED_DIRS.contains(&lower_name) {
+    if lower_name.starts_with('.') || DENIED_DIRS.contains(&lower_name) || DENIED_NAMES.contains(&lower_name) {
+        return false;
+    }
+    if lower_name.ends_with(".tfvars.json") {
         return false;
     }
     if lower_name.starts_with(".env") || lower_name.starts_with("id_") || lower_name.contains("credential") {
@@ -58,7 +78,7 @@ pub fn file_name_allowed(lower_name: &str) -> bool {
 
 /// Directories the content search must not descend into.
 pub fn dir_name_allowed(name: &str) -> bool {
-    !DENIED_DIRS.contains(&name.to_ascii_lowercase().as_str())
+    !name.starts_with('.') && !DENIED_DIRS.contains(&name.to_ascii_lowercase().as_str())
 }
 
 /// NUL byte in the first 8 KB → treat as binary.
@@ -81,6 +101,18 @@ static SECRET_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
         r"\bsk-(proj-|svcacct-)?[A-Za-z0-9_\-]{20,}",
         // JWTs.
         r"\beyJ[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}\.[A-Za-z0-9_\-]{8,}",
+        // Stripe live/test secret and restricted keys.
+        r"\b(sk|rk)_(live|test)_[A-Za-z0-9]{16,}",
+        // Slack tokens.
+        r"\bxox[abposr]-[A-Za-z0-9\-]{10,}",
+        // Google API keys.
+        r"\bAIza[0-9A-Za-z_\-]{35}",
+        // npm, GitLab, Hugging Face tokens.
+        r"\bnpm_[A-Za-z0-9]{36}\b",
+        r"\bglpat-[A-Za-z0-9_\-]{20,}",
+        r"\bhf_[A-Za-z0-9]{30,}\b",
+        // Generic secret assignments (`password = …`, `_authToken=…`, `api_key: …`).
+        r#"(?i)(password|passwd|secret|api[_\-]?key|access[_\-]?token|auth[_\-]?token|_authtoken)["']?\s*[:=]\s*["']?[^\s"']{8,}"#,
     ]
     .iter()
     .map(|p| Regex::new(p).expect("valid secret pattern"))
@@ -141,6 +173,18 @@ mod tests {
             "node_modules/x/index.js",
             "target/debug/app",
             "assets/logo.png",
+            ".mcp.json",
+            ".npmrc",
+            ".netrc",
+            ".pgpass",
+            "auth.json",
+            "config/auth.json",
+            "infra/prod.tfvars",
+            "infra/prod.auto.tfvars.json",
+            ".github/workflows/ci.yml",
+            ".claude/settings.json",
+            "src/.hidden/notes.md",
+            ".gitignore",
         ] {
             assert!(!path_allowed(Path::new(denied)), "{denied} must be denied");
         }
@@ -164,7 +208,26 @@ mod tests {
         for leaked in ["AKIA", "ghp_", "sk-proj", "sk-ant", "eyJhbGci", "MIIEow"] {
             assert!(!out.contains(leaked), "{leaked} leaked: {out}");
         }
-        assert!(out.contains("fn main() {}"), "ordinary code survives");
+        let more = "stripe sk_live_abcdefghijklmnop1234 rk_test_abcdefghijklmnop1234 \
+                    slack xoxb-1234567890-abcdefghij google AIzaSyA1234567890abcdefghijklmnopqrstuv \
+                    npm npm_abcdefghijklmnopqrstuvwxyz0123456789 gitlab glpat-abcdefghij0123456789 \
+                    hf hf_abcdefghijklmnopqrstuvwxyz0123 \
+                    //registry.npmjs.org/:_authToken=abcdef123456 password = \"hunter2hunter2\"";
+        let out = redact_secrets(more);
+        for leaked in [
+            "sk_live_",
+            "rk_test_",
+            "xoxb-",
+            "AIzaSy",
+            "npm_abc",
+            "glpat-",
+            "hf_abc",
+            "abcdef123456",
+            "hunter2",
+        ] {
+            assert!(!out.contains(leaked), "{leaked} leaked: {out}");
+        }
+        assert!(redact_secrets(text).contains("fn main() {}"), "ordinary code survives");
     }
 
     #[test]
