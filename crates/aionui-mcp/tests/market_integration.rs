@@ -1091,7 +1091,13 @@ async fn template_refresh_keeps_secrets_and_assignments_and_needs_new_secrets_fi
 
     assert_eq!(refreshed.instance.template_version.as_deref(), Some("0.2.0"));
     assert!(!refreshed.instance.template_update_available);
-    assert!(!market.get_instance(USER, &inst.id).await.unwrap().template_update_available);
+    assert!(
+        !market
+            .get_instance(USER, &inst.id)
+            .await
+            .unwrap()
+            .template_update_available
+    );
 
     // Refreshing again is a no-op.
     let again = market.refresh_template(USER, &inst.id).await.unwrap();
