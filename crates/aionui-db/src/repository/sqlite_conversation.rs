@@ -415,6 +415,53 @@ impl IConversationRepository for SqliteConversationRepository {
         Ok(())
     }
 
+    async fn set_extra_keys(
+        &self,
+        user_id: &str,
+        id: &str,
+        entries: &[(&str, serde_json::Value)],
+        status: Option<&str>,
+        updated_at: Option<TimestampMs>,
+    ) -> Result<bool, DbError> {
+        crate::repository::conversation::validate_extra_keys(entries)?;
+        // One statement: json_set on the CURRENT extra, so a concurrent writer
+        // (e.g. a model-failure recovery removing a key) is never undone.
+        let mut set_parts: Vec<String> = Vec::new();
+        if !entries.is_empty() {
+            let paths: Vec<String> = entries.iter().map(|(key, _)| format!("'$.{key}', json(?)")).collect();
+            set_parts.push(format!(
+                "extra = json_set(CASE WHEN json_valid(extra) AND json_type(extra) = 'object' \
+                 THEN extra ELSE '{{}}' END, {})",
+                paths.join(", ")
+            ));
+        }
+        if status.is_some() {
+            set_parts.push("status = ?".to_owned());
+        }
+        if updated_at.is_some() {
+            set_parts.push("updated_at = ?".to_owned());
+        }
+        if set_parts.is_empty() {
+            return Ok(self.get(user_id, id).await?.is_some());
+        }
+        let sql = format!(
+            "UPDATE conversations SET {} WHERE user_id = ? AND id = ?",
+            set_parts.join(", ")
+        );
+        let mut query = sqlx::query(&sql);
+        for (_, value) in entries {
+            query = query.bind(value.to_string());
+        }
+        if let Some(status) = status {
+            query = query.bind(status);
+        }
+        if let Some(updated_at) = updated_at {
+            query = query.bind(updated_at);
+        }
+        let result = query.bind(user_id).bind(id).execute(&self.pool).await?;
+        Ok(result.rows_affected() > 0)
+    }
+
     async fn delete(&self, user_id: &str, id: &str) -> Result<(), DbError> {
         let result = sqlx::query("DELETE FROM conversations WHERE user_id = ? AND id = ?")
             .bind(user_id)

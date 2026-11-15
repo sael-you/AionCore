@@ -7,7 +7,7 @@ use aionui_ai_agent::protocol::events::{
 use aionui_api_types::{ConversationRuntimeSummary, WebSocketMessage};
 use aionui_common::{ErrorChain, normalize_keys_to_snake_case, now_ms};
 use aionui_db::models::MessageRow;
-use aionui_db::{ConversationRowUpdate, DbError, IConversationRepository, MessageRowUpdate};
+use aionui_db::{DbError, IConversationRepository, MessageRowUpdate};
 use aionui_realtime::EventBroadcaster;
 use serde_json::json;
 use tracing::{debug, error, warn};
@@ -148,17 +148,18 @@ impl StreamPersistenceAdapter {
             return;
         }
 
-        let extra = match self.repo.get(&self.user_id, &self.conversation_id).await {
-            Ok(Some(row)) => crate::runtime_completion::extra_with_last_outcome(&row.extra, outcome),
-            _ => None,
-        };
-        let update = ConversationRowUpdate {
-            status: Some("finished".to_owned()),
-            extra,
-            updated_at: Some(now_ms()),
-            ..Default::default()
-        };
-        if let Err(e) = self.repo.update(&self.user_id, &self.conversation_id, &update).await {
+        let now = now_ms();
+        if let Err(e) = self
+            .repo
+            .set_extra_keys(
+                &self.user_id,
+                &self.conversation_id,
+                &crate::runtime_completion::last_outcome_entries(outcome, now),
+                Some("finished"),
+                Some(now),
+            )
+            .await
+        {
             log_persist_error(&e, "Failed to update conversation status");
         }
 
