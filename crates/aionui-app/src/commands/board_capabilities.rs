@@ -124,7 +124,11 @@ mod tests {
             .into_iter()
             .find(|tool| tool.name == "board_status")
             .unwrap();
-        assert!(descriptor.description.contains("Board Keeper"), "{}", descriptor.description);
+        assert!(
+            descriptor.description.contains("Board Keeper"),
+            "{}",
+            descriptor.description
+        );
     }
 
     #[test]

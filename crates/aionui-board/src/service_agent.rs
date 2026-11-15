@@ -92,9 +92,7 @@ impl BoardService {
         Ok(BoardStatusResponse {
             enabled,
             template: settings.as_ref().and_then(|s| BoardTemplate::parse(&s.template)),
-            keeper_conversation_id: settings
-                .and_then(|s| s.keeper_conversation_id)
-                .filter(|_| enabled),
+            keeper_conversation_id: settings.and_then(|s| s.keeper_conversation_id).filter(|_| enabled),
             project_id: Some(caller.project_id),
             keeper: caller.keeper,
         })
