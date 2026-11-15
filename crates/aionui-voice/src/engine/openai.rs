@@ -17,7 +17,10 @@ use tokio_tungstenite::tungstenite::http::HeaderValue;
 use tokio_tungstenite::tungstenite::{self, Message};
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
-use super::openai_config::{create_response_update, full_update, response_cancel, response_create, speak_exact};
+use super::openai_config::{
+    assistant_item, create_response_update, full_update, function_call_output, response_cancel, response_create,
+    speak_exact,
+};
 use super::openai_events::map_event;
 use super::{
     EngineCall, EngineError, EngineEvent, EngineSessionConfig, EngineTimings, OpenCallRequest, SpeakMode, VoiceEngine,
@@ -27,7 +30,7 @@ use crate::ports::ApiKey;
 
 pub const ENGINE_KIND: &str = "openai-realtime";
 
-type Sideband = WebSocketStream<MaybeTlsStream<TcpStream>>;
+pub(crate) type Sideband = WebSocketStream<MaybeTlsStream<TcpStream>>;
 
 /// Creates OpenAI Realtime WebRTC calls.
 #[derive(Clone)]
@@ -336,6 +339,14 @@ impl EngineCall for OpenAiCall {
 
     async fn interrupt(&mut self) -> Result<(), EngineError> {
         self.send(response_cancel()).await
+    }
+
+    async fn tool_result(&mut self, call_id: &str, output: &str) -> Result<(), EngineError> {
+        self.send(function_call_output(call_id, output)).await
+    }
+
+    async fn add_context(&mut self, text: &str) -> Result<(), EngineError> {
+        self.send(assistant_item(text)).await
     }
 
     async fn close(&mut self, reason: &str) -> Result<(), EngineError> {

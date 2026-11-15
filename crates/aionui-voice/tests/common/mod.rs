@@ -14,9 +14,12 @@ use aionui_voice::{
     SessionTokenVerifier, VoiceHttpGuards, VoiceRouterState, VoiceService, VoiceServiceDeps, VoiceSockets,
     VoiceTimings, voice_routes,
 };
+
+pub mod fakes;
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, Response};
+pub use fakes::{FakeConversations, FakeSpeech};
 use http_body_util::BodyExt;
 use serde_json::Value;
 use tokio::net::TcpListener;
@@ -85,6 +88,8 @@ pub fn fast_timings() -> VoiceTimings {
 }
 
 pub struct Harness {
+    pub conversations: Arc<FakeConversations>,
+    pub speech: Arc<FakeSpeech>,
     pub db: Database,
     pub router: Router,
     pub service: VoiceService,
@@ -113,7 +118,12 @@ impl Harness {
             runtime_token_verifier: None,
         };
         let voice_repo = Arc::new(SqliteVoiceRepository::new(db.pool().clone()));
+        let conversations = Arc::new(FakeConversations::default());
+        let speech = Arc::new(FakeSpeech::default());
         let service = VoiceService::new(VoiceServiceDeps {
+            conversations: conversations.clone(),
+            drafts: voice_repo.clone(),
+            speech: speech.clone(),
             settings: voice_repo.clone(),
             sessions: voice_repo.clone(),
             audit: voice_repo.clone(),
@@ -137,6 +147,8 @@ impl Harness {
             guards,
         );
         Self {
+            conversations,
+            speech,
             db,
             router,
             service,

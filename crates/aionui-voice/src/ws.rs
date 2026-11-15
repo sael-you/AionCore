@@ -17,6 +17,7 @@ use tokio::time::Instant;
 
 use crate::frames::{error_frame, state_frame, to_text};
 use crate::ports::AuthRejected;
+use crate::runner_drafts::ClientEvent;
 use crate::service::VoiceService;
 
 /// Control frames: ≤ 64 KB each (also the upgrade's `max_message_size`).
@@ -196,16 +197,51 @@ impl Socket {
                     None => self.send(&state_frame(session.as_deref(), "armed", Some("resumed"))),
                 }
             }
-            VoiceClientFrame::PlaybackFinished(_)
-            | VoiceClientFrame::SpeechOnset(_)
-            | VoiceClientFrame::ConfirmTap(_)
-            | VoiceClientFrame::CancelTap(_) => {
-                // Drafts, read-back clips and confirmation evidence arrive in S1b.
-                self.send(&error_frame(
-                    session.as_deref(),
-                    "UNSUPPORTED",
-                    "Not available in this build.",
-                ));
+            VoiceClientFrame::PlaybackFinished(frame) => {
+                self.service
+                    .client_event(
+                        &self.user_id,
+                        session.as_deref(),
+                        ClientEvent::PlaybackFinished {
+                            readback_id: frame.readback_id,
+                            t_end: frame.t_end,
+                        },
+                    )
+                    .await;
+            }
+            VoiceClientFrame::SpeechOnset(frame) => {
+                self.service
+                    .client_event(
+                        &self.user_id,
+                        session.as_deref(),
+                        ClientEvent::SpeechOnset { t: frame.t },
+                    )
+                    .await;
+            }
+            VoiceClientFrame::ConfirmTap(tap) => {
+                self.service
+                    .client_event(
+                        &self.user_id,
+                        session.as_deref(),
+                        ClientEvent::ConfirmTap {
+                            draft_id: tap.draft_id,
+                            version: tap.version,
+                            hash: tap.hash,
+                        },
+                    )
+                    .await;
+            }
+            VoiceClientFrame::CancelTap(tap) => {
+                self.service
+                    .client_event(
+                        &self.user_id,
+                        session.as_deref(),
+                        ClientEvent::CancelTap {
+                            draft_id: tap.draft_id,
+                            version: tap.version,
+                        },
+                    )
+                    .await;
             }
         }
         Flow::Continue

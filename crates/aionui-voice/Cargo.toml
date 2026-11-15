@@ -16,13 +16,19 @@ aionui-db.workspace = true
 # Voice sockets are registered in a dedicated WebSocketManager and written by
 # its shared send loop.
 aionui-realtime.workspace = true
-# Shared OpenAI base-URL normalisation + the rustls WebSocket connector.
+# Shared OpenAI base-URL normalisation, the rustls WebSocket connector and
+# the OpenAI transcription client (read-back name check).
 aionui-shell.workspace = true
+# Project containment + canonical paths for the read tools.
+aionui-project.workspace = true
 async-trait.workspace = true
 axum.workspace = true
+base64.workspace = true
 dashmap.workspace = true
 futures-util.workspace = true
 hex.workspace = true
+ignore.workspace = true
+regex.workspace = true
 reqwest.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -35,6 +41,7 @@ url.workspace = true
 
 [dev-dependencies]
 http-body-util.workspace = true
+tempfile.workspace = true
 sqlx.workspace = true
 tokio = { workspace = true, features = ["test-util"] }
 tower = { workspace = true, features = ["util"] }
@@ -50,4 +57,8 @@ required-features = ["voice-test"]
 
 [[test]]
 name = "voice_admission_races"
+required-features = ["voice-test"]
+
+[[test]]
+name = "voice_drafts"
 required-features = ["voice-test"]

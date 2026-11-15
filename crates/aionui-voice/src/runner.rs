@@ -16,6 +16,7 @@ use crate::error::VoiceError;
 use crate::frames::{call_ended_frame, error_frame, state_frame};
 use crate::lifecycle::{EndReason, TickInputs, tick_decision};
 use crate::ports::AuthRejected;
+use crate::runner_drafts::{ClientEvent, TurnState};
 use crate::service::{LiveCall, ServiceInner};
 use crate::settings::micros_to_usd;
 
@@ -31,6 +32,8 @@ pub(crate) enum CallCommand {
     CreateResponse {
         done: oneshot::Sender<Result<(), VoiceError>>,
     },
+    /// A client frame for this call (evidence, taps) or a pending `ask`.
+    Client(ClientEvent),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,11 +45,12 @@ pub(crate) enum RunMode {
 }
 
 pub(crate) struct CallRunner {
-    inner: Arc<ServiceInner>,
-    call: Arc<LiveCall>,
-    engine_call: Box<dyn EngineCall>,
+    pub(crate) inner: Arc<ServiceInner>,
+    pub(crate) call: Arc<LiveCall>,
+    pub(crate) engine_call: Box<dyn EngineCall>,
     cmd_rx: mpsc::Receiver<CallCommand>,
-    meter: BudgetMeter,
+    pub(crate) meter: BudgetMeter,
+    pub(crate) turn: TurnState,
     mode: RunMode,
     started: Instant,
     last_activity: Instant,
@@ -82,6 +86,7 @@ impl CallRunner {
             speaking: false,
             speech_start_ms: None,
             end_waiters: Vec::new(),
+            turn: TurnState::default(),
         }
     }
 
@@ -239,6 +244,7 @@ impl CallRunner {
         match event {
             EngineEvent::UserSpeechStarted { audio_start_ms } => {
                 self.speech_start_ms = audio_start_ms;
+                self.on_user_speech_started();
                 self.send(state_frame(Some(self.session_id()), "listening", None));
             }
             EngineEvent::UserSpeechStopped { audio_end_ms } => {
@@ -258,12 +264,18 @@ impl CallRunner {
                     let delta = self.meter.on_stt_seconds(seconds);
                     self.persist(&delta).await;
                 }
+                let user_final = (role == crate::engine::TranscriptRole::User && is_final).then(|| text.clone());
                 self.send(VoiceServerFrame::Caption(VoiceCaption {
                     voice_session_id: self.call.session_id.clone(),
                     role: role.as_str().to_owned(),
                     text,
                     is_final,
                 }));
+                if let Some(text) = user_final
+                    && !text.trim().is_empty()
+                {
+                    self.on_user_final(&text).await;
+                }
                 return self.check_budget();
             }
             EngineEvent::ResponseStarted { response_id } => {
@@ -307,9 +319,12 @@ impl CallRunner {
                 }));
                 self.send(state_frame(Some(self.session_id()), "listening", None));
             }
-            EngineEvent::ToolCall { name, .. } => {
-                // The tool runner arrives with S1b; S1a sessions declare no tools.
-                tracing::warn!(session_id = %self.call.session_id, tool = %name, "voice tool call ignored (no tools in this build)");
+            EngineEvent::ToolCall {
+                call_id,
+                name,
+                arguments,
+            } => {
+                self.on_tool_call(&call_id, &name, &arguments).await;
             }
             EngineEvent::ProviderError { code } => {
                 tracing::warn!(session_id = %self.call.session_id, code = %code, "voice provider error event");
@@ -376,6 +391,10 @@ impl CallRunner {
                 let _ = done.send(result);
                 None
             }
+            CallCommand::Client(event) => {
+                self.on_client(event).await;
+                None
+            }
             CallCommand::CreateResponse { done } => {
                 if self.meter.reserve_own().is_err() {
                     let _ = done.send(Err(VoiceError::BudgetReached));
@@ -392,6 +411,7 @@ impl CallRunner {
     }
 
     async fn on_tick(&mut self) -> Option<EndReason> {
+        self.tick_drafts().await;
         let timings = self.inner.timings;
         if let Some(token) = self.call.token()
             && self.last_revalidate.elapsed() >= timings.revalidate_every
@@ -424,7 +444,7 @@ impl CallRunner {
             device_frozen: frozen,
             response_in_flight: self.meter.has_in_flight(),
             assistant_speaking: self.speaking,
-            draft_pending: false,
+            draft_pending: self.draft_pending(),
         };
         tick_decision(&inputs, &timings)
     }
@@ -497,5 +517,6 @@ fn reject_not_ready(command: CallCommand) {
         CallCommand::SetCreateResponse { done, .. } | CallCommand::CreateResponse { done } => {
             let _ = done.send(Err(err()));
         }
+        CallCommand::Client(_) => {}
     }
 }

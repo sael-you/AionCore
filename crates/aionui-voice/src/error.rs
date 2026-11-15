@@ -20,6 +20,10 @@ pub enum VoiceError {
     NotFound(String),
     #[error("invalid request: {0}")]
     BadRequest(String),
+    #[error("forbidden: {0}")]
+    Forbidden(String),
+    #[error("rate limited")]
+    RateLimited,
     /// The provider refused or failed; the message never contains secrets.
     #[error("voice provider error: {0}")]
     Provider(String),

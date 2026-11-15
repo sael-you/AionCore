@@ -17,6 +17,7 @@ pub(crate) mod stt_stream_tls;
 
 /// Shared OpenAI/WebSocket plumbing reused by other provider clients (voice).
 pub use stt_openai::resolve_base_url as resolve_openai_base_url;
+pub use stt_openai::transcribe as transcribe_openai;
 pub use stt_stream_tls::build_ws_connector;
 
 pub use error::{ShellError, SttError};

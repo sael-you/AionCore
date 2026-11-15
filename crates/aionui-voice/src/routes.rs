@@ -53,6 +53,8 @@ impl From<VoiceError> for ApiError {
             ),
             VoiceError::NotFound(msg) => ApiError::NotFound(msg),
             VoiceError::BadRequest(msg) => ApiError::BadRequest(msg),
+            VoiceError::Forbidden(msg) => ApiError::Forbidden(msg),
+            VoiceError::RateLimited => ApiError::RateLimited,
             VoiceError::Provider(_) => ApiError::BadGateway("Voice provider unavailable.".into()),
             VoiceError::Internal(_) => ApiError::Internal("Voice service error.".into()),
         }
@@ -76,6 +78,7 @@ pub fn voice_routes(state: VoiceRouterState, guards: VoiceHttpGuards) -> Router 
         .route("/api/voice/settings", get(get_settings).put(put_settings))
         .route("/api/voice/status", get(status))
         .route("/api/voice/ws", get(voice_ws))
+        .route("/api/voice/readbacks/{id}", get(readback_clip))
         .merge(actions);
     guard_voice_router(routes, guards).with_state(state)
 }
@@ -150,6 +153,24 @@ async fn status(
     Extension(user): Extension<CurrentUser>,
 ) -> Result<Json<ApiResponse<VoiceStatusResponse>>, ApiError> {
     Ok(Json(ApiResponse::ok(state.service.status(&user.id).await?)))
+}
+
+/// Read-back / follow-up clip: single use, owner only, expires after 2 min.
+async fn readback_clip(
+    State(state): State<VoiceRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Response, ApiError> {
+    let clip = state
+        .service
+        .take_clip(&user.id, &id)
+        .ok_or_else(|| ApiError::NotFound("clip not found or expired".into()))?;
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(axum::http::header::CONTENT_TYPE, clip.mime)
+        .header(axum::http::header::CACHE_CONTROL, "no-store")
+        .body(axum::body::Body::from(clip.bytes))
+        .map_err(|_| ApiError::Internal("clip response failed".into()))
 }
 
 async fn voice_ws(

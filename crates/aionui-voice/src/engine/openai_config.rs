@@ -80,6 +80,19 @@ pub(crate) fn speak_exact(text: &str, max_output_tokens: u64) -> Value {
     })
 }
 
+pub(crate) fn function_call_output(call_id: &str, output: &str) -> Value {
+    json!({"type": "conversation.item.create", "item": {
+        "type": "function_call_output", "call_id": call_id, "output": output,
+    }})
+}
+
+/// Assistant text item (S0-A: "mirror the read-back as an assistant item").
+pub(crate) fn assistant_item(text: &str) -> Value {
+    json!({"type": "conversation.item.create", "item": {
+        "type": "message", "role": "assistant", "content": [{"type": "output_text", "text": text}],
+    }})
+}
+
 pub(crate) fn response_cancel() -> Value {
     json!({"type": "response.cancel"})
 }

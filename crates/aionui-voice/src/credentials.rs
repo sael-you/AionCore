@@ -89,6 +89,41 @@ impl CredentialPolicy {
     }
 }
 
+impl CredentialPolicy {
+    /// The user's MiniMax key for read-back speech: enabled row whose base URL
+    /// is an official MiniMax API host (`api.minimax.io`, `api.minimaxi.com`).
+    pub fn resolve_minimax(&self, credentials: &[ProviderCredential]) -> Option<ResolvedCredential> {
+        let chosen = credentials.iter().find(|cred| {
+            cred.enabled
+                && !cred.api_key.is_empty()
+                && (official_minimax_host(&cred.base_url).is_some()
+                    || (self.fake_provider_url.is_some() && cred.platform.eq_ignore_ascii_case("minimax")))
+        })?;
+        let base_url = match &self.fake_provider_url {
+            Some(fake) => fake.clone(),
+            None => format!("https://{}", official_minimax_host(&chosen.base_url)?),
+        };
+        Some(ResolvedCredential {
+            provider_id: chosen.provider_id.clone(),
+            base_url,
+            api_key: chosen.api_key.clone(),
+        })
+    }
+}
+
+/// `api.minimax.io` or `api.minimaxi.com` over https (any path), else `None`.
+fn official_minimax_host(raw: &str) -> Option<&'static str> {
+    let url = url::Url::parse(raw.trim()).ok()?;
+    if url.scheme() != "https" || url.port().is_some() || !url.username().is_empty() {
+        return None;
+    }
+    match url.host_str()? {
+        "api.minimax.io" => Some("api.minimax.io"),
+        "api.minimaxi.com" => Some("api.minimaxi.com"),
+        _ => None,
+    }
+}
+
 /// True for `https://api.openai.com`, optionally followed by `/` or `/v1`.
 fn is_official_openai_url(raw: &str) -> bool {
     let normalized = aionui_shell::resolve_openai_base_url(Some(raw));
@@ -176,6 +211,19 @@ mod tests {
             policy.resolve_openai(creds, Some("proxy")),
             Err(VoiceError::NoProvider)
         ));
+    }
+
+    #[test]
+    fn minimax_needs_an_official_host() {
+        let policy = CredentialPolicy::official_only();
+        let creds = vec![
+            cred("proxy", "custom", "https://minimax.proxy.example/v1", true, "k1"),
+            cred("mm", "custom", "https://api.minimaxi.com/v1", true, "k2"),
+        ];
+        let resolved = policy.resolve_minimax(&creds).unwrap();
+        assert_eq!(resolved.provider_id, "mm");
+        assert_eq!(resolved.base_url, "https://api.minimaxi.com");
+        assert!(policy.resolve_minimax(&creds[..1]).is_none());
     }
 
     #[test]

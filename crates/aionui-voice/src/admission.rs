@@ -44,6 +44,7 @@ pub(crate) struct RunnerStart {
     pub mode: RunMode,
     /// When the call started (hard cap / rotation clocks).
     pub started: Instant,
+    pub focus: Option<String>,
 }
 
 impl VoiceService {
@@ -93,7 +94,7 @@ impl VoiceService {
         }
 
         let profile = settings.call_profile();
-        let tools: Vec<Value> = Vec::new();
+        let tools: Vec<Value> = crate::tools::definitions();
         let used = self
             .inner
             .sessions
@@ -192,6 +193,7 @@ impl VoiceService {
             token,
             mode: RunMode::Fresh,
             started: Instant::now(),
+            focus: req.focus_conversation_id.clone(),
         });
         Ok(CreateVoiceSessionResponse {
             voice_session_id: session_id,
@@ -264,6 +266,7 @@ impl VoiceService {
                 frozen: false,
             }),
             token: std::sync::Mutex::new(start.token),
+            focus: start.focus,
         });
         self.inner.live.insert(start.session_id.clone(), call.clone());
         let runner = CallRunner::new(
@@ -350,7 +353,7 @@ impl VoiceService {
             .resolve_credential(&row.user_id, &settings)
             .await
             .map_err(|_| EndReason::Restart)?;
-        let tools: Vec<Value> = Vec::new();
+        let tools: Vec<Value> = crate::tools::definitions();
         let config = session_config(&settings.call_profile(), &row.model, tools.clone());
         let mut engine_call = self.inner.engine.resume(credential, call_id, config);
         if !settings.enabled {
@@ -379,6 +382,7 @@ impl VoiceService {
             token: None,
             mode: RunMode::Recovered,
             started: started_from_created_at(row.created_at),
+            focus: None,
         });
         Ok(())
     }

@@ -195,6 +195,13 @@ pub trait EngineCall: Send {
     /// Cancel the response in progress.
     async fn interrupt(&mut self) -> Result<(), EngineError>;
 
+    /// Answer a tool call (`call_id` from [`EngineEvent::ToolCall`]).
+    async fn tool_result(&mut self, call_id: &str, output: &str) -> Result<(), EngineError>;
+
+    /// Add an assistant text item to the model's context (e.g. the read-back
+    /// that was played as a local clip, so "change it to…" works).
+    async fn add_context(&mut self, text: &str) -> Result<(), EngineError>;
+
     /// Hang up the provider call. An already-ended call is not an error.
     async fn close(&mut self, reason: &str) -> Result<(), EngineError>;
 }

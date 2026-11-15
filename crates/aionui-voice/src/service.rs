@@ -6,22 +6,30 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use aionui_api_types::{UpdateVoiceSettingsRequest, VoiceSessionResponse, VoiceSettingsResponse, VoiceStatusResponse};
 use aionui_db::{
-    IVoiceAuditRepository, IVoiceSessionRepository, IVoiceSettingsRepository, NewVoiceAuditEntry, VoiceSessionRow,
+    IVoiceAuditRepository, IVoiceDraftRepository, IVoiceSessionRepository, IVoiceSettingsRepository,
+    NewVoiceAuditEntry, VoiceSessionRow,
 };
+use aionui_realtime::BroadcastEventBus;
 use dashmap::DashMap;
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, mpsc, oneshot};
 use tokio::time::Instant;
 
+use crate::agent::AskRegistry;
 use crate::budget::utc_day_start_ms;
+use crate::conversation_port::ConversationPort;
 use crate::credentials::CredentialPolicy;
+use crate::drafts::{DraftEngine, SpeechFactory};
 use crate::engine::VoiceEngine;
 use crate::error::VoiceError;
 use crate::frames::{VoiceSockets, call_ended_frame, error_frame};
 use crate::lifecycle::{EndReason, VoiceTimings};
 use crate::ports::{AuthRejected, AuthVerifier, CredentialPort, VerifiedUser};
+use crate::readback::{Clip, ClipStore};
 use crate::runner::CallCommand;
+use crate::runner_drafts::ClientEvent;
 use crate::settings::{VoiceSettings, micros_to_usd};
+use crate::tools::ToolRunner;
 
 const LIST_LIMIT: u32 = 50;
 
@@ -36,6 +44,10 @@ pub struct VoiceServiceDeps {
     pub verifier: Arc<dyn AuthVerifier>,
     pub sockets: VoiceSockets,
     pub timings: VoiceTimings,
+    /// S1b: conversations (tools, targets, sends), drafts storage, speech.
+    pub conversations: Arc<dyn ConversationPort>,
+    pub drafts: Arc<dyn IVoiceDraftRepository>,
+    pub speech: Arc<dyn SpeechFactory>,
 }
 
 /// Liveness the WebSocket reports for the device that owns a call (§3.8).
@@ -57,6 +69,8 @@ pub(crate) struct LiveCall {
     /// Session cookie the call re-validates every 60 s: the creating request's,
     /// or (recovered calls) the first socket's that binds the session.
     pub token: std::sync::Mutex<Option<String>>,
+    /// Conversation the user armed voice in (target when no name is said).
+    pub focus: Option<String>,
 }
 
 impl LiveCall {
@@ -90,6 +104,10 @@ pub(crate) struct ServiceInner {
     pub verifier: Arc<dyn AuthVerifier>,
     pub sockets: VoiceSockets,
     pub timings: VoiceTimings,
+    pub drafts: Arc<DraftEngine>,
+    pub tools: ToolRunner,
+    pub asks: AskRegistry,
+    pub say_limiter: aionui_auth::RateLimiter,
     pub live: DashMap<String, Arc<LiveCall>>,
     pub tasks: DashMap<String, tokio::task::AbortHandle>,
     /// Per-user admission lock: an admission, a resume and the kill switch of
@@ -144,8 +162,24 @@ pub struct VoiceService {
 
 impl VoiceService {
     pub fn new(deps: VoiceServiceDeps) -> Self {
+        let drafts = Arc::new(DraftEngine::new(
+            deps.drafts,
+            deps.conversations.clone(),
+            deps.speech,
+            ClipStore::default(),
+            deps.sockets.clone(),
+        ));
         Self {
             inner: Arc::new(ServiceInner {
+                drafts,
+                tools: ToolRunner {
+                    conversations: deps.conversations,
+                },
+                asks: AskRegistry::default(),
+                say_limiter: aionui_auth::RateLimiter::new(
+                    crate::agent::SAY_PER_MINUTE,
+                    std::time::Duration::from_secs(60),
+                ),
                 settings: deps.settings,
                 sessions: deps.sessions,
                 audit: deps.audit,
@@ -222,6 +256,8 @@ impl VoiceService {
         let lock = self.inner.user_lock(user_id);
         let _guard = lock.lock().await;
         let ended = self.end_user_calls(user_id, EndReason::Disabled).await;
+        let cancelled_drafts = self.inner.drafts.cancel_all_for_user(user_id).await;
+        self.inner.asks.cancel_user(user_id);
         let sockets = &self.inner.sockets;
         sockets.send_user(user_id, &error_frame(None, "VOICE_DISABLED", "Voice is turned off."));
         let closed = sockets.close_user(user_id, "voice disabled");
@@ -231,10 +267,10 @@ impl VoiceService {
                     user_id,
                     None,
                     "kill_switch",
-                    json!({"endedCalls": ended, "closedSockets": closed}),
+                    json!({"endedCalls": ended, "closedSockets": closed, "cancelledDrafts": cancelled_drafts}),
                 )
                 .await;
-            tracing::info!(user_id, ended, closed, "voice kill switch applied");
+            tracing::info!(user_id, ended, closed, cancelled_drafts, "voice kill switch applied");
         }
     }
 
@@ -427,6 +463,80 @@ impl VoiceService {
         }
     }
 
+    /// A client frame about drafts / clips. With a live call it goes to the
+    /// call's runner (evidence, hold); taps on a card without a live call act
+    /// on the draft directly (a confirmed hold is then sent by the worker).
+    pub(crate) async fn client_event(&self, user_id: &str, session_id: Option<&str>, event: ClientEvent) {
+        let call = session_id
+            .and_then(|id| self.inner.live.get(id).map(|c| c.clone()))
+            .filter(|c| c.user_id == user_id);
+        if let Some(call) = call {
+            let _ = call.cmd_tx.send(CallCommand::Client(event)).await;
+            return;
+        }
+        let drafts = &self.inner.drafts;
+        match event {
+            ClientEvent::ConfirmTap {
+                draft_id,
+                version,
+                hash,
+            } => {
+                if let Ok(Some(row)) = drafts.repo.get_draft(user_id, &draft_id, version).await {
+                    drafts.confirm(&row, Some(&hash)).await;
+                }
+            }
+            ClientEvent::CancelTap { draft_id, version } => {
+                if let Ok(Some(row)) = drafts.repo.get_draft(user_id, &draft_id, version).await {
+                    drafts.cancel(&row).await;
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// `GET /api/voice/readbacks/{id}`: single use, owner only, 2 min.
+    pub fn take_clip(&self, user_id: &str, clip_id: &str) -> Option<Clip> {
+        self.inner.drafts.clips.take(user_id, clip_id)
+    }
+
+    pub(crate) fn has_live_call(&self, user_id: &str) -> bool {
+        self.inner.live.iter().any(|c| c.user_id == user_id)
+    }
+
+    /// Start the draft worker and the follow-up watcher (called once by the app).
+    pub fn start_background(&self, bus: Arc<BroadcastEventBus>) {
+        crate::drafts::DraftWorker {
+            engine: self.inner.drafts.clone(),
+            live: Arc::new(self.clone()),
+            owner: aionui_common::generate_prefixed_id("vw"),
+            started_at_ms: aionui_common::now_ms(),
+            wake: Arc::new(tokio::sync::Notify::new()),
+        }
+        .spawn();
+        crate::followup::FollowUpWatcher::new(
+            bus,
+            self.inner.drafts.clone(),
+            self.inner.sockets.clone(),
+            Arc::new(self.clone()),
+        )
+        .spawn();
+    }
+
+    /// Test seam: one draft-worker pass as if this process started at
+    /// `started_at_ms` (recovery tests).
+    #[cfg(feature = "voice-test")]
+    pub async fn run_draft_sweep(&self, recovery: bool, started_at_ms: i64) {
+        crate::drafts::DraftWorker {
+            engine: self.inner.drafts.clone(),
+            live: Arc::new(self.clone()),
+            owner: aionui_common::generate_prefixed_id("vw"),
+            started_at_ms,
+            wake: Arc::new(tokio::sync::Notify::new()),
+        }
+        .sweep(recovery)
+        .await;
+    }
+
     pub async fn verify_token(&self, token: &str) -> Result<VerifiedUser, AuthRejected> {
         self.inner.verifier.verify(token).await
     }
@@ -481,5 +591,17 @@ pub(crate) fn session_response(row: VoiceSessionRow) -> VoiceSessionResponse {
         responses: row.responses,
         unknown_responses: row.unknown_responses,
         cost_usd: micros_to_usd(row.cost_micros),
+    }
+}
+
+impl crate::drafts::LiveSessions for VoiceService {
+    fn is_live(&self, session_id: &str) -> bool {
+        self.inner.live.contains_key(session_id)
+    }
+}
+
+impl crate::followup::CallPresence for VoiceService {
+    fn has_live_call(&self, user_id: &str) -> bool {
+        VoiceService::has_live_call(self, user_id)
     }
 }

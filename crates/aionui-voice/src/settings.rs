@@ -120,6 +120,15 @@ impl VoiceSettings {
             .unwrap_or(true)
     }
 
+    /// Conversations allowed to `say`/`ask` without a voice send first (opt-in).
+    pub fn agent_conversations(&self) -> Vec<String> {
+        self.extra_json()
+            .get("agent_voice_conversations")
+            .and_then(serde_json::Value::as_array)
+            .map(|items| items.iter().filter_map(|v| v.as_str().map(str::to_owned)).collect())
+            .unwrap_or_default()
+    }
+
     fn set_extra(&mut self, key: &str, value: serde_json::Value) {
         let mut extra = self.extra_json();
         extra.insert(key.to_owned(), value);
