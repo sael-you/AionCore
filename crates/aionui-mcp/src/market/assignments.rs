@@ -72,7 +72,11 @@ impl McpMarketService {
                 }
             }
         }
+        let mut seen = std::collections::HashSet::new();
         for cli in &req.clis {
+            if !seen.insert(cli.as_str()) {
+                problems.push(format!("cli \"{cli}\" is listed more than once"));
+            }
             if !CLIS.contains(&cli.as_str()) {
                 problems.push(format!("cli \"{cli}\" is not one of {}", CLIS.join(",")));
             } else if !inst.clis.contains(cli) {
@@ -100,25 +104,29 @@ impl McpMarketService {
         }
         super::service::reject(problems)?;
 
-        if let (Some(assistant_id), Some(binder)) = (assistant, &self.binder) {
-            binder
-                .bind(user_id, assistant_id, &inst.row.id)
-                .await
-                .map_err(|e| invalid(format!("assistant binding failed: {e}")))?;
-        }
-        let mut created = Vec::new();
-        for cli in &req.clis {
-            let row = self
-                .repo
-                .create_assignment(&CreateAssignmentParams {
-                    user_id,
-                    instance_id: &inst.row.id,
-                    project_id: project,
-                    assistant_id: assistant,
-                    cli,
-                })
-                .await?;
-            created.push(row);
+        // All rows in one transaction (a duplicate leaves none, TASK-73); the
+        // assistant binding only after the commit, undone rows if it fails.
+        let params: Vec<CreateAssignmentParams<'_>> = req
+            .clis
+            .iter()
+            .map(|cli| CreateAssignmentParams {
+                user_id,
+                instance_id: &inst.row.id,
+                project_id: project,
+                assistant_id: assistant,
+                cli,
+            })
+            .collect();
+        let created = self.repo.create_assignments(&params).await?;
+        if let (Some(assistant_id), Some(binder)) = (assistant, &self.binder)
+            && let Err(e) = binder.bind(user_id, assistant_id, &inst.row.id).await
+        {
+            for row in &created {
+                if let Err(undo) = self.repo.delete_assignment(user_id, &row.id).await {
+                    warn!(assignment = %row.id, error = %undo, "mcp market: could not undo an assignment after a failed binding");
+                }
+            }
+            return Err(invalid(format!("assistant binding failed: {e}")));
         }
         info!(instance = %name, project = project.unwrap_or("global"), assistant = assistant.unwrap_or("-"), count = created.len(), "mcp market: assignments created");
         let names = self.instance_names(user_id).await?;

@@ -3,7 +3,7 @@
 use axum::Router;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Extension, Json, Path, State};
-use axum::http::StatusCode;
+use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 
@@ -12,7 +12,7 @@ use aionui_api_types::{
     McpConnectionTestErrorCode, McpServerResponse, OAuthCheckStatusRequest, OAuthLoginRequest, OAuthLoginResponse,
     OAuthLogoutRequest, OAuthStatusResponse, TestMcpConnectionRequest, UpdateMcpServerRequest,
 };
-use aionui_auth::CurrentUser;
+use aionui_auth::{AuthChannel, CurrentUser, RUNTIME_TOKEN_HEADER};
 use aionui_common::ApiError;
 
 use crate::connection_test::McpConnectionTestService;
@@ -200,6 +200,8 @@ async fn batch_import(
 async fn test_connection(
     State(state): State<McpRouterState>,
     Extension(user): Extension<CurrentUser>,
+    channel: Option<Extension<AuthChannel>>,
+    headers: HeaderMap,
     body: Result<Json<TestMcpConnectionRequest>, JsonRejection>,
 ) -> Result<Response, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
@@ -211,6 +213,22 @@ async fn test_connection(
             .map_err(crate::market_routes::market_api_error)?,
         None => false,
     };
+    // Testing a market row starts it with its decrypted secrets: the owner's
+    // browser only, never an agent on the runtime-token channel (also refused
+    // when the header is present in local identity, where every caller is
+    // `Local`) (TASK-70).
+    let runtime_caller = matches!(
+        channel.as_ref().map(|Extension(c)| c),
+        Some(AuthChannel::RuntimeToken { .. })
+    ) || headers.contains_key(RUNTIME_TOKEN_HEADER);
+    if market_row && runtime_caller {
+        return Err(ApiError::coded(
+            StatusCode::FORBIDDEN,
+            "MCP_MARKET_SESSION_REQUIRED",
+            "Testing an MCP market instance needs the owner's browser session; agents cannot start it",
+            None,
+        ));
+    }
     let transport = match req.id.as_deref() {
         // R1 #12: a market row is tested with its template command, plain env and
         // decrypted secrets; the client-supplied transport is ignored.
@@ -230,19 +248,31 @@ async fn test_connection(
             {
                 crate::secret_mask::unmask_transport(&mut transport, &stored);
             }
+            // A masked value that could not be restored (changed command or
+            // host) is refused, never sent as "•••" or as the stored secret.
+            if crate::secret_mask::transport_contains_mask(&transport) {
+                return Err(crate::McpError::MaskedValue(
+                    "a value is masked (\"•••\"); enter the real value".to_owned(),
+                )
+                .into());
+            }
             transport
         }
         None => McpServerTransport::from(req.transport),
     };
-    let result = state
-        .connection_test_service
-        .test_connection_with_runtime_scope(
-            &req.name,
-            &transport,
-            Some(&user.id),
-            req.runtime_scope_id.as_deref().or(req.id.as_deref()),
-        )
-        .await;
+    let scope = req.runtime_scope_id.as_deref().or(req.id.as_deref());
+    let result = if market_row {
+        // The launcher's env only, never AionCore's own (TASK-70).
+        state
+            .connection_test_service
+            .test_market_connection(&req.name, &transport, Some(&user.id), scope)
+            .await
+    } else {
+        state
+            .connection_test_service
+            .test_connection_with_runtime_scope(&req.name, &transport, Some(&user.id), scope)
+            .await
+    };
     if let Some(server_id) = req.id.as_deref() {
         state
             .config_service
