@@ -230,6 +230,14 @@ async fn test_connection(
             {
                 crate::secret_mask::unmask_transport(&mut transport, &stored);
             }
+            // A masked value that could not be restored (changed command or
+            // host) is refused, never sent as "•••" or as the stored secret.
+            if crate::secret_mask::transport_contains_mask(&transport) {
+                return Err(crate::McpError::MaskedValue(
+                    "a value is masked (\"•••\"); enter the real value".to_owned(),
+                )
+                .into());
+            }
             transport
         }
         None => McpServerTransport::from(req.transport),
