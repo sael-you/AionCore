@@ -731,7 +731,7 @@ async fn a_page_that_connects_late_gets_the_pending_draft_card() {
     ws_send(
         &mut c.ws,
         json!({"name": "voice.cancelTap", "data": {"voiceSessionId": c.session, "draftId": id,
-            "version": draft["version"]}}),
+            "version": draft["version"], "hash": draft["hash"]}}),
     )
     .await;
     c.wait_state(&id, draft["version"].as_i64().unwrap(), "cancelled").await;
