@@ -34,6 +34,10 @@ pub struct AppServices {
     pub jwt_service: Arc<JwtService>,
     pub user_repo: Arc<dyn IUserRepository>,
     pub cookie_config: Arc<CookieConfig>,
+    /// Trusted browser origins (`AIONUI_PUBLIC_ORIGIN`,
+    /// `AIONUI_ALLOWED_ORIGINS`): CORS allow-list, unsafe-method and
+    /// WebSocket origin checks in non-local modes (card C11).
+    pub origin_policy: Arc<aionui_auth::OriginPolicy>,
     pub qr_token_store: Arc<QrTokenStore>,
     pub ws_manager: Arc<WebSocketManager>,
     pub event_bus: Arc<BroadcastEventBus>,
@@ -442,7 +446,8 @@ impl AppServices {
             jwt_service: Arc::new(JwtService::new(secret.clone())),
             antigravity_hook_tokens,
             user_repo,
-            cookie_config: Arc::new(CookieConfig::from_env()),
+            cookie_config: Arc::new(CookieConfig::for_identity(identity_mode == IdentityMode::WebUi)),
+            origin_policy: Arc::new(aionui_auth::OriginPolicy::from_env()),
             qr_token_store: Arc::new(QrTokenStore::new()),
             ws_manager: Arc::new(WebSocketManager::new()),
             event_bus,

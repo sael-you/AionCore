@@ -10,7 +10,6 @@ use aionui_ai_agent::{AgentRouterState, AgentService, IWorkerTaskManager, Remote
 use aionui_assistant::{
     AssistantAgentCatalogPort, AssistantError, AssistantRouterState, AssistantService, BuiltinAssistantRegistry,
 };
-use aionui_auth::extract_token_from_ws_headers;
 use aionui_board::BoardRouterState;
 use aionui_channel::ChannelRouterState;
 use aionui_common::AgentKillReason;
@@ -1221,8 +1220,10 @@ pub fn build_ws_state(services: &AppServices, router: Arc<dyn MessageRouter>) ->
         };
     }
 
+    // Only access tokens open a WebSocket (C11 change 4): a refresh token is
+    // accepted at the refresh endpoint alone.
     let jwt_service = services.jwt_service.clone();
-    let token_validator = Arc::new(move |token: &str| jwt_service.verify(token).is_ok());
+    let token_validator = Arc::new(move |token: &str| jwt_service.verify_access(token).is_ok());
     let jwt_service = services.jwt_service.clone();
     let user_repo = services.user_repo.clone();
     let identity_mode = services.identity_mode;
@@ -1230,7 +1231,7 @@ pub fn build_ws_state(services: &AppServices, router: Arc<dyn MessageRouter>) ->
         let jwt_service = jwt_service.clone();
         let user_repo = user_repo.clone();
         Box::pin(async move {
-            let payload = jwt_service.verify(&token).ok()?;
+            let payload = jwt_service.verify_access(&token).ok()?;
             let user = user_repo.find_active_by_id(&payload.user_id).await.ok()??;
             if identity_mode == IdentityMode::AionPro && user.user_type != aionui_db::UserType::Aionpro {
                 return None;
@@ -1239,7 +1240,9 @@ pub fn build_ws_state(services: &AppServices, router: Arc<dyn MessageRouter>) ->
         })
     });
 
-    let token_extractor = Arc::new(|headers: &axum::http::HeaderMap| extract_token_from_ws_headers(headers));
+    let session_cookie = services.cookie_config.names.session;
+    let token_extractor =
+        Arc::new(move |headers: &axum::http::HeaderMap| aionui_auth::extract_ws_token_named(headers, session_cookie));
 
     WsHandlerState {
         manager: services.ws_manager.clone(),
