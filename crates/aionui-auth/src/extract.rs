@@ -93,6 +93,26 @@ pub fn extract_cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
     None
 }
 
+/// Every non-empty value of a named cookie, in header order (a tossed cookie
+/// from a sibling domain can share the name of the real one).
+pub fn extract_cookie_values(headers: &HeaderMap, name: &str) -> Vec<String> {
+    let mut values = Vec::new();
+    for cookie_header in headers.get_all(header::COOKIE) {
+        let Ok(cookie_header) = cookie_header.to_str() else {
+            continue;
+        };
+        for part in cookie_header.split(';') {
+            if let Some((key, value)) = part.trim().split_once('=')
+                && key.trim() == name
+                && !value.trim().is_empty()
+            {
+                values.push(value.trim().to_owned());
+            }
+        }
+    }
+    values
+}
+
 /// Extract the bearer token from the `Authorization` header.
 fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {
     let auth = headers.get(header::AUTHORIZATION)?.to_str().ok()?;

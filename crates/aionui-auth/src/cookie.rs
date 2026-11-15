@@ -44,15 +44,26 @@ pub struct CookieConfig {
 }
 
 impl CookieConfig {
-    /// Cookie config for an identity mode: like [`from_env`](Self::from_env),
-    /// plus prefixed names when `webui` is set and cookies are `Secure` (the
-    /// prefixes require it).
-    pub fn for_identity(webui: bool) -> Self {
-        let mut config = Self::from_env();
-        if webui && config.secure {
-            config.names = CookieNames::PREFIXED;
+    /// Cookie config for an identity mode: `https` sets `Secure` and
+    /// `SameSite=Strict`; webui over HTTPS also switches to the prefixed
+    /// names (the prefixes require `Secure`).
+    pub fn for_identity(webui: bool, https: bool) -> Self {
+        Self {
+            secure: https,
+            same_site: if https { "Strict" } else { "Lax" },
+            names: if webui && https {
+                CookieNames::PREFIXED
+            } else {
+                CookieNames::LEGACY
+            },
         }
-        config
+    }
+
+    /// Whether `AIONUI_HTTPS=true` is set.
+    pub fn https_from_env() -> bool {
+        std::env::var("AIONUI_HTTPS")
+            .map(|v| v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
     }
 
     /// Create cookie config from environment variables.
@@ -60,14 +71,7 @@ impl CookieConfig {
     /// - `AIONUI_HTTPS=true` → Secure flag, SameSite=Strict
     /// - Otherwise → no Secure flag, SameSite=Lax (for remote HTTP access)
     pub fn from_env() -> Self {
-        let https = std::env::var("AIONUI_HTTPS")
-            .map(|v| v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
-        Self {
-            secure: https,
-            same_site: if https { "Strict" } else { "Lax" },
-            names: CookieNames::LEGACY,
-        }
+        Self::for_identity(false, Self::https_from_env())
     }
 
     /// Build `Set-Cookie` header value for the session token.

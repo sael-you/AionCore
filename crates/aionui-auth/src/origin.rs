@@ -47,7 +47,92 @@ pub fn normalize_origin(raw: &str) -> Option<String> {
     }
 }
 
+/// Parse one configured origin strictly: `scheme://host[:port]` with scheme
+/// `http`/`https`, no path, query, fragment or user info (a single trailing
+/// `/` is tolerated). `null` and `*` are refused. Returns the normalised
+/// (lower-case) origin.
+pub fn parse_origin(raw: &str) -> Result<String, String> {
+    let value = raw.trim();
+    let value = value.strip_suffix('/').unwrap_or(value);
+    if value == "null" || value == "*" {
+        return Err(format!(
+            "origin `{value}` is not allowed (use an explicit scheme://host[:port])"
+        ));
+    }
+    let Some((scheme, authority)) = value.split_once("://") else {
+        return Err(format!("origin `{value}` must look like scheme://host[:port]"));
+    };
+    let scheme = scheme.to_ascii_lowercase();
+    if scheme != "http" && scheme != "https" {
+        return Err(format!("origin `{value}`: the scheme must be http or https"));
+    }
+    if authority.is_empty()
+        || authority
+            .chars()
+            .any(|c| matches!(c, '/' | '?' | '#' | '@' | '*' | ',') || c.is_whitespace())
+    {
+        return Err(format!(
+            "origin `{value}` must be scheme://host[:port] without path, query or user info"
+        ));
+    }
+    let (host, port) = if let Some(rest) = authority.strip_prefix('[') {
+        let Some((host, after)) = rest.split_once(']') else {
+            return Err(format!("origin `{value}`: unterminated IPv6 host"));
+        };
+        (host, after.strip_prefix(':'))
+    } else {
+        match authority.rsplit_once(':') {
+            Some((host, port)) => (host, Some(port)),
+            None => (authority, None),
+        }
+    };
+    if host.is_empty() || (host.contains(':') && !authority.starts_with('[')) {
+        return Err(format!("origin `{value}`: invalid host"));
+    }
+    if let Some(port) = port
+        && !port.parse::<u16>().is_ok_and(|port| port > 0)
+    {
+        return Err(format!("origin `{value}`: invalid port"));
+    }
+    Ok(format!("{scheme}://{}", authority.to_ascii_lowercase()))
+}
+
 impl OriginPolicy {
+    /// Strict construction for startup: every value must pass
+    /// [`parse_origin`]; blanks in the comma-separated list are skipped.
+    pub fn parse(public_origin: Option<&str>, allowed_origins: &str) -> Result<Self, String> {
+        let public_origin = match public_origin.map(str::trim).filter(|value| !value.is_empty()) {
+            Some(value) => Some(parse_origin(value).map_err(|error| format!("{PUBLIC_ORIGIN_ENV}: {error}"))?),
+            None => None,
+        };
+        let mut allowed = Vec::new();
+        for raw in allowed_origins.split(',').filter(|value| !value.trim().is_empty()) {
+            let origin = parse_origin(raw).map_err(|error| format!("{ALLOWED_ORIGINS_ENV}: {error}"))?;
+            if !allowed.contains(&origin) {
+                allowed.push(origin);
+            }
+        }
+        Ok(Self {
+            public_origin,
+            allowed_origins: allowed,
+        })
+    }
+
+    /// [`parse`](Self::parse) from [`PUBLIC_ORIGIN_ENV`] and
+    /// [`ALLOWED_ORIGINS_ENV`].
+    pub fn from_env_strict() -> Result<Self, String> {
+        let public = std::env::var(PUBLIC_ORIGIN_ENV).ok();
+        let allowed = std::env::var(ALLOWED_ORIGINS_ENV).unwrap_or_default();
+        Self::parse(public.as_deref(), &allowed)
+    }
+
+    /// Whether the public origin is served over HTTPS.
+    pub fn public_is_https(&self) -> bool {
+        self.public_origin
+            .as_deref()
+            .is_some_and(|origin| origin.starts_with("https://"))
+    }
+
     pub fn new(public_origin: Option<&str>, allowed_origins: &[&str]) -> Self {
         let mut allowed: Vec<String> = Vec::new();
         for origin in allowed_origins.iter().filter_map(|o| normalize_origin(o)) {
@@ -106,6 +191,10 @@ impl OriginPolicy {
     /// not trusted, or when `Sec-Fetch-Site` is `cross-site`/`same-site` and
     /// `Origin` is not trusted.
     pub fn allows_websocket(&self, headers: &HeaderMap) -> bool {
+        // Same rule order as writes: a same-origin browser upgrade passes.
+        if matches!(fetch_site(headers), Some("same-origin" | "none")) {
+            return true;
+        }
         let origin = self.origin_trusted(headers);
         if origin == Some(false) {
             return false;
@@ -151,9 +240,29 @@ pub async fn websocket_origin_middleware(
     Ok(next.run(request).await)
 }
 
-/// Whether a method changes state (CSRF and change 3b apply).
+/// Whether a method may change state (CSRF and change 3b apply): every
+/// method except GET, HEAD and OPTIONS.
 pub fn is_unsafe_method(method: &Method) -> bool {
-    matches!(*method, Method::POST | Method::PUT | Method::DELETE | Method::PATCH)
+    !matches!(*method, Method::GET | Method::HEAD | Method::OPTIONS)
+}
+
+impl OriginPolicy {
+    /// Review B-L3 — a cross-site/same-site browser `fetch` of a GET API (not
+    /// a top-level navigation) needs a trusted `Origin`: side-effect GETs
+    /// (e.g. a channel login kick-off) must not be triggerable from a
+    /// sibling dev server. No `Sec-Fetch-Site` = not a browser = allowed.
+    pub fn allows_safe_api_request(&self, headers: &HeaderMap) -> bool {
+        match fetch_site(headers) {
+            Some("cross-site" | "same-site") => {
+                let navigation = headers
+                    .get("sec-fetch-mode")
+                    .and_then(|value| value.to_str().ok())
+                    .is_some_and(|mode| mode.eq_ignore_ascii_case("navigate"));
+                navigation || self.origin_trusted(headers) == Some(true)
+            }
+            _ => true,
+        }
+    }
 }
 
 #[cfg(test)]
@@ -206,6 +315,61 @@ mod tests {
         assert!(p.allows_unsafe_request(&headers(&[("origin", "https://y.talkseeds.com")])));
         assert!(!p.allows_unsafe_request(&headers(&[("origin", "https://evil.example")])));
         assert!(!p.allows_unsafe_request(&headers(&[("origin", "null")])));
+    }
+
+    #[test]
+    fn startup_parsing_is_strict() {
+        assert_eq!(
+            parse_origin("HTTPS://Y.talkseeds.com/").unwrap(),
+            "https://y.talkseeds.com"
+        );
+        assert_eq!(parse_origin("http://localhost:5173").unwrap(), "http://localhost:5173");
+        assert_eq!(parse_origin("http://[::1]:8080").unwrap(), "http://[::1]:8080");
+        for bad in [
+            "null",
+            "*",
+            "y.talkseeds.com",
+            "ftp://x",
+            "https://x/path",
+            "https://x?q",
+            "https://u@x",
+            "https://x:0",
+            "https://x:99999",
+            "https://",
+            "https://*.example",
+        ] {
+            assert!(parse_origin(bad).is_err(), "{bad}");
+        }
+        assert!(OriginPolicy::parse(Some("null"), "").is_err());
+        assert!(OriginPolicy::parse(None, "https://a, *").is_err());
+        let policy = OriginPolicy::parse(Some("https://y.talkseeds.com"), " https://a ,,https://a/").unwrap();
+        assert_eq!(policy.allowed_origins, ["https://a"]);
+        assert!(policy.public_is_https());
+    }
+
+    #[test]
+    fn cross_site_api_fetches_need_a_trusted_origin() {
+        let p = policy();
+        assert!(p.allows_safe_api_request(&headers(&[])), "not a browser");
+        assert!(p.allows_safe_api_request(&headers(&[("sec-fetch-site", "same-origin")])));
+        assert!(!p.allows_safe_api_request(&headers(&[
+            ("sec-fetch-site", "same-site"),
+            ("sec-fetch-mode", "no-cors")
+        ])));
+        assert!(!p.allows_safe_api_request(&headers(&[
+            ("sec-fetch-site", "cross-site"),
+            ("origin", "https://evil.example")
+        ])));
+        assert!(p.allows_safe_api_request(&headers(&[
+            ("sec-fetch-site", "cross-site"),
+            ("sec-fetch-mode", "navigate")
+        ])));
+        assert!(p.allows_safe_api_request(&headers(&[
+            ("sec-fetch-site", "cross-site"),
+            ("origin", "https://app.example")
+        ])));
+        assert!(is_unsafe_method(&Method::from_bytes(b"PROPFIND").unwrap()));
+        assert!(!is_unsafe_method(&Method::OPTIONS));
     }
 
     #[test]

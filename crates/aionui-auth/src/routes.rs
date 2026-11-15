@@ -24,7 +24,7 @@ use aionui_common::constants::COOKIE_MAX_AGE_DAYS;
 use aionui_db::{DbError, IUserRepository, UserStatus, UserType, models::User};
 
 use crate::error::AuthError;
-use crate::extract::{extract_cookie_value, extract_token_named};
+use crate::extract::{extract_cookie_value, extract_cookie_values, extract_token_named};
 use crate::middleware::{AuthIdentityMode, AuthState, CurrentUser, auth_middleware};
 use crate::password::{dummy_password_hash, generate_password, hash_password, verify_password_timed};
 use crate::qr_token::QrTokenStore;
@@ -832,7 +832,20 @@ async fn refresh_handler(
 ) -> Result<Response, ApiError> {
     // Prefer the HttpOnly refresh cookie; fall back to the request body for
     // legacy clients that posted the token explicitly.
-    let (raw_token, from_cookie) = match extract_cookie_value(&headers, state.cookie_config.names.refresh) {
+    // Webui (C11 L2/L3): several cookies may carry the refresh name (one
+    // tossed from a sibling domain), so use the first that verifies as a
+    // refresh token. Local and AionPro modes keep the first-cookie read.
+    let cookie_token = if !state.local && !state.aionpro_mode {
+        let candidates = extract_cookie_values(&headers, state.cookie_config.names.refresh);
+        candidates
+            .iter()
+            .find(|token| state.jwt_service.verify_refresh(token).is_ok())
+            .or(candidates.first())
+            .cloned()
+    } else {
+        extract_cookie_value(&headers, state.cookie_config.names.refresh)
+    };
+    let (raw_token, from_cookie) = match cookie_token {
         Some(cookie_token) => (cookie_token, true),
         None => {
             let Json(req) = body.map_err(ApiError::from)?;
@@ -868,9 +881,9 @@ async fn refresh_handler(
 /// Verify a refresh request and mint a fresh access + refresh token pair.
 ///
 /// A refresh token is required (`verify_refresh`) on both the cookie and the
-/// body path (card C11, change 3c: an access token posted in the body no
-/// longer refreshes). Local mode keeps the historical lenient body path
-/// (no behaviour change there). Runs behind [`RefreshCoalescer`] so an expiry storm
+/// body path in webui mode (card C11, change 3c: an access token posted in
+/// the body no longer refreshes). Local and AionPro modes keep the historical
+/// lenient body path. Runs behind [`RefreshCoalescer`] so an expiry storm
 /// collapses into a single execution — hence the crate-owned [`RefreshError`]:
 /// it is `Clone`, so one execution's outcome (success *or* failure) can be
 /// shared by every coalesced caller, and the route layer maps it to `ApiError`.
@@ -879,7 +892,8 @@ async fn refresh_tokens(
     raw_token: &str,
     from_cookie: bool,
 ) -> Result<RefreshedTokens, RefreshError> {
-    let payload = if from_cookie || !state.local {
+    let webui = !state.local && !state.aionpro_mode;
+    let payload = if from_cookie || webui {
         state.jwt_service.verify_refresh(raw_token)
     } else {
         state.jwt_service.verify(raw_token)

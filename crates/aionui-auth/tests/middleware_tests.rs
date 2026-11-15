@@ -20,7 +20,7 @@ use aionui_db::{IUserRepository, SqliteUserRepository, UserStatus, UserType, ini
 fn csrf_state(cookie_config: Arc<CookieConfig>) -> aionui_auth::CsrfState {
     aionui_auth::CsrfState {
         cookie_config,
-        origin_policy: Arc::new(aionui_auth::OriginPolicy::default()),
+        origin_policy: Some(Arc::new(aionui_auth::OriginPolicy::default())),
     }
 }
 
@@ -889,7 +889,7 @@ fn csrf_app_with_policy(policy: aionui_auth::OriginPolicy) -> Router {
             same_site: "Lax",
             names: aionui_auth::CookieNames::LEGACY,
         }),
-        origin_policy: Arc::new(policy),
+        origin_policy: Some(Arc::new(policy)),
     };
     Router::new()
         .route("/api/thing", post(|| async { "ok" }))
@@ -1007,4 +1007,119 @@ async fn c11_6_prefixed_names_ignore_a_tossed_unprefixed_session_cookie() {
         .await
         .unwrap();
     assert_eq!(real.status(), StatusCode::OK);
+}
+
+fn csrf_app_with(names: aionui_auth::CookieNames, policy: Option<aionui_auth::OriginPolicy>) -> Router {
+    let state = aionui_auth::CsrfState {
+        cookie_config: Arc::new(CookieConfig {
+            secure: true,
+            same_site: "Lax",
+            names,
+        }),
+        origin_policy: policy.map(Arc::new),
+    };
+    Router::new()
+        .route("/api/thing", post(|| async { "ok" }).get(|| async { "read" }))
+        .layer(middleware::from_fn_with_state(state, csrf_middleware))
+}
+
+#[tokio::test]
+async fn c11_6_prefixed_csrf_ignores_a_tossed_legacy_csrf_cookie() {
+    let app = csrf_app_with(
+        aionui_auth::CookieNames::PREFIXED,
+        Some(aionui_auth::OriginPolicy::default()),
+    );
+    let post_with = |cookie: &str| {
+        Request::post("/api/thing")
+            .header("cookie", cookie)
+            .header("x-csrf-token", "tossed")
+            .body(Body::empty())
+            .unwrap()
+    };
+    // A sibling-domain cookie under the legacy name plus a matching header: refused.
+    let tossed = app
+        .clone()
+        .oneshot(post_with("aionui-csrf-token=tossed"))
+        .await
+        .unwrap();
+    assert_eq!(tossed.status(), StatusCode::FORBIDDEN);
+    assert_eq!(json_body(tossed).await["code"], "CSRF_INVALID");
+    // The real __Host- cookie with the matching header passes.
+    let real = app.oneshot(post_with("__Host-aionui-csrf-token=tossed")).await.unwrap();
+    assert_eq!(real.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn c11_l4_aionpro_csrf_keeps_upstream_behaviour() {
+    // `None` policy (AionPro): no origin rule, the runtime header alone still exempts.
+    let app = csrf_app_with(aionui_auth::CookieNames::LEGACY, None);
+    let cross_site = app
+        .clone()
+        .oneshot(
+            Request::post("/api/thing")
+                .header("sec-fetch-site", "cross-site")
+                .header("origin", "https://evil.example")
+                .header("cookie", "aionui-csrf-token=t")
+                .header("x-csrf-token", "t")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(cross_site.status(), StatusCode::OK);
+    let helper = app
+        .clone()
+        .oneshot(
+            Request::post("/api/thing")
+                .header("x-aionui-runtime-token", "junk")
+                .header("cookie", "aionui-session=abc")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(helper.status(), StatusCode::OK);
+    let read = app
+        .oneshot(
+            Request::get("/api/thing")
+                .header("sec-fetch-site", "cross-site")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(read.status(), StatusCode::OK);
+}
+
+#[tokio::test]
+async fn c11_b_l3_cross_site_api_reads_need_navigation_or_a_trusted_origin() {
+    let policy = aionui_auth::OriginPolicy::new(Some("https://app.example"), &["https://dev.example"]);
+    let app = csrf_app_with(aionui_auth::CookieNames::PREFIXED, Some(policy));
+    let get = |site: &str, mode: Option<&str>, origin: Option<&str>| {
+        let mut builder = Request::get("/api/thing").header("sec-fetch-site", site);
+        if let Some(mode) = mode {
+            builder = builder.header("sec-fetch-mode", mode);
+        }
+        if let Some(origin) = origin {
+            builder = builder.header("origin", origin);
+        }
+        builder.body(Body::empty()).unwrap()
+    };
+    for (site, mode, origin, expected) in [
+        ("same-origin", Some("cors"), None, StatusCode::OK),
+        ("none", Some("navigate"), None, StatusCode::OK),
+        ("cross-site", Some("navigate"), None, StatusCode::OK),
+        ("cross-site", Some("cors"), Some("https://dev.example"), StatusCode::OK),
+        ("same-site", Some("no-cors"), None, StatusCode::FORBIDDEN),
+        (
+            "cross-site",
+            Some("cors"),
+            Some("https://evil.example"),
+            StatusCode::FORBIDDEN,
+        ),
+        ("cross-site", None, None, StatusCode::FORBIDDEN),
+    ] {
+        let resp = app.clone().oneshot(get(site, mode, origin)).await.unwrap();
+        assert_eq!(resp.status(), expected, "{site} {mode:?} {origin:?}");
+    }
 }
