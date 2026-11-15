@@ -8,6 +8,31 @@ use crate::repository::voice::{
     NewVoiceAuditEntry, VoiceUsageDelta,
 };
 
+/// Live voice calls of every user, read from `db_path` read-only (no create,
+/// no migrations) — for `aioncore voice status` while AionCore runs.
+/// `Ok(None)` when the database predates the voice tables.
+pub async fn count_live_voice_calls_read_only(db_path: &std::path::Path) -> Result<Option<i64>, DbError> {
+    use sqlx::ConnectOptions;
+    use sqlx::sqlite::SqliteConnectOptions;
+    let mut conn = SqliteConnectOptions::new()
+        .filename(db_path)
+        .read_only(true)
+        .create_if_missing(false)
+        .connect()
+        .await?;
+    let has_table: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM sqlite_master WHERE type = 'table' AND name = 'voice_sessions'")
+            .fetch_one(&mut conn)
+            .await?;
+    if has_table == 0 {
+        return Ok(None);
+    }
+    let live: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM voice_sessions WHERE state IN ('starting', 'live')")
+        .fetch_one(&mut conn)
+        .await?;
+    Ok(Some(live))
+}
+
 /// Start of the UTC day containing `at` (epoch ms).
 fn utc_day_start(at: TimestampMs) -> TimestampMs {
     at - at.rem_euclid(86_400_000)

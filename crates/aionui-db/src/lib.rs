@@ -75,7 +75,7 @@ pub use repository::{
     SqliteCronRepository, SqliteFeedbackDiagnosticsRepository, SqliteMcpServerRepository, SqliteOAuthTokenRepository,
     SqliteProjectStore, SqliteProviderRepository, SqliteRemoteAgentRepository, SqliteSettingsRepository,
     SqliteSidebarStore, SqliteSkillRepository, SqliteTeamRepository, SqliteUserOrderStore, SqliteUserRepository,
-    SqliteVoiceRepository,
+    SqliteVoiceRepository, count_live_voice_calls_read_only,
 };
 
 // Re-export sqlx pool type for downstream crates

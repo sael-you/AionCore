@@ -96,7 +96,7 @@ pub use sqlite_skill::SqliteSkillRepository;
 pub use sqlite_team::SqliteTeamRepository;
 pub use sqlite_user::SqliteUserRepository;
 pub use sqlite_user_order::SqliteUserOrderStore;
-pub use sqlite_voice::SqliteVoiceRepository;
+pub use sqlite_voice::{SqliteVoiceRepository, count_live_voice_calls_read_only};
 pub use team::{ActivityCursor, ITeamRepository, PageDirection};
 pub use user::IUserRepository;
 pub use user_order::{IUserOrderStore, MoveOutcome, OrderItemRef, PinOutcome, PinnedCursor};

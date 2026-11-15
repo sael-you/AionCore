@@ -250,3 +250,18 @@ async fn audit_appends_and_lists_newest_first() {
         .await;
     assert!(bad.is_err(), "detail must be valid JSON");
 }
+
+#[tokio::test]
+async fn live_calls_are_counted_read_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("aionui-backend.db");
+    let db = crate::init_database(&path).await.unwrap();
+    seed_user(db.pool(), USER).await;
+    let repo = SqliteVoiceRepository::new(db.pool().clone());
+    repo.create_starting(params("vs_1", USER)).await.unwrap();
+    assert_eq!(super::count_live_voice_calls_read_only(&path).await.unwrap(), Some(1));
+    // Read-only: a missing file is an error, never created.
+    let missing = dir.path().join("missing.db");
+    assert!(super::count_live_voice_calls_read_only(&missing).await.is_err());
+    assert!(!missing.exists());
+}
