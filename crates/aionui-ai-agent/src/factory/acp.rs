@@ -135,7 +135,7 @@ pub(super) async fn build(
                 // MCP market: rows assigned to this conversation's (project,
                 // assistant, CLI) are rewritten to the launcher (R1 #4, R9).
                 mcp_market: Some(crate::mcp_resolve::McpMarketLaunch::new(
-                    deps.backend_binary_path.as_ref(),
+                    &aionui_mcp::market::launcher_program(),
                     &deps.data_dir,
                     config.preset_assistant_id.as_deref(),
                     backend_label,
@@ -230,7 +230,7 @@ pub(super) async fn build(
         Some(repo) => {
             let market = config.backend.as_deref().map(|cli| {
                 crate::mcp_resolve::McpMarketLaunch::new(
-                    deps.backend_binary_path.as_ref(),
+                    &aionui_mcp::market::launcher_program(),
                     &deps.data_dir,
                     config.preset_assistant_id.as_deref(),
                     cli,

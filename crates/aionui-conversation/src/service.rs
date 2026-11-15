@@ -5673,6 +5673,9 @@ fn upsert_conversation_mcp_status(
 }
 
 fn classify_repo_mcp_status(row: &aionui_db::models::McpServerRow, support: McpSupportPolicy) -> ConversationMcpStatus {
+    // A market row's placeholder transport is checked against the real launcher binary.
+    let row = aionui_mcp::market::resolve_placeholder_row(row);
+    let row = row.as_ref();
     if !support.supports_row_transport(&row.transport_type) {
         return ConversationMcpStatus {
             id: row.id.clone(),
@@ -6378,6 +6381,32 @@ mod tests {
             changed_assistant_mcp_fingerprint("fixed", &["mcp-b".to_owned()], Some(r#"["mcp-a"]"#)).unwrap();
 
         assert_eq!(fingerprint, None);
+    }
+
+    /// MCP market: the placeholder transport of a market row is checked against
+    /// the real launcher binary, so the row is never "failed" just because
+    /// `aioncore` is not on PATH.
+    #[test]
+    fn market_placeholder_row_is_loaded_not_failed() {
+        let row = McpServerRow {
+            id: "mcp-market".into(),
+            user_id: "user-1".into(),
+            name: "tb-market".into(),
+            description: None,
+            enabled: false,
+            transport_type: "stdio".into(),
+            transport_config: aionui_mcp::market::stored::placeholder_transport_config("tb-market"),
+            tools: None,
+            last_test_status: "disconnected".into(),
+            last_connected: None,
+            original_json: None,
+            builtin: false,
+            deleted_at: None,
+            created_at: 0,
+            updated_at: 0,
+        };
+        let status = classify_repo_mcp_status(&row, McpSupportPolicy::AIONRS);
+        assert_eq!(status.status, ConversationMcpStatusKind::Loaded, "{:?}", status.reason);
     }
 
     #[test]

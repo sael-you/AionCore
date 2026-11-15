@@ -44,7 +44,8 @@ impl McpAgentAdapter for AionuiAdapter {
 
         let mut servers = Vec::new();
         for row in rows {
-            let server = McpServer::from_row(row)?;
+            let mut server = McpServer::from_row(row)?;
+            crate::market::resolve_placeholder_transport(&mut server.transport);
             servers.push(DetectedServer {
                 name: server.name,
                 transport: server.transport,
