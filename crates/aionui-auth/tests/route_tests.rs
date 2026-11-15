@@ -806,6 +806,32 @@ async fn t9_3_refresh_missing_token() {
     assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
 }
 
+/// TASK-85: a browser with no session posts the silent refresh without a body
+/// (and so without a JSON content type): 401, not 415, in every identity.
+#[tokio::test]
+async fn refresh_without_cookie_or_body_is_unauthorized() {
+    for local in [false, true] {
+        let (app, _ctx) = test_app_with_local(local).await;
+        let bare = Request::builder()
+            .method("POST")
+            .uri("/api/auth/refresh")
+            .body(Body::empty())
+            .unwrap();
+        let resp = app.clone().oneshot(bare).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "local={local}");
+        assert_eq!(body_json(resp).await["code"], "UNAUTHORIZED");
+        // A body that is not JSON: the same, there is no token to refresh with.
+        let text = Request::builder()
+            .method("POST")
+            .uri("/api/auth/refresh")
+            .header("content-type", "text/plain")
+            .body(Body::from("x"))
+            .unwrap();
+        let resp = app.oneshot(text).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::UNAUTHORIZED, "local={local}");
+    }
+}
+
 #[tokio::test]
 async fn refresh_rejects_local_user_token_in_aionpro_mode() {
     let (app, ctx) = test_app_with_options_and_hook(false, Some("bootstrap-secret"), true, None).await;
