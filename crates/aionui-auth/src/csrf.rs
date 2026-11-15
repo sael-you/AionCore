@@ -13,7 +13,7 @@ use aionui_common::constants::{COOKIE_NAME, CSRF_HEADER_NAME};
 use axum::http::StatusCode;
 
 use crate::cookie::{CookieConfig, CookieNames};
-use crate::extract::{extract_bearer_token, extract_cookie_value};
+use crate::extract::{extract_bearer_token, extract_cookie_value, extract_cookie_values};
 use crate::origin::{OriginPolicy, is_unsafe_method};
 
 /// State of [`csrf_middleware`] (installed in non-local modes only).
@@ -95,8 +95,11 @@ pub async fn csrf_middleware(
     // Bearer changes nothing: the auth middleware authenticates the Bearer
     // and never falls back to the runtime channel. Webui only: AionPro keeps
     // the upstream behaviour, local identity has no CSRF layer at all.
-    let has_any_session_cookie = extract_cookie_value(headers, CookieNames::PREFIXED.session).is_some()
-        || extract_cookie_value(headers, CookieNames::LEGACY.session).is_some();
+    // Every `Cookie` header counts (HTTP/2 clients may send one per cookie),
+    // not only the first.
+    let has_any_session_cookie = [CookieNames::PREFIXED.session, CookieNames::LEGACY.session]
+        .into_iter()
+        .any(|name| !extract_cookie_values(headers, name).is_empty());
     let is_bearer_request =
         state.origin_policy.is_some() && extract_bearer_token(headers).is_some() && !has_any_session_cookie;
     // agy's PreToolUse callback. A local `aioncore antigravity-hook` process

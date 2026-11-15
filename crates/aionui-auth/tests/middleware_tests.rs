@@ -1190,6 +1190,30 @@ async fn c11_switch_bearer_with_a_session_cookie_still_needs_csrf() {
 }
 
 #[tokio::test]
+async fn c11_switch_a_session_cookie_in_a_later_cookie_header_still_needs_csrf() {
+    for names in [aionui_auth::CookieNames::LEGACY, aionui_auth::CookieNames::PREFIXED] {
+        let app = csrf_app_with(names, Some(aionui_auth::OriginPolicy::default()));
+        for session in ["__Host-aionui-session=s", "aionui-session=s"] {
+            // HTTP/2 lets a client split cookies over several `Cookie` headers.
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::post("/api/thing")
+                        .header("authorization", "Bearer some-jwt")
+                        .header("cookie", "theme=dark")
+                        .header("cookie", session)
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{names:?} {session}");
+            assert_eq!(json_body(resp).await["code"], "CSRF_INVALID");
+        }
+    }
+}
+
+#[tokio::test]
 async fn c11_switch_non_bearer_authorization_is_not_exempt() {
     let app = csrf_app_with(
         aionui_auth::CookieNames::PREFIXED,
