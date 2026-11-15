@@ -533,6 +533,13 @@ impl McpMarketService {
     /// env and the decrypted secrets; the client's transport is ignored.
     pub async fn test_transport(&self, user_id: &str, id: &str) -> Result<McpServerTransport, MarketError> {
         let inst = self.load(user_id, id).await?;
+        // A revoked instance never starts, not even for a test (TASK-70).
+        if inst.status == "revoked" {
+            return Err(MarketError::Forbidden(format!(
+                "\"{}\" is revoked; re-activate it before testing",
+                inst.row.name
+            )));
+        }
         let mut env: HashMap<String, String> = inst.plain_env.clone().into_iter().collect();
         for (key, value) in self.decrypt_instance_secrets(user_id, &inst).await? {
             env.insert(key, value);
