@@ -16,6 +16,9 @@ use super::engine::{DraftEngine, START_CHECK_MS};
 pub const WORKER_TICK: Duration = Duration::from_secs(2);
 /// Recovery sweep period (§3.3.7: startup and every 30 s).
 pub const RECOVERY_EVERY: Duration = Duration::from_secs(30);
+/// Retention purge period (transcripts 7 days, draft texts 30 days, §3.3.8).
+pub const PURGE_EVERY: Duration = Duration::from_secs(3600);
+const DRAFT_TEXT_RETENTION_MS: i64 = 30 * 24 * 3600 * 1000;
 const LEASE_MS: i64 = 15_000;
 
 /// What the worker needs from the service: which sessions have a live
@@ -44,12 +47,17 @@ impl DraftWorker {
 
     async fn run(self) {
         let mut last_recovery = tokio::time::Instant::now() - RECOVERY_EVERY;
+        let mut last_purge = tokio::time::Instant::now() - PURGE_EVERY;
         loop {
             let recovery = last_recovery.elapsed() >= RECOVERY_EVERY;
             if recovery {
                 last_recovery = tokio::time::Instant::now();
             }
             self.sweep(recovery).await;
+            if last_purge.elapsed() >= PURGE_EVERY {
+                last_purge = tokio::time::Instant::now();
+                self.purge().await;
+            }
             tokio::select! {
                 _ = tokio::time::sleep(WORKER_TICK) => {}
                 _ = self.wake.notified() => {}
@@ -72,6 +80,21 @@ impl DraftWorker {
             )
             .await
             .unwrap_or(false)
+    }
+
+    /// Delete expired transcripts and blank draft texts past retention.
+    pub async fn purge(&self) {
+        let now = now_ms();
+        match self
+            .engine
+            .repo
+            .purge_voice_data(now, now - DRAFT_TEXT_RETENTION_MS)
+            .await
+        {
+            Ok(rows) if rows > 0 => tracing::info!(rows, "voice retention purge"),
+            Ok(_) => {}
+            Err(err) => tracing::warn!(error = %err, "voice retention purge failed"),
+        }
     }
 
     /// One pass. `recovery` also handles `sending` drafts without an outcome
@@ -100,10 +123,8 @@ impl DraftWorker {
             let now = now_ms();
             let live = row.session_id.as_deref().is_some_and(|s| self.live.is_live(s));
             match row.state.as_str() {
-                "queued" => {
-                    if self.lease(&row).await {
-                        self.engine.retry_queued(&row).await;
-                    }
+                "queued" if self.lease(&row).await => {
+                    self.engine.retry_queued(&row).await;
                 }
                 "sending" => {
                     let started = row.send_started_at.unwrap_or(row.updated_at);
@@ -137,10 +158,8 @@ impl DraftWorker {
                         self.engine.start_send(&row).await;
                     }
                 }
-                "drafted" | "ambiguous" | "pending_transcript" => {
-                    if row.expires_at.is_some_and(|t| t <= now) {
-                        self.engine.expire(&row).await;
-                    }
+                "drafted" | "ambiguous" | "pending_transcript" if row.expires_at.is_some_and(|t| t <= now) => {
+                    self.engine.expire(&row).await;
                 }
                 _ => {}
             }

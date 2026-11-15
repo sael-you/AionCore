@@ -159,6 +159,9 @@ impl DraftEngine {
             hold_frozen: hold.map(|(_, frozen)| frozen),
         });
         self.sockets.send_user(&row.user_id, &frame);
+        if DraftState::parse(&row.state).is_some_and(|s| s.is_terminal()) {
+            self.extras.remove(&(row.id.clone(), row.version));
+        }
     }
 
     /// Speak a short status line (Jarvis or agent voice) as a follow-up clip.
@@ -543,9 +546,7 @@ impl DraftEngine {
             tracing::warn!(draft_id = %row.id, "voice confirm refused: stale draft hash");
             return None;
         }
-        if row.target_id.is_none() {
-            return None;
-        }
+        row.target_id.as_ref()?;
         let confirmed = self
             .transition_and_emit(row, DraftState::Confirmed, DraftPatch::default())
             .await?;

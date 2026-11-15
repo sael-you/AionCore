@@ -3,9 +3,10 @@
 //!
 //! A draft becomes confirmed by voice only with ALL of:
 //! 1. `voice.playbackFinished {readbackId, tEnd}` for that draft's clip;
-//! 2. one client `voice.speechOnset {t}` with `t − tEnd ≥ 300 ms`, matched by
-//!    a provider `speech_started` within 1.5 s, with no other onset between;
+//! 2. one client `voice.speechOnset {t}` with `t − tEnd ≥ 300 ms`, matched
+//!    by a provider `speech_started` within 1.5 s, with no other onset between;
 //! 3. that utterance's final transcript is exactly a confirm phrase.
+//!
 //! Anything else never authorises a send.
 
 use std::time::Duration;

@@ -62,3 +62,7 @@ required-features = ["voice-test"]
 [[test]]
 name = "voice_drafts"
 required-features = ["voice-test"]
+
+[[test]]
+name = "voice_speech_adapters"
+required-features = ["voice-test"]

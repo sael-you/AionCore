@@ -48,6 +48,10 @@ struct FakeCall {
 }
 
 struct Knobs {
+    /// JSON text returned by `/v1/responses` (refiner).
+    refinement: Option<Value>,
+    /// Text returned by `/v1/audio/transcriptions`; `None` echoes the audio bytes.
+    transcript: Option<String>,
     attach_503: u32,
     ack_session_update: bool,
     create_status: Option<u16>,
@@ -89,6 +93,8 @@ impl FakeOpenAi {
             created_sdps: Mutex::new(Vec::new()),
             bearer_seen: Mutex::new(Vec::new()),
             knobs: Mutex::new(Knobs {
+                refinement: None,
+                transcript: None,
                 attach_503: 0,
                 ack_session_update: true,
                 create_status: None,
@@ -105,6 +111,9 @@ impl FakeOpenAi {
             .route("/v1/realtime/calls", post(create_call))
             .route("/v1/realtime/calls/{id}/hangup", post(hangup))
             .route("/v1/realtime", get(sideband))
+            .route("/v1/responses", post(responses))
+            .route("/v1/audio/transcriptions", post(transcriptions))
+            .route("/ws/v1/t2a_v2", get(minimax_tts))
             .with_state(state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -142,6 +151,16 @@ impl FakeOpenAi {
         let mut knobs = self.state.knobs.lock().unwrap();
         knobs.audio_started_after = started_after;
         knobs.audio_stopped_after_done = stopped_after_done;
+    }
+
+    /// Structured output the refiner endpoint returns.
+    pub fn set_refinement(&self, refinement: Value) {
+        self.state.knobs.lock().unwrap().refinement = Some(refinement);
+    }
+
+    /// What the transcription endpoint hears (`None` echoes the clip bytes).
+    pub fn set_transcript(&self, transcript: Option<&str>) {
+        self.state.knobs.lock().unwrap().transcript = transcript.map(str::to_owned);
     }
 
     /// Delay before the call-creation answer (call already registered).
@@ -337,6 +356,10 @@ async fn sideband(
     if bearer(&headers).is_none() {
         return StatusCode::UNAUTHORIZED.into_response();
     }
+    if !query.contains_key("call_id") && query.contains_key("model") {
+        // A plain realtime session (read-back fallback), not a call sideband.
+        return upgrade.on_upgrade(run_mini_session);
+    }
     let Some(call_id) = query.get("call_id").cloned() else {
         return StatusCode::BAD_REQUEST.into_response();
     };
@@ -448,5 +471,119 @@ fn replies(state: &FakeState, event: &Value, event_no: &mut u64) -> Vec<Value> {
             ]
         }
         _ => Vec::new(),
+    }
+}
+
+/// Responses API (refiner): the configured structured output as `output_text`.
+async fn responses(State(state): State<Arc<FakeState>>, headers: HeaderMap) -> Response {
+    if bearer(&headers).is_none() {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let Some(refinement) = state.knobs.lock().unwrap().refinement.clone() else {
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    };
+    axum::Json(json!({"output": [{"type": "message", "content": [
+        {"type": "output_text", "text": refinement.to_string()}
+    ]}]}))
+    .into_response()
+}
+
+/// Transcription (name check): echo the clip text unless a transcript is set.
+async fn transcriptions(State(state): State<Arc<FakeState>>, headers: HeaderMap, mut multipart: Multipart) -> Response {
+    if bearer(&headers).is_none() {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let mut audio = Vec::new();
+    while let Ok(Some(field)) = multipart.next_field().await {
+        if field.name() == Some("file") {
+            audio = field.bytes().await.map(|b| b.to_vec()).unwrap_or_default();
+        }
+    }
+    let text = state
+        .knobs
+        .lock()
+        .unwrap()
+        .transcript
+        .clone()
+        .unwrap_or_else(|| String::from_utf8_lossy(&audio).into_owned());
+    axum::Json(json!({"text": text})).into_response()
+}
+
+/// MiniMax `t2a_v2` WebSocket (S0-B wire format): the "audio" is the text's
+/// bytes, hex-encoded, so tests can read back what was spoken.
+async fn minimax_tts(headers: HeaderMap, upgrade: WebSocketUpgrade) -> Response {
+    if bearer(&headers).is_none() {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    upgrade.on_upgrade(|socket| async move {
+        let (mut sink, mut stream) = socket.split();
+        let send = |v: Value| Message::Text(v.to_string().into());
+        if sink.send(send(json!({"event": "connected_success"}))).await.is_err() {
+            return;
+        }
+        while let Some(Ok(Message::Text(text))) = stream.next().await {
+            let Ok(event) = serde_json::from_str::<Value>(text.as_str()) else {
+                continue;
+            };
+            match event["event"].as_str() {
+                Some("task_start") => {
+                    let _ = sink.send(send(json!({"event": "task_started"}))).await;
+                }
+                Some("task_continue") => {
+                    let spoken = event["text"].as_str().unwrap_or_default();
+                    let _ = sink
+                        .send(send(
+                            json!({"data": {"audio": hex::encode(spoken.as_bytes()), "status": 1}, "is_final": false}),
+                        ))
+                        .await;
+                    let _ = sink
+                        .send(send(json!({"data": {"audio": "", "status": 2}, "is_final": true})))
+                        .await;
+                }
+                Some("task_finish") => break,
+                _ => {}
+            }
+        }
+    })
+}
+
+/// Text-in/audio-out realtime session (read-back fallback): speaks exactly
+/// the text after "Say exactly the following text and nothing else: ".
+async fn run_mini_session(socket: WebSocket) {
+    let (mut sink, mut stream) = socket.split();
+    let send = |v: Value| Message::Text(v.to_string().into());
+    while let Some(Ok(Message::Text(text))) = stream.next().await {
+        let Ok(event) = serde_json::from_str::<Value>(text.as_str()) else {
+            continue;
+        };
+        match event["type"].as_str() {
+            Some("session.update") => {
+                let _ = sink
+                    .send(send(json!({"type": "session.updated", "session": event["session"]})))
+                    .await;
+            }
+            Some("response.create") => {
+                let instructions = event["response"]["instructions"].as_str().unwrap_or_default();
+                let spoken = instructions
+                    .split_once(": ")
+                    .map(|(_, t)| t)
+                    .unwrap_or(instructions)
+                    .to_owned();
+                use base64::Engine as _;
+                let audio = base64::engine::general_purpose::STANDARD.encode(spoken.as_bytes());
+                let _ = sink
+                    .send(send(json!({"type": "response.output_audio.delta", "delta": audio})))
+                    .await;
+                let _ = sink
+                    .send(send(
+                        json!({"type": "response.output_audio_transcript.done", "transcript": spoken}),
+                    ))
+                    .await;
+                let _ = sink
+                    .send(send(json!({"type": "response.done", "response": {"id": "resp_mini"}})))
+                    .await;
+            }
+            _ => {}
+        }
     }
 }

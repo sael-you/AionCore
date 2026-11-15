@@ -145,7 +145,7 @@ pub fn phonetic(token: &str) -> String {
             other => Some(other),
         };
         if let Some(m) = mapped
-            && key.chars().last() != Some(m)
+            && !key.ends_with(m)
         {
             key.push(m);
         }
@@ -194,9 +194,22 @@ pub fn score(candidate: &Candidate, heard: &[String]) -> f64 {
     score
 }
 
+/// Heard tokens plus adjacent pairs joined ("web socket" → "websocket",
+/// "mini max" → "minimax"): transcribers often split compound names.
+fn heard_tokens(transcript: &str) -> Vec<String> {
+    let all = tokens(transcript);
+    let mut heard: Vec<String> = all
+        .iter()
+        .filter(|t| !STOPWORDS.contains(&t.as_str()))
+        .cloned()
+        .collect();
+    heard.extend(all.windows(2).map(|pair| format!("{}{}", pair[0], pair[1])));
+    heard
+}
+
 /// Resolve the target named in `transcript` among `candidates`.
 pub fn resolve(transcript: &str, candidates: &[Candidate], focus: Option<&str>) -> Resolution {
-    let heard = content_tokens(transcript);
+    let heard = heard_tokens(transcript);
     let mut scored: Vec<(f64, &Candidate)> = candidates
         .iter()
         .map(|c| (score(c, &heard), c))
@@ -321,6 +334,17 @@ mod tests {
             resolve("add a retry", &catalogue(), Some("someone-elses")),
             Resolution::Unresolved
         );
+    }
+
+    #[test]
+    fn split_compound_names_are_joined() {
+        let cat = vec![c("ws", "Websocket reconnect", None), c("mm", "MiniMax cascade", None)];
+        assert!(
+            matches!(resolve("the web socket reconnect should back off", &cat, None),
+            Resolution::Unique { ref id, .. } if id == "ws")
+        );
+        assert!(matches!(resolve("tell the mini max cascade to switch", &cat, None),
+            Resolution::Unique { ref id, .. } if id == "mm"));
     }
 
     #[test]
