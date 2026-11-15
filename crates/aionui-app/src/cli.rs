@@ -313,9 +313,23 @@ pub(crate) enum BoardCommand {
     Unknown(Vec<OsString>),
 }
 
+/// Accept `N` or `TASK-N` (N ≥ 1) and normalise to `N`.
+pub(crate) fn parse_card_selector(value: &str) -> Result<String, String> {
+    let trimmed = value.trim();
+    let digits = trimmed
+        .strip_prefix("TASK-")
+        .or_else(|| trimmed.strip_prefix("task-"))
+        .unwrap_or(trimmed);
+    match digits.parse::<u64>() {
+        Ok(number) if number > 0 && digits.chars().all(|c| c.is_ascii_digit()) => Ok(number.to_string()),
+        _ => Err(format!("`{value}` is not a card number (N or TASK-N)")),
+    }
+}
+
 #[derive(Args, Debug, Clone)]
 pub(crate) struct BoardCardSelector {
     /// Card number: `N` or `TASK-N`.
+    #[arg(value_parser = parse_card_selector)]
     pub card: String,
 }
 
@@ -348,6 +362,7 @@ pub(crate) struct BoardListArgs {
 #[derive(Args, Debug, Clone)]
 pub(crate) struct BoardShowArgs {
     /// Card number: `N` or `TASK-N`.
+    #[arg(value_parser = parse_card_selector)]
     pub card: String,
     /// Print the card packet (what an assigned agent reads) instead.
     #[arg(long)]
@@ -357,6 +372,7 @@ pub(crate) struct BoardShowArgs {
 #[derive(Args, Debug, Clone)]
 pub(crate) struct BoardMoveArgs {
     /// Card number: `N` or `TASK-N`.
+    #[arg(value_parser = parse_card_selector)]
     pub card: String,
     /// Target column key (e.g. `in_progress`).
     pub column: String,
@@ -365,6 +381,7 @@ pub(crate) struct BoardMoveArgs {
 #[derive(Args, Debug, Clone)]
 pub(crate) struct BoardReviewArgs {
     /// Card number: `N` or `TASK-N`.
+    #[arg(value_parser = parse_card_selector)]
     pub card: String,
     /// The department you were assigned for (e.g. `qa`).
     pub department: String,
@@ -373,6 +390,7 @@ pub(crate) struct BoardReviewArgs {
 #[derive(Args, Debug, Clone)]
 pub(crate) struct BoardCommentArgs {
     /// Card number: `N` or `TASK-N`.
+    #[arg(value_parser = parse_card_selector)]
     pub card: String,
     /// Address the comment to a department.
     #[arg(long = "to")]
@@ -385,6 +403,7 @@ pub(crate) struct BoardCommentArgs {
 #[derive(Args, Debug, Clone)]
 pub(crate) struct BoardBlockArgs {
     /// Card number: `N` or `TASK-N`.
+    #[arg(value_parser = parse_card_selector)]
     pub card: String,
     /// Why the card is blocked.
     #[arg(long)]
@@ -394,6 +413,7 @@ pub(crate) struct BoardBlockArgs {
 #[derive(Args, Debug, Clone)]
 pub(crate) struct BoardLinkArgs {
     /// Card number: `N` or `TASK-N`.
+    #[arg(value_parser = parse_card_selector)]
     pub card: String,
     /// `other` (default), `build` or `qa`.
     #[arg(long)]

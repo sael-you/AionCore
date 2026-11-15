@@ -848,6 +848,43 @@ fn fork_req(message_id: &str) -> aionui_api_types::ForkConversationRequest {
     serde_json::from_value(json!({ "message_id": message_id })).unwrap()
 }
 
+/// The board's assignment key is unique per user (migration 901): a fork of an
+/// assigned conversation must not copy it, and clients cannot set it at all.
+#[tokio::test]
+async fn forking_a_board_assigned_conversation_drops_the_assignment_key() {
+    let (svc, repo, acp_repo) = setup_fork().await;
+    let mut server_extra = serde_json::Map::new();
+    server_extra.insert("board_assignment_id".into(), json!("asg-1"));
+    let parent = svc
+        .create_with_server_extra(USER_ID, fork_create_req("claude"), server_extra)
+        .await
+        .unwrap();
+    assert_eq!(parent.extra["board_assignment_id"], "asg-1");
+    acp_repo
+        .update_session_id_for_user(USER_ID, &parent.id, "parent-sid-asg")
+        .await
+        .unwrap();
+    let m1 = make_message(&parent.id, "hello", 0);
+    repo.insert_message(USER_ID, &m1).await.unwrap();
+
+    let fork = svc
+        .fork(USER_ID, &parent.id, fork_req(&m1.id))
+        .await
+        .expect("fork succeeds");
+    assert!(fork.extra.get("board_assignment_id").is_none(), "{:?}", fork.extra);
+    let second = svc.fork(USER_ID, &parent.id, fork_req(&m1.id)).await;
+    assert!(second.is_ok(), "a second fork does not hit the unique index either");
+}
+
+#[tokio::test]
+async fn clients_cannot_set_the_board_assignment_key() {
+    let (svc, _repo, _acp_repo) = setup_fork().await;
+    let mut request = fork_create_req("claude");
+    request.extra["board_assignment_id"] = json!("forged");
+    let created = svc.create(USER_ID, request).await.unwrap();
+    assert!(created.extra.get("board_assignment_id").is_none());
+}
+
 #[tokio::test]
 async fn fork_head_creates_lineage_row_and_copies_messages() {
     let (svc, repo, acp_repo) = setup_fork().await;

@@ -201,7 +201,7 @@ pub(crate) fn build_request(command: &BoardCommand, stdin: Value) -> Result<Boar
         Some(tool) => Some(validate_stdin(name, tool, stdin).map_err(schema_failure)?),
         None => None,
     };
-    let card_path = |card: &str, suffix: &str| format!("/cards/{}{suffix}", card.trim());
+    let card_path = |card: &str, suffix: &str| format!("/cards/{}{suffix}", encode_segment(card.trim()));
     let get = |path: String, query: Vec<(&'static str, String)>| BoardRequest {
         command: name,
         method: reqwest::Method::GET,
@@ -248,7 +248,10 @@ pub(crate) fn build_request(command: &BoardCommand, stdin: Value) -> Result<Boar
         }
         BoardCommand::Review(args) => write(
             reqwest::Method::PUT,
-            card_path(&args.card, &format!("/reviews/{}", args.department.trim())),
+            card_path(
+                &args.card,
+                &format!("/reviews/{}", encode_segment(args.department.trim())),
+            ),
             Value::Object(payload.unwrap_or_default()),
         ),
         BoardCommand::Comment(args) => {
@@ -292,6 +295,19 @@ pub(crate) fn build_request(command: &BoardCommand, stdin: Value) -> Result<Boar
             return Err(schema_failure("not an agent-router command".into()));
         }
     })
+}
+
+/// Percent-encode one URL path segment (everything but RFC 3986 unreserved).
+pub(crate) fn encode_segment(segment: &str) -> String {
+    let mut out = String::with_capacity(segment.len());
+    for byte in segment.bytes() {
+        if byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b'~') {
+            out.push(byte as char);
+        } else {
+            out.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    out
 }
 
 struct RuntimeEnv {
@@ -472,7 +488,7 @@ mod tests {
 
         let show = parse(&["show", "TASK-3", "--packet"]);
         let request = build_request(&show, json!({})).unwrap();
-        assert_eq!(request.path, "/cards/TASK-3");
+        assert_eq!(request.path, "/cards/3", "selectors are normalised to N");
         assert_eq!(request.query, vec![("packet", "true".into())]);
     }
 
@@ -532,6 +548,18 @@ mod tests {
     }
 
     #[test]
+    fn card_selectors_are_validated_and_segments_encoded() {
+        for bad in ["0", "TASK-", "4/../../x", "4?x=1", "-3", "TASK-1a"] {
+            assert!(
+                Cli::try_parse_from(["aioncore", "board", "show", bad]).is_err(),
+                "{bad}"
+            );
+        }
+        let request = build_request(&parse(&["review", "4", "q a/../x"]), json!({ "verdict": "approve" })).unwrap();
+        assert_eq!(request.path, "/cards/4/reviews/q%20a%2F..%2Fx");
+    }
+
+    #[test]
     fn block_requires_a_reason() {
         assert!(Cli::try_parse_from(["aioncore", "board", "block", "4"]).is_err());
     }
@@ -540,7 +568,7 @@ mod tests {
     fn review_puts_the_verdict_for_the_department() {
         let request = build_request(&parse(&["review", "TASK-4", "qa"]), json!({ "verdict": "approve" })).unwrap();
         assert_eq!(request.method, reqwest::Method::PUT);
-        assert_eq!(request.path, "/cards/TASK-4/reviews/qa");
+        assert_eq!(request.path, "/cards/4/reviews/qa");
         assert_eq!(request.body, Some(json!({ "verdict": "approve" })));
         assert!(
             validate_stdin("board review", "review", json!({ "summary": "x" })).is_err(),
