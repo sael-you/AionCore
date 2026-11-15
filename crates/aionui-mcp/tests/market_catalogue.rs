@@ -5,8 +5,13 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use aionui_api_types::{CreateMcpMarketAssignmentRequest, CreateMcpMarketInstanceRequest, UpdateMcpMarketInstanceRequest};
-use aionui_db::{IMcpMarketRepository, IMcpServerRepository, SqliteMcpMarketRepository, SqliteMcpServerRepository, init_database_memory};
+use aionui_api_types::{
+    CreateMcpMarketAssignmentRequest, CreateMcpMarketInstanceRequest, UpdateMcpMarketInstanceRequest,
+};
+use aionui_db::{
+    IMcpMarketRepository, IMcpServerRepository, SqliteMcpMarketRepository, SqliteMcpServerRepository,
+    init_database_memory,
+};
 use aionui_mcp::market::{
     LaunchRequest, LaunchScope, MarketError, builtin_entries, parse_template, resolve_launch, with_builtin,
 };
@@ -59,7 +64,11 @@ async fn market() -> (McpMarketService, Arc<dyn IMcpMarketRepository>, aionui_db
     .execute(db.pool())
     .await
     .unwrap();
-    (McpMarketService::new(repo.clone(), servers, Arc::new(catalog), KEY), repo, db)
+    (
+        McpMarketService::new(repo.clone(), servers, Arc::new(catalog), KEY),
+        repo,
+        db,
+    )
 }
 
 fn invalid(err: MarketError) -> String {
@@ -100,15 +109,42 @@ async fn builtin_catalogue_serves_every_template() {
     for entry in &entries {
         let id = entry["id"].as_str().unwrap_or("?");
         let t = parse_template(entry).unwrap_or_else(|e| panic!("{id}: {e}"));
-        assert!(t.category.is_some() && t.vendor.is_some() && t.summary.is_some(), "{id}: browse metadata");
+        assert!(
+            t.category.is_some() && t.vendor.is_some() && t.summary.is_some(),
+            "{id}: browse metadata"
+        );
     }
     let (market, _, _) = market().await;
-    let ids: Vec<String> = market.list_templates(USER).await.unwrap().into_iter().map(|t| t.id).collect();
+    let ids: Vec<String> = market
+        .list_templates(USER)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|t| t.id)
+        .collect();
     assert_eq!(ids, EXPECTED);
-    let ga4 = market.list_templates(USER).await.unwrap().into_iter().find(|t| t.id == "ga4").unwrap();
+    let ga4 = market
+        .list_templates(USER)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|t| t.id == "ga4")
+        .unwrap();
     assert!(ga4.optional);
-    let stripe = market.list_templates(USER).await.unwrap().into_iter().find(|t| t.id == "stripe").unwrap();
-    assert!(stripe.env["STRIPE_AGENT_KEY"].description.as_deref().unwrap().contains("2026-11-30"));
+    let stripe = market
+        .list_templates(USER)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|t| t.id == "stripe")
+        .unwrap();
+    assert!(
+        stripe.env["STRIPE_AGENT_KEY"]
+            .description
+            .as_deref()
+            .unwrap()
+            .contains("2026-11-30")
+    );
 }
 
 #[test]
@@ -127,17 +163,29 @@ async fn g1_project_ref_is_validated_and_supabase_write_stays_dormant_without_it
     let (market, repo, _db) = market().await;
     // A bad ref is refused at write time.
     let mut bad = instance("tb-sb-preprod", "supabase", "staging", "write", &["claude"]);
-    bad.plain_env.insert("SUPABASE_PROJECT_REF".into(), "abc&read_only=false".into());
+    bad.plain_env
+        .insert("SUPABASE_PROJECT_REF".into(), "abc&read_only=false".into());
     assert!(invalid(market.create_instance(USER, bad).await.unwrap_err()).contains("SUPABASE_PROJECT_REF"));
 
     // Without the ref the write instance cannot be activated, even with its token.
     let inst = market
-        .create_instance(USER, instance("tb-sb-preprod", "supabase", "staging", "write", &["claude"]))
+        .create_instance(
+            USER,
+            instance("tb-sb-preprod", "supabase", "staging", "write", &["claude"]),
+        )
         .await
         .unwrap();
     assert_eq!(inst.status, "dormant");
-    market.set_secret(USER, &inst.id, "SUPABASE_ACCESS_TOKEN", PAT).await.unwrap();
-    let err = invalid(market.update_instance(USER, &inst.id, status("active")).await.unwrap_err());
+    market
+        .set_secret(USER, &inst.id, "SUPABASE_ACCESS_TOKEN", PAT)
+        .await
+        .unwrap();
+    let err = invalid(
+        market
+            .update_instance(USER, &inst.id, status("active"))
+            .await
+            .unwrap_err(),
+    );
     assert!(err.contains("SUPABASE_PROJECT_REF"), "{err}");
 
     // With a valid ref it activates, and the launcher pins it into the bridge URL.
@@ -178,7 +226,11 @@ async fn g1_project_ref_is_validated_and_supabase_write_stays_dormant_without_it
     let url = format!("https://mcp.supabase.com/mcp?project_ref={REF}&read_only=false&");
     assert!(plan.args.iter().any(|a| a.starts_with(&url)), "{:?}", plan.args);
     assert!(!plan.args.iter().any(|a| a.contains("${SUPABASE_PROJECT_REF}")));
-    assert!(plan.env.iter().any(|(k, v)| k == "MCP_SERVER_URL" && v.starts_with(&url)));
+    assert!(
+        plan.env
+            .iter()
+            .any(|(k, v)| k == "MCP_SERVER_URL" && v.starts_with(&url))
+    );
 
     // The read tier forces read_only=true into the same URL.
     let read = market
@@ -200,7 +252,13 @@ async fn g1_project_ref_is_validated_and_supabase_write_stays_dormant_without_it
 #[tokio::test]
 async fn g2_github_and_chrome_devtools_are_in_the_market() {
     let (market, _, _db) = market().await;
-    let ids: Vec<String> = market.list_templates(USER).await.unwrap().into_iter().map(|t| t.id).collect();
+    let ids: Vec<String> = market
+        .list_templates(USER)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|t| t.id)
+        .collect();
     assert!(ids.contains(&"github".to_owned()) && ids.contains(&"chrome-devtools".to_owned()));
     market
         .create_instance(
@@ -225,7 +283,13 @@ async fn g3_proxy_enforcement_gives_a_production_read_tier_limited_to_the_pinned
             USER,
             CreateMcpMarketInstanceRequest {
                 status: Some("active".into()),
-                ..instance("lighthouse-prod", "chrome-devtools", "production", "read", &["claude", "codex", "gemini"])
+                ..instance(
+                    "lighthouse-prod",
+                    "chrome-devtools",
+                    "production",
+                    "read",
+                    &["claude", "codex", "gemini"],
+                )
             },
         )
         .await

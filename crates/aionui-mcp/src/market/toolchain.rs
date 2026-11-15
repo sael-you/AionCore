@@ -27,9 +27,16 @@ pub fn toolchain_bin(data_dir: &Path) -> PathBuf {
 /// Resolve a bare template command (`uvx`) in the toolchain directory. `None`
 /// for paths, Node tools (the runtime resolver owns those) and commands the
 /// toolchain does not hold (they go through the normal `PATH` lookup).
-pub fn resolve_toolchain_command(command: &str, data_dir: &Path, parent_path: Option<&OsStr>) -> Option<ToolchainCommand> {
+pub fn resolve_toolchain_command(
+    command: &str,
+    data_dir: &Path,
+    parent_path: Option<&OsStr>,
+) -> Option<ToolchainCommand> {
     let command = command.trim();
-    if command.is_empty() || command.contains('/') || command.contains('\\') || matches!(command, "node" | "npm" | "npx")
+    if command.is_empty()
+        || command.contains('/')
+        || command.contains('\\')
+        || matches!(command, "node" | "npm" | "npx")
     {
         return None;
     }

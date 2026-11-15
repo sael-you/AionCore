@@ -780,7 +780,9 @@ pub fn build_mcp_state(
         Arc::new(aionui_db::SqliteMcpMarketRepository::new(pool));
     let catalog: Arc<dyn aionui_mcp::IMcpTemplateCatalog> = match registry {
         Some(registry) => Arc::new(super::mcp_market::ExtensionTemplateCatalog { registry }),
-        None => Arc::new(aionui_mcp::StaticTemplateCatalog::new(aionui_mcp::market::builtin_entries())),
+        None => Arc::new(aionui_mcp::StaticTemplateCatalog::new(
+            aionui_mcp::market::builtin_entries(),
+        )),
     };
     // Same storage-encryption key as provider API keys (owner decision 1).
     let mut market = aionui_mcp::McpMarketService::new(

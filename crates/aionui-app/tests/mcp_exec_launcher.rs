@@ -83,16 +83,19 @@ async fn fx() -> Fx {
     .execute(db.pool())
     .await
     .unwrap();
-    let catalog = StaticTemplateCatalog::new(vec![json!({"id": "fakesrv", "name": "Fake", "market": {
-        "transport": "stdio",
-        "command": {"command": PYTHON, "args": ["-u", script.to_string_lossy()]},
-        "env": {"FAKE_API_KEY": {"kind": "secret", "required": true}, "FAKE_MODE": {"kind": "plain"}},
-        "tiers": ["read"], "enforcement": "server", "clis": ["claude", "codex"]
-    }}), json!({"id": "fakeuv", "name": "Fake uvx", "market": {
-        "transport": "stdio",
-        "command": {"command": "uvx", "args": ["fake-mcp@1.0.0"]},
-        "tiers": ["read"], "enforcement": "server", "clis": ["claude"]
-    }})]);
+    let catalog = StaticTemplateCatalog::new(vec![
+        json!({"id": "fakesrv", "name": "Fake", "market": {
+            "transport": "stdio",
+            "command": {"command": PYTHON, "args": ["-u", script.to_string_lossy()]},
+            "env": {"FAKE_API_KEY": {"kind": "secret", "required": true}, "FAKE_MODE": {"kind": "plain"}},
+            "tiers": ["read"], "enforcement": "server", "clis": ["claude", "codex"]
+        }}),
+        json!({"id": "fakeuv", "name": "Fake uvx", "market": {
+            "transport": "stdio",
+            "command": {"command": "uvx", "args": ["fake-mcp@1.0.0"]},
+            "tiers": ["read"], "enforcement": "server", "clis": ["claude"]
+        }}),
+    ]);
     let repo: Arc<dyn IMcpMarketRepository> = Arc::new(SqliteMcpMarketRepository::new(db.pool().clone()));
     let servers: Arc<dyn IMcpServerRepository> = Arc::new(SqliteMcpServerRepository::new(db.pool().clone()));
     let market = McpMarketService::new(
@@ -411,7 +414,10 @@ async fn resolves_uvx_from_the_data_dir_toolchain() {
     let path = env["PATH"].as_str().unwrap();
     assert!(path.starts_with(&bin.to_string_lossy().into_owned()), "{path}");
     let cache = env["UV_CACHE_DIR"].as_str().unwrap();
-    assert!(cache.starts_with(&f.data_dir.join("toolchain").to_string_lossy().into_owned()), "{cache}");
+    assert!(
+        cache.starts_with(&f.data_dir.join("toolchain").to_string_lossy().into_owned()),
+        "{cache}"
+    );
     drop(s.stdin);
     let _ = s.child.wait();
 }

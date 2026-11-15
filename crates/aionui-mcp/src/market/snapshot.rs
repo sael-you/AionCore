@@ -8,9 +8,9 @@ use aionui_api_types::{McpMarketEnvKind, McpMarketInstanceStatus, McpMarketStatu
 use serde_json::{Value, json};
 
 use super::error::{MarketError, invalid};
+use super::params::{substitute, substitute_command};
 use super::rules::{GLOBAL_IDS, instance_problems};
 use super::service::McpMarketService;
-use super::params::{substitute, substitute_command};
 use super::stored::StoredInstance;
 use crate::secret_mask::is_secret_key;
 

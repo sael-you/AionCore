@@ -27,8 +27,8 @@ use aionui_app::derive_encryption_key;
 use aionui_auth::resolve_encryption_secret;
 use aionui_db::{IUserRepository, SqliteMcpMarketRepository, SqliteUserRepository, open_database_read_only};
 use aionui_mcp::market::{
-    LaunchRequest, LaunchScope, MarketError, ProxyExit, child_env, resolve_launch, resolve_toolchain_command, run_stdio_proxy,
-    still_allowed,
+    LaunchRequest, LaunchScope, MarketError, ProxyExit, child_env, resolve_launch, resolve_toolchain_command,
+    run_stdio_proxy, still_allowed,
 };
 
 use crate::cli::{McpArgs, McpCommand, McpExecArgs};

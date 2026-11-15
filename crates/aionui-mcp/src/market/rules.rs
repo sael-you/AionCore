@@ -168,7 +168,9 @@ pub fn template_problems(t: &McpMarketTemplate) -> Vec<String> {
                 let samples = field.default.iter().chain(field.allowed.iter());
                 for value in samples {
                     if !value_matches(field, value) {
-                        p.push(format!("{w}: env.{key} default/enum value does not match its pattern (G1)"));
+                        p.push(format!(
+                            "{w}: env.{key} default/enum value does not match its pattern (G1)"
+                        ));
                     }
                 }
             }
@@ -192,7 +194,9 @@ pub fn template_problems(t: &McpMarketTemplate) -> Vec<String> {
         }
     }
     if t.enforcement == "proxy" && t.tiers.iter().any(|x| x == "read") && t.read_tools.is_empty() {
-        p.push(format!("{w}: enforcement proxy needs a pinned read_tools allowlist (G3)"));
+        p.push(format!(
+            "{w}: enforcement proxy needs a pinned read_tools allowlist (G3)"
+        ));
     }
     let check_command =
         |cmd: &aionui_api_types::McpMarketCommand, what: &str, allow_refs: bool, p: &mut Vec<String>| {
@@ -223,9 +227,9 @@ pub fn template_problems(t: &McpMarketTemplate) -> Vec<String> {
         },
         "http" => {
             match t.url.as_deref() {
-                Some(url) if refs_in(url).iter().any(|r| !is_param(t, r)) => {
-                    p.push(format!("{w}: no ${{NAME}} in url except launch parameters (R1 #13, G1)"))
-                }
+                Some(url) if refs_in(url).iter().any(|r| !is_param(t, r)) => p.push(format!(
+                    "{w}: no ${{NAME}} in url except launch parameters (R1 #13, G1)"
+                )),
                 Some(url) => match reqwest::Url::parse(&mask_params(url)) {
                     Ok(u) if matches!(u.scheme(), "http" | "https") => {
                         if looks_like_secret_value(url) {
@@ -368,8 +372,7 @@ pub fn instance_problems(spec: &InstanceSpec<'_>, t: &McpMarketTemplate, secrets
         ("write", Some(_)) => p.push(format!("{w}: write instances use tools_block, not tools_allow (R6)")),
         _ => {}
     }
-    if spec.tier == "read" && spec.environment == "production" && !READ_ENFORCEMENTS.contains(&t.enforcement.as_str())
-    {
+    if spec.tier == "read" && spec.environment == "production" && !READ_ENFORCEMENTS.contains(&t.enforcement.as_str()) {
         p.push(format!(
             "{w}: production read instances need enforcement {} (R6)",
             READ_ENFORCEMENTS.join("|")

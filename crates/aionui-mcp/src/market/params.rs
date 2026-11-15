@@ -55,11 +55,7 @@ pub fn referenced_params(t: &McpMarketTemplate) -> Vec<String> {
     if let Some(url) = &t.url {
         texts.push(url);
     }
-    let mut out: Vec<String> = texts
-        .into_iter()
-        .flat_map(refs_in)
-        .filter(|k| is_param(t, k))
-        .collect();
+    let mut out: Vec<String> = texts.into_iter().flat_map(refs_in).filter(|k| is_param(t, k)).collect();
     out.sort();
     out.dedup();
     out
@@ -126,7 +122,10 @@ mod tests {
         let t = template();
         let env = BTreeMap::from([("SUPABASE_PROJECT_REF".to_owned(), "abcdefghijklmnopqrst".to_owned())]);
         let cmd = substitute_command(t.bridge.as_ref().unwrap(), &t, &env).unwrap();
-        assert_eq!(cmd.args[2], "https://mcp.supabase.com/mcp?project_ref=abcdefghijklmnopqrst");
+        assert_eq!(
+            cmd.args[2],
+            "https://mcp.supabase.com/mcp?project_ref=abcdefghijklmnopqrst"
+        );
         assert_eq!(cmd.args[4], "Authorization:Bearer ${SUPABASE_ACCESS_TOKEN}");
         assert_eq!(referenced_params(&t), vec!["SUPABASE_PROJECT_REF"]);
     }
@@ -136,7 +135,12 @@ mod tests {
         let t = template();
         let url = t.url.clone().unwrap();
         assert!(substitute(&url, &t, &BTreeMap::new()).is_err());
-        for bad in ["abc", "abcdefghijklmnopqrs&", "abcdefghijklmnopqrst&read_only=false", "ABCDEFGHIJKLMNOPQRST"] {
+        for bad in [
+            "abc",
+            "abcdefghijklmnopqrs&",
+            "abcdefghijklmnopqrst&read_only=false",
+            "ABCDEFGHIJKLMNOPQRST",
+        ] {
             let env = BTreeMap::from([("SUPABASE_PROJECT_REF".to_owned(), bad.to_owned())]);
             assert!(substitute(&url, &t, &env).is_err(), "{bad}");
         }

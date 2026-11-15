@@ -20,12 +20,13 @@ pub mod toolchain;
 
 pub use error::MarketError;
 pub use launch::{
-    LaunchPlan, LaunchRequest, LaunchScope, child_env, inherit_env_allowed, launch_policy, resolve_launch, still_allowed,
+    LaunchPlan, LaunchRequest, LaunchScope, child_env, inherit_env_allowed, launch_policy, resolve_launch,
+    still_allowed,
 };
 pub use launcher::{LAUNCHER_ENV, launcher_program, resolve_placeholder_row, resolve_placeholder_transport};
 pub use proxy::{ProxyExit, ToolPolicy, run_stdio_proxy};
 pub use service::{IMcpAssistantBinder, McpMarketService};
-pub use toolchain::{ToolchainCommand, resolve_toolchain_command, toolchain_bin};
 pub use template::{
     CATALOG_EXTENSION, IMcpTemplateCatalog, StaticTemplateCatalog, builtin_entries, parse_template, with_builtin,
 };
+pub use toolchain::{ToolchainCommand, resolve_toolchain_command, toolchain_bin};
