@@ -8,6 +8,11 @@ use crate::repository::voice::{
     NewVoiceAuditEntry, VoiceUsageDelta,
 };
 
+/// Start of the UTC day containing `at` (epoch ms).
+fn utc_day_start(at: TimestampMs) -> TimestampMs {
+    at - at.rem_euclid(86_400_000)
+}
+
 /// SQLite-backed implementation of the three voice repositories.
 ///
 /// One struct serves all voice tables; callers hold it behind the trait they need.
@@ -121,8 +126,15 @@ impl IVoiceSessionRepository for SqliteVoiceRepository {
         Ok(())
     }
 
-    async fn add_usage(&self, user_id: &str, id: &str, delta: &VoiceUsageDelta) -> Result<(), DbError> {
-        sqlx::query(
+    async fn add_usage(
+        &self,
+        user_id: &str,
+        id: &str,
+        delta: &VoiceUsageDelta,
+        charged_at: TimestampMs,
+    ) -> Result<(), DbError> {
+        let mut tx = self.pool.begin().await?;
+        let updated = sqlx::query(
             "UPDATE voice_sessions SET \
                 input_tokens = input_tokens + ?, cached_input_tokens = cached_input_tokens + ?, \
                 output_tokens = output_tokens + ?, responses = responses + ?, \
@@ -140,8 +152,22 @@ impl IVoiceSessionRepository for SqliteVoiceRepository {
         .bind(aionui_common::now_ms())
         .bind(user_id)
         .bind(id)
-        .execute(&self.pool)
+        .execute(&mut *tx)
         .await?;
+        if updated.rows_affected() > 0 && delta.cost_micros != 0 {
+            sqlx::query(
+                "INSERT INTO voice_usage_daily (user_id, session_id, day_start, cost_micros) VALUES (?, ?, ?, ?) \
+                 ON CONFLICT(user_id, session_id, day_start) DO UPDATE SET \
+                    cost_micros = cost_micros + excluded.cost_micros",
+            )
+            .bind(user_id)
+            .bind(id)
+            .bind(utc_day_start(charged_at))
+            .bind(delta.cost_micros)
+            .execute(&mut *tx)
+            .await?;
+        }
+        tx.commit().await?;
         Ok(())
     }
 
@@ -196,10 +222,10 @@ impl IVoiceSessionRepository for SqliteVoiceRepository {
 
     async fn cost_since(&self, user_id: &str, since: TimestampMs) -> Result<i64, DbError> {
         let (total,): (i64,) = sqlx::query_as(
-            "SELECT COALESCE(SUM(cost_micros), 0) FROM voice_sessions WHERE user_id = ? AND created_at >= ?",
+            "SELECT COALESCE(SUM(cost_micros), 0) FROM voice_usage_daily WHERE user_id = ? AND day_start >= ?",
         )
         .bind(user_id)
-        .bind(since)
+        .bind(utc_day_start(since))
         .fetch_one(&self.pool)
         .await?;
         Ok(total)

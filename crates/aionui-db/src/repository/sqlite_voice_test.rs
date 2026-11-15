@@ -126,8 +126,8 @@ async fn lifecycle_usage_and_idempotent_finish() {
         stt_seconds: 3,
         cost_micros: 1234,
     };
-    repo.add_usage(USER, "vs_1", &delta).await.unwrap();
-    repo.add_usage(USER, "vs_1", &delta).await.unwrap();
+    repo.add_usage(USER, "vs_1", &delta, 1).await.unwrap();
+    repo.add_usage(USER, "vs_1", &delta, 1).await.unwrap();
 
     let row = IVoiceSessionRepository::get(&repo, USER, "vs_1")
         .await
@@ -161,9 +161,9 @@ async fn sessions_are_user_scoped_and_cost_is_summed() {
         cost_micros: 500,
         ..Default::default()
     };
-    repo.add_usage(USER, "vs_1", &delta).await.unwrap();
+    repo.add_usage(USER, "vs_1", &delta, 1).await.unwrap();
     // Cross-user writes and reads do nothing.
-    repo.add_usage(OTHER_USER, "vs_1", &delta).await.unwrap();
+    repo.add_usage(OTHER_USER, "vs_1", &delta, 1).await.unwrap();
     assert!(
         IVoiceSessionRepository::get(&repo, OTHER_USER, "vs_1")
             .await
@@ -173,7 +173,7 @@ async fn sessions_are_user_scoped_and_cost_is_summed() {
     assert!(!repo.finish(OTHER_USER, "vs_1", "ended", "x").await.unwrap());
 
     assert_eq!(repo.cost_since(USER, 0).await.unwrap(), 500);
-    assert_eq!(repo.cost_since(USER, i64::MAX).await.unwrap(), 0);
+    assert_eq!(repo.cost_since(USER, 2 * DAY).await.unwrap(), 0);
     assert_eq!(repo.cost_since(OTHER_USER, 0).await.unwrap(), 0);
     assert_eq!(IVoiceSessionRepository::list(&repo, USER, 10).await.unwrap().len(), 1);
     assert!(
@@ -182,6 +182,39 @@ async fn sessions_are_user_scoped_and_cost_is_summed() {
             .unwrap()
             .is_empty()
     );
+}
+
+const DAY: i64 = 86_400_000;
+
+/// A call that crosses UTC midnight is billed to the day the usage happened.
+#[tokio::test]
+async fn cost_is_attributed_to_the_day_it_was_charged() {
+    let (repo, _db) = repo().await;
+    repo.create_starting(params("vs_1", USER)).await.unwrap();
+    let cost = |micros| VoiceUsageDelta {
+        cost_micros: micros,
+        ..Default::default()
+    };
+    // Started on day 10, 23:59; usage before and after midnight.
+    repo.add_usage(USER, "vs_1", &cost(300), 10 * DAY + DAY - 1_000)
+        .await
+        .unwrap();
+    repo.add_usage(USER, "vs_1", &cost(200), 11 * DAY + 5_000)
+        .await
+        .unwrap();
+    repo.add_usage(USER, "vs_1", &cost(50), 11 * DAY + 9_000).await.unwrap();
+    assert_eq!(repo.cost_since(USER, 10 * DAY).await.unwrap(), 550);
+    assert_eq!(
+        repo.cost_since(USER, 11 * DAY + 123).await.unwrap(),
+        250,
+        "today = day 11 only"
+    );
+    assert_eq!(repo.cost_since(USER, 12 * DAY).await.unwrap(), 0);
+    let row = IVoiceSessionRepository::get(&repo, USER, "vs_1")
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(row.cost_micros, 550, "the session total is unchanged");
 }
 
 #[tokio::test]

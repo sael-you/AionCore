@@ -27,8 +27,15 @@ pub trait IVoiceSessionRepository: Send + Sync {
     /// Records when the provider acknowledged the server-owned config.
     async fn mark_ready(&self, user_id: &str, id: &str, ready_at: TimestampMs) -> Result<(), DbError>;
 
-    /// Adds usage and cost deltas to the session row.
-    async fn add_usage(&self, user_id: &str, id: &str, delta: &VoiceUsageDelta) -> Result<(), DbError>;
+    /// Adds usage and cost deltas to the session row; the cost is attributed
+    /// to the UTC day of `charged_at` (daily budget).
+    async fn add_usage(
+        &self,
+        user_id: &str,
+        id: &str,
+        delta: &VoiceUsageDelta,
+        charged_at: TimestampMs,
+    ) -> Result<(), DbError>;
 
     /// Moves a `starting`/`live` session to a terminal state. Returns `false`
     /// when it was already terminal (idempotent end).
@@ -42,7 +49,7 @@ pub trait IVoiceSessionRepository: Send + Sync {
     /// Every `starting`/`live` session of every user (startup recovery).
     async fn list_open(&self) -> Result<Vec<VoiceSessionRow>, DbError>;
 
-    /// Sum of `cost_micros` over the user's sessions created at or after `since`.
+    /// Cost charged to the user on UTC days starting at or after the day of `since`.
     async fn cost_since(&self, user_id: &str, since: TimestampMs) -> Result<i64, DbError>;
 }
 
