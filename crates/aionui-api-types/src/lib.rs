@@ -40,6 +40,7 @@ mod system;
 mod team;
 mod team_mcp;
 mod team_tools;
+mod voice;
 mod websocket;
 
 pub use acp::{
@@ -240,6 +241,12 @@ pub use team_tools::{
     TeamToolDescriptor, TeamToolErrorCode, TeamToolErrorPayload, TeamToolName, TeamToolPermission, TeamToolRole,
     TeamToolRuntimeCallRequest, TeamToolRuntimeCallResponse, TeamToolTransport, cli_command_for_tool,
     team_tool_descriptor, team_tool_descriptors, team_tool_descriptors_for_role, tool_name_for_cli_path,
+};
+pub use voice::{
+    CreateVoiceSessionRequest, CreateVoiceSessionResponse, EndVoiceSessionRequest, UpdateVoiceSettingsRequest,
+    VoiceAssistantAudioFinished, VoiceBudget, VoiceCallEnded, VoiceCaption, VoiceClientFrame, VoiceDraftTap,
+    VoiceErrorFrame, VoiceHeartbeat, VoiceHello, VoicePlaybackFinished, VoiceReady, VoiceServerFrame, VoiceSessionRef,
+    VoiceSessionResponse, VoiceSettingsResponse, VoiceSpeechOnset, VoiceStateFrame, VoiceStatusResponse,
 };
 pub use websocket::WebSocketMessage;
 
