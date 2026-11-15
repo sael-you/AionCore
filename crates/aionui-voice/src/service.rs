@@ -19,6 +19,7 @@ use tokio::time::Instant;
 
 use crate::agent::AskRegistry;
 use crate::budget::utc_day_start_ms;
+use crate::conversation_mode::SessionMode;
 use crate::conversation_port::ConversationPort;
 use crate::credentials::CredentialPolicy;
 use crate::drafts::{DraftEngine, SpeechFactory};
@@ -71,8 +72,12 @@ pub(crate) struct LiveCall {
     /// Session cookie the call re-validates every 60 s: the creating request's,
     /// or (recovered calls) the first socket's that binds the session.
     pub token: std::sync::Mutex<Option<String>>,
-    /// Conversation the user armed voice in (target when no name is said).
+    /// Conversation the user armed voice in (target when no name is said);
+    /// in conversation mode the bound conversation.
     pub focus: Option<String>,
+    pub mode: SessionMode,
+    /// Car mode at admission (shorter agent lines, `[[AION_VOICE]]` mode).
+    pub car: bool,
 }
 
 impl LiveCall {
@@ -96,6 +101,22 @@ impl LiveCall {
     }
 }
 
+/// The conversation a user's conversation voice mode is bound to (C26). Kept
+/// in memory only (no migration): a restart drops it and the client re-opens
+/// the session with its binding on the next wake or tap.
+#[derive(Debug, Clone)]
+pub(crate) struct Binding {
+    pub conversation_id: String,
+    pub session_id: String,
+    /// `None` while its call is live; after an idle/rotation hangup the mode
+    /// is still armed on the device, so the agent may keep speaking until then.
+    pub until: Option<Instant>,
+}
+
+/// How long a binding outlives its call when the call ended without the user
+/// ending voice mode (idle hangup, rotation, network loss).
+pub(crate) const BINDING_GRACE: std::time::Duration = std::time::Duration::from_secs(30 * 60);
+
 pub(crate) struct ServiceInner {
     pub settings: Arc<dyn IVoiceSettingsRepository>,
     pub sessions: Arc<dyn IVoiceSessionRepository>,
@@ -113,6 +134,8 @@ pub(crate) struct ServiceInner {
     /// `voice.wake` per user per hour, shared with the follow-up watcher.
     pub wake_limiter: Arc<aionui_auth::RateLimiter>,
     pub live: DashMap<String, Arc<LiveCall>>,
+    /// user id → conversation voice-mode binding (C26).
+    pub bindings: DashMap<String, Binding>,
     pub tasks: DashMap<String, tokio::task::AbortHandle>,
     /// Per-user admission lock: an admission, a resume and the kill switch of
     /// one user never interleave; other users are not blocked.
@@ -128,6 +151,32 @@ impl ServiceInner {
             .entry(user_id.to_owned())
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone()
+    }
+
+    /// The conversation the user's voice mode is bound to, if still valid.
+    pub(crate) fn bound_conversation(&self, user_id: &str) -> Option<String> {
+        let binding = self.bindings.get(user_id)?;
+        binding
+            .until
+            .is_none_or(|until| until > Instant::now())
+            .then(|| binding.conversation_id.clone())
+    }
+
+    /// A call ended: the user ended voice mode (drop the binding) or the
+    /// call merely went away (keep it for [`BINDING_GRACE`]).
+    pub(crate) fn release_binding(&self, user_id: &str, session_id: &str, reason: EndReason) {
+        let ends_mode = matches!(
+            reason,
+            EndReason::User | EndReason::Sleep | EndReason::Disabled | EndReason::AuthRevoked | EndReason::Budget
+        );
+        if ends_mode {
+            self.bindings
+                .remove_if(user_id, |_, binding| binding.session_id == session_id);
+        } else if let Some(mut binding) = self.bindings.get_mut(user_id)
+            && binding.session_id == session_id
+        {
+            binding.until = Some(Instant::now() + BINDING_GRACE);
+        }
     }
 
     pub(crate) fn mark_listening(&self) {
@@ -172,6 +221,7 @@ impl VoiceService {
             deps.speech,
             ClipStore::default(),
             deps.sockets.clone(),
+            deps.sessions.clone(),
         ));
         Self {
             inner: Arc::new(ServiceInner {
@@ -195,6 +245,7 @@ impl VoiceService {
                 sockets: deps.sockets,
                 timings: deps.timings,
                 live: DashMap::new(),
+                bindings: DashMap::new(),
                 tasks: DashMap::new(),
                 admission: DashMap::new(),
                 listening_since: std::sync::Mutex::new(None),
@@ -264,6 +315,7 @@ impl VoiceService {
     /// first (and then sees voice off and hangs up its call itself).
     async fn kill_user(&self, user_id: &str, audit: bool) {
         let ended = self.end_user_calls(user_id, EndReason::Disabled).await;
+        self.inner.bindings.remove(user_id);
         let cancelled_drafts = self.inner.drafts.cancel_all_for_user(user_id).await;
         self.inner.asks.cancel_user(user_id);
         let sockets = &self.inner.sockets;
@@ -617,5 +669,9 @@ impl crate::drafts::LiveSessions for VoiceService {
 impl crate::followup::CallPresence for VoiceService {
     fn has_live_call(&self, user_id: &str) -> bool {
         VoiceService::has_live_call(self, user_id)
+    }
+
+    fn bound_conversation(&self, user_id: &str) -> Option<String> {
+        self.inner.bound_conversation(user_id)
     }
 }

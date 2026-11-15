@@ -247,6 +247,11 @@ impl Socket {
                     )
                     .await;
             }
+            VoiceClientFrame::Commit(_) => {
+                self.service
+                    .client_event(&self.user_id, session.as_deref(), ClientEvent::Commit)
+                    .await;
+            }
         }
         Flow::Continue
     }

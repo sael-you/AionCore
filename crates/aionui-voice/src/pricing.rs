@@ -35,6 +35,18 @@ pub const PRICING_MINI: ModelPricing = ModelPricing {
 /// `gpt-transcribe` ≈ $0.07/h of input audio (S0-A estimate) → 20 µUSD/s.
 pub const STT_MICROS_PER_SECOND: u64 = 20;
 
+/// Spoken clips (C26 §2.3 7): MiniMax `speech-2.8-turbo` is $60 per million
+/// characters (S0, 2026-11-14) = 60 µUSD per character; the OpenAI
+/// realtime-mini fallback is charged at the same, higher-or-equal estimate.
+pub const TTS_MICROS_PER_CHAR: i64 = 60;
+
+/// Daily-budget charge of one synthesized clip of `chars` characters.
+pub fn tts_cost_micros(chars: usize) -> i64 {
+    i64::try_from(chars)
+        .unwrap_or(i64::MAX)
+        .saturating_mul(TTS_MICROS_PER_CHAR)
+}
+
 /// User audio is billed at 10 tokens per second (S0-A).
 pub const USER_AUDIO_TOKENS_PER_SECOND: u64 = 10;
 
@@ -196,6 +208,13 @@ mod tests {
             ..Default::default()
         };
         assert_eq!(usage_cost_micros(&PRICING_FULL, &partial), 2_400 + 12_800 + 2_400);
+    }
+
+    #[test]
+    fn clips_are_charged_per_character() {
+        // ≈ 900 characters per spoken minute ≈ $0.05 (design §2.6).
+        assert_eq!(tts_cost_micros(900), 54_000);
+        assert_eq!(tts_cost_micros(0), 0);
     }
 
     #[test]

@@ -247,6 +247,38 @@ impl SynthPort for RealtimeMiniSynth {
     }
 }
 
+/// MiniMax first, OpenAI realtime-mini when MiniMax fails or is slow
+/// (D51, C26 §2.3 6): before, a MiniMax error meant text only.
+pub struct FallbackSynth {
+    pub primary: Arc<dyn SynthPort>,
+    pub fallback: Arc<dyn SynthPort>,
+    /// The primary gets this long before the fallback is asked.
+    pub primary_timeout: Duration,
+}
+
+/// MiniMax's budget inside [`FallbackSynth`] (cold TTFA P95 ≈ 1.1 s in S0).
+pub const PRIMARY_SYNTH_TIMEOUT: Duration = Duration::from_secs(4);
+
+#[async_trait::async_trait]
+impl SynthPort for FallbackSynth {
+    fn voice_id(&self, voice: ClipVoice) -> String {
+        self.primary.voice_id(voice)
+    }
+
+    async fn synthesize(&self, text: &str, voice: ClipVoice) -> Result<Clip, String> {
+        let primary = tokio::time::timeout(self.primary_timeout, self.primary.synthesize(text, voice))
+            .await
+            .unwrap_or_else(|_| Err("synthesis timed out".to_owned()));
+        match primary {
+            Ok(clip) => Ok(clip),
+            Err(err) => {
+                tracing::warn!(error = %err, "voice primary synthesis failed; using the OpenAI fallback");
+                self.fallback.synthesize(text, voice).await
+            }
+        }
+    }
+}
+
 /// Mono PCM16 → WAV container.
 pub fn wav_from_pcm16(pcm: &[u8], rate: u32) -> Vec<u8> {
     let data_len = pcm.len() as u32;
@@ -456,6 +488,49 @@ mod tests {
         let id = store.insert("alice", None, clip());
         tokio::time::advance(CLIP_TTL + Duration::from_secs(1)).await;
         assert!(store.take("alice", &id).is_none());
+    }
+
+    struct Fixed(Result<&'static str, &'static str>, Duration);
+
+    #[async_trait::async_trait]
+    impl SynthPort for Fixed {
+        fn voice_id(&self, _voice: ClipVoice) -> String {
+            "fixed".into()
+        }
+
+        async fn synthesize(&self, _text: &str, _voice: ClipVoice) -> Result<Clip, String> {
+            tokio::time::sleep(self.1).await;
+            self.0
+                .map(|tag| Clip {
+                    bytes: tag.as_bytes().to_vec(),
+                    mime: "audio/mpeg",
+                })
+                .map_err(str::to_owned)
+        }
+    }
+
+    fn fallback(primary: Fixed) -> FallbackSynth {
+        FallbackSynth {
+            primary: Arc::new(primary),
+            fallback: Arc::new(Fixed(Ok("openai"), Duration::ZERO)),
+            primary_timeout: PRIMARY_SYNTH_TIMEOUT,
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn minimax_first_openai_when_it_fails_or_stalls() {
+        let ok = fallback(Fixed(Ok("minimax"), Duration::ZERO));
+        assert_eq!(ok.synthesize("hi", ClipVoice::Agent).await.unwrap().bytes, b"minimax");
+        let failing = fallback(Fixed(Err("task_failed"), Duration::ZERO));
+        assert_eq!(
+            failing.synthesize("hi", ClipVoice::Agent).await.unwrap().bytes,
+            b"openai"
+        );
+        let stalled = fallback(Fixed(Ok("minimax"), Duration::from_secs(30)));
+        assert_eq!(
+            stalled.synthesize("hi", ClipVoice::Agent).await.unwrap().bytes,
+            b"openai"
+        );
     }
 
     #[test]

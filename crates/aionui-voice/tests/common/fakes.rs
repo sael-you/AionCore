@@ -28,6 +28,8 @@ pub struct ConversationState {
     /// Next send outcome override (`Busy`, `Rejected`…); `None` → delivered.
     pub next_outcomes: std::collections::VecDeque<SendOutcome>,
     pub probe: SendProbe,
+    /// Conversations whose running turn was cancelled (`cancel_turn`).
+    pub cancelled: Vec<String>,
 }
 
 #[derive(Default)]
@@ -144,6 +146,19 @@ impl ConversationPort for FakeConversations {
 
     async fn probe_send(&self, _user_id: &str, _conversation_id: &str, _msg_id: &str) -> Result<SendProbe, String> {
         Ok(self.state.lock().unwrap().probe.clone())
+    }
+
+    async fn cancel_turn(&self, _user_id: &str, conversation_id: &str) -> Result<bool, String> {
+        let mut state = self.state.lock().unwrap();
+        let running = state.statuses.get(conversation_id).is_some_and(|s| s.is_processing);
+        if running {
+            state.cancelled.push(conversation_id.to_owned());
+            if let Some(status) = state.statuses.get_mut(conversation_id) {
+                status.is_processing = false;
+                status.active_turn_id = None;
+            }
+        }
+        Ok(running)
     }
 
     async fn create_conversation(

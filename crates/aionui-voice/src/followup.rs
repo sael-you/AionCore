@@ -55,6 +55,8 @@ pub enum Signal {
         conversation_id: String,
         turn_id: Option<String>,
         kind: FollowUpKind,
+        /// `turn.completed`'s `last_outcome` (`finished` | `error` | `cancelled`).
+        outcome: Option<String>,
     },
     /// The target may accept queued drafts now (turn ended / approval gone).
     Retry { user_id: String, conversation_id: String },
@@ -71,11 +73,13 @@ pub fn classify(event: &WebSocketMessage<Value>) -> Vec<Signal> {
         return Vec::new();
     };
     let turn_id = field(data, "turn_id");
+    let outcome = field(data, "last_outcome");
     let follow = |kind| Signal::FollowUp {
         user_id: user_id.clone(),
         conversation_id: conversation_id.clone(),
         turn_id: turn_id.clone(),
         kind,
+        outcome: outcome.clone(),
     };
     let retry = || Signal::Retry {
         user_id: user_id.clone(),
@@ -96,6 +100,9 @@ pub fn classify(event: &WebSocketMessage<Value>) -> Vec<Signal> {
 /// Is the user in a live call? (Without one, a clip is announced by `voice.wake`.)
 pub trait CallPresence: Send + Sync {
     fn has_live_call(&self, user_id: &str) -> bool;
+
+    /// The conversation the user's conversation voice mode is bound to (C26).
+    fn bound_conversation(&self, user_id: &str) -> Option<String>;
 }
 
 pub struct FollowUpWatcher {
@@ -177,8 +184,12 @@ impl FollowUpWatcher {
                 conversation_id,
                 turn_id,
                 kind,
+                outcome,
             } => {
-                if self.drafts.watched.get(&conversation_id).map(|u| u.clone()).as_deref() != Some(user_id.as_str()) {
+                let bound = self.presence.bound_conversation(&user_id).as_deref() == Some(conversation_id.as_str());
+                let watched =
+                    self.drafts.watched.get(&conversation_id).map(|u| u.clone()).as_deref() == Some(user_id.as_str());
+                if !bound && !watched {
                     return;
                 }
                 let key = (conversation_id.clone(), turn_id, kind);
@@ -201,7 +212,12 @@ impl FollowUpWatcher {
                     .ok()
                     .and_then(|list| list.into_iter().find(|c| c.id == conversation_id).map(|c| c.name))
                     .unwrap_or_else(|| "A conversation".to_owned());
-                tracing::info!(conversation_id = %conversation_id, status = kind.status(), "voice follow-up");
+                tracing::info!(conversation_id = %conversation_id, status = kind.status(), bound, "voice follow-up");
+                if bound {
+                    self.bound_follow_up(&user_id, &conversation_id, &name, kind, outcome.as_deref())
+                        .await;
+                    return;
+                }
                 let clip = self
                     .drafts
                     .speak_line(
@@ -227,6 +243,58 @@ impl FollowUpWatcher {
                     );
                 }
             }
+        }
+    }
+}
+
+impl FollowUpWatcher {
+    /// The bound conversation (conversation voice mode): its own agent speaks
+    /// with `say`; the watcher only fills gaps. A finished turn whose agent
+    /// already spoke gets a text line (the "your turn" cue), otherwise the
+    /// spoken "<name> finished."; a cancelled turn was already answered
+    /// with "Stopped.". Bound lines never count against the wake limit.
+    async fn bound_follow_up(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        name: &str,
+        kind: FollowUpKind,
+        outcome: Option<&str>,
+    ) {
+        let spoke = self.drafts.spoke.remove(conversation_id).is_some();
+        let (kind, quiet) = match (kind, outcome) {
+            (FollowUpKind::Finished, Some("cancelled")) => (FollowUpKind::Finished, true),
+            (FollowUpKind::Finished, Some("error")) => (FollowUpKind::Failed, false),
+            (FollowUpKind::Finished, _) => (FollowUpKind::Finished, spoke),
+            (other, _) => (other, false),
+        };
+        if quiet {
+            self.drafts
+                .voice_line(user_id, None, conversation_id, kind.status(), &kind.line(name));
+            return;
+        }
+        let clip = self
+            .drafts
+            .speak_line(
+                user_id,
+                None,
+                conversation_id,
+                kind.status(),
+                &kind.line(name),
+                ClipVoice::Agent,
+            )
+            .await;
+        if !self.presence.has_live_call(user_id)
+            && let Some(clip_id) = clip
+        {
+            self.sockets.send_user(
+                user_id,
+                &VoiceServerFrame::Wake(VoiceWake {
+                    voice_session_id: None,
+                    reason: "follow_up".to_owned(),
+                    item_id: clip_id,
+                }),
+            );
         }
     }
 }

@@ -89,6 +89,10 @@ pub trait ConversationPort: Send + Sync {
 
     async fn probe_send(&self, user_id: &str, conversation_id: &str, msg_id: &str) -> Result<SendProbe, String>;
 
+    /// Cancel the running turn (as the Stop button does). `Ok(false)` when
+    /// no turn is running (C26 "stop the task").
+    async fn cancel_turn(&self, user_id: &str, conversation_id: &str) -> Result<bool, String>;
+
     /// Create a conversation in `project_id`, idempotently: a conversation
     /// whose `extra.voice_draft_key` equals `draft_key` is returned instead
     /// of creating a second one. Returns the conversation id.

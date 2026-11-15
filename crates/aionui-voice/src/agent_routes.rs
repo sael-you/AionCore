@@ -117,10 +117,12 @@ async fn capabilities(
     State(state): State<VoiceAgentRouterState>,
     headers: HeaderMap,
 ) -> Result<Json<ApiResponse<VoiceAgentCapabilities>>, ApiError> {
-    caller(&state, &headers)?;
+    let caller = caller(&state, &headers)?;
+    let bound = state.service.is_bound(&caller.user_id, &caller.conversation_id);
     Ok(Json(ApiResponse::ok(VoiceAgentCapabilities {
         max_wait_s: MAX_WAIT.as_secs(),
         say_per_minute: SAY_PER_MINUTE,
         note: "A voice answer is never permission for a destructive action; ask for an approval instead.".into(),
+        voice_mode: if bound { "on" } else { "off" }.into(),
     })))
 }

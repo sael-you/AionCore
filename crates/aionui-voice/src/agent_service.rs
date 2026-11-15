@@ -5,6 +5,7 @@ use std::time::Duration;
 use aionui_api_types::{VoiceAgentReply, VoiceServerFrame, VoiceWake};
 
 use crate::agent::AskStatus;
+use crate::conversation_mode::{BOUND_SAY_MAX_CHARS, CLIP_MAX_CHARS, split_for_speech};
 use crate::drafts::evidence::contains_confirm_grammar;
 use crate::error::VoiceError;
 use crate::readback::ClipVoice;
@@ -22,13 +23,31 @@ fn reply(status: &str, id: Option<String>, answer: Option<String>) -> VoiceAgent
     }
 }
 
+/// Who is speaking: the bound conversation of conversation voice mode
+/// (C26: no prefix, longer text, no confirm-word ban) or a C9 conversation.
+struct AgentAccess {
+    name: String,
+    bound: bool,
+}
+
 impl VoiceService {
-    /// Agents may speak only for conversations the user sent to by voice, or
-    /// that the user opted in.
-    async fn agent_allowed(&self, user_id: &str, conversation_id: &str) -> Result<String, VoiceError> {
+    /// Whether `conversation_id` is the user's conversation voice-mode binding.
+    pub fn is_bound(&self, user_id: &str, conversation_id: &str) -> bool {
+        self.inner.bound_conversation(user_id).as_deref() == Some(conversation_id)
+    }
+
+    /// Agents may speak only for the bound conversation, conversations the
+    /// user sent to by voice, or that the user opted in.
+    async fn agent_allowed(&self, user_id: &str, conversation_id: &str) -> Result<AgentAccess, VoiceError> {
         let settings = self.settings(user_id).await?;
         if !settings.enabled {
             return Err(VoiceError::Disabled);
+        }
+        if self.is_bound(user_id, conversation_id) {
+            return Ok(AgentAccess {
+                name: String::new(),
+                bound: true,
+            });
         }
         let watched = self
             .inner
@@ -41,7 +60,7 @@ impl VoiceService {
                 "this conversation may not speak by voice (no voice request was sent to it)".into(),
             ));
         }
-        Ok(self
+        let name = self
             .inner
             .drafts
             .conversations
@@ -49,7 +68,69 @@ impl VoiceService {
             .await
             .ok()
             .and_then(|list| list.into_iter().find(|c| c.id == conversation_id).map(|c| c.name))
-            .unwrap_or_else(|| "A conversation".to_owned()))
+            .unwrap_or_else(|| "A conversation".to_owned());
+        Ok(AgentAccess { name, bound: false })
+    }
+
+    /// Text of a bound `say`/`ask`: 1–1 200 characters, no control characters.
+    fn bound_text(text: &str) -> Result<String, VoiceError> {
+        let text: String = text
+            .chars()
+            .filter(|c| !c.is_control())
+            .collect::<String>()
+            .trim()
+            .to_owned();
+        if text.is_empty() || text.chars().count() > BOUND_SAY_MAX_CHARS {
+            return Err(VoiceError::BadRequest(format!(
+                "text must be 1-{BOUND_SAY_MAX_CHARS} characters"
+            )));
+        }
+        Ok(text)
+    }
+
+    /// The bound conversation speaks: ≤ 300-character clips played in order,
+    /// synthesized in the background so `say` returns at once. With no live
+    /// call each clip is announced by `voice.wake` (no shared wake limit).
+    fn bound_speak(&self, user_id: &str, conversation_id: &str, status: &'static str, text: &str) {
+        self.inner.drafts.spoke.insert(conversation_id.to_owned(), ());
+        let lines = split_for_speech(text, CLIP_MAX_CHARS);
+        let service = self.clone();
+        let user_id = user_id.to_owned();
+        let conversation_id = conversation_id.to_owned();
+        tokio::spawn(async move {
+            for line in lines {
+                let session = service
+                    .inner
+                    .live
+                    .iter()
+                    .find(|c| c.user_id == user_id && c.focus.as_deref() == Some(conversation_id.as_str()))
+                    .map(|c| c.session_id.clone());
+                let clip = service
+                    .inner
+                    .drafts
+                    .speak_unchecked(
+                        &user_id,
+                        session.as_deref(),
+                        &conversation_id,
+                        status,
+                        &line,
+                        ClipVoice::Agent,
+                    )
+                    .await;
+                if session.is_none()
+                    && let Some(clip_id) = clip
+                {
+                    service.inner.sockets.send_user(
+                        &user_id,
+                        &VoiceServerFrame::Wake(VoiceWake {
+                            voice_session_id: None,
+                            reason: status.to_owned(),
+                            item_id: clip_id,
+                        }),
+                    );
+                }
+            }
+        });
     }
 
     fn agent_text(text: &str) -> Result<String, VoiceError> {
@@ -104,12 +185,24 @@ impl VoiceService {
         conversation_id: &str,
         text: &str,
     ) -> Result<VoiceAgentReply, VoiceError> {
-        let name = self.agent_allowed(user_id, conversation_id).await?;
-        let text = Self::agent_text(text)?;
+        let access = self.agent_allowed(user_id, conversation_id).await?;
+        let text = if access.bound {
+            Self::bound_text(text)?
+        } else {
+            Self::agent_text(text)?
+        };
         if self.inner.say_limiter.check_and_increment(conversation_id).is_err() {
             return Err(VoiceError::RateLimited);
         }
-        tracing::info!(user_id, conversation_id, "voice agent say");
+        tracing::info!(user_id, conversation_id, bound = access.bound, "voice agent say");
+        if access.bound {
+            if self.inner.sockets.count_for_user(user_id) == 0 {
+                return Ok(reply("no_device", None, None));
+            }
+            self.bound_speak(user_id, conversation_id, "says", &text);
+            return Ok(reply("delivered", None, None));
+        }
+        let name = access.name;
         let delivered = self
             .agent_speak(user_id, conversation_id, "says", &format!("{name} says: {text}"))
             .await;
@@ -123,8 +216,12 @@ impl VoiceService {
         question: &str,
         timeout: Duration,
     ) -> Result<VoiceAgentReply, VoiceError> {
-        let name = self.agent_allowed(user_id, conversation_id).await?;
-        let question = Self::agent_text(question)?;
+        let access = self.agent_allowed(user_id, conversation_id).await?;
+        let question = if access.bound {
+            Self::bound_text(question)?
+        } else {
+            Self::agent_text(question)?
+        };
         if self.inner.sockets.count_for_user(user_id) == 0 {
             return Ok(reply("no_device", None, None));
         }
@@ -147,8 +244,13 @@ impl VoiceService {
         for tx in calls {
             let _ = tx.send(CallCommand::Client(ClientEvent::AskPending)).await;
         }
-        self.agent_speak(user_id, conversation_id, "asks", &format!("{name} asks: {question}"))
-            .await;
+        if access.bound {
+            self.bound_speak(user_id, conversation_id, "asks", &question);
+        } else {
+            let name = access.name;
+            self.agent_speak(user_id, conversation_id, "asks", &format!("{name} asks: {question}"))
+                .await;
+        }
         self.ask_reply(user_id, conversation_id, &id, timeout).await
     }
 

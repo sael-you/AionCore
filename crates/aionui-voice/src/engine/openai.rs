@@ -341,6 +341,11 @@ impl EngineCall for OpenAiCall {
         self.send(response_cancel()).await
     }
 
+    async fn commit_input(&mut self) -> Result<(), EngineError> {
+        self.send(serde_json::json!({"type": "input_audio_buffer.commit"}))
+            .await
+    }
+
     async fn tool_result(&mut self, call_id: &str, output: &str) -> Result<(), EngineError> {
         self.send(function_call_output(call_id, output)).await
     }
