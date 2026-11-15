@@ -58,6 +58,13 @@ async fn assert_origin_refused(
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{method} {uri} origin={origin:?}");
+        let code = body_json(resp).await["code"].as_str().unwrap_or_default().to_owned();
+        let expected = if origin.is_some() {
+            "ORIGIN_FORBIDDEN"
+        } else {
+            "ORIGIN_REQUIRED"
+        };
+        assert_eq!(code, expected, "{method} {uri} origin={origin:?}");
     }
     let mut builder = Request::builder()
         .uri("/api/voice/ws")
@@ -89,6 +96,37 @@ async fn assert_origin_refused(
         "ORIGIN_REQUIRED"
     };
     assert_eq!(code, expected, "ws upgrade origin={origin:?}");
+}
+
+/// Serve `router` on a real socket and open `/api/voice/ws` with the session
+/// cookie, `Origin` and the web host's `X-Forwarded-Host`; the HTTP status on
+/// refusal.
+async fn real_ws_upgrade(
+    router: axum::Router,
+    cookie: &str,
+    origin: &str,
+    forwarded_host: &str,
+) -> Result<tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>, u16> {
+    use tokio_tungstenite::tungstenite::client::IntoClientRequest;
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    tokio::spawn(async move {
+        let _ = axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+        )
+        .await;
+    });
+    let mut request = format!("ws://{addr}/api/voice/ws").into_client_request().unwrap();
+    let headers = request.headers_mut();
+    headers.insert("cookie", cookie.parse().unwrap());
+    headers.insert("origin", origin.parse().unwrap());
+    headers.insert("x-forwarded-host", forwarded_host.parse().unwrap());
+    match tokio_tungstenite::connect_async(request).await {
+        Ok((ws, _)) => Ok(ws),
+        Err(tokio_tungstenite::tungstenite::Error::Http(response)) => Err(response.status().as_u16()),
+        Err(other) => panic!("voice ws connect failed: {other}"),
+    }
 }
 
 fn set_origin_env() {
@@ -370,22 +408,13 @@ async fn local_identity_voice_accepts_same_origin_via_the_web_host() {
     let resp = router.clone().oneshot(put).await.unwrap();
     assert_eq!(resp.status(), StatusCode::OK, "same-origin write");
 
-    // The same-origin upgrade passes the Origin rule (the in-memory router
-    // cannot complete a real upgrade, so anything but 403 is a pass here).
-    let upgrade = Request::builder()
-        .uri("/api/voice/ws")
-        .header("cookie", &cookie)
-        .header("origin", SAME_ORIGIN)
-        .header("host", "127.0.0.1:41234")
-        .header("x-forwarded-host", SAME_HOST)
-        .header("connection", "upgrade")
-        .header("upgrade", "websocket")
-        .header("sec-websocket-version", "13")
-        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
-        .body(Body::empty())
-        .unwrap();
-    let resp = router.clone().oneshot(upgrade).await.unwrap();
-    assert_ne!(resp.status(), StatusCode::FORBIDDEN, "same-origin upgrade");
+    // The same-origin upgrade completes on a real socket.
+    assert!(
+        real_ws_upgrade(router.clone(), &cookie, SAME_ORIGIN, SAME_HOST)
+            .await
+            .is_ok(),
+        "same-origin upgrade"
+    );
 
     // Another host, or no Origin, is refused on every write and the upgrade
     // even with the forwarded host present.
@@ -393,5 +422,132 @@ async fn local_identity_voice_accepts_same_origin_via_the_web_host() {
     assert_origin_refused(&router, &cookie, None, None, Some(SAME_HOST)).await;
     // Without the web host's X-Forwarded-Host the unconfigured origin is foreign.
     assert_origin_refused(&router, &cookie, None, Some(SAME_ORIGIN), None).await;
+    services.database.close().await;
+}
+
+/// TASK-68 (director): in local identity (production) a real session cookie
+/// for `system_default_user` — the Token Pool internal login — is accepted on
+/// every voice route and the `/api/voice/ws` upgrade, behind the web host.
+/// Voice only refuses requests that carry no session cookie.
+#[tokio::test]
+async fn local_identity_accepts_a_system_default_user_session_on_every_voice_route_and_the_ws() {
+    set_origin_env();
+    let db = aionui_db::init_database_memory().await.unwrap();
+    let config = aionui_app::AppConfig {
+        local: true,
+        ..Default::default()
+    };
+    let services = aionui_app::AppServices::from_config(db, &config).await.unwrap();
+    let router = aionui_app::create_router(&services).await.expect("router");
+    let user = services
+        .user_repo
+        .find_by_id("system_default_user")
+        .await
+        .unwrap()
+        .expect("local identity seeds system_default_user");
+    let token = services
+        .jwt_service
+        .sign_with_session_generation(
+            &user.id,
+            user.username.as_deref().unwrap_or("system_default_user"),
+            user.session_generation,
+        )
+        .unwrap();
+    let cookie = format!("aionui-session={token}");
+    let call = |method: &str, uri: &str, body: Option<&str>| {
+        let builder = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header("cookie", &cookie)
+            .header("origin", SAME_ORIGIN)
+            .header("host", "127.0.0.1:41234")
+            .header("x-forwarded-host", SAME_HOST)
+            .header("content-type", "application/json");
+        builder
+            .body(body.map_or_else(Body::empty, |b| Body::from(b.to_owned())))
+            .unwrap()
+    };
+    // Each route answers as the authenticated user: success, or the route's
+    // own refusal — never 401 or an Origin/CSRF refusal.
+    for (method, uri, body, status, code) in [
+        ("GET", "/api/voice/settings", None, StatusCode::OK, None),
+        (
+            "PUT",
+            "/api/voice/settings",
+            Some(r#"{"enabled": true}"#),
+            StatusCode::OK,
+            None,
+        ),
+        ("GET", "/api/voice/status", None, StatusCode::OK, None),
+        ("GET", "/api/voice/sessions", None, StatusCode::OK, None),
+        (
+            "POST",
+            "/api/voice/sessions",
+            Some(r#"{"sdp_offer": "v=0\r\n"}"#),
+            StatusCode::PRECONDITION_FAILED,
+            Some("VOICE_NO_PROVIDER"),
+        ),
+        (
+            "POST",
+            "/api/voice/sessions/vs_missing/end",
+            Some("{}"),
+            StatusCode::NOT_FOUND,
+            Some("NOT_FOUND"),
+        ),
+        (
+            "GET",
+            "/api/voice/readbacks/rb_missing",
+            None,
+            StatusCode::NOT_FOUND,
+            None,
+        ),
+    ] {
+        let resp = router.clone().oneshot(call(method, uri, body)).await.unwrap();
+        let got = resp.status();
+        let json = body_json(resp).await;
+        assert_eq!(got, status, "{method} {uri}: {json}");
+        if let Some(code) = code {
+            assert_eq!(json["code"], code, "{method} {uri}: {json}");
+        }
+    }
+
+    // The WebSocket: upgrade, hello, armed (voice was just turned on).
+    use futures_util::{SinkExt, StreamExt};
+    let mut ws = real_ws_upgrade(router.clone(), &cookie, SAME_ORIGIN, SAME_HOST)
+        .await
+        .expect("voice ws upgrade with the system_default_user session");
+    ws.send(tokio_tungstenite::tungstenite::Message::Text(
+        r#"{"name":"voice.hello","data":{"device":"web","capabilities":{}}}"#.into(),
+    ))
+    .await
+    .unwrap();
+    let frame = tokio::time::timeout(std::time::Duration::from_secs(5), ws.next())
+        .await
+        .expect("a frame after hello")
+        .expect("socket open")
+        .unwrap();
+    let frame: serde_json::Value = serde_json::from_str(frame.to_text().unwrap()).unwrap();
+    assert_eq!(frame["name"], "voice.state", "{frame}");
+    assert_eq!(frame["data"]["state"], "armed", "{frame}");
+
+    // Without the cookie the same requests are refused.
+    let resp = router
+        .clone()
+        .oneshot(
+            Request::builder()
+                .uri("/api/voice/settings")
+                .header("origin", SAME_ORIGIN)
+                .header("host", "127.0.0.1:41234")
+                .header("x-forwarded-host", SAME_HOST)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(
+        real_ws_upgrade(router, "a=b", SAME_ORIGIN, SAME_HOST).await.err(),
+        Some(401)
+    );
     services.database.close().await;
 }
