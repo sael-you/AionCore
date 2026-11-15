@@ -105,6 +105,12 @@ impl IMcpMarketRepository for RevokeBeforeWrite {
     async fn create_assignment(&self, params: &CreateAssignmentParams<'_>) -> Result<McpAssignmentRow, DbError> {
         self.inner.create_assignment(params).await
     }
+    async fn create_assignments(
+        &self,
+        params: &[CreateAssignmentParams<'_>],
+    ) -> Result<Vec<McpAssignmentRow>, DbError> {
+        self.inner.create_assignments(params).await
+    }
     async fn delete_assignment(&self, user_id: &str, id: &str) -> Result<bool, DbError> {
         self.inner.delete_assignment(user_id, id).await
     }

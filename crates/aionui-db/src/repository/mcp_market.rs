@@ -75,6 +75,11 @@ pub trait IMcpMarketRepository: Send + Sync {
     /// Insert one assignment. Returns `DbError::Conflict` on a duplicate.
     async fn create_assignment(&self, params: &CreateAssignmentParams<'_>) -> Result<McpAssignmentRow, DbError>;
 
+    /// Insert several assignments in one transaction: all or none
+    /// (`DbError::Conflict` on a duplicate, nothing inserted, TASK-73).
+    async fn create_assignments(&self, params: &[CreateAssignmentParams<'_>])
+    -> Result<Vec<McpAssignmentRow>, DbError>;
+
     async fn delete_assignment(&self, user_id: &str, id: &str) -> Result<bool, DbError>;
 
     /// Delete every assignment of an instance; returns the removed rows.

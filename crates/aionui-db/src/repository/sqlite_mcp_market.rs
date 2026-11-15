@@ -403,6 +403,44 @@ impl IMcpMarketRepository for SqliteMcpMarketRepository {
             .ok_or_else(|| DbError::NotFound(format!("assignment {id}")))
     }
 
+    async fn create_assignments(
+        &self,
+        params: &[CreateAssignmentParams<'_>],
+    ) -> Result<Vec<McpAssignmentRow>, DbError> {
+        let now = aionui_common::now_ms();
+        let mut ids = Vec::with_capacity(params.len());
+        let mut tx = self.pool.begin().await?;
+        for p in params {
+            let id = aionui_common::generate_prefixed_id("mcpa");
+            sqlx::query(
+                "INSERT INTO mcp_assignments (id, user_id, mcp_server_id, project_id, assistant_id, cli, created_at, updated_at) \
+                 VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            )
+            .bind(&id)
+            .bind(p.user_id)
+            .bind(p.instance_id)
+            .bind(p.project_id)
+            .bind(p.assistant_id)
+            .bind(p.cli)
+            .bind(now)
+            .bind(now)
+            .execute(&mut *tx)
+            .await
+            .map_err(|e| map_conflict(e, "assignment already exists"))?;
+            ids.push((p.user_id, id));
+        }
+        tx.commit().await?;
+        let mut rows = Vec::with_capacity(ids.len());
+        for (user_id, id) in ids {
+            rows.push(
+                self.find_assignment(user_id, &id)
+                    .await?
+                    .ok_or_else(|| DbError::NotFound(format!("assignment {id}")))?,
+            );
+        }
+        Ok(rows)
+    }
+
     async fn delete_assignment(&self, user_id: &str, id: &str) -> Result<bool, DbError> {
         let affected = sqlx::query("DELETE FROM mcp_assignments WHERE user_id = ? AND id = ?")
             .bind(user_id)
