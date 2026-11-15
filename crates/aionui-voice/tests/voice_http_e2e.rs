@@ -140,7 +140,7 @@ async fn writes_need_an_allowed_origin_not_a_csrf_token() {
             .send(Req::new(method, uri).cookie(&user).json(body.clone()).build())
             .await;
         assert_eq!(status, 403, "{method} {uri} without Origin: {resp}");
-        assert_eq!(resp["code"], "VOICE_ORIGIN_REQUIRED");
+        assert_eq!(resp["code"], "ORIGIN_REQUIRED");
         let (status, resp) = h
             .send(
                 Req::new(method, uri)
@@ -151,7 +151,7 @@ async fn writes_need_an_allowed_origin_not_a_csrf_token() {
             )
             .await;
         assert_eq!(status, 403, "{method} {uri} foreign Origin: {resp}");
-        assert_eq!(resp["code"], "VOICE_ORIGIN_DENIED");
+        assert_eq!(resp["code"], "ORIGIN_FORBIDDEN");
         let (status, resp) = h
             .send(
                 Req::new(method, uri)
@@ -168,7 +168,7 @@ async fn writes_need_an_allowed_origin_not_a_csrf_token() {
     }
     let end = format!("/api/voice/sessions/{session}/end");
     let (status, resp) = h.send(Req::new("POST", &end).cookie(&user).build()).await;
-    assert_eq!((status, resp["code"].as_str()), (403, Some("VOICE_ORIGIN_REQUIRED")));
+    assert_eq!((status, resp["code"].as_str()), (403, Some("ORIGIN_REQUIRED")));
     let (status, resp) = h
         .send(Req::new("POST", &end).cookie(&user).header("origin", ORIGIN).build())
         .await;
@@ -191,7 +191,7 @@ async fn origin_allowlist_is_enforced() {
         )
         .await;
     assert_eq!(status, 403, "{body}");
-    assert_eq!(body["code"], "VOICE_ORIGIN_DENIED");
+    assert_eq!(body["code"], "ORIGIN_FORBIDDEN");
 
     let (status, body) = h
         .send(
@@ -202,7 +202,7 @@ async fn origin_allowlist_is_enforced() {
         )
         .await;
     assert_eq!(status, 403, "{body}");
-    assert_eq!(body["code"], "VOICE_ORIGIN_REQUIRED");
+    assert_eq!(body["code"], "ORIGIN_REQUIRED");
 
     // Same-origin GET without Origin (browsers omit it) is fine.
     let (status, _) = h.send(Req::new("GET", "/api/voice/status").cookie(&user).build()).await;

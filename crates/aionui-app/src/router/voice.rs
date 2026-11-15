@@ -4,7 +4,7 @@
 
 use std::sync::Arc;
 
-use aionui_auth::{AuthIdentityMode, AuthState, OriginPolicy};
+use aionui_auth::{AuthIdentityMode, AuthState, OriginGuard, OriginPolicy};
 use aionui_db::{SqliteProviderRepository, SqliteSidebarStore, SqliteVoiceRepository};
 use aionui_realtime::WebSocketManager;
 use aionui_system::ProviderService;
@@ -110,8 +110,9 @@ pub fn voice_guards(services: &AppServices) -> VoiceHttpGuards {
     let mut allowed: Vec<&str> = app.allowed_origins.iter().map(String::as_str).collect();
     allowed.extend(extra.split(','));
     let origins = OriginPolicy::new(app.public_origin.as_deref(), &allowed);
+    let local = services.identity_mode.is_local();
     static WARN_ONCE: std::sync::Once = std::sync::Once::new();
-    if origins.public_origin.is_none() && origins.allowed_origins.is_empty() {
+    if !local && origins.public_origin.is_none() && origins.allowed_origins.is_empty() {
         WARN_ONCE.call_once(|| {
             tracing::warn!(
                 env = VOICE_ALLOWED_ORIGINS_ENV,
@@ -121,6 +122,12 @@ pub fn voice_guards(services: &AppServices) -> VoiceHttpGuards {
     }
     VoiceHttpGuards {
         auth_state: voice_auth_state(services),
-        origins: Arc::new(origins),
+        // Shared strict Origin rule (aionui-auth); in local identity also
+        // same-origin via the web host's X-Forwarded-Host, so production
+        // needs no origin configuration.
+        origins: OriginGuard {
+            policy: Arc::new(origins),
+            same_origin_via_web_host: local,
+        },
     }
 }

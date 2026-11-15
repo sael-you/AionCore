@@ -14,10 +14,22 @@ use tower::ServiceExt;
 use common::{body_json, get_request, setup_and_login};
 
 const ORIGIN: &str = "https://voice-e2e.test";
+/// The production case: an origin that is NOT configured, accepted in local
+/// identity only because it names the host the browser addressed.
+const SAME_ORIGIN: &str = "https://y.talkseeds.com";
+const SAME_HOST: &str = "y.talkseeds.com";
 
 /// Every voice write and the `/api/voice/ws` upgrade, with `origin` (None =
 /// no header) and an optional CSRF header, all must be refused with 403.
-async fn assert_origin_refused(router: &axum::Router, cookie: &str, csrf: Option<&str>, origin: Option<&str>) {
+/// `forwarded_host`: the web host's `X-Forwarded-Host` (`Host` is then the
+/// backend's loopback address).
+async fn assert_origin_refused(
+    router: &axum::Router,
+    cookie: &str,
+    csrf: Option<&str>,
+    origin: Option<&str>,
+    forwarded_host: Option<&str>,
+) {
     let writes = [
         ("PUT", "/api/voice/settings", r#"{"daily_budget_usd": 2}"#),
         ("POST", "/api/voice/sessions", r#"{"sdp_offer": "v=0\r\n"}"#),
@@ -34,6 +46,9 @@ async fn assert_origin_refused(router: &axum::Router, cookie: &str, csrf: Option
         }
         if let Some(csrf) = csrf {
             builder = builder.header("x-csrf-token", csrf);
+        }
+        if let Some(host) = forwarded_host {
+            builder = builder.header("host", "127.0.0.1:41234").header("x-forwarded-host", host);
         }
         let resp = router
             .clone()
@@ -52,6 +67,9 @@ async fn assert_origin_refused(router: &axum::Router, cookie: &str, csrf: Option
     if let Some(origin) = origin {
         builder = builder.header("origin", origin);
     }
+    if let Some(host) = forwarded_host {
+        builder = builder.header("host", "127.0.0.1:41234").header("x-forwarded-host", host);
+    }
     let resp = router
         .clone()
         .oneshot(builder.body(Body::empty()).unwrap())
@@ -59,17 +77,10 @@ async fn assert_origin_refused(router: &axum::Router, cookie: &str, csrf: Option
         .unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN, "ws upgrade origin={origin:?}");
     let code = body_json(resp).await["code"].as_str().unwrap_or_default().to_owned();
-    // A foreign Origin may already be refused by the app's global C11 origin
-    // layer (webui identity) before the voice guard sees it.
-    let expected: &[&str] = if origin.is_some() {
-        &["VOICE_ORIGIN_DENIED", "ORIGIN_FORBIDDEN"]
-    } else {
-        &["VOICE_ORIGIN_REQUIRED"]
-    };
-    assert!(
-        expected.contains(&code.as_str()),
-        "ws upgrade origin={origin:?}: {code}"
-    );
+    // The shared aionui-auth rule (or, in webui, the global C11 WebSocket
+    // origin layer before it) answers with the same codes.
+    let expected = if origin.is_some() { "ORIGIN_FORBIDDEN" } else { "ORIGIN_REQUIRED" };
+    assert_eq!(code, expected, "ws upgrade origin={origin:?}");
 }
 
 fn set_origin_env() {
@@ -131,8 +142,8 @@ async fn local_mode_voice_rejects_injected_default_user_but_accepts_session_cook
     // Local identity: no CSRF header (the C11 UI sends none there); the
     // strict Origin check refuses a missing or foreign Origin on every write
     // and on the WS upgrade.
-    assert_origin_refused(&router, &cookie, None, None).await;
-    assert_origin_refused(&router, &cookie, None, Some("https://evil.test")).await;
+    assert_origin_refused(&router, &cookie, None, None, None).await;
+    assert_origin_refused(&router, &cookie, None, Some("https://evil.test"), None).await;
     let put = Request::builder()
         .method("PUT")
         .uri("/api/voice/settings")
@@ -226,8 +237,12 @@ async fn session_mode_voice_is_behind_the_global_csrf_layer() {
     assert_eq!(resp.status(), StatusCode::OK);
 
     // Webui identity: a valid CSRF token never replaces the Origin check.
-    assert_origin_refused(&router, &cookie, Some(&csrf), None).await;
-    assert_origin_refused(&router, &cookie, Some(&csrf), Some("https://evil.test")).await;
+    assert_origin_refused(&router, &cookie, Some(&csrf), None, None).await;
+    assert_origin_refused(&router, &cookie, Some(&csrf), Some("https://evil.test"), None).await;
+    // Webui identity never uses the web host's same-origin rule: an origin
+    // that is not configured stays refused even when it names the
+    // forwarded host.
+    assert_origin_refused(&router, &cookie, Some(&csrf), Some(SAME_ORIGIN), Some(SAME_HOST)).await;
 
     let resp = router.clone().oneshot(post(Some(&csrf))).await.unwrap();
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
@@ -311,5 +326,64 @@ async fn voice_agent_route_and_clip_endpoint_are_mounted() {
         .await
         .unwrap();
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    services.database.close().await;
+}
+
+#[tokio::test]
+async fn local_identity_voice_accepts_same_origin_via_the_web_host() {
+    set_origin_env();
+    let db = aionui_db::init_database_memory().await.unwrap();
+    let config = aionui_app::AppConfig {
+        local: true,
+        ..Default::default()
+    };
+    let services = aionui_app::AppServices::from_config(db, &config).await.unwrap();
+    let router = aionui_app::create_router(&services).await.expect("router");
+    let hash = aionui_auth::hash_password("Voice-Test-Pass-1").unwrap();
+    let user = services.user_repo.create_user("voiceuser", &hash).await.unwrap();
+    let token = services
+        .jwt_service
+        .sign_with_session_generation(&user.id, "voiceuser", user.session_generation)
+        .unwrap();
+    let cookie = format!("aionui-session={token}");
+
+    // Same-origin write: Host rewritten by the web host, X-Forwarded-Host =
+    // the browser's Host, no CSRF header.
+    let put = Request::builder()
+        .method("PUT")
+        .uri("/api/voice/settings")
+        .header("cookie", &cookie)
+        .header("origin", SAME_ORIGIN)
+        .header("host", "127.0.0.1:41234")
+        .header("x-forwarded-host", SAME_HOST)
+        .header("content-type", "application/json")
+        .body(Body::from(r#"{"daily_budget_usd": 2}"#))
+        .unwrap();
+    let resp = router.clone().oneshot(put).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK, "same-origin write");
+
+    // The same-origin upgrade passes the Origin rule (the in-memory router
+    // cannot complete a real upgrade, so anything but 403 is a pass here).
+    let upgrade = Request::builder()
+        .uri("/api/voice/ws")
+        .header("cookie", &cookie)
+        .header("origin", SAME_ORIGIN)
+        .header("host", "127.0.0.1:41234")
+        .header("x-forwarded-host", SAME_HOST)
+        .header("connection", "upgrade")
+        .header("upgrade", "websocket")
+        .header("sec-websocket-version", "13")
+        .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+        .body(Body::empty())
+        .unwrap();
+    let resp = router.clone().oneshot(upgrade).await.unwrap();
+    assert_ne!(resp.status(), StatusCode::FORBIDDEN, "same-origin upgrade");
+
+    // Another host, or no Origin, is refused on every write and the upgrade
+    // even with the forwarded host present.
+    assert_origin_refused(&router, &cookie, None, Some("https://evil.test"), Some(SAME_HOST)).await;
+    assert_origin_refused(&router, &cookie, None, None, Some(SAME_HOST)).await;
+    // Without the web host's X-Forwarded-Host the unconfigured origin is foreign.
+    assert_origin_refused(&router, &cookie, None, Some(SAME_ORIGIN), None).await;
     services.database.close().await;
 }

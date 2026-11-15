@@ -220,5 +220,5 @@ async fn unparseable_origin_is_refused() {
         .insert("origin", HeaderValue::from_bytes(b"https://voice.test\xff").unwrap());
     let (status, body) = h.send(request).await;
     assert_eq!(status, 403, "{body}");
-    assert_eq!(body["code"], "VOICE_ORIGIN_DENIED");
+    assert_eq!(body["code"], "ORIGIN_FORBIDDEN");
 }

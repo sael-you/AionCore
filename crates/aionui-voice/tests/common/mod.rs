@@ -5,7 +5,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use aionui_auth::{AuthIdentityMode, AuthState, CookieNames, JwtService, OriginPolicy};
+use aionui_auth::{AuthIdentityMode, AuthState, CookieNames, JwtService, OriginGuard, OriginPolicy};
 use aionui_db::{Database, IUserRepository, SqliteUserRepository, SqliteVoiceRepository, init_database_memory};
 use aionui_realtime::WebSocketManager;
 use aionui_voice::fake_provider::FakeOpenAi;
@@ -133,7 +133,10 @@ impl Harness {
         });
         let guards = VoiceHttpGuards {
             auth_state: auth_state.clone(),
-            origins: Arc::new(OriginPolicy::new(None, &[ORIGIN])),
+            origins: OriginGuard {
+                policy: Arc::new(OriginPolicy::new(None, &[ORIGIN])),
+                same_origin_via_web_host: true,
+            },
         };
         let router = voice_routes(
             VoiceRouterState {
