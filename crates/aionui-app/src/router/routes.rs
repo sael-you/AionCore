@@ -21,8 +21,8 @@ use aionui_assets::{AssetRouterState, asset_routes};
 use aionui_assistant::assistant_routes;
 use aionui_auth::{
     AuthIdentityMode, AuthRouterState, AuthState, CsrfState, IRuntimeTokenVerifier, RefreshCoalescer,
-    SystemDefaultFilesystemAdopter, auth_middleware, auth_routes, csrf_middleware, security_headers_middleware,
-    websocket_origin_middleware,
+    SystemDefaultFilesystemAdopter, auth_middleware, auth_routes, csrf_middleware, require_trusted_origin_middleware,
+    security_headers_middleware, websocket_origin_middleware,
 };
 use aionui_channel::channel_routes;
 #[cfg(feature = "weixin")]
@@ -327,27 +327,20 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     };
     let mcp_market_read = aionui_mcp::mcp_market_read_routes(market_state.clone())
         .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
-    let mcp_market_write = {
-        let router = aionui_mcp::mcp_market_write_routes(market_state).route_layer(from_fn_with_state(
+    // Market writes (C15): a verified browser session in every identity, and
+    // an allowed Origin in every identity (missing or foreign → 403). No
+    // market CSRF layer: in local identity the UI sends no CSRF header (C11
+    // csrf.ts) and the strict Origin rule is the cross-site defence (as
+    // voice); in webui the global C11 CSRF + origin layer below also applies.
+    let mcp_market_write = aionui_mcp::mcp_market_write_routes(market_state)
+        .route_layer(from_fn_with_state(
             super::mcp_market::market_write_auth_state(services),
             auth_middleware,
+        ))
+        .route_layer(from_fn_with_state(
+            services.origin_policy.clone(),
+            require_trusted_origin_middleware,
         ));
-        if services.identity_mode.is_local() {
-            // Local mode has no global CSRF layer: the market adds the C11
-            // double submit itself (cookie names from the app config; no
-            // origin rules in local mode, as the global layer). Other modes
-            // get the global `CsrfState` layer with webui's origin policy.
-            router.route_layer(middleware::from_fn_with_state(
-                CsrfState {
-                    cookie_config: services.cookie_config.clone(),
-                    origin_policy: None,
-                },
-                csrf_middleware,
-            ))
-        } else {
-            router
-        }
-    };
 
     // MCP routes protected by auth middleware
     let mcp_authenticated =

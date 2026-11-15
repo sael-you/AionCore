@@ -4,7 +4,10 @@
 
 use std::sync::Arc;
 
-use aionui_auth::{AuthIdentityMode, AuthState, CookieNames, IRuntimeTokenVerifier, JwtService, auth_middleware};
+use aionui_auth::{
+    AuthIdentityMode, AuthState, CookieNames, IRuntimeTokenVerifier, JwtService, OriginPolicy, auth_middleware,
+    require_trusted_origin_middleware,
+};
 use aionui_db::{
     IMcpMarketRepository, IMcpServerRepository, IUserRepository, SqliteMcpMarketRepository, SqliteMcpServerRepository,
     SqliteUserRepository, init_database_memory,
@@ -22,6 +25,7 @@ use tower::ServiceExt;
 
 const USER: &str = "system_default_user";
 const FIXTURE_SECRET: &str = "pdl_live_ROUTEFIXTURESECRET0123456789";
+const ORIGIN: &str = "https://y.talkseeds.test";
 
 struct AlwaysValid;
 impl IRuntimeTokenVerifier for AlwaysValid {
@@ -63,17 +67,26 @@ fn auth(f: &Fx, mode: AuthIdentityMode, verifier: Option<Arc<dyn IRuntimeTokenVe
     }
 }
 
+fn policy() -> Arc<OriginPolicy> {
+    Arc::new(OriginPolicy::new(Some(ORIGIN), &[]))
+}
+
+/// Writes as `aionui-app` mounts them: session-only state, then the strict
+/// Origin rule outermost (every identity, C11/C15).
+fn write_router(f: &Fx, write_auth: AuthState) -> Router {
+    mcp_market_write_routes(f.state.clone())
+        .route_layer(from_fn_with_state(write_auth, auth_middleware))
+        .route_layer(from_fn_with_state(policy(), require_trusted_origin_middleware))
+}
+
 /// The composition used by `aionui-app` in `--local`: reads with the Local
-/// state, writes with the session-only state.
+/// state, writes with the session-only state behind the Origin rule.
 fn app(f: &Fx) -> Router {
     let read = mcp_market_read_routes(f.state.clone()).route_layer(from_fn_with_state(
         auth(f, AuthIdentityMode::Local, None),
         auth_middleware,
     ));
-    let write = mcp_market_write_routes(f.state.clone()).route_layer(from_fn_with_state(
-        auth(f, AuthIdentityMode::UserSession, None),
-        auth_middleware,
-    ));
+    let write = write_router(f, auth(f, AuthIdentityMode::UserSession, None));
     Router::new().merge(read).merge(write)
 }
 
@@ -87,7 +100,16 @@ fn post(path: &str, body: &Value) -> axum::http::request::Builder {
     Request::post(path).header(header::CONTENT_TYPE, "application/json")
 }
 
-async fn send(app: &Router, req: Request<Body>) -> (StatusCode, Value) {
+/// Sends like a same-origin browser: the trusted `Origin` unless the
+/// request already carries one (see [`send_raw`] for other cases).
+async fn send(app: &Router, mut req: Request<Body>) -> (StatusCode, Value) {
+    if !req.headers().contains_key(header::ORIGIN) {
+        req.headers_mut().insert(header::ORIGIN, ORIGIN.parse().unwrap());
+    }
+    send_raw(app, req).await
+}
+
+async fn send_raw(app: &Router, req: Request<Body>) -> (StatusCode, Value) {
     let resp = app.clone().oneshot(req).await.unwrap();
     let status = resp.status();
     let bytes = resp.into_body().collect().await.unwrap().to_bytes();
@@ -301,46 +323,42 @@ async fn session_writes_succeed_and_never_echo_secrets() {
     assert!(resp.to_string().contains("R2"), "{resp}");
 }
 
-/// C11: market writes read the session cookie under the configured name and,
-/// in local mode, sit behind the shared `CsrfState` double submit (the
-/// composition in `aionui-app`), so `__Host-` names in webui work and a
-/// write without a matching CSRF header is refused.
+/// C11/C15: market writes read the session cookie under the configured name
+/// (`__Host-aionui-session` in webui over HTTPS) and refuse a missing or
+/// foreign `Origin` before authentication, in every identity.
 #[tokio::test]
-async fn writes_follow_the_c11_cookie_names_and_csrf_state() {
-    use aionui_auth::{CookieConfig, CsrfState, csrf_middleware};
+async fn writes_need_a_trusted_origin_and_read_the_configured_session_cookie() {
     let f = fx().await;
     let token = f.jwt.sign(USER, USER).unwrap();
     let names = CookieNames::PREFIXED;
     let mut write_auth = auth(&f, AuthIdentityMode::UserSession, None);
     write_auth.cookie_names = names;
-    let csrf = CsrfState {
-        cookie_config: Arc::new(CookieConfig::for_identity(true, true)),
-        origin_policy: None,
-    };
-    let app = mcp_market_write_routes(f.state.clone())
-        .route_layer(from_fn_with_state(write_auth, auth_middleware))
-        .route_layer(from_fn_with_state(csrf, csrf_middleware));
+    let app = write_router(&f, write_auth);
     let body = create_body();
-    let write = |cookie: String, csrf_header: Option<&str>| {
+    let write = |cookie: String, origin: Option<&str>| {
         let mut req = post("/api/mcp/market/instances", &body).header(header::COOKIE, cookie);
-        if let Some(h) = csrf_header {
-            req = req.header("x-csrf-token", h);
+        if let Some(origin) = origin {
+            req = req.header(header::ORIGIN, origin);
         }
         req.body(Body::from(body.to_string())).unwrap()
     };
+    let session = format!("{}={token}", names.session);
 
-    // Missing CSRF header → refused before the handler.
-    let cookie = format!("{}={token}; {}=c1", names.session, names.csrf);
-    let (status, resp) = send(&app, write(cookie.clone(), None)).await;
-    assert_eq!(status, StatusCode::FORBIDDEN, "{resp}");
-    assert_eq!(resp["code"], "CSRF_INVALID");
+    let (status, resp) = send_raw(&app, write(session.clone(), None)).await;
+    assert_eq!(
+        (status, resp["code"].as_str()),
+        (StatusCode::FORBIDDEN, Some("ORIGIN_REQUIRED"))
+    );
+    let (status, resp) = send_raw(&app, write(session.clone(), Some("https://evil.example"))).await;
+    assert_eq!(
+        (status, resp["code"].as_str()),
+        (StatusCode::FORBIDDEN, Some("ORIGIN_FORBIDDEN"))
+    );
 
     // The legacy session cookie name is not read once prefixed names are set.
-    let legacy = format!("aionui-session={token}; {}=c1", names.csrf);
-    let (status, _) = send(&app, write(legacy, Some("c1"))).await;
+    let (status, _) = send_raw(&app, write(format!("aionui-session={token}"), Some(ORIGIN))).await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
 
-    // Prefixed session cookie + matching double submit → created.
-    let (status, created) = send(&app, write(cookie, Some("c1"))).await;
+    let (status, created) = send_raw(&app, write(session, Some(ORIGIN))).await;
     assert_eq!(status, StatusCode::CREATED, "{created}");
 }

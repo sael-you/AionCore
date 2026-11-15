@@ -10,7 +10,8 @@
 //! browser requests (helper CLIs, the Token Pool client, hooks) and pass; the
 //! CSRF double-submit and runtime-token checks still apply to them.
 //!
-//! Local mode never installs these layers.
+//! Local mode never installs these layers, except
+//! [`require_trusted_origin_middleware`], which a route opts into in every mode.
 
 use std::sync::Arc;
 
@@ -238,6 +239,46 @@ pub async fn websocket_origin_middleware(
         ));
     }
     Ok(next.run(request).await)
+}
+
+/// Strict origin rule for routes that change sensitive state from a browser
+/// session in EVERY identity, local included (MCP market writes, card C15):
+/// an unsafe method or a WebSocket upgrade must carry an `Origin` the policy
+/// trusts. A missing `Origin` is refused (`ORIGIN_REQUIRED`), a foreign or
+/// unreadable one too (`ORIGIN_FORBIDDEN`). Browsers send `Origin` on every
+/// unsafe request, same-origin included, so this is the cross-site defence
+/// where no CSRF layer runs (local identity); in webui the global CSRF layer
+/// applies on top. Safe non-upgrade requests pass untouched.
+pub async fn require_trusted_origin_middleware(
+    State(policy): State<Arc<OriginPolicy>>,
+    request: Request,
+    next: Next,
+) -> Result<Response, ApiError> {
+    let headers = request.headers();
+    if !is_unsafe_method(request.method()) && !is_websocket_upgrade(headers) {
+        return Ok(next.run(request).await);
+    }
+    match policy.origin_trusted(headers) {
+        Some(true) => Ok(next.run(request).await),
+        Some(false) => {
+            tracing::warn!(path = %request.uri().path(), "request refused: untrusted origin");
+            Err(ApiError::coded(
+                StatusCode::FORBIDDEN,
+                "ORIGIN_FORBIDDEN",
+                "Cross-site request refused.",
+                None,
+            ))
+        }
+        None => {
+            tracing::warn!(path = %request.uri().path(), "request refused: missing origin");
+            Err(ApiError::coded(
+                StatusCode::FORBIDDEN,
+                "ORIGIN_REQUIRED",
+                "Origin header required.",
+                None,
+            ))
+        }
+    }
 }
 
 /// Whether a method may change state (CSRF and change 3b apply): every
