@@ -90,6 +90,7 @@ pub fn build_voice_state(services: &AppServices) -> VoiceRouterState {
             service: services.conversation_service.clone(),
             task_manager: services.worker_task_manager.clone(),
             sidebar: Arc::new(SqliteSidebarStore::new(pool)),
+            create_locks: Default::default(),
         }),
         drafts: voice_repo,
         speech: Arc::new(ProviderSpeechFactory {
