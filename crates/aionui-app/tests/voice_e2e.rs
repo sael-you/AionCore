@@ -48,7 +48,9 @@ async fn assert_origin_refused(
             builder = builder.header("x-csrf-token", csrf);
         }
         if let Some(host) = forwarded_host {
-            builder = builder.header("host", "127.0.0.1:41234").header("x-forwarded-host", host);
+            builder = builder
+                .header("host", "127.0.0.1:41234")
+                .header("x-forwarded-host", host);
         }
         let resp = router
             .clone()
@@ -68,7 +70,9 @@ async fn assert_origin_refused(
         builder = builder.header("origin", origin);
     }
     if let Some(host) = forwarded_host {
-        builder = builder.header("host", "127.0.0.1:41234").header("x-forwarded-host", host);
+        builder = builder
+            .header("host", "127.0.0.1:41234")
+            .header("x-forwarded-host", host);
     }
     let resp = router
         .clone()
@@ -79,7 +83,11 @@ async fn assert_origin_refused(
     let code = body_json(resp).await["code"].as_str().unwrap_or_default().to_owned();
     // The shared aionui-auth rule (or, in webui, the global C11 WebSocket
     // origin layer before it) answers with the same codes.
-    let expected = if origin.is_some() { "ORIGIN_FORBIDDEN" } else { "ORIGIN_REQUIRED" };
+    let expected = if origin.is_some() {
+        "ORIGIN_FORBIDDEN"
+    } else {
+        "ORIGIN_REQUIRED"
+    };
     assert_eq!(code, expected, "ws upgrade origin={origin:?}");
 }
 

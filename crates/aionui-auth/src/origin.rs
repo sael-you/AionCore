@@ -284,7 +284,11 @@ impl OriginGuard {
     pub fn check(&self, method: &Method, headers: &HeaderMap) -> Result<(), OriginRefusal> {
         let needs_origin = is_unsafe_method(method) || is_websocket_upgrade(headers);
         let Some(value) = headers.get(header::ORIGIN) else {
-            return if needs_origin { Err(OriginRefusal::Missing) } else { Ok(()) };
+            return if needs_origin {
+                Err(OriginRefusal::Missing)
+            } else {
+                Ok(())
+            };
         };
         let Ok(origin) = value.to_str() else {
             return Err(OriginRefusal::Untrusted);
