@@ -148,8 +148,13 @@ impl StreamPersistenceAdapter {
             return;
         }
 
+        let extra = match self.repo.get(&self.user_id, &self.conversation_id).await {
+            Ok(Some(row)) => crate::runtime_completion::extra_with_last_outcome(&row.extra, outcome),
+            _ => None,
+        };
         let update = ConversationRowUpdate {
             status: Some("finished".to_owned()),
+            extra,
             updated_at: Some(now_ms()),
             ..Default::default()
         };
@@ -165,6 +170,7 @@ impl StreamPersistenceAdapter {
             "status": "finished",
             "canSendMessage": true,
             "runtime": runtime,
+            "last_outcome": outcome.as_str(),
         });
         broadcaster.broadcast(WebSocketMessage::new("turn.completed", payload));
 
