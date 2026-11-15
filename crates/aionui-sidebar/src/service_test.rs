@@ -1951,7 +1951,8 @@ impl crate::ports::ConversationLivePorts for FakeLivePorts {
 
 /// C21: collapsed parents need "needs you" and "failed" without per-child
 /// subscriptions. Waiting comes from the live ports; failed from the persisted
-/// `extra.last_outcome`, and only while the descendant is not running again.
+/// `extra.last_outcome`, only while the descendant is not running again and
+/// the owner has not opened it since it failed (FIXES 2).
 #[tokio::test]
 async fn descendant_roll_up_counts_waiting_and_failed() {
     let fx = fixture().await;
@@ -1961,7 +1962,27 @@ async fn descendant_roll_up_counts_waiting_and_failed() {
     insert_conv(pool, USER, "failed", None, r#"{"last_outcome":"error"}"#, 120).await;
     insert_conv(pool, USER, "retrying", None, r#"{"last_outcome":"error"}"#, 130).await;
     insert_conv(pool, USER, "ok", None, r#"{"last_outcome":"finished"}"#, 140).await;
-    for kid in ["waits", "failed", "retrying", "ok"] {
+    // Opened after it failed: seen, no longer counted.
+    insert_conv(
+        pool,
+        USER,
+        "seen",
+        None,
+        r#"{"last_outcome":"error","last_outcome_at":100,"last_outcome_seen_at":200}"#,
+        150,
+    )
+    .await;
+    // Failed AGAIN after the last time it was opened: counted.
+    insert_conv(
+        pool,
+        USER,
+        "failed-again",
+        None,
+        r#"{"last_outcome":"error","last_outcome_at":300,"last_outcome_seen_at":200}"#,
+        160,
+    )
+    .await;
+    for kid in ["waits", "failed", "retrying", "ok", "seen", "failed-again"] {
         set_parent(pool, kid, "root", 1).await;
     }
     set_status(pool, "retrying", "running").await;
@@ -1981,13 +2002,17 @@ async fn descendant_roll_up_counts_waiting_and_failed() {
         .first_screen(USER, Some(50), &[], ArchiveScope::Active)
         .await
         .unwrap();
-    assert_eq!(counts(&resp), (0, 1));
+    assert_eq!(
+        counts(&resp),
+        (0, 2),
+        "failed + failed-again; seen and retrying excluded"
+    );
     let json = serde_json::to_value(&find_chats(&resp).items[0]).unwrap();
     assert!(
         json.get("waiting_descendant_count").is_none(),
         "zero is omitted: {json}"
     );
-    assert_eq!(json["failed_descendant_count"], 1);
+    assert_eq!(json["failed_descendant_count"], 2);
 
     fx.service
         .set_conversation_live_ports(Arc::new(FakeLivePorts(vec!["waits", "root"])));
@@ -1996,7 +2021,7 @@ async fn descendant_roll_up_counts_waiting_and_failed() {
         .first_screen(USER, Some(50), &[], ArchiveScope::Active)
         .await
         .unwrap();
-    assert_eq!(counts(&resp), (1, 1), "the root itself is not its own descendant");
+    assert_eq!(counts(&resp), (1, 2), "the root itself is not its own descendant");
 }
 
 #[tokio::test]

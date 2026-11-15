@@ -10026,3 +10026,44 @@ mod session_mentions_integration {
         }
     }
 }
+
+// ── C21: last outcome and "seen" ────────────────────────────────────
+
+/// FIXES 1/2: a turn end records how it ended and when; opening the
+/// conversation marks it seen without touching updated_at, and a missing
+/// conversation is a 404.
+#[tokio::test]
+async fn turn_end_records_outcome_and_open_marks_it_seen() {
+    let (svc, broadcaster, repo, _task_mgr) = make_service();
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "acp",
+        "extra": { "workspace": ensure_test_workspace_path() }
+    }))
+    .unwrap();
+    let conv = svc.create("user_1", req).await.unwrap();
+
+    svc.complete_turn("user_1", &conv.id, "turn-1").await;
+    let row = repo.get("user_1", &conv.id).await.unwrap().unwrap();
+    let extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap();
+    assert_eq!(extra["last_outcome"], "finished");
+    let outcome_at = extra["last_outcome_at"].as_i64().expect("outcome time");
+    assert_eq!(row.status.as_deref(), Some("finished"));
+    let completed = broadcaster
+        .take_events()
+        .into_iter()
+        .find(|event| event.name == "turn.completed")
+        .expect("turn.completed");
+    assert_eq!(completed.data["last_outcome"], "finished");
+
+    let updated_before = row.updated_at;
+    let seen_at = svc.mark_outcome_seen("user_1", &conv.id).await.unwrap();
+    assert!(seen_at >= outcome_at);
+    let row = repo.get("user_1", &conv.id).await.unwrap().unwrap();
+    let extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap();
+    assert_eq!(extra["last_outcome_seen_at"], seen_at);
+    assert_eq!(extra["last_outcome"], "finished", "seen keeps the outcome");
+    assert_eq!(row.updated_at, updated_before, "opening never reorders the sidebar");
+
+    let missing = svc.mark_outcome_seen("user_1", "nope").await.unwrap_err();
+    assert!(matches!(missing, ConversationError::NotFound { .. }));
+}

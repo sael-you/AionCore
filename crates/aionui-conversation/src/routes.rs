@@ -11,9 +11,9 @@ use aionui_api_types::{
     CancelConversationResponse, CloneConversationRequest, ConfirmRequest, ConfirmationListResponse,
     ConversationArtifactListResponse, ConversationArtifactResponse, ConversationListResponse, ConversationResponse,
     CreateConversationRequest, EnsureConversationRuntimeResponse, ForkConversationRequest, ListConversationsQuery,
-    ListMessagesQuery, MessageListResponse, MessageResponse, MessageSearchResponse, ReparentConversationRequest,
-    SearchMessagesQuery, SendMessageRequest, SendMessageResponse, UpdateConversationArtifactRequest,
-    UpdateConversationRequest,
+    ListMessagesQuery, MessageListResponse, MessageResponse, MessageSearchResponse, OutcomeSeenResponse,
+    ReparentConversationRequest, SearchMessagesQuery, SendMessageRequest, SendMessageResponse,
+    UpdateConversationArtifactRequest, UpdateConversationRequest,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -144,6 +144,7 @@ pub fn conversation_routes(state: ConversationRouterState) -> Router {
         .route("/api/conversations/{id}/artifacts", get(list_artifacts))
         .route("/api/conversations/{id}/artifacts/{artifactId}", patch(update_artifact))
         .route("/api/conversations/{id}/cancel", post(cancel))
+        .route("/api/conversations/{id}/outcome-seen", post(outcome_seen))
         .route(
             "/api/conversations/{id}/terminals/{terminalId}/kill",
             post(kill_terminal),
@@ -414,6 +415,20 @@ async fn cancel(
         .await
         .map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(response)))
+}
+
+/// The owner opened the conversation: its last turn's outcome is seen (C21).
+async fn outcome_seen(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<OutcomeSeenResponse>>, ApiError> {
+    let last_outcome_seen_at = state
+        .service
+        .mark_outcome_seen(&user.id, &id)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(OutcomeSeenResponse { last_outcome_seen_at })))
 }
 
 async fn ensure_runtime(
