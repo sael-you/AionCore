@@ -245,12 +245,36 @@ async fn r3_ready_to_deploy_is_not_enabled_and_deploying_is_system_only() {
         "board_gate_use_decision",
         "cards enter deploying only through the Deploy approval"
     );
-    // The supervisor runs deploys: it may move into / out of deploying.
+    // Not even the supervisor enters deploying by a plain move (only a
+    // deploy job, S5); a card already there leaves only to deployed /
+    // local_test for it.
     let system = BoardActor::system(USER);
-    env.service
-        .move_card(&system, &other.id, mv("deploying", "ideas"))
-        .await
-        .unwrap();
+    assert_eq!(
+        code(
+            env.service
+                .move_card(&system, &other.id, mv("deploying", "ideas"))
+                .await
+                .unwrap_err()
+        ),
+        "board_gate_use_decision"
+    );
+    exec(
+        env.pool(),
+        &format!(
+            "UPDATE board_cards SET column_key = 'deploying' WHERE id = '{}'",
+            other.id
+        ),
+    )
+    .await;
+    assert_eq!(
+        code(
+            env.service
+                .move_card(&system, &other.id, mv("done", "deploying"))
+                .await
+                .unwrap_err()
+        ),
+        "board_gate_use_decision"
+    );
     assert_eq!(
         code(
             env.service
@@ -896,4 +920,316 @@ async fn re_enabling_a_board_recreates_a_missing_keeper() {
         .await
         .unwrap();
     assert_eq!(exists, 1);
+}
+
+#[tokio::test]
+async fn non_owner_actors_never_jump_over_a_gate() {
+    let env = env_with_host(true).await;
+    let settings = enable(&env.service, PROJECT).await;
+    let keeper = BoardActor::Agent(
+        env.service
+            .resolve_agent(USER, &settings.keeper_conversation_id.unwrap())
+            .await
+            .unwrap(),
+    );
+    let system = BoardActor::system(USER);
+    let late = env
+        .service
+        .create_card(&owner(), PROJECT, create_in("l", "local_test"))
+        .await
+        .unwrap();
+    for actor in [&keeper, &system] {
+        let card = env
+            .service
+            .create_card(&owner(), PROJECT, create_in("c", "triage"))
+            .await
+            .unwrap();
+        let error = env
+            .service
+            .move_card(actor, &card.id, mv("planned", "triage"))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(code(error), "board_agent_move_denied" | "board_gate_use_decision"),
+            "triage → planned skips Decision"
+        );
+        let error = env
+            .service
+            .move_card(actor, &late.id, mv("deployed", "local_test"))
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            code(error),
+            "board_agent_move_denied" | "board_gate_use_decision"
+        ));
+        for column in ["planned", "deployed"] {
+            let error = env
+                .service
+                .create_card(actor, PROJECT, create_in("x", column))
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(code(error), "board_agent_move_denied" | "board_gate_use_decision"),
+                "create into {column}"
+            );
+        }
+    }
+    // The supervisor may still deliver a card ONTO the Decision gate.
+    let card = env
+        .service
+        .create_card(&owner(), PROJECT, create_in("d", "accuracy"))
+        .await
+        .unwrap();
+    env.service
+        .move_card(&system, &card.id, mv("decision", "accuracy"))
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn agents_cannot_change_owner_if_inputs_while_a_card_waits_at_a_gate() {
+    let env = env().await;
+    enable(&env.service, PROJECT).await;
+    let agent = BoardActor::Agent(env.service.resolve_agent(USER, CONV).await.unwrap());
+    let card = env
+        .service
+        .create_card(&owner(), PROJECT, create_in("c", "triage"))
+        .await
+        .unwrap();
+    let edit = |version, department: &str| UpdateBoardCardRequest {
+        version,
+        routing: Some(vec![department.into()]),
+        ..Default::default()
+    };
+    let card = env
+        .service
+        .update_card(&agent, &card.id, edit(card.version, "qa"))
+        .await
+        .expect("allowed in triage");
+    let card = env
+        .service
+        .move_card(&owner(), &card.id, forced("decision", "triage", None))
+        .await
+        .unwrap();
+    let error = env
+        .service
+        .update_card(&agent, &card.id, edit(card.version, "arch"))
+        .await
+        .unwrap_err();
+    assert_eq!(code(error), "board_gate_use_decision");
+}
+
+#[tokio::test]
+async fn agents_answer_only_their_departments_questions_and_keep_owner_blocks() {
+    let env = env().await;
+    enable(&env.service, PROJECT).await;
+    let card = env.service.create_card(&owner(), PROJECT, create("a")).await.unwrap();
+    env.service
+        .add_link(
+            &owner(),
+            &card.id,
+            BoardLinkRequest {
+                conversation_id: CONV.into(),
+                role: LinkRole::Review,
+                department: Some("qa".into()),
+            },
+        )
+        .await
+        .unwrap();
+    for (id, to) in [("q-owner", "owner"), ("q-qa", "qa"), ("q-arch", "arch")] {
+        sqlx::query(
+            "INSERT INTO board_card_questions (id, card_id, project_id, user_id, from_department, to_department, \
+             text, created_at, updated_at) VALUES (?, ?, ?, ?, 'review', ?, '?', 1, 1)",
+        )
+        .bind(id)
+        .bind(&card.id)
+        .bind(PROJECT)
+        .bind(USER)
+        .bind(to)
+        .execute(env.pool())
+        .await
+        .unwrap();
+    }
+    let agent = BoardActor::Agent(env.service.resolve_agent(USER, CONV).await.unwrap());
+    let answer = |id: &str| aionui_api_types::BoardCommentRequest {
+        body: "answer".into(),
+        to_department: None,
+        answers: Some(id.into()),
+    };
+    for id in ["q-owner", "q-arch"] {
+        assert_eq!(
+            code(env.service.comment(&agent, &card.id, answer(id)).await.unwrap_err()),
+            "board_department_mismatch"
+        );
+    }
+    env.service.comment(&agent, &card.id, answer("q-qa")).await.unwrap();
+    env.service
+        .comment(&owner(), &card.id, answer("q-owner"))
+        .await
+        .expect("the owner answers owner questions");
+
+    // An owner's block is the owner's to lift.
+    let card = env.service.card_detail(&owner(), &card.id).await.unwrap().card;
+    let blocked = env
+        .service
+        .update_card(
+            &owner(),
+            &card.id,
+            UpdateBoardCardRequest {
+                version: card.version,
+                blocked: Some(true),
+                blocked_reason: Some(Some("legal review".into())),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(blocked.blocked_by, Some(aionui_api_types::BoardActorKind::User));
+    assert_eq!(
+        code(env.service.set_blocked(&agent, &card.id, None).await.unwrap_err()),
+        "board_agent_move_denied"
+    );
+    let own = env.service.create_card(&owner(), PROJECT, create("b")).await.unwrap();
+    env.service.set_blocked(&agent, &own.id, Some("waits")).await.unwrap();
+    env.service
+        .set_blocked(&agent, &own.id, None)
+        .await
+        .expect("an agent lifts its own block");
+}
+
+#[tokio::test]
+async fn an_assign_that_lost_its_claim_does_not_delete_the_conversation() {
+    let env = env_with_host(true).await;
+    enable(&env.service, PROJECT).await;
+    let card = env.service.create_card(&owner(), PROJECT, create("a")).await.unwrap();
+    *env.host.steal_claim.lock().unwrap() = true;
+    let error = env
+        .service
+        .assign(&owner(), &card.id, assign_request("s1"))
+        .await
+        .unwrap_err();
+    assert_eq!(code(error), "board_assignment_in_progress");
+    assert!(
+        env.host.deleted.lock().unwrap().is_empty(),
+        "the new claimant owns the conversation now"
+    );
+}
+
+#[tokio::test]
+async fn a_lost_keeper_race_returns_the_winner_and_drops_the_loser() {
+    let env = env_with_host(true).await;
+    // Enable without a keeper (no host at that point is not possible here):
+    // delete the enable-time keeper, then race the re-creation.
+    let settings = enable(&env.service, PROJECT).await;
+    sqlx::query("DELETE FROM conversations WHERE id = ?")
+        .bind(settings.keeper_conversation_id.unwrap())
+        .execute(env.pool())
+        .await
+        .unwrap();
+    *env.host.race_keeper.lock().unwrap() = true;
+    let response = env.service.ensure_keeper(&owner(), PROJECT).await.unwrap();
+    assert_eq!(
+        (response.conversation_id.as_str(), response.created),
+        ("winner-keeper", false)
+    );
+    assert_eq!(env.host.deleted.lock().unwrap().len(), 1, "our duplicate is deleted");
+}
+
+#[tokio::test]
+async fn a_resumed_team_assignment_does_not_resend_the_packet() {
+    let env = env_with_host(true).await;
+    enable(&env.service, PROJECT).await;
+    let card = env.service.create_card(&owner(), PROJECT, create("a")).await.unwrap();
+    exec(
+        env.pool(),
+        "INSERT INTO teams (id, user_id, name, project_id, created_at, updated_at) VALUES ('team-1', 'user-1', 'T', 'proj-1', 1, 1)",
+    )
+    .await;
+    conversation(env.pool(), USER, "lead-1", Some(PROJECT), r#"{"teamId":"team-1"}"#).await;
+    env.host.teams.lock().unwrap().push(HostTeam {
+        team_id: "team-1".into(),
+        name: "T".into(),
+        lead_conversation_id: Some("lead-1".into()),
+    });
+    let request = BoardAssignRequest {
+        assistant_id: None,
+        team_id: Some("team-1".into()),
+        department: Some("build".into()),
+        role: None,
+        idempotency_key: "tm".into(),
+    };
+    env.service.assign(&owner(), &card.id, request.clone()).await.unwrap();
+    exec(
+        env.pool(),
+        "UPDATE board_idempotency SET state = 'pending', packet_message_id = NULL, updated_at = 1",
+    )
+    .await;
+    let resumed = env.service.assign(&owner(), &card.id, request).await.unwrap();
+    assert!(resumed.packet_sent);
+    assert_eq!(
+        env.host.team_messages.lock().unwrap().len(),
+        1,
+        "delivered once per assignment"
+    );
+}
+
+#[tokio::test]
+async fn reads_write_nothing_and_archived_cards_take_no_comments() {
+    let env = env().await;
+    enable(&env.service, PROJECT).await;
+    let card = env.service.create_card(&owner(), PROJECT, create("a")).await.unwrap();
+    exec(env.pool(), "UPDATE board_settings SET archived_at = 5").await;
+    let before = env.event_count().await;
+    env.service.board_view(&owner(), PROJECT, false).await.unwrap();
+    assert_eq!(env.event_count().await, before, "GET does not auto-unarchive");
+    exec(env.pool(), "UPDATE board_settings SET archived_at = NULL").await;
+    env.service.set_card_archived(&owner(), &card.id, true).await.unwrap();
+    let error = env
+        .service
+        .comment(
+            &owner(),
+            &card.id,
+            aionui_api_types::BoardCommentRequest {
+                body: "x".into(),
+                to_department: None,
+                answers: None,
+            },
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(code(error), "board_invalid");
+}
+
+#[tokio::test]
+async fn a_rebalance_is_recorded_in_the_moves_event() {
+    let env = env().await;
+    enable(&env.service, PROJECT).await;
+    let a = env.service.create_card(&owner(), PROJECT, create("a")).await.unwrap();
+    let b = env.service.create_card(&owner(), PROJECT, create("b")).await.unwrap();
+    let c = env
+        .service
+        .create_card(&owner(), PROJECT, create_in("c", "inbox"))
+        .await
+        .unwrap();
+    exec(
+        env.pool(),
+        &format!("UPDATE board_cards SET position = 10 WHERE id = '{}'", a.id),
+    )
+    .await;
+    exec(
+        env.pool(),
+        &format!("UPDATE board_cards SET position = 11 WHERE id = '{}'", b.id),
+    )
+    .await;
+    let mut between = mv("ideas", "inbox");
+    between.after_id = Some(a.id.clone());
+    env.service.move_card(&owner(), &c.id, between).await.unwrap();
+    let events = env.service.card_events(&owner(), &c.id, None, None).await.unwrap();
+    let reordered = events.items.last().unwrap().payload["reordered"]
+        .as_array()
+        .unwrap()
+        .clone();
+    assert_eq!(reordered.len(), 2);
+    assert_eq!(reordered[0]["card_id"], a.id.as_str());
+    assert_eq!(reordered[0]["position"], 1024);
 }

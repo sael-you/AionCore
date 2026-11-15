@@ -49,7 +49,12 @@ pub(crate) struct Inner {
     pub(crate) emitter: BoardEventEmitter,
     pub(crate) host: OnceLock<Arc<dyn BoardHostPort>>,
     pub(crate) rate_limiter: AgentRateLimiter,
+    /// Cards the board GET returns before paging (`next_cards_cursor`).
+    pub(crate) view_page: std::sync::atomic::AtomicUsize,
 }
+
+/// Default first page of the board GET.
+pub const BOARD_VIEW_PAGE: usize = 500;
 
 /// What a committed write publishes.
 pub(crate) struct Committed {
@@ -95,8 +100,16 @@ impl BoardService {
                 emitter: BoardEventEmitter::new(broadcaster),
                 host: OnceLock::new(),
                 rate_limiter: AgentRateLimiter::default(),
+                view_page: std::sync::atomic::AtomicUsize::new(BOARD_VIEW_PAGE),
             }),
         }
+    }
+
+    /// Change how many cards the board GET returns before paging.
+    pub fn set_view_page_size(&self, cards: usize) {
+        self.inner
+            .view_page
+            .store(cards.max(1), std::sync::atomic::Ordering::Relaxed);
     }
 
     /// Install the host port (set-once; later calls are ignored).
@@ -236,9 +249,10 @@ impl BoardService {
         }
     }
 
-    /// Lazily clear `archived_at` once an active conversation or team is bound
-    /// to the project again (SPEC §6). Its own write: one `board_unarchived`
-    /// event, then the caller's write proceeds.
+    /// Clear `archived_at` once an active conversation or team is bound to the
+    /// project again (SPEC §6). Runs at the start of a WRITE (never on reads):
+    /// its own write with one `board_unarchived` event, then the caller's
+    /// write proceeds.
     pub(crate) async fn refresh_archive(&self, actor: &BoardActor, project_id: &str) -> BoardResult<()> {
         let user_id = actor.user_id();
         let Some(settings) = self.store().settings(user_id, project_id).await? else {
@@ -295,7 +309,7 @@ impl BoardService {
 
     /// `GET /api/projects/{pid}/board`: settings, columns, card summaries and
     /// the board's `last_seq`. A never-enabled board answers `enabled:false,
-    /// version:0` with no columns.
+    /// version:0` with no columns. Writes nothing.
     pub async fn board_view(
         &self,
         actor: &BoardActor,
@@ -304,14 +318,19 @@ impl BoardService {
     ) -> BoardResult<BoardView> {
         let user_id = actor.user_id();
         self.user_project(user_id, project_id).await?;
-        self.refresh_archive(actor, project_id).await?;
         let store = self.store();
+        // Read the chain head first: the snapshot below is at least that
+        // new, so replaying hints after `last_seq` never skips a change.
+        let last_seq = store.last_seq(user_id, project_id).await?;
         let settings = store.settings(user_id, project_id).await?;
         let columns = store.columns(user_id, project_id).await?;
         let cards = store.cards(user_id, project_id, include_archived).await?;
         let deps = store.project_dependencies(user_id, project_id).await?;
-        let open = open_dependencies(&cards, &deps, &columns, self, user_id).await?;
-        let decisions = self.needs_decision(user_id, &cards, &columns).await?;
+        let page = self.inner.view_page.load(std::sync::atomic::Ordering::Relaxed);
+        let next_cards_cursor = (cards.len() > page).then(|| crate::service_relations::encode_cursor(&cards[page - 1]));
+        let summaries = self
+            .summaries(user_id, &cards[..cards.len().min(page)], &columns, &deps)
+            .await?;
         let mut counts: HashMap<&str, i64> = HashMap::new();
         for card in cards.iter().filter(|card| card.archived_at.is_none()) {
             *counts.entry(card.column_key.as_str()).or_default() += 1;
@@ -322,15 +341,30 @@ impl BoardService {
                 .iter()
                 .map(|column| column_dto(column, counts.get(column.key.as_str()).copied().unwrap_or(0)))
                 .collect(),
-            cards: cards
-                .iter()
-                .map(|card| {
-                    let open = open.get(&card.id).copied().unwrap_or(0);
-                    crate::convert::card_summary(card, card.blocked || open > 0, open, decisions.contains(&card.id))
-                })
-                .collect(),
-            last_seq: store.last_seq(user_id, project_id).await?,
+            cards: summaries,
+            last_seq,
+            next_cards_cursor,
         })
+    }
+
+    /// Board-list form of `cards`: effective blocked state, open dependency
+    /// count and `needs_decision`.
+    pub(crate) async fn summaries(
+        &self,
+        user_id: &str,
+        cards: &[BoardCardRow],
+        columns: &[BoardColumnRow],
+        deps: &[BoardDepRow],
+    ) -> BoardResult<Vec<aionui_api_types::BoardCardSummaryDto>> {
+        let open = open_dependencies(cards, deps, columns, self, user_id).await?;
+        let decisions = self.needs_decision(user_id, cards, columns).await?;
+        Ok(cards
+            .iter()
+            .map(|card| {
+                let open = open.get(&card.id).copied().unwrap_or(0);
+                crate::convert::card_summary(card, card.blocked || open > 0, open, decisions.contains(&card.id))
+            })
+            .collect())
     }
 
     /// Ids of active cards waiting in a gate column whose `owner_if` they
@@ -664,6 +698,12 @@ impl BoardService {
             let mut tx = self.store().begin().await?;
             let mut settings = Self::tx_settings(tx.as_mut(), actor, project_id).await?;
             Self::check_writable(&settings, actor)?;
+            if settings.keeper_conversation_id != current.keeper_conversation_id
+                && let Some(winner) = settings.keeper_conversation_id.clone()
+            {
+                // A concurrent request created the keeper first: keep theirs.
+                return Ok(Some(winner));
+            }
             let expected = settings.version;
             settings.keeper_conversation_id = Some(keeper.clone());
             settings.version += 1;
@@ -673,18 +713,28 @@ impl BoardService {
             }
             let payload = json!({ "settings": settings_dto(project_id, Some(&settings)), "version": settings.version });
             let event = Self::append_event(tx.as_mut(), actor, project_id, None, SETTINGS_CHANGED, payload).await?;
-            self.commit(tx, user_id, &Committed::event(event)).await
+            self.commit(tx, user_id, &Committed::event(event)).await?;
+            Ok(None)
         }
         .instrument(write_span(SETTINGS_CHANGED, actor, None))
         .await;
-        if let Err(error) = result {
-            self.discard_conversation(user_id, &keeper).await;
-            return Err(error);
+        match result {
+            Ok(None) => Ok(BoardKeeperResponse {
+                conversation_id: keeper,
+                created: true,
+            }),
+            Ok(Some(winner)) => {
+                self.discard_conversation(user_id, &keeper).await;
+                Ok(BoardKeeperResponse {
+                    conversation_id: winner,
+                    created: false,
+                })
+            }
+            Err(error) => {
+                self.discard_conversation(user_id, &keeper).await;
+                Err(error)
+            }
         }
-        Ok(BoardKeeperResponse {
-            conversation_id: keeper,
-            created: true,
-        })
     }
 
     // -- Project lifecycle ports (sidebar) -----------------------------------

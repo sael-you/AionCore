@@ -35,7 +35,7 @@ fn page_limit(requested: Option<i64>, default: i64, max: i64) -> i64 {
     requested.unwrap_or(default).clamp(1, max)
 }
 
-fn encode_cursor(card: &BoardCardRow) -> String {
+pub(crate) fn encode_cursor(card: &BoardCardRow) -> String {
     URL_SAFE_NO_PAD.encode(json!([card.column_key, card.position, card.id]).to_string())
 }
 
@@ -182,25 +182,7 @@ impl BoardService {
         let store = self.store();
         let columns = store.columns(user_id, project_id).await?;
         let deps = store.project_dependencies(user_id, project_id).await?;
-        let ids: Vec<String> = deps.iter().map(|dep| dep.depends_on_card_id.clone()).collect();
-        let targets: HashMap<String, BoardCardRow> = store
-            .cards_by_ids(user_id, &ids)
-            .await?
-            .into_iter()
-            .map(|row| (row.id.clone(), row))
-            .collect();
-        let items = rows
-            .iter()
-            .map(|row| {
-                let dependencies = deps
-                    .iter()
-                    .filter(|dep| dep.card_id == row.id)
-                    .filter_map(|dep| targets.get(&dep.depends_on_card_id))
-                    .map(|target| dependency_dto(target, &columns))
-                    .collect();
-                card_dto(row, dependencies)
-            })
-            .collect();
+        let items = self.summaries(user_id, &rows, &columns, &deps).await?;
         Ok(BoardCardPage {
             next_cursor: if has_more { rows.last().map(encode_cursor) } else { None },
             items,
@@ -343,8 +325,10 @@ impl BoardService {
         async {
             let user_id = actor.user_id();
             let mut tx = self.store().begin().await?;
-            let settings = Self::tx_settings(tx.as_mut(), actor, &card.project_id).await?;
-            Self::check_writable(&settings, actor)?;
+            let card = Self::tx_card(tx.as_mut(), actor, card_id).await?;
+            if card.archived_at.is_some() {
+                return Err(crate::service_cards::card_archived());
+            }
             let event_id = generate_id();
             let mut payload = json!({ "body": body, "to_department": to_department, "answers": request.answers });
             if let Some(question_id) = request.answers.as_deref() {
@@ -354,6 +338,27 @@ impl BoardService {
                     .ok_or_else(|| BoardError::not_found("question"))?;
                 if question.answered_by_event.is_some() {
                     return Err(BoardError::invalid("answers", "the question is already answered"));
+                }
+                // Only the owner answers questions to `owner`; an agent answers
+                // only questions to the department it is linked for.
+                if let Some(agent) = actor.as_agent() {
+                    let department = tx
+                        .links(user_id, card_id)
+                        .await?
+                        .into_iter()
+                        .find(|link| link.conversation_id == agent.conversation_id)
+                        .and_then(|link| link.department);
+                    if question.to_department == crate::rules::OWNER_DEPARTMENT
+                        || department.as_deref() != Some(question.to_department.as_str())
+                    {
+                        return Err(BoardError::new(
+                            BoardErrorCode::DepartmentMismatch,
+                            "agents answer only questions addressed to their own department",
+                        )
+                        .with_details(
+                            json!({ "to_department": question.to_department, "linked_department": department }),
+                        ));
+                    }
                 }
                 let expected = question.version;
                 question.answered_by_event = Some(event_id.clone());
@@ -541,6 +546,7 @@ mod tests {
             assignee_ref: None,
             blocked: false,
             blocked_reason: None,
+            blocked_by: None,
             change_id: None,
             metadata: "{}".into(),
             version: 1,

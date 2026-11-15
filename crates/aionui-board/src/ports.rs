@@ -89,8 +89,16 @@ pub trait BoardHostPort: Send + Sync {
     async fn team(&self, user_id: &str, team_id: &str) -> Result<Option<HostTeam>, String>;
 
     /// Deliver `content` to the team's lead as a user message (the path
-    /// behind `POST /api/teams/{id}/messages`).
-    async fn send_team_message(&self, user_id: &str, team_id: &str, content: &str) -> Result<(), String>;
+    /// behind `POST /api/teams/{id}/messages`), at most once per
+    /// `dedupe_key`: when the team's mailbox already holds a message carrying
+    /// the key, nothing is sent.
+    async fn send_team_message(
+        &self,
+        user_id: &str,
+        team_id: &str,
+        content: &str,
+        dedupe_key: &str,
+    ) -> Result<(), String>;
 
     /// The resolved skill set of an assignee (`assistant` or `team`).
     async fn assignee_skills(&self, user_id: &str, kind: &str, assignee_ref: &str) -> Result<Vec<String>, String>;

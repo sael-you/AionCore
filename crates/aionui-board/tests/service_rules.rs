@@ -400,8 +400,8 @@ impl BoardHostPort for BindingPort {
     async fn team(&self, u: &str, t: &str) -> Result<Option<aionui_board::HostTeam>, String> {
         self.inner.team(u, t).await
     }
-    async fn send_team_message(&self, u: &str, t: &str, c: &str) -> Result<(), String> {
-        self.inner.send_team_message(u, t, c).await
+    async fn send_team_message(&self, u: &str, t: &str, c: &str, k: &str) -> Result<(), String> {
+        self.inner.send_team_message(u, t, c, k).await
     }
     async fn assignee_skills(&self, u: &str, k: &str, a: &str) -> Result<Vec<String>, String> {
         self.inner.assignee_skills(u, k, a).await
@@ -1044,4 +1044,59 @@ async fn interleaved_projects_each_keep_a_gapless_event_chain() {
         assert_eq!(view.last_seq, page.items[3].seq);
         assert_eq!(heads[project], view.last_seq);
     }
+}
+
+#[tokio::test]
+async fn the_board_get_pages_large_boards_and_the_card_list_continues_it() {
+    let env = env().await;
+    enable(&env.service, PROJECT).await;
+    for i in 0..5 {
+        let column = if i % 2 == 0 { "ideas" } else { "inbox" };
+        env.service
+            .create_card(&owner(), PROJECT, create_in(&format!("c{i}"), column))
+            .await
+            .unwrap();
+    }
+    env.service.set_view_page_size(2);
+    let view = env.service.board_view(&owner(), PROJECT, false).await.unwrap();
+    assert_eq!(view.cards.len(), 2);
+    assert_eq!(
+        view.columns.iter().find(|c| c.key == "ideas").unwrap().card_count,
+        3,
+        "counts cover every card"
+    );
+    let mut seen: Vec<String> = view.cards.iter().map(|c| c.id.clone()).collect();
+    let mut cursor = view.next_cards_cursor.clone();
+    assert!(cursor.is_some());
+    while let Some(next) = cursor {
+        let page = env
+            .service
+            .list_project_cards(
+                &owner(),
+                PROJECT,
+                &aionui_api_types::BoardCardListQuery {
+                    cursor: Some(next),
+                    limit: Some(2),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+        seen.extend(page.items.iter().map(|c| c.id.clone()));
+        cursor = page.next_cursor;
+    }
+    let all = env.service.board_view(&owner(), PROJECT, false).await;
+    assert!(all.is_ok());
+    seen.sort();
+    seen.dedup();
+    assert_eq!(seen.len(), 5, "every card exactly once across the pages");
+    env.service.set_view_page_size(500);
+    assert!(
+        env.service
+            .board_view(&owner(), PROJECT, false)
+            .await
+            .unwrap()
+            .next_cards_cursor
+            .is_none()
+    );
 }

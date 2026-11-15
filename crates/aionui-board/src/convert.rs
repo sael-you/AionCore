@@ -115,6 +115,7 @@ pub fn card_dto(row: &BoardCardRow, dependencies: Vec<BoardDependencyDto>) -> Bo
         assignee_ref: row.assignee_ref.clone(),
         blocked: row.blocked,
         blocked_reason: row.blocked_reason.clone(),
+        blocked_by: row.blocked_by.as_deref().and_then(BoardActorKind::parse),
         change_id: row.change_id.clone(),
         metadata: json_or(&row.metadata, json!({})),
         dependencies,

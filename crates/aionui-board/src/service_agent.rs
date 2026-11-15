@@ -95,13 +95,11 @@ impl BoardService {
     }
 
     /// R1 for agent reads and writes: the board must exist and be enabled.
-    /// Also performs the lazy unarchive check so an agent of a re-bound
-    /// project sees a writable board.
+    /// Reads nothing but settings and writes nothing.
     pub async fn require_enabled(&self, actor: &BoardActor) -> BoardResult<()> {
         let Some(agent) = actor.as_agent() else {
             return Ok(());
         };
-        self.refresh_archive(actor, &agent.project_id).await?;
         match self.store().settings(&agent.user_id, &agent.project_id).await? {
             Some(settings) if settings.enabled => Ok(()),
             _ => Err(disabled()),

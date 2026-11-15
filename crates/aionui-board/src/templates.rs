@@ -5,6 +5,8 @@
 /// Column keys the rules refer to by name.
 pub const DEPLOYING: &str = "deploying";
 pub const READY_TO_DEPLOY: &str = "ready_to_deploy";
+pub const DEPLOYED: &str = "deployed";
+pub const LOCAL_TEST: &str = "local_test";
 
 use aionui_api_types::{AgentMove, BoardTemplate, ColumnCategory, ColumnKind, ColumnResolution};
 use serde_json::{Value, json};

@@ -235,6 +235,11 @@ pub struct FakeHost {
     pub fail_send: Mutex<bool>,
     pub deleted: Mutex<Vec<String>>,
     pub teams: Mutex<Vec<HostTeam>>,
+    /// Simulate a takeover of the assignment lease while the conversation
+    /// is being created.
+    pub steal_claim: Mutex<bool>,
+    /// Simulate a concurrent keeper creation that wins the race.
+    pub race_keeper: Mutex<bool>,
     counter: Mutex<u32>,
 }
 
@@ -247,6 +252,8 @@ impl FakeHost {
             fail_send: Mutex::new(false),
             deleted: Mutex::new(Vec::new()),
             teams: Mutex::new(Vec::new()),
+            steal_claim: Mutex::new(false),
+            race_keeper: Mutex::new(false),
             counter: Mutex::new(0),
         }
     }
@@ -314,6 +321,12 @@ impl BoardHostPort for FakeHost {
                 HostError::Failed(e.to_string())
             }
         })?;
+        if *self.steal_claim.lock().unwrap() {
+            sqlx::query("UPDATE board_idempotency SET claim_token = 'stolen'")
+                .execute(&self.pool)
+                .await
+                .map_err(|e| HostError::Failed(e.to_string()))?;
+        }
         Ok(id)
     }
 
@@ -359,11 +372,21 @@ impl BoardHostPort for FakeHost {
             .cloned())
     }
 
-    async fn send_team_message(&self, _user_id: &str, team_id: &str, content: &str) -> Result<(), String> {
-        self.team_messages
-            .lock()
-            .unwrap()
-            .push((team_id.to_owned(), content.to_owned()));
+    async fn send_team_message(
+        &self,
+        _user_id: &str,
+        team_id: &str,
+        content: &str,
+        dedupe_key: &str,
+    ) -> Result<(), String> {
+        let mut messages = self.team_messages.lock().unwrap();
+        if messages
+            .iter()
+            .any(|(team, text)| team == team_id && text.contains(dedupe_key))
+        {
+            return Ok(());
+        }
+        messages.push((team_id.to_owned(), content.to_owned()));
         Ok(())
     }
 
@@ -390,6 +413,21 @@ impl BoardHostPort for FakeHost {
         .execute(&self.pool)
         .await
         .map_err(|e| e.to_string())?;
+        if *self.race_keeper.lock().unwrap() {
+            sqlx::query(
+                "INSERT INTO conversations (id, user_id, name, type, extra, status, project_id, created_at, updated_at) \
+                 VALUES ('winner-keeper', ?, 'w', 'acp', '{}', 'pending', ?, 1, 1)",
+            )
+            .bind(user_id)
+            .bind(PROJECT)
+            .execute(&self.pool)
+            .await
+            .map_err(|e| e.to_string())?;
+            sqlx::query("UPDATE board_settings SET keeper_conversation_id = 'winner-keeper'")
+                .execute(&self.pool)
+                .await
+                .map_err(|e| e.to_string())?;
+        }
         Ok(id)
     }
 }

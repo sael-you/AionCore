@@ -150,15 +150,10 @@ impl BoardService {
                 return Err(crate::service_cards::card_version_conflict(&card));
             }
             let dto = Self::tx_card_dto(tx.as_mut(), &card).await?;
-            let event = Self::append_event(
-                tx.as_mut(),
-                actor,
-                &card.project_id,
-                Some(&card.id),
-                kind,
-                json!({ "card": dto, "version": card.version, "from": from_key, "to": to.key, "reason": reason }),
-            )
-            .await?;
+            let mut payload =
+                json!({ "card": dto, "version": card.version, "from": from_key, "to": to.key, "reason": reason });
+            crate::service_cards::add_reordered(&mut payload, tx.as_mut());
+            let event = Self::append_event(tx.as_mut(), actor, &card.project_id, Some(&card.id), kind, payload).await?;
             let now = now_ms();
             tx.insert_idempotency(&BoardIdempotencyRow {
                 user_id: user_id.to_owned(),

@@ -99,22 +99,6 @@ impl BoardService {
         let department = required_text("department", department, DEPARTMENT_MAX)?;
         let verdict = validate_verdict(request)?;
         let card = self.scoped_card(actor, card_id).await?;
-        if let Some(agent) = actor.as_agent() {
-            let linked = self
-                .store()
-                .links(actor.user_id(), card_id)
-                .await?
-                .into_iter()
-                .find(|link| link.conversation_id == agent.conversation_id)
-                .and_then(|link| link.department);
-            if linked.as_deref() != Some(department.as_str()) {
-                return Err(BoardError::new(
-                    BoardErrorCode::DepartmentMismatch,
-                    "agents review only for the department they were assigned",
-                )
-                .with_details(json!({ "department": department, "linked_department": linked })));
-            }
-        }
         self.refresh_archive(actor, &card.project_id).await?;
         async {
             let user_id = actor.user_id();
@@ -122,6 +106,22 @@ impl BoardService {
             let card = Self::tx_card(tx.as_mut(), actor, card_id).await?;
             if card.archived_at.is_some() {
                 return Err(crate::service_cards::card_archived());
+            }
+            // R6, checked on the rows this transaction writes against.
+            if let Some(agent) = actor.as_agent() {
+                let linked = tx
+                    .links(user_id, card_id)
+                    .await?
+                    .into_iter()
+                    .find(|link| link.conversation_id == agent.conversation_id)
+                    .and_then(|link| link.department);
+                if linked.as_deref() != Some(department.as_str()) {
+                    return Err(BoardError::new(
+                        BoardErrorCode::DepartmentMismatch,
+                        "agents review only for the department they were assigned",
+                    )
+                    .with_details(json!({ "department": department, "linked_department": linked })));
+                }
             }
             let now = now_ms();
             let existing = tx

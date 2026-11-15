@@ -26,7 +26,7 @@ use crate::events::{
 use crate::rate_limit::WriteBudget;
 use crate::rules::{exit_rule_missing, owner_must_decide};
 use crate::service::{BoardService, Committed, completed_columns, require_owner, version_conflict, write_span};
-use crate::templates::DEPLOYING;
+use crate::templates::{DEPLOYED, DEPLOYING, LOCAL_TEST, READY_TO_DEPLOY};
 use crate::validation::{
     BLOCK_REASON_MAX, CHANGE_ID_MAX, DESCRIPTION_MAX, METADATA_MAX_BYTES, ROUTING_MAX, TAG_LIST_MAX, TITLE_MAX,
     free_text, json_object, required_text, tag_list,
@@ -283,6 +283,7 @@ impl BoardService {
         if let (Some(target), Value::Object(fields)) = (payload.as_object_mut(), extra) {
             target.extend(fields);
         }
+        add_reordered(&mut payload, tx.as_mut());
         let event = Self::append_event(tx.as_mut(), actor, &card.project_id, Some(&card.id), kind, payload).await?;
         self.commit(tx, actor.user_id(), &Committed::card(event, dto.clone()))
             .await?;
@@ -345,6 +346,7 @@ impl BoardService {
                     if column.key == DEPLOYING || (is_gate(column) && !actor.is_user()) {
                         return Err(gate_use_decision(&column.key));
                     }
+                    check_barrier(actor, &columns, None, column)?;
                     // Creating straight into a column counts as moving there.
                     if let Some(agent) = actor.as_agent() {
                         let open = column.agent_move == AgentMove::Allow.as_str() || (agent.keeper && !is_gate(column));
@@ -402,6 +404,7 @@ impl BoardService {
                 assignee_ref: None,
                 blocked: false,
                 blocked_reason: None,
+                blocked_by: None,
                 change_id,
                 metadata: metadata.to_string(),
                 version: 1,
@@ -411,15 +414,10 @@ impl BoardService {
             };
             tx.insert_card(&card).await?;
             let dto = card_dto(&card, Vec::new());
-            let event = Self::append_event(
-                tx.as_mut(),
-                actor,
-                project_id,
-                Some(&card.id),
-                CARD_CREATED,
-                json!({ "card": dto, "version": card.version }),
-            )
-            .await?;
+            let mut payload = json!({ "card": dto, "version": card.version });
+            add_reordered(&mut payload, tx.as_mut());
+            let event =
+                Self::append_event(tx.as_mut(), actor, project_id, Some(&card.id), CARD_CREATED, payload).await?;
             self.commit(tx, user_id, &Committed::card(event, dto.clone())).await?;
             Ok(dto)
         }
@@ -450,6 +448,22 @@ impl BoardService {
                 return Err(card_version_conflict(&card));
             }
             let changed = patch.apply(&mut card);
+            // The fields owner_if reads cannot be changed by agents while the
+            // card waits for a decision (allowed again once it left the gate).
+            if actor.as_agent().is_some()
+                && changed
+                    .iter()
+                    .any(|field| matches!(*field, "size" | "tier" | "routing"))
+            {
+                let columns = tx.columns(actor.user_id(), &card.project_id).await?;
+                if columns.iter().any(|c| c.key == card.column_key && is_gate(c)) {
+                    return Err(gate_use_decision(&card.column_key)
+                        .with_details(json!({ "column": card.column_key, "fields": ["size", "tier", "routing"] })));
+                }
+            }
+            if changed.contains(&"blocked") {
+                card.blocked_by = card.blocked.then(|| actor.kind().as_str().to_owned());
+            }
             if card.blocked && card.blocked_reason.is_none() && changed.contains(&"blocked") {
                 return Err(BoardError::invalid("blocked_reason", "blocking a card needs a reason"));
             }
@@ -518,15 +532,23 @@ impl BoardService {
             let mut kind = CARD_MOVED;
             let mut overrides: Vec<&str> = Vec::new();
             if changes_column {
-                // `deploying` is entered only through the Deploy approval and
-                // left by the supervisor; the owner may force a card out.
-                if to.key == DEPLOYING && !matches!(actor, BoardActor::System { .. }) {
+                // `deploying` is entered only through the Deploy approval of
+                // a deploy job (S5), never by a plain move. The supervisor
+                // leaves it only to `deployed` or `local_test`; the owner may
+                // force a card out with a reason.
+                if to.key == DEPLOYING {
                     return Err(gate_use_decision(DEPLOYING));
                 }
-                if card.column_key == DEPLOYING && !matches!(actor, BoardActor::System { .. }) {
-                    require_forced_reason(actor, &request, &reason, DEPLOYING)?;
-                    kind = DEPLOY_FORCED;
-                    overrides.push("deploying");
+                if card.column_key == DEPLOYING {
+                    if matches!(actor, BoardActor::System { .. }) {
+                        if to.key != DEPLOYED && to.key != LOCAL_TEST {
+                            return Err(gate_use_decision(DEPLOYING));
+                        }
+                    } else {
+                        require_forced_reason(actor, &request, &reason, DEPLOYING)?;
+                        kind = DEPLOY_FORCED;
+                        overrides.push("deploying");
+                    }
                 } else if let Some(from) = from.filter(|from| is_gate(from)) {
                     let reviews = tx.reviews(user_id, &card.id).await?;
                     let questions = tx.questions(user_id, &card.id).await?;
@@ -536,6 +558,9 @@ impl BoardService {
                         overrides.push("gate");
                     }
                 }
+            }
+            if card.column_key != DEPLOYING {
+                check_barrier(actor, &columns, from, to)?;
             }
             let forward = changes_column && from.is_some_and(|from| to.position > from.position);
             if forward {
@@ -673,8 +698,16 @@ impl BoardService {
                 // Already unblocked: nothing changes, nothing is written.
                 return Self::tx_card_dto(tx.as_mut(), &card).await;
             }
+            if actor.as_agent().is_some() && card.blocked && card.blocked_by.as_deref() == Some("user") {
+                return Err(BoardError::new(
+                    BoardErrorCode::AgentMoveDenied,
+                    "the owner set this block; only the owner lifts or changes it",
+                )
+                .with_details(json!({ "reason": "owner_block" })));
+            }
             card.blocked = reason.is_some();
             card.blocked_reason = reason.clone();
+            card.blocked_by = reason.is_some().then(|| actor.kind().as_str().to_owned());
             let expected = card.version;
             card.version += 1;
             card.updated_at = now_ms();
@@ -770,6 +803,20 @@ impl BoardService {
     }
 }
 
+/// A rebalance renumbered the column: record `(card_id, position)` of every
+/// card it moved, so replaying the events keeps the column order.
+pub(crate) fn add_reordered(payload: &mut Value, tx: &mut dyn IBoardTx) {
+    let reordered = tx.take_rebalanced();
+    if !reordered.is_empty() {
+        payload["reordered"] = json!(
+            reordered
+                .into_iter()
+                .map(|(card_id, position)| json!({ "card_id": card_id, "position": position }))
+                .collect::<Vec<_>>()
+        );
+    }
+}
+
 /// Agents move only through columns open to them; the Board Keeper may move
 /// between any two non-gate columns (D40). `deploying` stays closed to both.
 fn check_agent_move(actor: &BoardActor, from: Option<&BoardColumnRow>, to: &BoardColumnRow) -> BoardResult<()> {
@@ -788,6 +835,44 @@ fn check_agent_move(actor: &BoardActor, from: Option<&BoardColumnRow>, to: &Boar
         }
     }
     Ok(())
+}
+
+/// Every actor but the owner stays in front of the next gate: a move (or a
+/// create, which starts before the first column) may land ON the first gate or
+/// `deploying` column after its source, never beyond it. The keeper also never
+/// reaches the terminal columns after Ready to deploy.
+fn check_barrier(
+    actor: &BoardActor,
+    columns: &[BoardColumnRow],
+    from: Option<&BoardColumnRow>,
+    to: &BoardColumnRow,
+) -> BoardResult<()> {
+    if actor.is_user() {
+        return Ok(());
+    }
+    let from_position = from.map(|column| column.position).unwrap_or(i64::MIN);
+    if to.position <= from_position {
+        return Ok(());
+    }
+    let barrier = columns
+        .iter()
+        .filter(|c| !c.archived && c.position > from_position && (is_gate(c) || c.key == DEPLOYING))
+        .min_by_key(|c| c.position);
+    let blocked_by_barrier = barrier.is_some_and(|barrier| to.position > barrier.position);
+    let keeper_terminal = actor.as_agent().is_some_and(|agent| agent.keeper)
+        && to.kind == ColumnKind::Terminal.as_str()
+        && columns
+            .iter()
+            .find(|c| c.key == READY_TO_DEPLOY)
+            .is_some_and(|ready| to.position > ready.position);
+    if !(blocked_by_barrier || keeper_terminal) {
+        return Ok(());
+    }
+    let gate = barrier.map(|b| b.key.as_str()).unwrap_or(READY_TO_DEPLOY);
+    Err(match actor {
+        BoardActor::Agent(_) => agent_move_denied(&to.key).with_details(json!({ "column": to.key, "gate": gate })),
+        _ => gate_use_decision(gate),
+    })
 }
 
 /// Leaving a decided gate or `deploying` needs the owner's force with a

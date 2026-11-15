@@ -171,6 +171,8 @@ pub struct BoardCardDto {
     pub assignee_ref: Option<String>,
     pub blocked: bool,
     pub blocked_reason: Option<String>,
+    /// Who set the manual block (agents cannot lift an owner's block).
+    pub blocked_by: Option<BoardActorKind>,
     pub change_id: Option<String>,
     pub metadata: Value,
     /// Cards this card waits for.
@@ -226,6 +228,9 @@ pub struct BoardView {
     /// `seq` of the board's newest event (head of its chain; resume point for
     /// the events API).
     pub last_seq: i64,
+    /// Set when `cards` is only the first page: read the rest with
+    /// `GET …/board/cards?cursor=<this>` (same order and filter).
+    pub next_cards_cursor: Option<String>,
 }
 
 /// `PUT /api/projects/{pid}/board/columns` response.
@@ -353,7 +358,7 @@ pub struct BoardEventPage {
 /// A page of cards (stable cursor over `(column, position, id)`).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct BoardCardPage {
-    pub items: Vec<BoardCardDto>,
+    pub items: Vec<BoardCardSummaryDto>,
     pub next_cursor: Option<String>,
     pub has_more: bool,
 }

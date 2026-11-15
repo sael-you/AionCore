@@ -304,7 +304,13 @@ impl BoardService {
         {
             Ok(linked) => linked,
             Err(error) => {
-                if created_now {
+                // Only the claim holder may undo its side effects: a claimant
+                // that lost the lease leaves the conversation to the new one.
+                if created_now
+                    && self
+                        .claim_held(user_id, &card.project_id, &plan.key, &claim.token)
+                        .await
+                {
                     self.discard_conversation(user_id, &conversation_id).await;
                 }
                 return Err(error);
@@ -346,7 +352,7 @@ impl BoardService {
             let packet = build_packet(&detail, &columns, plan.department.as_deref(), &missing);
             let text = format!(
                 "You were assigned {} on the project board as {} ({}). Work on it as described below; read it again \
-                 with `aioncore board show {} --packet`{}.\n\n{}",
+                 with `aioncore board show {} --packet`{}.\n\n{}\n[board-assignment {}]",
                 reference(card.number),
                 plan.department.as_deref().unwrap_or("brainstorm"),
                 plan.role.as_str(),
@@ -358,7 +364,8 @@ impl BoardService {
                     ),
                     _ => String::new(),
                 },
-                packet.text
+                packet.text,
+                claim.assignment_id
             );
             self.ensure_claim(user_id, &card.project_id, &plan.key, &claim.token)
                 .await?;
@@ -369,7 +376,7 @@ impl BoardService {
                     None => host.send_message(user_id, &conversation_id, &text).await,
                 },
                 Assignee::Team(team) => host
-                    .send_team_message(user_id, team, &text)
+                    .send_team_message(user_id, team, &text, &claim.assignment_id)
                     .await
                     .map(|_| format!("team:{}", claim.assignment_id)),
             };
@@ -483,6 +490,21 @@ impl BoardService {
         }
         tx.commit().await?;
         Ok(())
+    }
+
+    /// Whether `token` still holds the reservation (read in a transaction).
+    async fn claim_held(&self, user_id: &str, project_id: &str, key: &str, token: &str) -> bool {
+        let held: BoardResult<bool> = async {
+            let mut tx = self.store().begin().await?;
+            let held = tx
+                .idempotency(user_id, project_id, key)
+                .await?
+                .is_some_and(|row| row.claim_token.as_deref() == Some(token));
+            tx.commit().await?;
+            Ok(held)
+        }
+        .await;
+        held.unwrap_or(false)
     }
 
     /// Best-effort: mark the lease stale so a retry can take over at once.

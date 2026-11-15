@@ -123,6 +123,7 @@ mod tests {
             assignee_ref: None,
             blocked: false,
             blocked_reason: None,
+            blocked_by: None,
             change_id: None,
             metadata: "{}".into(),
             version: 1,
