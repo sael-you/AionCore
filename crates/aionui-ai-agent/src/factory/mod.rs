@@ -94,6 +94,17 @@ pub struct ResolvedSkillDelivery {
     /// the same function, so the wording cannot diverge); computing it here too
     /// would be dead work.
     pub injected_prefix: Option<String>,
+    /// This conversation's AionUi-owned view directory, also used as the
+    /// session's private runtime dir (`SessionConfig.runtime_dir`): claude writes
+    /// its `--mcp-config` file there so MCP secrets stay out of argv. Its
+    /// lifecycle already exists — removed on conversation delete, orphans reaped
+    /// at startup — and a view rebuild only replaces `{view}/skills`. `None` for a
+    /// rejected id.
+    pub runtime_dir: Option<std::path::PathBuf>,
+    /// `{data_dir}/session-runtime`: where claude writes the `--mcp-config` file
+    /// (in a fresh 0700 dir) when `runtime_dir` is missing or unwritable, so it
+    /// never has to fall back to argv. Swept at startup.
+    pub runtime_scratch_root: Option<std::path::PathBuf>,
 }
 
 /// Resolve the per-vendor delivery for one session build.
@@ -113,9 +124,8 @@ pub(crate) async fn resolve_skill_delivery(
 
     // A rejected id yields no view path. `plan_skill_delivery` then contributes
     // no plugin flag rather than a half-substituted one.
-    let view_dir = aionui_extension::skill_view::view_dir(&deps.data_dir, user_id, conversation_id)
-        .ok()
-        .map(|path| path.to_string_lossy().into_owned());
+    let runtime_dir = aionui_extension::skill_view::view_dir(&deps.data_dir, user_id, conversation_id).ok();
+    let view_dir = runtime_dir.as_ref().map(|path| path.to_string_lossy().into_owned());
     let view_skills_dir = aionui_extension::skill_view::view_skills_dir(&deps.data_dir, user_id, conversation_id)
         .ok()
         .map(|path| path.to_string_lossy().into_owned());
@@ -152,6 +162,8 @@ pub(crate) async fn resolve_skill_delivery(
         plan,
         skill_dirs,
         injected_prefix: None,
+        runtime_dir,
+        runtime_scratch_root: Some(aionui_session::session_scratch_root(&deps.data_dir)),
     }
 }
 
