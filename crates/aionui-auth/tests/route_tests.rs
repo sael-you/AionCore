@@ -47,6 +47,7 @@ async fn test_app_with_options_and_hook(
     let cookie_config = Arc::new(CookieConfig {
         secure: false,
         same_site: "Lax",
+        names: aionui_auth::CookieNames::LEGACY,
     });
     let qr_token_store = Arc::new(QrTokenStore::new());
 
@@ -662,11 +663,13 @@ async fn t8_7_change_password_missing_fields() {
 // T9. Refresh Token (POST /api/auth/refresh)
 // ===========================================================================
 
+/// The legacy body path refreshes with a REFRESH token outside local mode.
 #[tokio::test]
 async fn t9_1_refresh_token_success() {
     let (mut app, ctx) = test_app().await;
     create_test_user(&ctx, "admin", "StrongP@ss1").await;
-    let (token, _) = login(&mut app, "admin", "StrongP@ss1").await;
+    let (_access, user_id) = login(&mut app, "admin", "StrongP@ss1").await;
+    let token = ctx.jwt_service.sign_refresh(&user_id, "admin", 0).unwrap();
 
     let body = format!(r#"{{"token":"{token}"}}"#);
     let req = json_post("/api/auth/refresh", &body);
@@ -680,6 +683,35 @@ async fn t9_1_refresh_token_success() {
     // New token should be valid
     let new_token = json["token"].as_str().unwrap();
     assert!(ctx.jwt_service.verify(new_token).is_ok());
+}
+
+/// C11 change 3c: an ACCESS token posted in the body no longer refreshes
+/// outside local mode.
+#[tokio::test]
+async fn refresh_body_refuses_an_access_token_outside_local_mode() {
+    let (mut app, ctx) = test_app().await;
+    create_test_user(&ctx, "admin", "StrongP@ss1").await;
+    let (access, _) = login(&mut app, "admin", "StrongP@ss1").await;
+    let resp = app
+        .oneshot(json_post("/api/auth/refresh", &format!(r#"{{"token":"{access}"}}"#)))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// Local mode keeps the historical lenient body path (no behaviour change).
+#[tokio::test]
+async fn refresh_body_still_accepts_an_access_token_in_local_mode() {
+    let (app, ctx) = test_app_with_local(true).await;
+    let access = ctx
+        .jwt_service
+        .sign_with_session_generation("system_default_user", "admin", 0)
+        .unwrap();
+    let resp = app
+        .oneshot(json_post("/api/auth/refresh", &format!(r#"{{"token":"{access}"}}"#)))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
 }
 
 #[tokio::test]
@@ -707,9 +739,10 @@ async fn t9_3_refresh_missing_token() {
 #[tokio::test]
 async fn refresh_rejects_local_user_token_in_aionpro_mode() {
     let (app, ctx) = test_app_with_options_and_hook(false, Some("bootstrap-secret"), true, None).await;
+    // A refresh token (C11 3c: the body path takes refresh tokens only).
     let token = ctx
         .jwt_service
-        .sign_with_session_generation("system_default_user", "system_default_user", 0)
+        .sign_refresh("system_default_user", "system_default_user", 0)
         .unwrap();
 
     let body = format!(r#"{{"token":"{token}"}}"#);

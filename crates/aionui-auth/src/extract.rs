@@ -36,21 +36,33 @@ pub fn extract_client_ip_from_headers(headers: &HeaderMap) -> String {
 ///
 /// Priority: `Authorization: Bearer <token>` > `aionui-session` cookie.
 pub fn extract_token_from_headers(headers: &HeaderMap) -> Option<String> {
+    extract_token_named(headers, COOKIE_NAME)
+}
+
+/// [`extract_token_from_headers`] with the session cookie name in use
+/// (prefixed names in webui-over-HTTPS — un-prefixed cookies are then
+/// ignored).
+pub fn extract_token_named(headers: &HeaderMap, session_cookie: &str) -> Option<String> {
     if let Some(token) = extract_bearer_token(headers) {
         return Some(token);
     }
-    extract_cookie_value(headers, COOKIE_NAME)
+    extract_cookie_value(headers, session_cookie)
 }
 
 /// Extract bearer token from WebSocket upgrade request headers.
 ///
 /// Priority: `Authorization` > `Cookie` > `Sec-WebSocket-Protocol` (first value).
 pub fn extract_token_from_ws_headers(headers: &HeaderMap) -> Option<String> {
+    extract_ws_token_named(headers, COOKIE_NAME)
+}
+
+/// [`extract_token_from_ws_headers`] with the session cookie name in use.
+pub fn extract_ws_token_named(headers: &HeaderMap, session_cookie: &str) -> Option<String> {
     if let Some(token) = extract_bearer_token(headers) {
         return Some(token);
     }
 
-    if let Some(token) = extract_cookie_value(headers, COOKIE_NAME) {
+    if let Some(token) = extract_cookie_value(headers, session_cookie) {
         return Some(token);
     }
 

@@ -20,11 +20,11 @@ use aionui_api_types::{
     WebuiResetPasswordResponse, WsTokenResponse,
 };
 use aionui_common::ApiError;
-use aionui_common::constants::{COOKIE_MAX_AGE_DAYS, REFRESH_COOKIE_NAME};
+use aionui_common::constants::COOKIE_MAX_AGE_DAYS;
 use aionui_db::{DbError, IUserRepository, UserStatus, UserType, models::User};
 
 use crate::error::AuthError;
-use crate::extract::{extract_cookie_value, extract_token_from_headers};
+use crate::extract::{extract_cookie_value, extract_token_named};
 use crate::middleware::{AuthIdentityMode, AuthState, CurrentUser, auth_middleware};
 use crate::password::{dummy_password_hash, generate_password, hash_password, verify_password_timed};
 use crate::qr_token::QrTokenStore;
@@ -270,6 +270,7 @@ pub fn auth_routes(state: AuthRouterState) -> Router {
         // Auth endpoints manage sessions themselves; the helper CLI never
         // calls them, so the runtime-token channel stays disabled here.
         runtime_token_verifier: None,
+        cookie_names: state.cookie_config.names,
     };
 
     // Auth rate limited routes (login, qr-login)
@@ -560,7 +561,7 @@ async fn login_handler(
 // ---------------------------------------------------------------------------
 
 async fn logout_handler(State(state): State<AuthRouterState>, headers: HeaderMap) -> Result<Response, ApiError> {
-    if let Some(token) = extract_token_from_headers(&headers) {
+    if let Some(token) = extract_token_named(&headers, state.cookie_config.names.session) {
         state.jwt_service.blacklist_token(&token);
     }
 
@@ -604,7 +605,7 @@ async fn status_handler(
 
     // Check authentication without requiring it. Only an access token counts as
     // "authenticated" — a refresh token is not a request credential.
-    let is_authenticated = extract_token_from_headers(&headers)
+    let is_authenticated = extract_token_named(&headers, state.cookie_config.names.session)
         .and_then(|token| state.jwt_service.verify_access(&token).ok())
         .is_some();
 
@@ -831,7 +832,7 @@ async fn refresh_handler(
 ) -> Result<Response, ApiError> {
     // Prefer the HttpOnly refresh cookie; fall back to the request body for
     // legacy clients that posted the token explicitly.
-    let (raw_token, from_cookie) = match extract_cookie_value(&headers, REFRESH_COOKIE_NAME) {
+    let (raw_token, from_cookie) = match extract_cookie_value(&headers, state.cookie_config.names.refresh) {
         Some(cookie_token) => (cookie_token, true),
         None => {
             let Json(req) = body.map_err(ApiError::from)?;
@@ -866,9 +867,10 @@ async fn refresh_handler(
 
 /// Verify a refresh request and mint a fresh access + refresh token pair.
 ///
-/// A cookie-borne token must be a refresh token (`verify_refresh`); the legacy
-/// body path stays lenient (`verify`) because older clients posted their access
-/// session token here. Runs behind [`RefreshCoalescer`] so an expiry storm
+/// A refresh token is required (`verify_refresh`) on both the cookie and the
+/// body path (card C11, change 3c: an access token posted in the body no
+/// longer refreshes). Local mode keeps the historical lenient body path
+/// (no behaviour change there). Runs behind [`RefreshCoalescer`] so an expiry storm
 /// collapses into a single execution — hence the crate-owned [`RefreshError`]:
 /// it is `Clone`, so one execution's outcome (success *or* failure) can be
 /// shared by every coalesced caller, and the route layer maps it to `ApiError`.
@@ -877,7 +879,7 @@ async fn refresh_tokens(
     raw_token: &str,
     from_cookie: bool,
 ) -> Result<RefreshedTokens, RefreshError> {
-    let payload = if from_cookie {
+    let payload = if from_cookie || !state.local {
         state.jwt_service.verify_refresh(raw_token)
     } else {
         state.jwt_service.verify(raw_token)
@@ -938,7 +940,8 @@ async fn ws_token_handler(
     headers: HeaderMap,
 ) -> Result<Json<WsTokenResponse>, ApiError> {
     // Reuse the existing session token for WebSocket connections
-    let token = extract_token_from_headers(&headers).ok_or_else(|| ApiError::Unauthorized("No token found".into()))?;
+    let token = extract_token_named(&headers, state.cookie_config.names.session)
+        .ok_or_else(|| ApiError::Unauthorized("No token found".into()))?;
 
     // Ensure user still exists
     state

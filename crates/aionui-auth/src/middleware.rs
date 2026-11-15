@@ -11,7 +11,8 @@ use aionui_common::ApiError;
 use aionui_db::{IUserRepository, UserStatus, UserType};
 
 use crate::JwtService;
-use crate::extract::extract_token_from_headers;
+use crate::cookie::CookieNames;
+use crate::extract::extract_token_named;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AuthIdentityMode {
@@ -92,6 +93,8 @@ pub struct AuthState {
     /// (`aioncore config` / `diagnose`), which cannot carry a JWT or cookies.
     /// `None` disables the channel (requests without a JWT are rejected).
     pub runtime_token_verifier: Option<Arc<dyn IRuntimeTokenVerifier>>,
+    /// Cookie names in use (the session cookie is read by this name only).
+    pub cookie_names: CookieNames,
 }
 
 /// Authentication middleware that verifies JWT tokens and injects `CurrentUser`.
@@ -117,7 +120,7 @@ pub async fn auth_middleware(
         return Ok(next.run(request).await);
     }
 
-    let Some(token) = extract_token_from_headers(request.headers()) else {
+    let Some(token) = extract_token_named(request.headers(), state.cookie_names.session) else {
         // No JWT/cookie: fall back to the conversation-helper runtime-token
         // channel used by agent subprocess CLIs.
         return runtime_token_channel(&state, request, next).await;
