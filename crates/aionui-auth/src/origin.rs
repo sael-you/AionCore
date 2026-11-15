@@ -278,14 +278,13 @@ pub enum OriginRefusal {
 }
 
 impl OriginGuard {
-    /// `Ok` for safe non-upgrade requests and for unsafe requests/upgrades
-    /// carrying a trusted `Origin`.
+    /// Unsafe requests and upgrades need a trusted `Origin`; a safe
+    /// non-upgrade request passes without one (browsers omit it on
+    /// same-origin GETs) but not with an untrusted one.
     pub fn check(&self, method: &Method, headers: &HeaderMap) -> Result<(), OriginRefusal> {
-        if !is_unsafe_method(method) && !is_websocket_upgrade(headers) {
-            return Ok(());
-        }
+        let needs_origin = is_unsafe_method(method) || is_websocket_upgrade(headers);
         let Some(value) = headers.get(header::ORIGIN) else {
-            return Err(OriginRefusal::Missing);
+            return if needs_origin { Err(OriginRefusal::Missing) } else { Ok(()) };
         };
         let Ok(origin) = value.to_str() else {
             return Err(OriginRefusal::Untrusted);
@@ -330,7 +329,8 @@ fn is_same_origin(origin: &str, headers: &HeaderMap) -> bool {
 /// a foreign or unreadable one too (`ORIGIN_FORBIDDEN`). Browsers send
 /// `Origin` on every unsafe request and upgrade, same-origin included, so this
 /// is the cross-site defence where no CSRF layer runs (local identity); in
-/// webui the global CSRF layer applies on top. Safe non-upgrade requests pass.
+/// webui the global CSRF layer applies on top. Safe non-upgrade requests pass
+/// unless they carry an untrusted `Origin`.
 pub async fn require_trusted_origin_middleware(
     State(guard): State<OriginGuard>,
     request: Request,
@@ -527,8 +527,13 @@ mod tests {
                 g.check(&Method::DELETE, &headers(&[("origin", "https://evil.example")])),
                 Err(OriginRefusal::Untrusted)
             );
-            // Safe requests pass; upgrades need an Origin like writes.
+            // Safe requests pass without an Origin, not with a foreign one;
+            // upgrades need an Origin like writes.
             assert_eq!(g.check(&Method::GET, &headers(&[])), Ok(()));
+            assert_eq!(
+                g.check(&Method::GET, &headers(&[("origin", "https://evil.example")])),
+                Err(OriginRefusal::Untrusted)
+            );
             assert_eq!(
                 g.check(&Method::GET, &headers(&[("upgrade", "websocket")])),
                 Err(OriginRefusal::Missing)
