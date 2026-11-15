@@ -57,6 +57,13 @@ const SETTINGS_EVENT_KINDS: [&str; 5] = [
     "board_archived",
     "board_unarchived",
 ];
+/// A kept row belongs to a project this DB knows (alias `k`).
+const KNOWN_PROJECT: &str =
+    "EXISTS (SELECT 1 FROM main.projects p WHERE p.project_id = k.project_id AND p.user_id = k.user_id)";
+/// An event written by recover itself (alias `m`).
+const RECOVERED_EVENT: &str = "(json_extract(m.payload, '$.recovered_from_seq') IS NOT NULL \
+     OR json_extract(m.payload, '$.recovered_by') IS NOT NULL)";
+
 /// Tables the kept DB must have for a recovery to make sense.
 const REQUIRED_KEPT_TABLES: [&str; 8] = [
     "board_settings",
@@ -138,6 +145,8 @@ pub struct BoardRecoverReport {
     /// Kept deploy jobs absent here — listed, never re-created or re-run.
     pub deploy_jobs: Vec<String>,
     pub cursors: Vec<BoardRecoverCursor>,
+    /// Kept projects that do not exist here: their rows are skipped.
+    pub skipped_projects: Vec<String>,
     /// `(project_id, user_id)` of every board recover appended events to.
     #[serde(skip)]
     affected_projects: BTreeSet<(String, String)>,
@@ -211,14 +220,29 @@ async fn recover_attached(conn: &mut SqliteConnection, dry_run: bool) -> Result<
     report.kept_has_board = true;
 
     let mut tx = sqlx::Connection::begin_with(&mut *conn, "BEGIN IMMEDIATE").await?;
-    let restore_point: Option<i64> = sqlx::query_scalar(
-        "SELECT MAX(m.seq) FROM main.board_events m WHERE m.id IN (SELECT id FROM kept.board_events)",
-    )
+    // Events recover copied on an earlier run share their id with the kept DB
+    // but are not shared history: they never move the restore point.
+    let restore_point: Option<i64> = sqlx::query_scalar(&format!(
+        "SELECT MAX(m.seq) FROM main.board_events m \
+         WHERE m.id IN (SELECT id FROM kept.board_events) AND NOT {RECOVERED_EVENT}"
+    ))
     .fetch_one(&mut *tx)
     .await?;
     report.restore_point_seq = restore_point.unwrap_or(0);
     let touched = touched_set(&mut tx, report.restore_point_seq).await?;
 
+    report.skipped_projects = sqlx::query_scalar(&format!(
+        "SELECT DISTINCT k.project_id FROM (\
+             SELECT project_id, user_id FROM kept.board_settings \
+             UNION SELECT project_id, user_id FROM kept.board_cards \
+             UNION SELECT project_id, user_id FROM kept.board_events\
+         ) k WHERE NOT {KNOWN_PROJECT} ORDER BY k.project_id"
+    ))
+    .fetch_all(&mut *tx)
+    .await?;
+    let first_inserted_seq: i64 = sqlx::query_scalar("SELECT COALESCE(MAX(seq), 0) + 1 FROM main.board_events")
+        .fetch_one(&mut *tx)
+        .await?;
     let inserted = copy_events(&mut tx, &mut report).await?;
     recover_settings(&mut tx, &touched, &mut report).await?;
     recover_cards(&mut tx, &touched, &mut report).await?;
@@ -227,6 +251,7 @@ async fn recover_attached(conn: &mut SqliteConnection, dry_run: bool) -> Result<
     replay_set_operations(&mut tx, &inserted, &touched, &mut report).await?;
     raise_next_numbers(&mut tx).await?;
     list_deploy_jobs(&mut tx, &mut report).await?;
+    tag_conflicts(&mut tx, &report, first_inserted_seq).await?;
     advance_cursors(&mut tx, &mut report).await?;
 
     if dry_run {
@@ -269,7 +294,7 @@ async fn touched_set(tx: &mut Transaction<'_, Sqlite>, restore_point: i64) -> Re
         }
         if let Some(card_id) = card_id {
             if let Some(conversation) = payload_str(&payload, &[&["link", "conversation_id"], &["conversation_id"]])
-                && kind.starts_with("link_")
+                && (kind.starts_with("link_") || kind == "card_assigned")
             {
                 touched.links.insert((card_id.clone(), conversation.to_owned()));
             }
@@ -291,7 +316,7 @@ async fn copy_events(
 ) -> Result<Vec<BoardEventRow>, DbError> {
     let kept: Vec<BoardEventRow> = sqlx::query_as(&format!(
         "SELECT {EVENT_COLS} FROM kept.board_events k \
-         WHERE NOT EXISTS (SELECT 1 FROM main.board_events m WHERE m.id = k.id) ORDER BY k.seq ASC"
+         WHERE {KNOWN_PROJECT} AND NOT EXISTS (SELECT 1 FROM main.board_events m WHERE m.id = k.id) ORDER BY k.seq ASC"
     ))
     .fetch_all(&mut **tx)
     .await?;
@@ -351,9 +376,11 @@ async fn recover_settings(
     touched: &TouchedSet,
     report: &mut BoardRecoverReport,
 ) -> Result<(), DbError> {
-    let kept: Vec<BoardSettingsRow> = sqlx::query_as(&format!("SELECT {SETTINGS_COLS} FROM kept.board_settings"))
-        .fetch_all(&mut **tx)
-        .await?;
+    let kept: Vec<BoardSettingsRow> = sqlx::query_as(&format!(
+        "SELECT {SETTINGS_COLS} FROM kept.board_settings k WHERE {KNOWN_PROJECT}"
+    ))
+    .fetch_all(&mut **tx)
+    .await?;
     for row in kept {
         let current: Option<i64> = sqlx::query_scalar("SELECT version FROM main.board_settings WHERE project_id = ?")
             .bind(&row.project_id)
@@ -421,7 +448,7 @@ async fn copy_columns(tx: &mut Transaction<'_, Sqlite>, project_id: &str) -> Res
 /// Card columns that a kept snapshot overwrites (identity, owner, number and
 /// creation stay as they are here).
 const CARD_MUTABLE_COLS: &str = "title, description, type, priority, size, tier, column_key, position, labels, \
-     skills, routing, assignee_kind, assignee_ref, blocked, blocked_reason, change_id, metadata, version, \
+     skills, routing, assignee_kind, assignee_ref, blocked, blocked_reason, blocked_by, change_id, metadata, version, \
      archived_at, updated_at";
 
 async fn recover_cards(
@@ -429,9 +456,10 @@ async fn recover_cards(
     touched: &TouchedSet,
     report: &mut BoardRecoverReport,
 ) -> Result<(), DbError> {
-    let kept: Vec<(String, String, String, i64, i64)> = sqlx::query_as(
-        "SELECT id, project_id, user_id, number, version FROM kept.board_cards ORDER BY project_id, number",
-    )
+    let kept: Vec<(String, String, String, i64, i64)> = sqlx::query_as(&format!(
+        "SELECT id, project_id, user_id, number, version FROM kept.board_cards k WHERE {KNOWN_PROJECT} \
+             ORDER BY project_id, number"
+    ))
     .fetch_all(&mut **tx)
     .await?;
     for (card_id, project_id, user_id, number, kept_version) in kept {
@@ -586,7 +614,7 @@ async fn recover_versioned(
 ) -> Result<(u64, u64), DbError> {
     let table = spec.table;
     let kept: Vec<(String, String, i64)> = sqlx::query_as(&format!(
-        "SELECT id, card_id, version FROM kept.{table} ORDER BY created_at, id"
+        "SELECT id, card_id, version FROM kept.{table} k WHERE {KNOWN_PROJECT} ORDER BY created_at, id"
     ))
     .fetch_all(&mut **tx)
     .await?;
@@ -697,7 +725,8 @@ async fn replay_set_operations(
         };
         let payload: Value = serde_json::from_str(&event.payload).unwrap_or(Value::Null);
         match event.kind.as_str() {
-            "link_added" | "link_removed" => {
+            // An assignment's link rides on its `card_assigned` event.
+            "link_added" | "link_removed" | "card_assigned" => {
                 let Some(conversation_id) =
                     payload_str(&payload, &[&["link", "conversation_id"], &["conversation_id"]])
                 else {
@@ -714,7 +743,7 @@ async fn replay_set_operations(
                     ));
                     continue;
                 }
-                if event.kind == "link_added" {
+                if event.kind != "link_removed" {
                     replay_link_added(tx, event, card_id, conversation_id, &payload, report).await?;
                 } else {
                     let removed =
@@ -903,6 +932,47 @@ fn reaches(edges: &[(String, String)], from: &str, to: &str) -> bool {
     false
 }
 
+/// Mark the events this run copied that belong to a conflicted entity
+/// (`recover_conflict: true`), so the owner sees which history did not apply.
+async fn tag_conflicts(
+    tx: &mut Transaction<'_, Sqlite>,
+    report: &BoardRecoverReport,
+    first_inserted_seq: i64,
+) -> Result<(), DbError> {
+    for conflict in &report.conflicts {
+        let (filter, keys): (&str, Vec<String>) = match conflict.entity.as_str() {
+            "card" => ("card_id = ?", vec![conflict.key.clone()]),
+            "review" => ("json_extract(payload, '$.review.id') = ?", vec![conflict.key.clone()]),
+            "question" => ("json_extract(payload, '$.question.id') = ?", vec![conflict.key.clone()]),
+            "settings" => (
+                "project_id = ? AND kind IN ('board_created', 'settings_changed', 'columns_changed', \
+                 'board_archived', 'board_unarchived')",
+                vec![conflict.key.clone()],
+            ),
+            "link" | "dep" => match conflict.key.split_once(':') {
+                Some((card, other)) => (
+                    "card_id = ? AND (COALESCE(json_extract(payload, '$.link.conversation_id'), \
+                     json_extract(payload, '$.conversation_id'), json_extract(payload, '$.dep.depends_on_card_id'), \
+                     json_extract(payload, '$.depends_on_card_id')) = ?)",
+                    vec![card.to_owned(), other.to_owned()],
+                ),
+                None => continue,
+            },
+            _ => continue,
+        };
+        let sql = format!(
+            "UPDATE main.board_events SET payload = json_set(payload, '$.recover_conflict', json('true')) \
+             WHERE seq >= ? AND json_extract(payload, '$.recovered_from_seq') IS NOT NULL AND {filter}"
+        );
+        let mut query = sqlx::query(&sql).bind(first_inserted_seq);
+        for key in keys {
+            query = query.bind(key);
+        }
+        query.execute(&mut **tx).await?;
+    }
+    Ok(())
+}
+
 async fn raise_next_numbers(tx: &mut Transaction<'_, Sqlite>) -> Result<(), DbError> {
     // Settings copied from the kept DB carry the kept chain head; the head is
     // this DB's newest event of the project.
@@ -931,8 +1001,8 @@ async fn list_deploy_jobs(tx: &mut Transaction<'_, Sqlite>, report: &mut BoardRe
         return Ok(());
     }
     report.deploy_jobs = sqlx::query_scalar(
-        "SELECT k.id FROM kept.board_deploy_jobs k \
-         WHERE NOT EXISTS (SELECT 1 FROM main.board_deploy_jobs m WHERE m.id = k.id) ORDER BY k.created_at, k.id",
+        &format!("SELECT k.id FROM kept.board_deploy_jobs k \
+         WHERE {KNOWN_PROJECT} AND NOT EXISTS (SELECT 1 FROM main.board_deploy_jobs m WHERE m.id = k.id) ORDER BY k.created_at, k.id"),
     )
     .fetch_all(&mut **tx)
     .await?;

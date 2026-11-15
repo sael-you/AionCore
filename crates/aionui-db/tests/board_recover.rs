@@ -101,6 +101,12 @@ struct Fixture {
 }
 
 async fn shared_history(pool: &SqlitePool) {
+    exec(
+        pool,
+        "INSERT INTO projects (project_id, user_id, name, kind, created_at, updated_at) \
+         VALUES ('proj-r', 'system_default_user', 'R', 'standard', 1, 1)",
+    )
+    .await;
     settings(pool, 1, 2).await;
     card(pool, "A", 1, "original", 1).await;
     event(pool, "e1", None, "board_created", json!({ "version": 1 })).await;
@@ -489,4 +495,102 @@ async fn a_kept_database_without_board_tables_recovers_nothing() {
     let report = recover_board(current.pool(), &kept_path, false).await.unwrap();
     assert!(!report.kept_has_board);
     assert_eq!(report.events_inserted, 0);
+}
+
+/// Run 2 of a conflicted recovery reports the same conflict and changes
+/// nothing (recovered events never move the restore point).
+#[tokio::test]
+async fn a_conflict_stays_a_conflict_on_the_second_run() {
+    let fx = fixture().await;
+    let pool = fx.current.pool();
+    card(pool, "A", 1, "current edit", 2).await;
+    event(pool, "e10", Some("A"), "card_updated", json!({ "version": 2 })).await;
+    {
+        let kept = open(&fx.kept_path).await;
+        card(kept.pool(), "A", 1, "kept v3", 3).await;
+        kept.close().await;
+    }
+    let first = recover_board(pool, &fx.kept_path, false).await.unwrap();
+    assert!(first.conflicts.iter().any(|c| c.entity == "card" && c.key == "A"));
+    // L2: the copied history of the conflicted card is tagged.
+    let tagged = scalar_i64(
+        pool,
+        "SELECT COUNT(*) FROM board_events WHERE id = 'e3' AND json_extract(payload, '$.recover_conflict') = 1",
+    )
+    .await;
+    assert_eq!(tagged, 1);
+    let second = recover_board(pool, &fx.kept_path, false).await.unwrap();
+    assert_eq!(second.restore_point_seq, first.restore_point_seq);
+    assert!(
+        second.conflicts.iter().any(|c| c.entity == "card" && c.key == "A"),
+        "{:?}",
+        second.conflicts
+    );
+    assert_eq!(second.cards_updated, 0);
+    assert_eq!(
+        scalar_str(pool, "SELECT title FROM board_cards WHERE id = 'A'").await,
+        "current edit"
+    );
+}
+
+/// Rows of a project this DB does not know are skipped and reported.
+#[tokio::test]
+async fn kept_rows_of_unknown_projects_are_skipped() {
+    let fx = fixture().await;
+    {
+        let kept = open(&fx.kept_path).await;
+        exec(
+            kept.pool(),
+            "INSERT INTO board_cards (id, project_id, user_id, number, title, column_key, position, creator_kind, \
+             creator_ref, created_at, updated_at) VALUES ('G', 'ghost', 'system_default_user', 1, 'g', 'ideas', 1, \
+             'user', 'u', 1, 1)",
+        )
+        .await;
+        exec(
+            kept.pool(),
+            "INSERT INTO board_events (id, card_id, project_id, user_id, actor_kind, actor_ref, kind, payload, created_at) \
+             VALUES ('eg', 'G', 'ghost', 'system_default_user', 'user', 'u', 'card_created', '{}', 1)",
+        )
+        .await;
+        kept.close().await;
+    }
+    let pool = fx.current.pool();
+    let report = recover_board(pool, &fx.kept_path, false).await.unwrap();
+    assert_eq!(report.skipped_projects, vec!["ghost".to_owned()]);
+    assert_eq!(
+        scalar_i64(pool, "SELECT COUNT(*) FROM board_cards WHERE id = 'G'").await,
+        0
+    );
+    assert_eq!(
+        scalar_i64(pool, "SELECT COUNT(*) FROM board_events WHERE id = 'eg'").await,
+        0
+    );
+}
+
+/// An assignment's link travels in its `card_assigned` event.
+#[tokio::test]
+async fn assignment_links_are_recovered_from_card_assigned() {
+    let fx = fixture().await;
+    {
+        let kept = open(&fx.kept_path).await;
+        event(
+            kept.pool(),
+            "e20",
+            Some("A"),
+            "card_assigned",
+            json!({ "link": { "card_id": "A", "conversation_id": "conv-asg", "role": "review",
+                              "department": "qa", "created_at": 9 } }),
+        )
+        .await;
+        kept.close().await;
+    }
+    let pool = fx.current.pool();
+    let report = recover_board(pool, &fx.kept_path, false).await.unwrap();
+    assert_eq!(report.links_added, 2, "link_added (e5) and the assignment link");
+    let (role, department): (String, Option<String>) =
+        sqlx::query_as("SELECT role, department FROM board_card_links WHERE conversation_id = 'conv-asg'")
+            .fetch_one(pool)
+            .await
+            .unwrap();
+    assert_eq!((role.as_str(), department.as_deref()), ("review", Some("qa")));
 }

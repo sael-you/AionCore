@@ -76,6 +76,8 @@ CREATE TABLE IF NOT EXISTS board_cards (
     assignee_ref   TEXT,
     blocked        INTEGER NOT NULL DEFAULT 0 CHECK (blocked IN (0, 1)),
     blocked_reason TEXT,
+    -- Who set the manual block (agents may not lift an owner's block).
+    blocked_by     TEXT    CHECK (blocked_by IS NULL OR blocked_by IN ('user', 'agent', 'system')),
     change_id      TEXT,
     metadata       TEXT    NOT NULL DEFAULT '{}',
     version        INTEGER NOT NULL DEFAULT 1,

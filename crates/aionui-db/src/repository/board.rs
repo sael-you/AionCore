@@ -413,5 +413,10 @@ pub trait IBoardTx: Send {
     /// newest `seq`, and `board_settings.last_event_seq` moves to the new one.
     async fn insert_event(&mut self, event: &NewBoardEvent) -> Result<BoardEventSeq, DbError>;
 
+    /// `(card_id, position)` of the cards [`place`](Self::place) renumbered
+    /// in this transaction (a rebalance), drained. Writers put them in their
+    /// event so a replay keeps the column order.
+    fn take_rebalanced(&mut self) -> Vec<(String, i64)>;
+
     async fn commit(self: Box<Self>) -> Result<(), DbError>;
 }

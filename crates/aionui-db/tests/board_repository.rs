@@ -81,6 +81,7 @@ fn card(user: &str, project: &str, id: &str, number: i64, column: &str, position
         assignee_ref: None,
         blocked: false,
         blocked_reason: None,
+        blocked_by: None,
         change_id: None,
         metadata: "{}".into(),
         version: 1,

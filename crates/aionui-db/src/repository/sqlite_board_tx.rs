@@ -25,11 +25,16 @@ use crate::repository::sqlite_board::{
 /// One open board write transaction.
 pub(crate) struct SqliteBoardTx {
     tx: Transaction<'static, Sqlite>,
+    /// Cards renumbered by rebalances in this transaction.
+    rebalanced: Vec<(String, i64)>,
 }
 
 impl SqliteBoardTx {
     pub(crate) fn new(tx: Transaction<'static, Sqlite>) -> Self {
-        Self { tx }
+        Self {
+            tx,
+            rebalanced: Vec::new(),
+        }
     }
 
     fn conn(&mut self) -> &mut SqliteConnection {
@@ -310,6 +315,7 @@ impl IBoardTx for SqliteBoardTx {
                         .await?;
                     renumbered.push((id, position));
                 }
+                self.rebalanced.extend(renumbered.iter().cloned());
                 match compute_position(&renumbered, placement) {
                     Slot::At(position) => Ok(BoardPlacementOutcome::Placed(position)),
                     Slot::Rebalance => Err(DbError::Conflict("board column rebalance left no gap".into())),
@@ -324,8 +330,9 @@ impl IBoardTx for SqliteBoardTx {
             "INSERT INTO board_cards \
              (id, project_id, user_id, number, title, description, type, priority, size, tier, column_key, position, \
               labels, skills, routing, creator_kind, creator_ref, assignee_kind, assignee_ref, blocked, blocked_reason, \
+              blocked_by, \
               change_id, metadata, version, archived_at, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&row.id)
         .bind(&row.project_id)
@@ -348,6 +355,7 @@ impl IBoardTx for SqliteBoardTx {
         .bind(&row.assignee_ref)
         .bind(row.blocked)
         .bind(&row.blocked_reason)
+        .bind(&row.blocked_by)
         .bind(&row.change_id)
         .bind(&row.metadata)
         .bind(row.version)
@@ -363,7 +371,7 @@ impl IBoardTx for SqliteBoardTx {
         let result = sqlx::query(
             "UPDATE board_cards SET title = ?, description = ?, type = ?, priority = ?, size = ?, tier = ?, \
              column_key = ?, position = ?, labels = ?, skills = ?, routing = ?, assignee_kind = ?, assignee_ref = ?, \
-             blocked = ?, blocked_reason = ?, change_id = ?, metadata = ?, version = ?, archived_at = ?, \
+             blocked = ?, blocked_reason = ?, blocked_by = ?, change_id = ?, metadata = ?, version = ?, archived_at = ?, \
              updated_at = ? \
              WHERE user_id = ? AND id = ? AND version = ?",
         )
@@ -382,6 +390,7 @@ impl IBoardTx for SqliteBoardTx {
         .bind(&row.assignee_ref)
         .bind(row.blocked)
         .bind(&row.blocked_reason)
+        .bind(&row.blocked_by)
         .bind(&row.change_id)
         .bind(&row.metadata)
         .bind(row.version)
@@ -728,6 +737,10 @@ impl IBoardTx for SqliteBoardTx {
 
     async fn insert_event(&mut self, event: &NewBoardEvent) -> Result<BoardEventSeq, DbError> {
         insert_chained_event(self.conn(), "main", event).await
+    }
+
+    fn take_rebalanced(&mut self) -> Vec<(String, i64)> {
+        std::mem::take(&mut self.rebalanced)
     }
 
     async fn commit(self: Box<Self>) -> Result<(), DbError> {

@@ -84,6 +84,8 @@ pub struct BoardCardRow {
     pub assignee_ref: Option<String>,
     pub blocked: bool,
     pub blocked_reason: Option<String>,
+    /// Actor kind that set the manual block (`user|agent|system`).
+    pub blocked_by: Option<String>,
     pub change_id: Option<String>,
     /// JSON object.
     pub metadata: String,
