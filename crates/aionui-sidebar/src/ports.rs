@@ -28,8 +28,29 @@ pub trait RemoveProjectPorts: Send + Sync {
     /// team-delete path, reused verbatim).
     async fn remove_team(&self, user_id: &str, team_id: &str) -> Result<(), String>;
 
+    /// Delete the project's board (all board rows, owner-scoped). Runs after
+    /// the teams and conversations and before the project record; when it
+    /// fails the record is kept so running Remove again finishes the job.
+    /// Returns the number of cards removed.
+    async fn delete_board(&self, user_id: &str, project_id: &str) -> Result<i64, String>;
+
     /// Delete the project record and its explorer entries (owner-scoped).
     async fn delete_project_record(&self, user_id: &str, project_id: &str) -> Result<(), String>;
+}
+
+/// Board side of the project lifecycle (SPEC §6). Projects have no archived
+/// flag of their own: archiving a project marks its board read-only, and the
+/// remove preview reports how many cards would go. Kept separate from the
+/// best-effort [`ArchiveTeardownPorts`] because the board flag is data, not a
+/// process teardown.
+#[async_trait]
+pub trait ProjectBoardPorts: Send + Sync {
+    /// Set (`true`) or clear (`false`) `board_settings.archived_at`. A project
+    /// without a board is a no-op.
+    async fn set_board_archived(&self, user_id: &str, project_id: &str, archived: bool) -> Result<(), String>;
+
+    /// Cards (archived included) the project's board holds.
+    async fn count_board_cards(&self, user_id: &str, project_id: &str) -> Result<i64, String>;
 }
 
 /// Process-teardown ports for archiving (parallel to `RemoveProjectPorts`, but

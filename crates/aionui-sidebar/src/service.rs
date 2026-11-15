@@ -32,7 +32,7 @@ use aionui_db::{
 use aionui_project::canonical;
 
 use crate::hierarchy::{Hierarchy, fold_hierarchy, subtree_ids};
-use crate::ports::{ArchiveTeardownPorts, RemoveProjectPorts};
+use crate::ports::{ArchiveTeardownPorts, ProjectBoardPorts, RemoveProjectPorts};
 use crate::types::{
     Cursor, DEFAULT_ITEMS_LIMIT, DEFAULT_LIMIT, ScopeToken, SidebarError, canonical_to_dir_key, validate_limit,
 };
@@ -60,6 +60,10 @@ pub struct SidebarService {
     /// read/pin paths. Absent → archive still flips `archived_at`; only the
     /// best-effort process teardown is skipped.
     archive_teardown_ports: Arc<OnceLock<Arc<dyn ArchiveTeardownPorts>>>,
+    /// Board ports (archive flag, remove preview count), injected once after
+    /// startup like the two above. Absent → projects behave as if they had
+    /// no board.
+    project_board_ports: Arc<OnceLock<Arc<dyn ProjectBoardPorts>>>,
 }
 
 impl SidebarService {
@@ -70,6 +74,7 @@ impl SidebarService {
             work_dir,
             remove_project_ports: Arc::new(OnceLock::new()),
             archive_teardown_ports: Arc::new(OnceLock::new()),
+            project_board_ports: Arc::new(OnceLock::new()),
         }
     }
 
@@ -86,6 +91,21 @@ impl SidebarService {
     /// [`set_remove_project_ports`](Self::set_remove_project_ports)).
     pub fn set_archive_teardown_ports(&self, ports: Arc<dyn ArchiveTeardownPorts>) {
         let _ = self.archive_teardown_ports.set(ports);
+    }
+
+    /// Install the board ports the project archive / remove paths drive
+    /// (set-once, `Arc`-shared like the other ports).
+    pub fn set_project_board_ports(&self, ports: Arc<dyn ProjectBoardPorts>) {
+        let _ = self.project_board_ports.set(ports);
+    }
+
+    /// Best-effort board archive flag flip for a project (warn on failure).
+    async fn set_board_archived(&self, user_id: &str, project_id: &str, archived: bool) {
+        if let Some(ports) = self.project_board_ports.get()
+            && let Err(err) = ports.set_board_archived(user_id, project_id, archived).await
+        {
+            tracing::warn!(project_id = %project_id, archived, error = %err, "project board archive flag failed");
+        }
     }
 
     // -- Write side (pin / unpin) --------------------------------------------
@@ -418,9 +438,18 @@ impl SidebarService {
                 });
             }
 
+            let board_cards = match self.project_board_ports.get() {
+                Some(ports) => ports.count_board_cards(user_id, project_id).await.unwrap_or_else(|err| {
+                    tracing::warn!(project_id = %project_id, error = %err, "remove_project: board card count failed");
+                    0
+                }),
+                None => 0,
+            };
             return Ok(RemoveProjectResult {
                 teams_deleted: team_ids.len() as i64,
                 conversations_deleted: conv_ids.len() as i64,
+                board_cards,
+                partial: false,
                 items,
             });
         }
@@ -450,9 +479,21 @@ impl SidebarService {
             }
         }
 
+        // The board goes after its conversations/teams and before the record.
+        // A failure keeps the record, so running Remove again finishes it.
+        let board_cards = match ports.delete_board(user_id, project_id).await {
+            Ok(cards) => Some(cards),
+            Err(err) => {
+                tracing::warn!(project_id = %project_id, error = %err, "remove_project: board delete failed; keeping the project record");
+                None
+            }
+        };
+
         // Project record last: its contents are already gone, so a failure here
         // leaves only an empty shell (which a retry finishes off).
-        if let Err(err) = ports.delete_project_record(user_id, project_id).await {
+        if board_cards.is_some()
+            && let Err(err) = ports.delete_project_record(user_id, project_id).await
+        {
             tracing::warn!(project_id = %project_id, error = %err, "remove_project: project record delete failed");
         }
 
@@ -466,6 +507,8 @@ impl SidebarService {
         Ok(RemoveProjectResult {
             teams_deleted,
             conversations_deleted,
+            board_cards: board_cards.unwrap_or(0),
+            partial: board_cards.is_none(),
             items: Vec::new(),
         })
     }
@@ -520,6 +563,9 @@ impl SidebarService {
             }
         }
 
+        // The board turns read-only once its units are archived (SPEC §6).
+        self.set_board_archived(user_id, project_id, true).await;
+
         tracing::info!(
             project_id = %project_id,
             teams = teams.len(),
@@ -554,6 +600,8 @@ impl SidebarService {
                 .collect();
             self.cascade_archive_flag(user_id, &subtree, None).await;
         }
+
+        self.set_board_archived(user_id, project_id, false).await;
 
         tracing::info!(
             project_id = %project_id,

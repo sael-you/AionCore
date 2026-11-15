@@ -9,15 +9,16 @@ use aionui_ai_agent::{
     RuntimeTokenService, WorkerTaskManagerImpl, build_agent_factory,
 };
 use aionui_auth::{CookieConfig, JwtService, QrTokenStore, resolve_encryption_secret, resolve_jwt_secret};
+use aionui_board::BoardService;
 use aionui_common::OnConversationDelete;
 use aionui_conversation::{ConversationService, runtime_state::ConversationRuntimeStateService};
 use aionui_db::{
     Database, IAcpSessionRepository, IAgentMetadataRepository, IConversationRepository, IMcpServerRepository,
     IProjectStore, ISkillRepository, IUserOrderStore, IUserRepository, SqliteAcpSessionRepository,
     SqliteAgentMetadataRepository, SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository,
-    SqliteAssistantPreferenceRepository, SqliteConversationRepository, SqliteMcpServerRepository, SqliteProjectStore,
-    SqliteProviderRepository, SqliteSettingsRepository, SqliteSkillRepository, SqliteUserOrderStore,
-    SqliteUserRepository,
+    SqliteAssistantPreferenceRepository, SqliteBoardStore, SqliteConversationRepository, SqliteMcpServerRepository,
+    SqliteProjectStore, SqliteProviderRepository, SqliteSettingsRepository, SqliteSkillRepository,
+    SqliteUserOrderStore, SqliteUserRepository,
 };
 use aionui_project::ProjectService;
 use aionui_realtime::{BroadcastEventBus, WebSocketManager};
@@ -57,6 +58,9 @@ pub struct AppServices {
     /// delete hook (path-1 cascade), the team service (path-2 cascade), and the
     /// sidebar read state. Cheap to clone (Arc). See sidebar design §4.
     pub user_order_store: Arc<dyn IUserOrderStore>,
+    /// Built-in project board (Kanban). Shared by the board routers, the
+    /// sidebar project ports and the helper CLI recover path. Cheap to clone.
+    pub board_service: BoardService,
     /// Same instance as `worker_task_manager`, exposed through the
     /// `OnConversationDelete` trait so `ConversationService::with_delete_hook`
     /// can wire it up. Optional because tests construct `AppServices` with a
@@ -429,6 +433,10 @@ impl AppServices {
             session_message_service.clone(),
         )));
 
+        let board_service = BoardService::new(
+            Arc::new(SqliteBoardStore::new(database.pool().clone())),
+            event_bus.clone(),
+        );
         Ok(Self {
             database,
             jwt_service: Arc::new(JwtService::new(secret.clone())),
@@ -448,6 +456,7 @@ impl AppServices {
             session_message_notify,
             project_service,
             user_order_store,
+            board_service,
             task_manager_delete_hook: Some(task_manager_delete_hook),
             agent_registry,
             conversation_repo,

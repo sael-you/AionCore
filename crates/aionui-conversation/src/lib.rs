@@ -41,7 +41,7 @@ pub use routes::conversation_routes;
 pub use routes_aux::conversation_ops_routes;
 pub use runtime_create::ConversationCreateError;
 pub use runtime_routes::{ConversationRuntimeRouterState, conversation_runtime_routes};
-pub use service::is_temp_session_workspace;
+pub use service::{BOARD_ASSIGNMENT_EXTRA_KEY, is_temp_session_workspace};
 pub use service::{
     ConversationAgentTurnOutcome, ConversationAgentTurnRequest, ConversationAgentTurnStarted,
     ConversationAgentTurnStartedCallback, ConversationAgentTurnStatus, ConversationService,

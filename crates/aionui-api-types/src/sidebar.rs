@@ -120,6 +120,14 @@ pub struct RemoveProjectResult {
     pub teams_deleted: i64,
     /// Independent conversations classified into the project's group.
     pub conversations_deleted: i64,
+    /// Board cards (archived included) removed with the project's board.
+    /// On a `dry_run` the count that *would* be removed.
+    #[serde(default)]
+    pub board_cards: i64,
+    /// `true` when part of the project could not be removed (e.g. its board):
+    /// the project record is kept and running Remove again finishes it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub partial: bool,
     /// The named units in the delete set, so a `dry_run` preview can list *which*
     /// items go — not just how many. Pinned members live in the top pinned group
     /// (B1 double-render: a project's pinned rows are anti-joined out of its own

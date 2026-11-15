@@ -404,6 +404,7 @@ dependencies = [
  "aionui-assets",
  "aionui-assistant",
  "aionui-auth",
+ "aionui-board",
  "aionui-channel",
  "aionui-common",
  "aionui-conversation",
@@ -522,6 +523,33 @@ dependencies = [
  "tower",
  "tower-http",
  "tracing",
+]
+
+[[package]]
+name = "aionui-board"
+version = "0.2.2"
+dependencies = [
+ "aionui-ai-agent",
+ "aionui-api-types",
+ "aionui-auth",
+ "aionui-common",
+ "aionui-db",
+ "aionui-realtime",
+ "async-trait",
+ "axum",
+ "base64",
+ "hex",
+ "http-body-util",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "sqlx",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tower",
+ "tracing",
+ "tracing-subscriber",
 ]
 
 [[package]]

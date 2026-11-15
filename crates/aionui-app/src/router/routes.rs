@@ -307,6 +307,11 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     let project_authenticated =
         project_routes(states.project).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
+    // Board user router (owner + Local-mode supervisor) protected by auth
+    // middleware; the handlers refuse the runtime-token channel themselves.
+    let board_authenticated = aionui_board::board_routes(states.board.clone())
+        .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
+
     // Sidebar read + ordering routes protected by auth middleware
     let sidebar_authenticated =
         sidebar_routes(states.sidebar).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
@@ -377,6 +382,12 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         service: services.conversation_service.clone(),
         runtime_token_service: services.runtime_token_service.clone(),
     });
+    // Board agent router (helper CLI). Same runtime-token self-authentication,
+    // validated in every identity mode, so it is mounted after the CSRF layer.
+    let board_runtime = aionui_board::board_runtime_routes(aionui_board::BoardRuntimeRouterState {
+        service: services.board_service.clone(),
+        runtime_token_service: services.runtime_token_service.clone(),
+    });
     // Channel A. Same runtime-token self-authentication: the caller is an agent
     // process holding a conversation-scoped token, not a browser session.
     let skill_runtime = skill_runtime_routes(states.skill_runtime);
@@ -408,6 +419,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         .merge(file_authenticated)
         .merge(project_authenticated)
         .merge(sidebar_authenticated)
+        .merge(board_authenticated)
         .merge(mcp_authenticated)
         .merge(extension_authenticated)
         .merge(hub_authenticated)
@@ -437,6 +449,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     .merge(runtime_team_tools)
     .merge(session_message_runtime)
     .merge(conversation_runtime)
+    .merge(board_runtime)
     .merge(office_proxy)
     .merge(public_assets)
     .layer(middleware::from_fn(security_headers_middleware));

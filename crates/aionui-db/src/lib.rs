@@ -26,10 +26,12 @@ pub use error::{
 pub use instance_lock::{DataDirInstanceGuard, instance_lock_path};
 pub use models::{
     AgentMetadataRow, AssistantDefinitionRow, AssistantOverlayRow, AssistantOverrideRow, AssistantPreferenceRow,
-    AssistantRow, ConversationArtifactRow, ConversationAssistantSnapshotRow, CreateAssistantParams,
-    ExternalUserProjection, FolderRow, OrderItemType, OrderScene, ProjectExplorerRow, ProjectKind, ProjectRow, Role,
-    SkillImportRecordRow, SkillRow, UpdateAgentAvailabilitySnapshotParams, UpdateAgentHandshakeParams,
-    UpdateAssistantParams, UpsertAgentMetadataParams, UpsertAssistantDefinitionParams, UpsertAssistantOverlayParams,
+    AssistantRow, BoardCardRow, BoardColumnRow, BoardDepRow, BoardDeployJobRow, BoardEventRow, BoardIdempotencyRow,
+    BoardLinkRow, BoardLinkViewRow, BoardQuestionRow, BoardReviewRow, BoardSettingsRow, BoardSupervisorCursorRow,
+    ConversationArtifactRow, ConversationAssistantSnapshotRow, CreateAssistantParams, ExternalUserProjection,
+    FolderRow, OrderItemType, OrderScene, ProjectExplorerRow, ProjectKind, ProjectRow, Role, SkillImportRecordRow,
+    SkillRow, UpdateAgentAvailabilitySnapshotParams, UpdateAgentHandshakeParams, UpdateAssistantParams,
+    UpsertAgentMetadataParams, UpsertAssistantDefinitionParams, UpsertAssistantOverlayParams,
     UpsertAssistantPreferenceParams, UpsertConversationAssistantSnapshotParams, UpsertOverrideParams, UserOrderRow,
     UserStatus, UserType,
 };
@@ -46,23 +48,30 @@ pub use repository::oauth_token::UpsertOAuthTokenParams;
 pub use repository::provider::{CreateProviderParams, UpdateProviderParams};
 pub use repository::remote_agent::{CreateRemoteAgentParams, UpdateRemoteAgentParams};
 pub use repository::skill::{CreateSkillImportRecordParams, UpsertSkillParams};
+pub use repository::sqlite_board_recover::{
+    BoardRecoverConflict, BoardRecoverCursor, BoardRecoverListedEvent, BoardRecoverRenumber, BoardRecoverReport,
+    recover_board,
+};
 pub use repository::team::{UpdateTaskParams, UpdateTeamParams};
 pub use repository::{
-    ActivityCursor, ArchiveScope, CreateAcpSessionParams, FeedbackDiagnosticsDbContext, FeedbackDiagnosticsProfile,
+    ActivityCursor, ArchiveScope, BOARD_POSITION_GAP, BoardCallerRow, BoardCardCursor, BoardCardFilter,
+    BoardConversationInfo, BoardEventQuery, BoardEventScope, BoardEventSeq, BoardPlacement, BoardPlacementOutcome,
+    BoardProjectRow, CreateAcpSessionParams, FeedbackDiagnosticsDbContext, FeedbackDiagnosticsProfile,
     FeedbackDiagnosticsProfileResult, FeedbackDiagnosticsRequest, FeedbackDiagnosticsResult, IAcpSessionRepository,
     IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
-    IAssistantOverrideRepository, IAssistantPreferenceRepository, IAssistantRepository, IChannelRepository,
-    IClientPreferenceRepository, IConversationRepository, ICronRepository, IFeedbackDiagnosticsRepository,
-    IMcpServerRepository, IOAuthTokenRepository, IProjectStore, IProviderRepository, IRemoteAgentRepository,
-    ISettingsRepository, ISidebarStore, ISkillRepository, ITeamRepository, IUserOrderStore, IUserRepository,
-    MoveOutcome, OrderItemRef, PageDirection, PersistedSessionState, PinOutcome, PinnedCursor, SaveRuntimeStateParams,
-    SidebarConversationThin, SidebarProjectMeta, SidebarTeamThin, SqliteAcpSessionRepository,
-    SqliteAgentMetadataRepository, SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository,
-    SqliteAssistantOverrideRepository, SqliteAssistantPreferenceRepository, SqliteAssistantRepository,
-    SqliteChannelRepository, SqliteClientPreferenceRepository, SqliteConversationRepository, SqliteCronRepository,
-    SqliteFeedbackDiagnosticsRepository, SqliteMcpServerRepository, SqliteOAuthTokenRepository, SqliteProjectStore,
-    SqliteProviderRepository, SqliteRemoteAgentRepository, SqliteSettingsRepository, SqliteSidebarStore,
-    SqliteSkillRepository, SqliteTeamRepository, SqliteUserOrderStore, SqliteUserRepository,
+    IAssistantOverrideRepository, IAssistantPreferenceRepository, IAssistantRepository, IBoardStore, IBoardTx,
+    IChannelRepository, IClientPreferenceRepository, IConversationRepository, ICronRepository,
+    IFeedbackDiagnosticsRepository, IMcpServerRepository, IOAuthTokenRepository, IProjectStore, IProviderRepository,
+    IRemoteAgentRepository, ISettingsRepository, ISidebarStore, ISkillRepository, ITeamRepository, IUserOrderStore,
+    IUserRepository, MoveOutcome, NewBoardEvent, OrderItemRef, PageDirection, PersistedSessionState, PinOutcome,
+    PinnedCursor, SaveRuntimeStateParams, SidebarConversationThin, SidebarProjectMeta, SidebarTeamThin,
+    SqliteAcpSessionRepository, SqliteAgentMetadataRepository, SqliteAssistantDefinitionRepository,
+    SqliteAssistantOverlayRepository, SqliteAssistantOverrideRepository, SqliteAssistantPreferenceRepository,
+    SqliteAssistantRepository, SqliteBoardStore, SqliteChannelRepository, SqliteClientPreferenceRepository,
+    SqliteConversationRepository, SqliteCronRepository, SqliteFeedbackDiagnosticsRepository, SqliteMcpServerRepository,
+    SqliteOAuthTokenRepository, SqliteProjectStore, SqliteProviderRepository, SqliteRemoteAgentRepository,
+    SqliteSettingsRepository, SqliteSidebarStore, SqliteSkillRepository, SqliteTeamRepository, SqliteUserOrderStore,
+    SqliteUserRepository,
 };
 
 // Re-export sqlx pool type for downstream crates

@@ -1034,11 +1034,24 @@ impl ConversationService {
     ///
     /// Generates a UUID v7, sets status to `pending`, defaults source
     /// to `aionui`, and broadcasts `conversation.listChanged(created)`.
-    #[tracing::instrument(skip_all, fields(user_id = %user_id, req_type = ?req.r#type))]
     pub async fn create(
         &self,
         user_id: &str,
         req: CreateConversationRequest,
+    ) -> Result<ConversationResponse, ConversationError> {
+        self.create_with_server_extra(user_id, req, serde_json::Map::new())
+            .await
+    }
+
+    /// [`create`](Self::create) plus server-minted `extra` keys that a client
+    /// may never set (e.g. the board's `board_assignment_id`). They are
+    /// inserted after the client-supplied copies were stripped.
+    #[tracing::instrument(skip_all, fields(user_id = %user_id, req_type = ?req.r#type))]
+    pub async fn create_with_server_extra(
+        &self,
+        user_id: &str,
+        req: CreateConversationRequest,
+        server_extra: serde_json::Map<String, serde_json::Value>,
     ) -> Result<ConversationResponse, ConversationError> {
         let id = generate_short_id();
         let now = now_ms();
@@ -1065,6 +1078,13 @@ impl ConversationService {
         // value would let anyone fork an arbitrary `parent_session_id` they do
         // not own — strip it unconditionally on the create path.
         strip_request_fork_spec(&mut extra);
+        strip_request_board_assignment(&mut extra);
+        if !server_extra.is_empty() {
+            match extra.as_object_mut() {
+                Some(obj) => obj.extend(server_extra),
+                None => extra = serde_json::Value::Object(server_extra),
+            }
+        }
 
         let assistant_id = req
             .assistant
@@ -2867,6 +2887,8 @@ impl ConversationService {
         let mut extra: serde_json::Value = serde_json::from_str(&parent.extra)
             .map_err(|e| ConversationError::internal(format!("Invalid parent extra JSON: {e}")))?;
         if let Some(obj) = extra.as_object_mut() {
+            // The assignment key belongs to the parent alone (unique index).
+            obj.remove(BOARD_ASSIGNMENT_EXTRA_KEY);
             obj.insert(
                 "fork".to_owned(),
                 serde_json::to_value(aionui_api_types::ForkSpec {
@@ -5103,6 +5125,20 @@ fn strip_request_fork_spec(extra: &mut serde_json::Value) {
         warn!("create: stripped client-supplied `extra.fork` (server-minted only)");
     }
 }
+
+/// `extra.board_assignment_id` is the project board's find-or-create key
+/// (unique per user, migration 901): only the board may set it (through
+/// `create_with_server_extra`), and a fork must never copy it.
+fn strip_request_board_assignment(extra: &mut serde_json::Value) {
+    if let Some(obj) = extra.as_object_mut()
+        && obj.remove(BOARD_ASSIGNMENT_EXTRA_KEY).is_some()
+    {
+        warn!("create: stripped client-supplied `extra.board_assignment_id` (board-minted only)");
+    }
+}
+
+/// See [`strip_request_board_assignment`].
+pub const BOARD_ASSIGNMENT_EXTRA_KEY: &str = "board_assignment_id";
 
 fn team_id_from_extra(extra: &str) -> Option<String> {
     TeamSessionBinding::team_id_marker_from_extra_str(extra)
