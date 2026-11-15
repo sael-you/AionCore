@@ -120,6 +120,18 @@ pub struct McpMarketInstanceResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     pub template_id: String,
+    /// Template version this instance was created or last refreshed from.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub template_version: Option<String>,
+    /// Version of the template in the catalogue now (`None` when the catalogue
+    /// has no such template or no version, or is unavailable).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub template_current_version: Option<String>,
+    /// Whether the catalogue still offers this template.
+    pub template_in_catalogue: bool,
+    /// Whether the catalogue template differs from the instance's snapshot, i.e.
+    /// `refresh-template` would change something.
+    pub template_update_available: bool,
     pub transport: String,
     pub environment: String,
     pub tier: String,

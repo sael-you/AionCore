@@ -994,6 +994,9 @@ async fn template_refresh_keeps_secrets_and_assignments_and_needs_new_secrets_fi
     req.clis = vec!["claude".into()];
     req.plain_env = BTreeMap::from([("OLD_PLAIN".into(), "x".into())]);
     let inst = market.create_instance(USER, req).await.unwrap();
+    assert_eq!(inst.template_version.as_deref(), Some("0.1.0"));
+    assert_eq!(inst.template_current_version.as_deref(), Some("0.1.0"));
+    assert!(inst.template_in_catalogue && !inst.template_update_available);
     market
         .set_secret(USER, &inst.id, "PADDLE_API_KEY", FIXTURE_SECRET)
         .await
@@ -1030,6 +1033,14 @@ async fn template_refresh_keeps_secrets_and_assignments_and_needs_new_secrets_fi
                "NEW_SECRET": {"kind": "secret", "required": true},
                "NEW_MODE": {"kind": "plain", "default": "safe"}}),
     )];
+    // List and detail now report the pending update.
+    let detail = market.get_instance(USER, &inst.id).await.unwrap();
+    let listed = market.list_instances(USER).await.unwrap().remove(0);
+    for view in [&detail, &listed] {
+        assert_eq!(view.template_version.as_deref(), Some("0.1.0"));
+        assert_eq!(view.template_current_version.as_deref(), Some("0.2.0"));
+        assert!(view.template_in_catalogue && view.template_update_available);
+    }
     let launch = LaunchRequest {
         user_id: USER,
         instance: "tb-refresh",
@@ -1078,7 +1089,18 @@ async fn template_refresh_keeps_secrets_and_assignments_and_needs_new_secrets_fi
     assert!(plan.env.iter().any(|(k, _)| k == "NEW_SECRET"));
     assert!(!serde_json::to_string(&refreshed).unwrap().contains("FIXTURE"));
 
+    assert_eq!(refreshed.instance.template_version.as_deref(), Some("0.2.0"));
+    assert!(!refreshed.instance.template_update_available);
+    assert!(!market.get_instance(USER, &inst.id).await.unwrap().template_update_available);
+
     // Refreshing again is a no-op.
     let again = market.refresh_template(USER, &inst.id).await.unwrap();
     assert!(!again.changed && again.added_keys.is_empty() && again.removed_keys.is_empty());
+
+    // Template withdrawn from the catalogue: the instance still lists, no update offered.
+    catalog.0.lock().unwrap().clear();
+    let listed = market.list_instances(USER).await.unwrap().remove(0);
+    assert!(!listed.template_in_catalogue && !listed.template_update_available);
+    assert_eq!(listed.template_version.as_deref(), Some("0.2.0"));
+    assert!(listed.template_current_version.is_none());
 }

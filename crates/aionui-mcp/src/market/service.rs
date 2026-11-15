@@ -80,12 +80,16 @@ impl McpMarketService {
 
     pub async fn list_instances(&self, user_id: &str) -> Result<Vec<McpMarketInstanceResponse>, MarketError> {
         let secrets = self.secrets_by_instance(user_id).await?;
+        // A catalogue outage must not hide instances: versions just read as unknown.
+        let templates = load_templates(self.catalog.as_ref(), user_id).await.unwrap_or_default();
         let mut out = Vec::new();
         for row in self.repo.list_instances(user_id).await? {
             let inst = StoredInstance::from_row(row)?;
+            let current = templates.iter().find(|t| t.id == inst.template.id);
             out.push(to_response(
                 &inst,
                 secrets.get(&inst.row.id).map(Vec::as_slice).unwrap_or(&[]),
+                current,
             ));
         }
         Ok(out)
@@ -94,7 +98,8 @@ impl McpMarketService {
     pub async fn get_instance(&self, user_id: &str, id: &str) -> Result<McpMarketInstanceResponse, MarketError> {
         let inst = self.load(user_id, id).await?;
         let secrets = self.repo.list_instance_secrets(user_id, id).await?;
-        Ok(to_response(&inst, &secrets))
+        let current = self.current_template(user_id, &inst.template.id).await;
+        Ok(to_response(&inst, &secrets, current.as_ref()))
     }
 
     pub(crate) async fn secrets_by_instance(
@@ -185,7 +190,7 @@ impl McpMarketService {
             .await?;
         info!(instance = %req.name, template = %template.id, tier = %req.tier, status = %status, revived = revive.is_some(), "mcp market: instance created");
         let inst = StoredInstance::from_row(row)?;
-        Ok(to_response(&inst, &[]))
+        Ok(to_response(&inst, &[], Some(&template)))
     }
 
     async fn write_new(
@@ -294,7 +299,8 @@ impl McpMarketService {
         info!(instance = %inst.row.name, status = %inst.status, tier = %inst.tier, "mcp market: instance updated");
         let inst = StoredInstance::from_row(row)?;
         let secrets = self.repo.list_instance_secrets(user_id, id).await?;
-        Ok(to_response(&inst, &secrets))
+        let current = self.current_template(user_id, &inst.template.id).await;
+        Ok(to_response(&inst, &secrets, current.as_ref()))
     }
 
     /// Template secret keys of `inst` that hold a value.
@@ -404,7 +410,8 @@ impl McpMarketService {
         info!(instance = %inst.row.name, recorded = inst.approval_ref.is_some(), "mcp market: approval record changed");
         let inst = StoredInstance::from_row(row)?;
         let secrets = self.repo.list_instance_secrets(user_id, id).await?;
-        Ok(to_response(&inst, &secrets))
+        let current = self.current_template(user_id, &inst.template.id).await;
+        Ok(to_response(&inst, &secrets, current.as_ref()))
     }
 
     /// Re-apply the catalogue's current version of the instance's template
@@ -502,13 +509,18 @@ impl McpMarketService {
         let inst = StoredInstance::from_row(row)?;
         let secrets = self.repo.list_instance_secrets(user_id, id).await?;
         Ok(aionui_api_types::McpMarketTemplateRefreshResponse {
-            instance: to_response(&inst, &secrets),
+            instance: to_response(&inst, &secrets, Some(&current)),
             from_version: old.version,
             to_version: current.version,
             added_keys,
             removed_keys,
             changed,
         })
+    }
+
+    /// The catalogue's current version of `template_id`, if it can be read.
+    pub(crate) async fn current_template(&self, user_id: &str, template_id: &str) -> Option<McpMarketTemplate> {
+        find_template(self.catalog.as_ref(), user_id, template_id).await.ok()
     }
 
     /// Whether `id` is a (non-deleted) market row.
@@ -585,7 +597,11 @@ pub(crate) fn reject(problems: Vec<String>) -> Result<(), MarketError> {
 }
 
 /// Response mapping: refs, `set` flags and missing keys; never a value.
-pub(crate) fn to_response(inst: &StoredInstance, secrets: &[McpSecretRow]) -> McpMarketInstanceResponse {
+pub(crate) fn to_response(
+    inst: &StoredInstance,
+    secrets: &[McpSecretRow],
+    current: Option<&McpMarketTemplate>,
+) -> McpMarketInstanceResponse {
     let mut statuses = Vec::new();
     let mut missing = Vec::new();
     for (key, field) in &inst.template.env {
@@ -622,6 +638,10 @@ pub(crate) fn to_response(inst: &StoredInstance, secrets: &[McpSecretRow]) -> Mc
         name: inst.row.name.clone(),
         description: inst.row.description.clone(),
         template_id: inst.template.id.clone(),
+        template_version: inst.template.version.clone(),
+        template_current_version: current.and_then(|t| t.version.clone()),
+        template_in_catalogue: current.is_some(),
+        template_update_available: current.is_some_and(|t| *t != inst.template),
         transport: inst.template.transport.clone(),
         environment: inst.environment.clone(),
         tier: inst.tier.clone(),
