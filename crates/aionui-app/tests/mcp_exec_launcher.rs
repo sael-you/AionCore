@@ -253,9 +253,8 @@ async fn refuses_unassigned_dormant_revoked_and_missing_db() {
     assert!(err.contains("revoked"), "{err}");
     let (code, _) = refused(f.launcher("no-such", "proj-a", "claude"));
     assert_eq!(code, 3);
-    for (_, err) in [refused(f.launcher("tb-refuse", "proj-a", "claude"))] {
-        assert!(!err.contains("LAUNCHERFIXTURE"), "no secret on stderr");
-    }
+    let (_, err) = refused(f.launcher("tb-refuse", "proj-a", "claude"));
+    assert!(!err.contains("LAUNCHERFIXTURE"), "no secret on stderr");
 
     // Missing DB: refused, and the file is never created (read-only open).
     let empty = f._dir.path().join("empty-data-dir");
