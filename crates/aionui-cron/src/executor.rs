@@ -3140,7 +3140,21 @@ mod tests {
             self.updates
                 .lock()
                 .ok()
-                .and_then(|items| items.iter().rev().find(|update| update.extra.is_some()).cloned())
+                // The workspace write, not merely the last extra write: since C21 a turn end also
+                // writes `extra` (last_outcome); on this fake (which never applies updates) the
+                // default set_extra_keys would otherwise hide the workspace write.
+                .and_then(|items| {
+                    items
+                        .iter()
+                        .rev()
+                        .find(|update| {
+                            update
+                                .extra
+                                .as_deref()
+                                .is_some_and(|extra| extra.contains("\"workspace\""))
+                        })
+                        .cloned()
+                })
         }
 
         fn inserted_messages(&self) -> Vec<aionui_db::models::MessageRow> {
