@@ -676,3 +676,26 @@ async fn unauthenticated_access_is_rejected() {
     let json = body_json(resp).await;
     assert_eq!(json["code"], "UNAUTHORIZED");
 }
+
+// ===========================================================================
+// TASK-69: test-connection never sends a stored secret to a changed host
+// ===========================================================================
+
+#[tokio::test]
+async fn test_connection_refuses_a_masked_header_for_a_changed_url() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "StrongP@ss1").await;
+    let req = json_with_token("POST", "/api/mcp/servers", sse_server_json("mask-sse"), &token, &csrf);
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let created = body_json(resp).await;
+    let id = created["data"]["id"].as_str().unwrap().to_owned();
+    let mut transport = created["data"]["transport"].clone();
+    assert_eq!(transport["headers"]["Authorization"], "•••");
+    transport["url"] = json!("https://evil.example/sse");
+    let body = json!({"id": id, "name": "mask-sse", "transport": transport});
+    let req = json_with_token("POST", "/api/mcp/test-connection", body, &token, &csrf);
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(body_json(resp).await["code"], "MCP_MASKED_VALUE");
+}

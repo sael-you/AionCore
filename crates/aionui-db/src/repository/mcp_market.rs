@@ -30,7 +30,10 @@ pub trait IMcpMarketRepository: Send + Sync {
         params: &MarketInstanceParams<'_>,
     ) -> Result<McpMarketRow, DbError>;
 
-    /// Partial update of a market instance (`None` keeps the stored value).
+    /// Partial update of a market instance: only the columns given are written
+    /// (`None` keeps the stored value), in one statement. With
+    /// `expected_updated_at` the write happens only if the row is unchanged
+    /// since it was read (`DbError::Conflict` otherwise, TASK-71).
     async fn update_instance(
         &self,
         user_id: &str,
@@ -71,6 +74,11 @@ pub trait IMcpMarketRepository: Send + Sync {
 
     /// Insert one assignment. Returns `DbError::Conflict` on a duplicate.
     async fn create_assignment(&self, params: &CreateAssignmentParams<'_>) -> Result<McpAssignmentRow, DbError>;
+
+    /// Insert several assignments in one transaction: all or none
+    /// (`DbError::Conflict` on a duplicate, nothing inserted, TASK-73).
+    async fn create_assignments(&self, params: &[CreateAssignmentParams<'_>])
+    -> Result<Vec<McpAssignmentRow>, DbError>;
 
     async fn delete_assignment(&self, user_id: &str, id: &str) -> Result<bool, DbError>;
 
@@ -140,6 +148,10 @@ pub struct UpdateMarketInstanceParams<'a> {
     pub tools_allow_json: Option<Option<&'a str>>,
     pub tools_block_json: Option<&'a str>,
     pub approval_ref: Option<Option<&'a str>>,
+    /// Write only if the row's `updated_at` still equals this value (the
+    /// service read-decide-write paths); `DbError::Conflict` otherwise.
+    /// `None` = unconditional column-level write (revoke/dormant).
+    pub expected_updated_at: Option<i64>,
 }
 
 #[derive(Debug, Clone)]
