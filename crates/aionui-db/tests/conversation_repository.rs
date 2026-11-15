@@ -1052,6 +1052,86 @@ async fn update_extra_replaces_json() {
     assert_eq!(found.extra, r#"{"workspace":"/new","flag":true}"#);
 }
 
+/// C21 FIXES 1: `set_extra_keys` is one `json_set` on the CURRENT extra. A
+/// writer that removed or added a key after another reader loaded the row is
+/// kept (a read-modify-write would resurrect `current_model_id`, the key the
+/// ACP model-failure recovery deletes).
+#[tokio::test]
+async fn set_extra_keys_is_atomic_against_a_concurrent_extra_writer() {
+    let (repo, _db) = setup().await;
+    let mut conv = make_conversation("extra-atomic");
+    conv.extra = r#"{"workspace":"/w","current_model_id":"bad-model"}"#.to_string();
+    conv.status = Some("running".to_string());
+    repo.create(&conv).await.unwrap();
+
+    // Turn completion "read" the row earlier; now a concurrent writer removes
+    // current_model_id and adds a key of its own.
+    let stale = repo.get(&conv.user_id, &conv.id).await.unwrap().unwrap();
+    assert!(stale.extra.contains("current_model_id"));
+    repo.update(
+        &conv.user_id,
+        &conv.id,
+        &ConversationRowUpdate {
+            extra: Some(r#"{"workspace":"/w","acp_session_id":"s-2"}"#.to_string()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+
+    let matched = repo
+        .set_extra_keys(
+            &conv.user_id,
+            &conv.id,
+            &[
+                ("last_outcome", serde_json::json!("error")),
+                ("last_outcome_at", serde_json::json!(1234)),
+            ],
+            Some("finished"),
+            Some(5678),
+        )
+        .await
+        .unwrap();
+    assert!(matched);
+
+    let found = repo.get(&conv.user_id, &conv.id).await.unwrap().unwrap();
+    let extra: serde_json::Value = serde_json::from_str(&found.extra).unwrap();
+    assert_eq!(extra["last_outcome"], "error");
+    assert_eq!(extra["last_outcome_at"], 1234);
+    assert_eq!(extra["acp_session_id"], "s-2", "the concurrent write survives");
+    assert!(extra.get("current_model_id").is_none(), "the removed key stays removed");
+    assert_eq!(found.status.as_deref(), Some("finished"));
+    assert_eq!(found.updated_at, 5678);
+}
+
+#[tokio::test]
+async fn set_extra_keys_replaces_non_object_extra_and_rejects_path_keys() {
+    let (repo, _db) = setup().await;
+    let mut conv = make_conversation("extra-bad");
+    // A JSON array: valid JSON but not an object, so it is replaced.
+    conv.extra = "[1,2]".to_string();
+    repo.create(&conv).await.unwrap();
+    assert!(
+        repo.set_extra_keys(&conv.user_id, &conv.id, &[("k", serde_json::json!(1))], None, None)
+            .await
+            .unwrap()
+    );
+    let found = repo.get(&conv.user_id, &conv.id).await.unwrap().unwrap();
+    assert_eq!(found.extra, r#"{"k":1}"#);
+
+    let err = repo
+        .set_extra_keys(&conv.user_id, &conv.id, &[("a.b", serde_json::json!(1))], None, None)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, DbError::Init(_)));
+    assert!(
+        !repo
+            .set_extra_keys(&conv.user_id, "missing", &[("k", serde_json::json!(1))], None, None)
+            .await
+            .unwrap()
+    );
+}
+
 #[tokio::test]
 async fn get_messages_excludes_legacy_cron_and_skill_suggest_rows() {
     let (repo, _db) = setup().await;

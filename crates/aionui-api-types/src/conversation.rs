@@ -379,6 +379,14 @@ pub struct ConversationResponse {
     pub extra: serde_json::Value,
 }
 
+/// Response of `POST /api/conversations/{id}/outcome-seen` (C21): the owner
+/// opened the conversation; a failed last turn no longer counts as needing
+/// them until the next turn ends.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OutcomeSeenResponse {
+    pub last_outcome_seen_at: TimestampMs,
+}
+
 /// Paginated list of conversations.
 pub type ConversationListResponse = PaginatedResult<ConversationResponse>;
 

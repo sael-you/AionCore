@@ -119,7 +119,7 @@ pub use conversation::{
     ConversationNameUpdatedPayload, ConversationResponse, ConversationRuntimeStateKind, ConversationRuntimeSummary,
     CreateConversationRequest, EnsureConversationRuntimeResponse, ForkCapabilityView, ForkConversationRequest,
     ListConversationsQuery, ListMessagesQuery, McpRuntimeSnapshot, MessageListResponse, MessageResponse,
-    MessageSearchItem, MessageSearchResponse, MessageStatusChangedPayload, PromptCapabilityView,
+    MessageSearchItem, MessageSearchResponse, MessageStatusChangedPayload, OutcomeSeenResponse, PromptCapabilityView,
     ReparentConversationRequest, SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SessionRef,
     UpdateConversationArtifactRequest, UpdateConversationRequest,
 };

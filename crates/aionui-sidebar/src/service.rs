@@ -1661,11 +1661,24 @@ fn conversation_item(
     }
 }
 
-/// The conversation's last turn ended in an error (`extra.last_outcome`) and
-/// no new turn is running.
+/// The conversation's last turn ended in an error (`extra.last_outcome`), no
+/// new turn is running, and the owner has not opened it since
+/// (`last_outcome_seen_at` older than `last_outcome_at`, or absent).
 fn last_turn_failed(conversation: &ConversationResponse) -> bool {
-    conversation.status != ConversationStatus::Running
-        && conversation.extra.get("last_outcome").and_then(|v| v.as_str()) == Some("error")
+    let extra = &conversation.extra;
+    if conversation.status == ConversationStatus::Running
+        || extra.get("last_outcome").and_then(|v| v.as_str()) != Some("error")
+    {
+        return false;
+    }
+    match extra.get("last_outcome_seen_at").and_then(|v| v.as_i64()) {
+        None => true,
+        // Rows from before `last_outcome_at` existed: any seen mark counts.
+        Some(seen) => extra
+            .get("last_outcome_at")
+            .and_then(|v| v.as_i64())
+            .is_some_and(|failed_at| failed_at > seen),
+    }
 }
 
 fn team_item(agg: &TeamAgg, pinned: bool) -> SidebarItem {

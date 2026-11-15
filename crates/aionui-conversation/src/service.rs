@@ -2529,6 +2529,34 @@ impl ConversationService {
         Ok(())
     }
 
+    /// The owner opened the conversation: mark its last outcome as seen
+    /// (C21), so a failed turn stops counting as "needs you" once looked at.
+    /// One atomic `json_set` of `extra.last_outcome_seen_at`; `updated_at` is
+    /// left alone so opening never reorders the sidebar. A later failure has a
+    /// newer `last_outcome_at` and shows again.
+    #[tracing::instrument(skip_all, fields(user_id = %user_id, conversation_id = %conversation_id))]
+    pub async fn mark_outcome_seen(&self, user_id: &str, conversation_id: &str) -> Result<i64, ConversationError> {
+        let seen_at = now_ms();
+        let matched = self
+            .conversation_repo
+            .set_extra_keys(
+                user_id,
+                conversation_id,
+                &[("last_outcome_seen_at", serde_json::Value::from(seen_at))],
+                None,
+                None,
+            )
+            .await?;
+        if !matched {
+            return Err(ConversationError::NotFound {
+                id: conversation_id.to_owned(),
+            });
+        }
+        debug!("Conversation outcome marked seen");
+        self.broadcast_list_changed(user_id, conversation_id, "updated", None);
+        Ok(seen_at)
+    }
+
     pub async fn save_acp_runtime_mode(
         &self,
         user_id: &str,

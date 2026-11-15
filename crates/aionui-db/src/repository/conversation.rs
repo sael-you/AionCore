@@ -30,6 +30,45 @@ pub trait IConversationRepository: Send + Sync {
     /// Partially updates a conversation. Returns `DbError::NotFound` if ID is missing for the user.
     async fn update(&self, user_id: &str, id: &str, updates: &ConversationRowUpdate) -> Result<(), DbError>;
 
+    /// Set top-level keys of `extra` (JSON values), and optionally `status` /
+    /// `updated_at`, in ONE statement, so a concurrent `extra` write is never
+    /// overwritten with a stale copy (C21: `last_outcome`, `last_outcome_seen_at`).
+    /// A non-object `extra` is replaced by an object. Keys must be plain
+    /// identifiers (`[a-z_][a-z0-9_]*`). Returns `false` when no row matched.
+    ///
+    /// The default is a read-modify-write for in-memory test doubles; the
+    /// SQLite repository overrides it with an atomic `json_set`.
+    async fn set_extra_keys(
+        &self,
+        user_id: &str,
+        id: &str,
+        entries: &[(&str, serde_json::Value)],
+        status: Option<&str>,
+        updated_at: Option<TimestampMs>,
+    ) -> Result<bool, DbError> {
+        validate_extra_keys(entries)?;
+        let Some(row) = self.get(user_id, id).await? else {
+            return Ok(false);
+        };
+        let mut extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap_or_else(|_| serde_json::json!({}));
+        if !extra.is_object() {
+            extra = serde_json::json!({});
+        }
+        if let Some(object) = extra.as_object_mut() {
+            for (key, value) in entries {
+                object.insert((*key).to_owned(), value.clone());
+            }
+        }
+        let updates = ConversationRowUpdate {
+            extra: Some(extra.to_string()),
+            status: status.map(str::to_owned),
+            updated_at,
+            ..Default::default()
+        };
+        self.update(user_id, id, &updates).await?;
+        Ok(true)
+    }
+
     /// Deletes a conversation (messages cascade via FK).
     /// Returns `DbError::NotFound` if ID is missing for the user.
     async fn delete(&self, user_id: &str, id: &str) -> Result<(), DbError>;
@@ -600,4 +639,18 @@ pub struct MessageSearchRow {
     pub conversation_pinned_at: Option<TimestampMs>,
     pub conversation_created_at: TimestampMs,
     pub conversation_updated_at: TimestampMs,
+}
+
+/// Reject `extra` keys that are not plain identifiers: they are spliced into a
+/// JSON path (`$.key`), so anything else could address a different location.
+pub fn validate_extra_keys(entries: &[(&str, serde_json::Value)]) -> Result<(), DbError> {
+    for (key, _) in entries {
+        let mut chars = key.chars();
+        let valid = chars.next().is_some_and(|c| c == '_' || c.is_ascii_lowercase())
+            && chars.all(|c| c == '_' || c.is_ascii_lowercase() || c.is_ascii_digit());
+        if !valid {
+            return Err(DbError::Init(format!("invalid extra key: {key:?}")));
+        }
+    }
+    Ok(())
 }
