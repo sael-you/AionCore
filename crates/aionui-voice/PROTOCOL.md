@@ -55,6 +55,10 @@ Notes:
   reset, a fresh read-back clip (`voice.draftUpdated` + `voice.readbackReady`
   with the new session id) and the read-back text as model context, so it can be
   confirmed by voice there, not only by tap. Same `draftId` and `version`.
+- `voice.hello` replays that pending card to the socket that sent it (after
+  `voice.ready` / `voice.state`): `voice.draftUpdated`, plus
+  `voice.readbackReady` with the same clip id while the clip is still unfetched
+  (clips are single use; once taken, only the card is replayed — tap to confirm).
 
 ## `/api/voice/ws`
 

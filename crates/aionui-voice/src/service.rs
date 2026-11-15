@@ -4,7 +4,9 @@
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use aionui_api_types::{UpdateVoiceSettingsRequest, VoiceSessionResponse, VoiceSettingsResponse, VoiceStatusResponse};
+use aionui_api_types::{
+    UpdateVoiceSettingsRequest, VoiceServerFrame, VoiceSessionResponse, VoiceSettingsResponse, VoiceStatusResponse,
+};
 use aionui_db::{
     IVoiceAuditRepository, IVoiceDraftRepository, IVoiceSessionRepository, IVoiceSettingsRepository,
     NewVoiceAuditEntry, VoiceSessionRow,
@@ -492,6 +494,11 @@ impl VoiceService {
             }
             _ => {}
         }
+    }
+
+    /// The user's pending draft card, replayed on `voice.hello`.
+    pub async fn pending_draft_frames(&self, user_id: &str) -> Vec<VoiceServerFrame> {
+        self.inner.drafts.replay_for(user_id).await
     }
 
     /// `GET /api/voice/readbacks/{id}`: single use, owner only, 2 min.

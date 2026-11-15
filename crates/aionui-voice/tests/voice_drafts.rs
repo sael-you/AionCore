@@ -691,3 +691,55 @@ async fn a_redial_after_rotation_carries_a_short_summary_of_the_previous_call() 
             .any(|t| t.starts_with("Summary of the previous call"))
     );
 }
+
+#[tokio::test]
+async fn a_page_that_connects_late_gets_the_pending_draft_card() {
+    let mut c = call().await;
+    let (draft, readback) = c
+        .request_draft("tell the kanban build to run the linter", "call_l")
+        .await;
+    let addr = c.h.serve().await;
+
+    // A second page says hello after the card was sent: it gets it replayed.
+    let mut late = ws_connect(&addr, &c.user, Some(ORIGIN)).await.unwrap();
+    ws_send(&mut late, hello(Some(&c.session))).await;
+    ws_expect(&mut late, "voice.ready").await;
+    let card = ws_expect(&mut late, "voice.draftUpdated").await["data"].clone();
+    assert_eq!(card["draftId"], draft["draftId"]);
+    assert_eq!(card["version"], draft["version"]);
+    assert_eq!(card["hash"], draft["hash"]);
+    assert_eq!(card["state"], "drafted");
+    assert_eq!(card["voiceSessionId"], c.session.as_str());
+    let rb = ws_expect(&mut late, "voice.readbackReady").await["data"].clone();
+    assert_eq!(rb["readbackId"], readback["readbackId"], "same clip, same tracker");
+
+    // Once the clip was fetched, a later page gets the card but no dead clip.
+    let url = readback["url"].as_str().unwrap().to_owned();
+    let (status, _) = c.h.send(Req::browser("GET", &url, &c.user).build()).await;
+    assert_eq!(status, 200);
+    let mut later = ws_connect(&addr, &c.user, Some(ORIGIN)).await.unwrap();
+    ws_send(&mut later, hello(Some(&c.session))).await;
+    ws_expect(&mut later, "voice.draftUpdated").await;
+    let mut extra = Vec::new();
+    while let Some(frame) = ws_next(&mut later, Duration::from_millis(400)).await {
+        extra.push(frame);
+    }
+    assert!(!extra.iter().any(|f| f["name"] == "voice.readbackReady"), "{extra:?}");
+
+    // A cancelled draft is not replayed.
+    let id = draft["draftId"].as_str().unwrap().to_owned();
+    ws_send(
+        &mut c.ws,
+        json!({"name": "voice.cancelTap", "data": {"voiceSessionId": c.session, "draftId": id,
+            "version": draft["version"]}}),
+    )
+    .await;
+    c.wait_state(&id, draft["version"].as_i64().unwrap(), "cancelled").await;
+    let mut last = ws_connect(&addr, &c.user, Some(ORIGIN)).await.unwrap();
+    ws_send(&mut last, hello(Some(&c.session))).await;
+    let mut frames = Vec::new();
+    while let Some(frame) = ws_next(&mut last, Duration::from_millis(400)).await {
+        frames.push(frame);
+    }
+    assert!(!frames.iter().any(|f| f["name"] == "voice.draftUpdated"), "{frames:?}");
+}

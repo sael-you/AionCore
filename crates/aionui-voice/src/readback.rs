@@ -376,6 +376,13 @@ impl ClipStore {
         self.clips.remove(clip_id).map(|(_, stored)| stored.clip)
     }
 
+    /// Whether the owner can still fetch the clip (not taken, not expired).
+    pub fn available(&self, user_id: &str, clip_id: &str) -> bool {
+        self.clips
+            .get(clip_id)
+            .is_some_and(|stored| stored.user_id == user_id && stored.expires_at > Instant::now())
+    }
+
     /// The clip's session (for binding checks), without consuming it.
     pub fn session_of(&self, clip_id: &str) -> Option<String> {
         self.clips.get(clip_id).and_then(|s| s.session_id.clone())

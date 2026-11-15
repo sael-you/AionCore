@@ -107,6 +107,36 @@ impl DraftEngine {
     // ---------------------------------------------------------------- frames
 
     pub(crate) fn emit(&self, row: &VoiceDraftRow, hold: Option<(u64, bool)>) {
+        let frame = self.draft_frame(row, hold);
+        self.sockets.send_user(&row.user_id, &frame);
+        if DraftState::parse(&row.state).is_some_and(|s| s.is_terminal()) {
+            self.extras.remove(&(row.id.clone(), row.version));
+        }
+    }
+
+    /// Frames that put the user's pending draft card back on a socket that
+    /// connected late (`voice.hello`): `draftUpdated`, plus `readbackReady`
+    /// while its clip is still unfetched (clips are single use).
+    pub async fn replay_for(&self, user_id: &str) -> Vec<VoiceServerFrame> {
+        let Some(row) = self.pending_for_user(user_id).await else {
+            return Vec::new();
+        };
+        let mut frames = vec![self.draft_frame(&row, None)];
+        if let Some(clip_id) = row.readback_id.as_deref()
+            && self.clips.available(user_id, clip_id)
+        {
+            frames.push(VoiceServerFrame::ReadbackReady(VoiceReadbackReady {
+                voice_session_id: row.session_id.clone(),
+                draft_id: row.id.clone(),
+                version: row.version,
+                readback_id: clip_id.to_owned(),
+                url: format!("/api/voice/readbacks/{clip_id}"),
+            }));
+        }
+        frames
+    }
+
+    fn draft_frame(&self, row: &VoiceDraftRow, hold: Option<(u64, bool)>) -> VoiceServerFrame {
         let extras = self
             .extras
             .get(&(row.id.clone(), row.version))
@@ -117,7 +147,7 @@ impl DraftEngine {
         } else {
             "conversation"
         };
-        let frame = VoiceServerFrame::DraftUpdated(VoiceDraftUpdated {
+        VoiceServerFrame::DraftUpdated(VoiceDraftUpdated {
             voice_session_id: row.session_id.clone(),
             draft_id: row.id.clone(),
             version: row.version,
@@ -157,11 +187,7 @@ impl DraftEngine {
             spoken_confirm: row.spoken_confirm,
             hold_remaining_ms: hold.map(|(ms, _)| ms),
             hold_frozen: hold.map(|(_, frozen)| frozen),
-        });
-        self.sockets.send_user(&row.user_id, &frame);
-        if DraftState::parse(&row.state).is_some_and(|s| s.is_terminal()) {
-            self.extras.remove(&(row.id.clone(), row.version));
-        }
+        })
     }
 
     /// Speak a short status line (Jarvis or agent voice) as a follow-up clip.

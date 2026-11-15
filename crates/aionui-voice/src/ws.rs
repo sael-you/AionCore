@@ -176,6 +176,10 @@ impl Socket {
                     })),
                     None => self.send(&state_frame(session.as_deref(), "armed", None)),
                 }
+                // A page that connects after the call is ready still gets the card.
+                for frame in self.service.pending_draft_frames(&self.user_id).await {
+                    self.send(&frame);
+                }
             }
             VoiceClientFrame::Heartbeat(_) => self.service.note_heartbeat(&self.user_id, session.as_deref()),
             VoiceClientFrame::Frozen(_) => {
