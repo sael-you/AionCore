@@ -98,7 +98,10 @@ async fn create_sse_server_with_headers() {
 
     let json = body_json(resp).await;
     assert_eq!(json["data"]["transport"]["type"], "sse");
-    assert_eq!(json["data"]["transport"]["headers"]["Authorization"], "Bearer xxx");
+    // MCP market R1 #11 (intentional contract change): secret-looking header
+    // values are masked in every response; a PUT that sends the mask back keeps
+    // the stored value.
+    assert_eq!(json["data"]["transport"]["headers"]["Authorization"], "•••");
 }
 
 // ===========================================================================

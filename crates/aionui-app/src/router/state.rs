@@ -317,7 +317,13 @@ pub async fn build_module_states(
         project: build_module_state_phase(&boot, "project", || build_project_state(services)),
         sidebar: build_module_state_phase(&boot, "sidebar", || build_sidebar_state(services)),
         board: build_module_state_phase(&boot, "board", || build_board_state(services)),
-        mcp: build_module_state_phase(&boot, "mcp", || build_mcp_state(services)),
+        mcp: build_module_state_phase(&boot, "mcp", || {
+            build_mcp_state(
+                services,
+                Some(ext_state.registry.clone()),
+                Some(assistant.service.clone()),
+            )
+        }),
         extension: ext_state,
         hub: hub_state,
         skill: skill_state,
@@ -725,10 +731,34 @@ impl ArchiveTeardownPorts for ArchiveTeardownAdapter {
     }
 }
 
-/// Build the default `McpRouterState` from application services.
-pub fn build_mcp_state(services: &AppServices) -> McpRouterState {
+/// Build the default `McpRouterState` from application services. The MCP
+/// market reads templates from the catalogue extension (`registry`) and
+/// updates assistant bindings through `assistant`; either may be absent
+/// (empty catalogue / no binding updates).
+pub fn build_mcp_state(
+    services: &AppServices,
+    registry: Option<ExtensionRegistry>,
+    assistant: Option<Arc<aionui_assistant::AssistantService>>,
+) -> McpRouterState {
     let pool = services.database.pool().clone();
-    let repo: Arc<dyn aionui_db::IMcpServerRepository> = Arc::new(aionui_db::SqliteMcpServerRepository::new(pool));
+    let repo: Arc<dyn aionui_db::IMcpServerRepository> =
+        Arc::new(aionui_db::SqliteMcpServerRepository::new(pool.clone()));
+    let market_repo: Arc<dyn aionui_db::IMcpMarketRepository> =
+        Arc::new(aionui_db::SqliteMcpMarketRepository::new(pool));
+    let catalog: Arc<dyn aionui_mcp::IMcpTemplateCatalog> = match registry {
+        Some(registry) => Arc::new(super::mcp_market::ExtensionTemplateCatalog { registry }),
+        None => Arc::new(aionui_mcp::StaticTemplateCatalog::new(Vec::new())),
+    };
+    // Same storage-encryption key as provider API keys (owner decision 1).
+    let mut market = aionui_mcp::McpMarketService::new(
+        market_repo.clone(),
+        repo.clone(),
+        catalog,
+        derive_encryption_key(&services.encryption_secret_raw),
+    );
+    if let Some(assistant) = assistant {
+        market = market.with_assistant_binder(Arc::new(super::mcp_market::AssistantMcpBinder { assistant }));
+    }
 
     let adapters: Vec<Arc<dyn McpAgentAdapter>> = vec![
         Arc::new(ClaudeAdapter),
@@ -747,7 +777,8 @@ pub fn build_mcp_state(services: &AppServices) -> McpRouterState {
     let http_client = reqwest::Client::new();
 
     McpRouterState {
-        config_service: McpConfigService::new(repo.clone()),
+        config_service: McpConfigService::new(repo.clone()).with_market_repo(market_repo),
+        market,
         sync_service: McpSyncService::new(repo, adapters),
         connection_test_service: McpConnectionTestService::new(http_client.clone(), services.event_bus.clone()),
         oauth_service: aionui_mcp::McpOAuthService::new(oauth_token_repo, http_client),

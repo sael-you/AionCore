@@ -318,6 +318,30 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     let sidebar_authenticated =
         sidebar_routes(states.sidebar).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
+    // MCP market: reads behind the ordinary auth middleware; every market write
+    // behind a session-only auth state (never the agent runtime-token channel,
+    // never `--local`'s default user, R1 #1), plus CSRF in local mode (the
+    // global CSRF layer covers the other modes).
+    let market_state = aionui_mcp::McpMarketRouterState {
+        market: states.mcp.market.clone(),
+    };
+    let mcp_market_read = aionui_mcp::mcp_market_read_routes(market_state.clone())
+        .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
+    let mcp_market_write = {
+        let router = aionui_mcp::mcp_market_write_routes(market_state).route_layer(from_fn_with_state(
+            super::mcp_market::market_write_auth_state(services),
+            auth_middleware,
+        ));
+        if services.identity_mode.is_local() {
+            router.route_layer(middleware::from_fn_with_state(
+                services.cookie_config.clone(),
+                csrf_middleware,
+            ))
+        } else {
+            router
+        }
+    };
+
     // MCP routes protected by auth middleware
     let mcp_authenticated =
         mcp_routes(states.mcp).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
@@ -423,6 +447,8 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         .merge(sidebar_authenticated)
         .merge(board_authenticated)
         .merge(mcp_authenticated)
+        .merge(mcp_market_read)
+        .merge(mcp_market_write)
         .merge(extension_authenticated)
         .merge(hub_authenticated)
         .merge(skill_authenticated)

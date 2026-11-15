@@ -156,6 +156,12 @@ pub(crate) enum Command {
     /// is independent of the JWT *signing* secret, which change-password may
     /// rotate freely without affecting decryption.
     Secret(SecretArgs),
+    /// MCP market helpers. `mcp exec <id>` is the launcher every market MCP
+    /// server is started through: it re-checks the instance and its assignment
+    /// in the database (opened read-only), starts the template's pinned command
+    /// with a clean env plus the instance's own secrets, and proxies stdio,
+    /// filtering `tools/list` and `tools/call` by the instance's tool lists.
+    Mcp(McpArgs),
 }
 
 impl Command {
@@ -175,12 +181,49 @@ impl Command {
             Self::PrepareManagedResources(_) => "prepare-managed-resources",
             Self::User(_) => "user",
             Self::Secret(_) => "secret",
+            Self::Mcp(_) => "mcp",
         }
     }
 
     pub(crate) fn need_runtime(&self) -> bool {
         matches!(self, Self::Doctor | Self::PrepareManagedResources(_))
     }
+}
+
+#[derive(Args, Debug, Clone)]
+#[command(disable_help_subcommand = true)]
+pub(crate) struct McpArgs {
+    #[command(subcommand)]
+    pub command: McpCommand,
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub(crate) enum McpCommand {
+    /// Start market instance <ID> as a filtering stdio MCP proxy. Refuses
+    /// (exit 3) unless the instance is active and assigned to exactly this
+    /// scope and CLI now.
+    Exec(McpExecArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct McpExecArgs {
+    /// Instance id (= tool prefix, `mcp__<id>__*`).
+    pub instance: String,
+    /// Project id (`projects.project_id`) the instance is assigned to.
+    #[arg(long, conflicts_with = "global", required_unless_present = "global")]
+    pub project: Option<String>,
+    /// A global assignment (context7 / studio-memory only).
+    #[arg(long)]
+    pub global: bool,
+    /// Assistant id, for the AionUi assistant-binding channel.
+    #[arg(long, requires = "project")]
+    pub assistant: Option<String>,
+    /// The CLI the server is started for.
+    #[arg(long, value_parser = ["claude", "codex", "gemini"])]
+    pub cli: String,
+    /// AionUi data dir; `AIONUI_DATA_DIR` takes precedence when set.
+    #[arg(long = "data-dir")]
+    pub data_dir: Option<PathBuf>,
 }
 
 #[derive(Args, Debug, Clone)]
