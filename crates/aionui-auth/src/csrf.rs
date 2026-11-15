@@ -12,8 +12,8 @@ use aionui_common::ApiError;
 use aionui_common::constants::{COOKIE_NAME, CSRF_HEADER_NAME};
 use axum::http::StatusCode;
 
-use crate::cookie::{CookieConfig, CookieNames};
-use crate::extract::{extract_bearer_token, extract_cookie_value};
+use crate::cookie::CookieConfig;
+use crate::extract::extract_cookie_value;
 use crate::origin::{OriginPolicy, is_unsafe_method};
 
 /// State of [`csrf_middleware`] (installed in non-local modes only).
@@ -30,8 +30,6 @@ pub struct CsrfState {
 /// Behavior:
 /// - Safe methods (GET, HEAD, OPTIONS) bypass validation.
 /// - Exempt paths (`/login`, `/api/auth/qr-login`, Bootstrap-secret internal auth) bypass validation.
-/// - Webui: `Authorization: Bearer` requests without a session cookie bypass
-///   validation (mobile app); the token is still validated behind this layer.
 /// - All other requests must include an `x-csrf-token` header whose value
 ///   matches the CSRF cookie.
 /// - Every state-changing request must pass the browser-origin rule
@@ -83,22 +81,6 @@ pub async fn csrf_middleware(
         || extract_cookie_value(headers, COOKIE_NAME).is_some();
     let is_runtime_token_request = headers.contains_key(crate::middleware::RUNTIME_TOKEN_HEADER)
         && (state.origin_policy.is_none() || !has_session_credential);
-    // Bearer clients (the mobile app) in webui identity: a request carrying
-    // `Authorization: Bearer <token>` and no session cookie under either name
-    // is exempt. A browser never attaches an Authorization header on its own
-    // and cannot add one cross-site without a CORS preflight, so there is no
-    // ambient credential for CSRF to defend. The token is still validated
-    // behind this layer (auth middleware reads the Bearer first; the refresh
-    // route verifies its own token). A session cookie under either name
-    // (`__Host-aionui-session`, `aionui-session`) removes the exemption, so a
-    // browser session cannot use it. A runtime-token header next to the
-    // Bearer changes nothing: the auth middleware authenticates the Bearer
-    // and never falls back to the runtime channel. Webui only: AionPro keeps
-    // the upstream behaviour, local identity has no CSRF layer at all.
-    let has_any_session_cookie = extract_cookie_value(headers, CookieNames::PREFIXED.session).is_some()
-        || extract_cookie_value(headers, CookieNames::LEGACY.session).is_some();
-    let is_bearer_request =
-        state.origin_policy.is_some() && extract_bearer_token(headers).is_some() && !has_any_session_cookie;
     // agy's PreToolUse callback. A local `aioncore antigravity-hook` process
     // posts here for every tool the agent wants to run; it has no user session
     // and no CSRF token to present. The route is already deliberately outside
@@ -120,8 +102,7 @@ pub async fn csrf_middleware(
         || path.starts_with("/api/auth/internal/external-users/")
         || path.starts_with("/api/auth/internal/external-sessions")
         || is_antigravity_hook
-        || is_runtime_token_request
-        || is_bearer_request;
+        || is_runtime_token_request;
 
     if needs_validation && !is_exempt {
         let header_token = request
