@@ -17,6 +17,14 @@ pub const AIONUI_SESSIONS_END_MARKER: &str = "[[/AION_SESSIONS]]";
 pub const AIONUI_SESSION_MESSAGE_MARKER: &str = "[[AION_SESSION_MESSAGE]]";
 pub const AIONUI_SESSION_MESSAGE_END_MARKER: &str = "[[/AION_SESSION_MESSAGE]]";
 
+// --- Conversation voice mode (C26) ---
+
+/// Block appended server-side to every message spoken in conversation voice
+/// mode: tells the agent the text is a transcript and how to talk back.
+/// Typed messages never carry it; the UI hides it and shows a mic chip.
+pub const AIONUI_VOICE_MARKER: &str = "[[AION_VOICE]]";
+pub const AIONUI_VOICE_END_MARKER: &str = "[[/AION_VOICE]]";
+
 // --- WebSocket ---
 
 pub const HEARTBEAT_INTERVAL_MS: u64 = 30_000;

@@ -191,3 +191,49 @@ DROP TABLE IF EXISTS voice_settings;
 and start AionCore again (it re-applies the current 902). Never do this on a
 database that holds real voice data; production rolls back by restoring the
 pre-deploy backup.
+
+## Conversation voice mode (C26, D51)
+
+`POST /api/voice/sessions` takes `mode`: `jarvis` (default, the C9 dispatcher
+above) or `conversation`, which needs `focus_conversation_id` (a conversation
+of the caller; 404 otherwise). A conversation-mode call is only an ear: no
+tools, `create_response: false`, semantic VAD eagerness `low`, transcription
+keywords = the user's project and conversation names. One live call per user
+still applies (`VOICE_BUSY`).
+
+- Each final user transcript (an open `ask` takes it first) is classified as
+  a whole utterance (≤ 4 words after "hey/ok/jarvis/please"):
+  `stop`, `stop it`, `quiet`, `stop talking` → `silenced` (speech only, the
+  task keeps running); `stop the task`, `cancel`, `cancel that`, `abort` →
+  the running turn is cancelled (and queued voice messages for it dropped),
+  spoken "Stopped."; `stop voice`, `end voice`, `jarvis sleep` → the call
+  ends with reason `sleep`. Anything else is the user's message.
+- A message is posted verbatim into the bound conversation plus an
+  `[[AION_VOICE]] … [[/AION_VOICE]]` block, idempotency key
+  `<draft id>:1`: mid-turn when a turn runs (`voice.followUp.status`
+  `added`), else a new turn (`sent`). An open approval or a busy
+  non-steerable agent → a `voice_drafts` row (`action = send_message`,
+  `delivery = voice_mode`, `state = queued`, 30 min) that the C9 worker sends
+  with the same key when the turn ends, after a restart too (`queued`; no
+  draft card, no read-back). Failures → `failed`. These follow-ups are text
+  only (no `clipId`).
+- `voice.commit` (client → server, `{voiceSessionId}`): "Done", commits the
+  input buffer now.
+- Agent `say`/`ask` from the bound conversation: no "<name> says:" prefix,
+  ≤ 1200 characters split into ≤ 300-character clips (`status` `says` /
+  `asks`), no confirm-word ban, not counted against the 6/h wake limit; the
+  6/min say limit stays. Allowed while the call is live and 30 min after an
+  idle/rotation/network hangup (the device is still armed); ended by the
+  user (`user`, `sleep`), the kill switch, a revoked session or the budget.
+- Turn end of the bound conversation: `finished` as text when the agent
+  spoke in that turn, spoken "<name> finished." when it did not; a
+  cancelled turn is text only; an error is the spoken `failed` line.
+- While the bound conversation runs a turn (or waits for an approval) the
+  call is not idle-hung-up.
+- Restart: the binding is in memory only; a conversation-mode call (told
+  apart by its instructions hash) is closed with `restart`, never re-attached
+  as a Jarvis call.
+- Speech: MiniMax `speech-2.8-turbo` (4 s) → OpenAI `gpt-realtime-2.1-mini`
+  → text. Every clip is charged 60 µUSD per character to the daily budget
+  (the live session, else the user's latest).
+
