@@ -1986,6 +1986,9 @@ pub async fn build_session_instance(
         // flags first and appends these after, with no de-duplication, so the
         // repeated `--add-dir` survives intact (probe-verified).
         extra_args: skill_delivery.plan.extra_args.clone(),
+        // claude writes its `--mcp-config` file here (0600) instead of putting
+        // MCP env/header values on the command line. codex ignores it.
+        runtime_dir: skill_delivery.runtime_dir.clone(),
         ..Default::default()
     };
 
@@ -4855,11 +4858,18 @@ mod build_mapping_tests {
     #[derive(Default)]
     struct RecordingFailSpawner {
         last_command: std::sync::Mutex<Option<aionui_common::CommandSpec>>,
+        /// The `--mcp-config` file body as it existed AT spawn time (the file is
+        /// removed once the failed open drops its guard).
+        mcp_config_body: std::sync::Mutex<Option<String>>,
     }
 
     impl RecordingFailSpawner {
         fn last_command(&self) -> Option<aionui_common::CommandSpec> {
             self.last_command.lock().unwrap().clone()
+        }
+
+        fn mcp_config_body(&self) -> Option<String> {
+            self.mcp_config_body.lock().unwrap().clone()
         }
     }
 
@@ -4871,6 +4881,13 @@ mod build_mapping_tests {
             _extra_env: &[(String, String)],
             _opaque_owner_tag: &str,
         ) -> Result<Arc<aionui_process::ManagedProcess>, aionui_process::ProcessError> {
+            let mcp_config_body = spec
+                .args
+                .iter()
+                .position(|arg| arg == "--mcp-config")
+                .and_then(|i| spec.args.get(i + 1))
+                .and_then(|path| std::fs::read_to_string(path).ok());
+            *self.mcp_config_body.lock().unwrap() = mcp_config_body;
             *self.last_command.lock().unwrap() = Some(spec);
             Err(aionui_process::ProcessError::internal(
                 "recording spawner deliberately stops after assembly",
@@ -5025,6 +5042,9 @@ mod build_mapping_tests {
         let metadata = test_metadata(Some("claude"), None);
         let broadcaster: Arc<dyn EventBroadcaster> = Arc::new(aionui_realtime::BroadcastEventBus::new(16));
         let spawner = Arc::new(RecordingFailSpawner::default());
+        // C16: the conversation's private runtime dir (the skill view dir in
+        // production) receives the `--mcp-config` file.
+        let runtime_dir = tempfile::tempdir().expect("runtime dir");
 
         let result = build_session_instance(
             "claude",
@@ -5038,8 +5058,12 @@ mod build_mapping_tests {
                 config: &config,
                 metadata: &metadata,
                 // This test is about MCP injection; skill delivery contributes
-                // nothing so the argv it asserts on stays unchanged.
-                skill_delivery: Default::default(),
+                // no args so the argv it asserts on stays unchanged — only the
+                // private runtime dir is set.
+                skill_delivery: crate::factory::ResolvedSkillDelivery {
+                    runtime_dir: Some(runtime_dir.path().to_path_buf()),
+                    ..Default::default()
+                },
                 session_snapshot: None,
                 backend_session_id: None,
                 mcp_server_repo: Some(&repo),
@@ -5064,9 +5088,35 @@ mod build_mapping_tests {
             .iter()
             .position(|arg| arg == "--mcp-config")
             .expect("direct claude spawn must carry --mcp-config");
+        // C16: the flag carries a path into the runtime dir, never the JSON, and
+        // claude keeps its native MCPs (no strict flag) — Team mode included.
+        assert!(
+            std::path::Path::new(&command.args[mcp_flag + 1]).starts_with(runtime_dir.path()),
+            "--mcp-config must point at the private file, got {:?}",
+            command.args[mcp_flag + 1]
+        );
+        assert!(
+            !command.args.iter().any(|arg| arg == "--strict-mcp-config"),
+            "team/user MCPs are added to the native ones, never swapped in"
+        );
+        assert!(
+            !command.args.iter().any(|arg| arg.contains("mcpServers")),
+            "no MCP config body (team token included) may ride argv"
+        );
         let config_json: serde_json::Value =
-            serde_json::from_str(&command.args[mcp_flag + 1]).expect("valid inline MCP config");
+            serde_json::from_str(&spawner.mcp_config_body().expect("file readable at spawn time"))
+                .expect("valid MCP config file");
         let servers = config_json["mcpServers"].as_object().expect("MCP server map");
+        assert_eq!(
+            servers[TEAM_MCP_SERVER_NAME]["env"][TeamMcpStdioConfig::ENV_TOKEN],
+            serde_json::json!("tok"),
+            "the team token lives in the file"
+        );
+        assert_eq!(
+            std::fs::read_dir(runtime_dir.path()).expect("runtime dir").count(),
+            0,
+            "the failed spawn must not leave the secrets file behind"
+        );
 
         assert_eq!(servers.len(), 3);
         assert!(servers.contains_key("mcp-docs"));

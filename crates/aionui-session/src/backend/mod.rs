@@ -11,6 +11,7 @@
 mod acp_conn;
 mod antigravity;
 mod claude_conn;
+mod claude_mcp_file;
 mod cli_version;
 mod codex_conn;
 mod codex_title;
@@ -335,4 +336,10 @@ pub struct SessionConfig {
     /// SESSION-cumulative across process recycles and app restarts. `None`
     /// (default) = fresh conversation, base 0. Other backends ignore it.
     pub initial_cost_usd: Option<f64>,
+    /// AionUi-owned, per-conversation private directory (the skill view dir) where
+    /// a backend may write launch artifacts that must not ride argv. claude writes
+    /// its `--mcp-config` file here (0600, removed with the backend) so MCP
+    /// env/header values stay out of `ps`. `None` ⇒ claude falls back to the
+    /// inline JSON flag and warns. Other backends ignore it.
+    pub runtime_dir: Option<std::path::PathBuf>,
 }
