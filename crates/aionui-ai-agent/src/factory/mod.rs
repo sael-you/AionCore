@@ -101,6 +101,10 @@ pub struct ResolvedSkillDelivery {
     /// at startup — and a view rebuild only replaces `{view}/skills`. `None` for a
     /// rejected id.
     pub runtime_dir: Option<std::path::PathBuf>,
+    /// `{data_dir}/session-runtime`: where claude writes the `--mcp-config` file
+    /// (in a fresh 0700 dir) when `runtime_dir` is missing or unwritable, so it
+    /// never has to fall back to argv. Swept at startup.
+    pub runtime_scratch_root: Option<std::path::PathBuf>,
 }
 
 /// Resolve the per-vendor delivery for one session build.
@@ -159,6 +163,7 @@ pub(crate) async fn resolve_skill_delivery(
         skill_dirs,
         injected_prefix: None,
         runtime_dir,
+        runtime_scratch_root: Some(aionui_session::session_scratch_root(&deps.data_dir)),
     }
 }
 

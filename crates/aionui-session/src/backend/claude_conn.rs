@@ -136,8 +136,8 @@ fn prepend_args(head: &[String], tail: &[String]) -> Vec<String> {
 /// route). Each flag is omitted when its source is empty, so a default/empty config
 /// produces no flags (pre-0c spawn byte-identical):
 /// - `init.mcp_servers` → `--mcp-config <mcp_config_arg>`, where the arg is the
-///   path of the private file [`prepare_claude_mcp_config`] wrote (or, without a
-///   runtime dir, the inline JSON). NEVER `--strict-mcp-config`: AionUi servers are
+///   path of the private file [`prepare_claude_mcp_config`] wrote (inline JSON
+///   only as its last resort). NEVER `--strict-mcp-config`: AionUi servers are
 ///   ADDED to the user's own MCPs (project `.mcp.json`, local/user scopes, plugins),
 ///   not swapped in for them — a session without AionUi servers already kept them,
 ///   and selecting one AionUi server must not silently drop the rest. Name clash:
@@ -277,44 +277,77 @@ pub(crate) fn build_claude_init_args(config: &SessionConfig, mcp_config_arg: Opt
     args
 }
 
-/// Resolve the `--mcp-config` value for `config`'s MCP servers: the path of a
-/// private 0600 file in `config.runtime_dir` (plus the guard that deletes it), so
-/// env/header secrets never reach argv. Falls back to the inline JSON — the
-/// pre-file behavior — only when there is no runtime dir or the write fails, and
-/// warns then because the values become visible in `ps`. `(None, None)` when there
-/// are no servers. Logs server NAMES only, never the config body.
-fn prepare_claude_mcp_config(
-    config: &SessionConfig,
-) -> (Option<String>, Option<super::claude_mcp_file::McpConfigFile>) {
+/// What [`prepare_claude_mcp_config`] resolved: the `--mcp-config` value and,
+/// when it is a file path, the guard that owns (and finally deletes) that file.
+pub(crate) type PreparedMcpConfig = (Option<String>, Option<super::claude_mcp_file::McpConfigFile>);
+
+/// Resolve the `--mcp-config` value for `config`'s MCP servers, keeping env/header
+/// secrets out of argv. In order:
+/// 1. a private 0600 file in `config.runtime_dir` (the conversation's view dir);
+/// 2. a private 0600 file in a FRESH 0700 dir under `config.runtime_scratch_root`;
+/// 3. if both fail: `Err` when `config.mcp_inline_forbidden` (the Team token must
+///    never reach argv — fail closed), else the inline JSON with a `warn`.
+///
+/// `(None, None)` when there are no servers. Logs server NAMES only, never the
+/// config body.
+pub(crate) fn prepare_claude_mcp_config(config: &SessionConfig) -> Result<PreparedMcpConfig, BackendError> {
+    use super::claude_mcp_file::McpConfigFile;
     let Some(json) = build_claude_mcp_config(&config.init.mcp_servers) else {
-        return (None, None);
+        return Ok((None, None));
     };
     let names: Vec<&str> = config.init.mcp_servers.iter().map(|s| s.name.as_str()).collect();
+    let as_arg = |file: McpConfigFile| -> PreparedMcpConfig {
+        tracing::info!(
+            servers = ?names,
+            "claude: AionUi MCP servers passed via a private --mcp-config file \
+             (added to the native MCPs; a same-named native server is shadowed)"
+        );
+        (Some(file.path().to_string_lossy().into_owned()), Some(file))
+    };
+
     match config.runtime_dir.as_deref() {
-        Some(dir) => match super::claude_mcp_file::McpConfigFile::write(dir, &json) {
-            Ok(file) => {
-                tracing::info!(
-                    servers = ?names,
-                    "claude: AionUi MCP servers passed via a private --mcp-config file \
-                     (added to the native MCPs; a same-named native server is shadowed)"
-                );
-                let arg = file.path().to_string_lossy().into_owned();
-                return (Some(arg), Some(file));
-            }
+        Some(dir) => match McpConfigFile::write_in(dir, &json) {
+            Ok(file) => return Ok(as_arg(file)),
             Err(e) => tracing::warn!(
                 servers = ?names,
                 error = %e,
-                "claude: could not write the private MCP config file; passing it inline \
-                 (env/header values visible in the process argv)"
+                "claude: could not write the MCP config file in the runtime dir; trying the scratch root"
             ),
         },
         None => tracing::warn!(
             servers = ?names,
-            "claude: no private runtime dir for the MCP config; passing it inline \
-             (env/header values visible in the process argv)"
+            "claude: no runtime dir for the MCP config file; trying the scratch root"
         ),
     }
-    (Some(json), None)
+    match config.runtime_scratch_root.as_deref() {
+        Some(root) => match McpConfigFile::write_scratch(root, &json) {
+            Ok(file) => return Ok(as_arg(file)),
+            Err(e) => tracing::warn!(
+                servers = ?names,
+                error = %e,
+                "claude: could not write the MCP config file in the scratch root"
+            ),
+        },
+        None => tracing::warn!(servers = ?names, "claude: no scratch root for the MCP config file"),
+    }
+
+    if config.mcp_inline_forbidden {
+        tracing::error!(
+            servers = ?names,
+            "claude: refusing to pass the MCP config inline (it carries the team token); \
+             the session cannot start"
+        );
+        return Err(BackendError::SetupRejected(
+            "claude: the private MCP config file could not be written, and the team \
+             coordination token must not be passed on the command line"
+                .to_string(),
+        ));
+    }
+    tracing::warn!(
+        servers = ?names,
+        "claude: passing the MCP config inline (env/header values visible in the process argv)"
+    );
+    Ok((Some(json), None))
 }
 
 /// Serialize neutral [`McpServerSpec`]s into claude's `--mcp-config` inline JSON
@@ -378,9 +411,7 @@ impl BackendConnection for ClaudeConnection {
         // The MCP config goes to a private file first; its guard rides the wake
         // recipe so every respawn can re-read it, and is dropped (file removed)
         // with the backend — or right here if the spawn fails.
-        let (mcp_config_arg, mcp_config_file) = prepare_claude_mcp_config(&config);
-        let init_args = build_claude_init_args(&config, mcp_config_arg.as_deref());
-        let spawn_args = prepend_args(&init_args, &config.extra_args);
+        let wake = ClaudeWakeRecipe::for_open(self.spawner.clone(), claude_session_id, &config)?;
 
         // Spawn the persistent process via the legacy adapter (reuses the exact
         // flag-building + spawn path, so behavior is verbatim).
@@ -389,29 +420,13 @@ impl BackendConnection for ClaudeConnection {
                 self.spawner.as_ref(),
                 &legacy_spec,
                 config.cwd.as_deref(),
-                &spawn_args,
+                &wake.extra_args,
                 &config.spawn_env,
                 config.cli_program.as_deref(),
             )
             .await
             .map_err(|e| BackendError::from_spawn("claude spawn failed", e))?;
 
-        // F-4 wake recipe: re-spawn on wake by RESUMING the SAME claude session id
-        // we spawned with (`--session-id <claude_session_id>` on Fresh → `--resume
-        // <claude_session_id>`), so the on-disk session is re-attached. This id is
-        // the bare-UUID claude id (NOT the logical demux key), so the resume target
-        // is always a valid UUID (§4.1). The init flags + spawn env are carried
-        // verbatim so the re-spawned process gets the same MCP / preset / model /
-        // mode AND the same provider env (#103).
-        let wake = ClaudeWakeRecipe {
-            spawner: self.spawner.clone(),
-            claude_session_id: Arc::new(std::sync::Mutex::new(claude_session_id)),
-            cwd: config.cwd.clone(),
-            extra_args: spawn_args,
-            env: config.spawn_env.clone(),
-            cli_program: config.cli_program.clone(),
-            _mcp_config_file: mcp_config_file,
-        };
         let fresh = matches!(&spec, SessionSpec::Fresh { .. });
         let backend = ClaudeSessionBackend::spawn(logical_id, adapter, io, config, wake, fresh).await;
         // #98/#101: ask claude for its discovery catalog (selectable models + slash
@@ -792,9 +807,38 @@ struct ClaudeWakeRecipe {
     /// The bundled-CLI path captured at open time so a resume-respawn uses the
     /// SAME binary (R16 continuity). `None` ⇒ bare "claude" via PATH.
     cli_program: Option<std::path::PathBuf>,
-    /// The private `--mcp-config` file `extra_args` points at. Held (never read)
-    /// so it outlives every respawn and is deleted with the backend.
-    _mcp_config_file: Option<super::claude_mcp_file::McpConfigFile>,
+    /// The private `--mcp-config` file `extra_args` points at. Held so it
+    /// outlives every respawn (re-written before one if it went missing) and is
+    /// deleted with the backend.
+    mcp_config_file: Option<super::claude_mcp_file::McpConfigFile>,
+}
+
+impl ClaudeWakeRecipe {
+    /// The recipe an open spawns with — and every F-4 wake re-spawns with: resume
+    /// the SAME claude session id we spawned with (`--session-id
+    /// <claude_session_id>` on Fresh → `--resume <claude_session_id>`), so the
+    /// on-disk session is re-attached. This id is the bare-UUID claude id (NOT the
+    /// logical demux key), so the resume target is always a valid UUID (§4.1). The
+    /// init flags + spawn env are carried verbatim so the re-spawned process gets
+    /// the same MCP / preset / model / mode AND the same provider env (#103).
+    /// Writes the private MCP config file (see [`prepare_claude_mcp_config`]).
+    fn for_open(
+        spawner: Arc<dyn Spawner>,
+        claude_session_id: String,
+        config: &SessionConfig,
+    ) -> Result<Self, BackendError> {
+        let (mcp_config_arg, mcp_config_file) = prepare_claude_mcp_config(config)?;
+        let init_args = build_claude_init_args(config, mcp_config_arg.as_deref());
+        Ok(Self {
+            spawner,
+            claude_session_id: Arc::new(std::sync::Mutex::new(claude_session_id)),
+            cwd: config.cwd.clone(),
+            extra_args: prepend_args(&init_args, &config.extra_args),
+            env: config.spawn_env.clone(),
+            cli_program: config.cli_program.clone(),
+            mcp_config_file,
+        })
+    }
 }
 
 /// #98/#101: the discovery catalog captured from the `control_request{initialize}`
@@ -1107,6 +1151,23 @@ impl ClaudeSessionBackend {
             .unwrap_or_else(|e| e.into_inner())
             .clone();
         let legacy_spec = LegacySessionSpec::Resume(resume_sid);
+        // `extra_args` points `--mcp-config` at the private file. If something
+        // removed it while the process was dormant, write it back at the SAME path
+        // rather than respawn claude without its AionUi servers.
+        if let Some(file) = &self.wake.mcp_config_file {
+            match file.ensure_present() {
+                Ok(true) => tracing::warn!(
+                    session_id = %self.session_id,
+                    "claude: the private MCP config file was missing before a resume; re-wrote it"
+                ),
+                Ok(false) => {}
+                Err(e) => {
+                    return Err(BackendError::SetupRejected(format!(
+                        "claude resume: the private MCP config file is missing and could not be re-written: {e}"
+                    )));
+                }
+            }
+        }
         let io = self
             .adapter
             .start_turn(
@@ -3646,7 +3707,7 @@ impl ClaudeSessionBackend {
             extra_args: Vec::new(),
             env: Vec::new(),
             cli_program: None,
-            _mcp_config_file: None,
+            mcp_config_file: None,
         };
         Self::spawn(
             session_id,
@@ -3672,7 +3733,7 @@ impl ClaudeSessionBackend {
             extra_args: Vec::new(),
             env: Vec::new(),
             cli_program: None,
-            _mcp_config_file: None,
+            mcp_config_file: None,
         };
         Self::spawn(
             session_id,
@@ -3701,7 +3762,7 @@ impl ClaudeSessionBackend {
             extra_args: Vec::new(),
             env: Vec::new(),
             cli_program: None,
-            _mcp_config_file: None,
+            mcp_config_file: None,
         };
         Self::spawn(session_id, ClaudeAdapter::new(), io, config, wake, false).await
     }
@@ -3729,13 +3790,29 @@ impl ClaudeSessionBackend {
             extra_args: Vec::new(),
             env: Vec::new(),
             cli_program: None,
-            _mcp_config_file: None,
+            mcp_config_file: None,
         };
         let config = SessionConfig {
             idle_ttl_ms: Some(idle_ttl_ms),
             ..Default::default()
         };
         Self::spawn(session_id, ClaudeAdapter::new(), io, config, wake, false).await
+    }
+
+    /// Test-support seam: a SUSPENDABLE backend whose wake recipe is built exactly
+    /// like `open_session`'s ([`ClaudeWakeRecipe::for_open`], so the private MCP
+    /// config file is really written) over an injected `AgentIo`. `config` must
+    /// carry `idle_ttl_ms`.
+    #[cfg(any(test, feature = "test-support"))]
+    pub async fn build_with_io_suspending_config(
+        session_id: impl Into<String>,
+        io: Box<dyn AgentIo>,
+        spawner: Arc<dyn Spawner>,
+        config: SessionConfig,
+    ) -> Result<Self, BackendError> {
+        let session_id = session_id.into();
+        let wake = ClaudeWakeRecipe::for_open(spawner, session_id.clone(), &config)?;
+        Ok(Self::spawn(session_id, ClaudeAdapter::new(), io, config, wake, false).await)
     }
 }
 
@@ -3834,7 +3911,7 @@ mod tests {
         );
         let dir = tempfile::tempdir().unwrap();
         let config = mcp_fs_config(Some(dir.path().to_path_buf()));
-        let (arg, file) = prepare_claude_mcp_config(&config);
+        let (arg, file) = prepare_claude_mcp_config(&config).expect("prepare");
         let file = file.expect("a runtime dir yields a private file");
         let args = build_claude_init_args(&config, arg.as_deref());
 
@@ -3873,12 +3950,13 @@ mod tests {
         assert!(!path.exists(), "the file is removed with its guard (session end)");
     }
 
-    /// Without a runtime dir (a rejected id, legacy callers) the config falls back
-    /// to the pre-C16 inline JSON — still without `--strict-mcp-config`.
+    /// With NO private location at all (neither runtime dir nor scratch root) and
+    /// no Team server, the last resort is the inline JSON — still without
+    /// `--strict-mcp-config`.
     #[test]
     fn build_claude_init_args_mcp_without_runtime_dir_falls_back_inline() {
         let config = mcp_fs_config(None);
-        let (arg, file) = prepare_claude_mcp_config(&config);
+        let (arg, file) = prepare_claude_mcp_config(&config).expect("prepare");
         assert!(file.is_none(), "no runtime dir → no file");
         let args = build_claude_init_args(&config, arg.as_deref());
         let i = args
@@ -3900,7 +3978,7 @@ mod tests {
             runtime_dir: Some(dir.path().to_path_buf()),
             ..Default::default()
         };
-        let (arg, file) = prepare_claude_mcp_config(&config);
+        let (arg, file) = prepare_claude_mcp_config(&config).expect("prepare");
         assert!(arg.is_none() && file.is_none(), "no servers → nothing to pass");
         let args = build_claude_init_args(&config, arg.as_deref());
         assert!(
@@ -3934,7 +4012,7 @@ mod tests {
                 },
             },
         );
-        let (arg, file) = prepare_claude_mcp_config(&config);
+        let (arg, file) = prepare_claude_mcp_config(&config).expect("prepare");
         let file = file.expect("private file");
         let args = build_claude_init_args(&config, arg.as_deref());
         assert!(!args.iter().any(|a| a == "--strict-mcp-config"), "{args:?}");
@@ -3945,6 +4023,78 @@ mod tests {
             "team-tok-123"
         );
         assert_eq!(json["mcpServers"]["fs"]["command"], "/usr/bin/mcp-fs");
+    }
+
+    /// A runtime dir that cannot hold the file (here: a regular file) falls back to
+    /// a FRESH 0700 dir under the scratch root — never to argv — and that dir goes
+    /// with the guard.
+    #[test]
+    fn unwritable_runtime_dir_falls_back_to_the_scratch_root() {
+        let tmp = tempfile::tempdir().unwrap();
+        let not_a_dir = tmp.path().join("view");
+        std::fs::write(&not_a_dir, "x").unwrap();
+        let root = tmp.path().join("session-runtime");
+        let mut config = mcp_fs_config(Some(not_a_dir));
+        config.runtime_scratch_root = Some(root.clone());
+
+        let (arg, file) = prepare_claude_mcp_config(&config).expect("scratch fallback");
+        let file = file.expect("a scratch file");
+        let args = build_claude_init_args(&config, arg.as_deref());
+        assert!(file.path().starts_with(&root), "file under the scratch root");
+        assert!(
+            !args
+                .iter()
+                .any(|a| a == "--strict-mcp-config" || a.contains("secret-abc"))
+        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let dir_mode = std::fs::metadata(file.path().parent().unwrap())
+                .unwrap()
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(dir_mode, 0o700);
+        }
+        drop(file);
+        assert_eq!(
+            std::fs::read_dir(&root).unwrap().count(),
+            0,
+            "nothing left on disk after the guard drops"
+        );
+    }
+
+    /// Both private locations unwritable: a Team session (inline forbidden) fails
+    /// CLOSED; a session with only user servers degrades to inline + warn. Neither
+    /// leaves anything on disk, neither passes the strict flag.
+    #[test]
+    fn unwritable_locations_fail_closed_for_team_and_inline_for_user_servers() {
+        let tmp = tempfile::tempdir().unwrap();
+        let blocker = tmp.path().join("blocker");
+        std::fs::write(&blocker, "x").unwrap();
+        let mut config = mcp_fs_config(Some(blocker.join("view")));
+        config.runtime_scratch_root = Some(blocker.join("session-runtime"));
+
+        config.mcp_inline_forbidden = true;
+        let err = prepare_claude_mcp_config(&config).expect_err("team: fail closed");
+        assert!(
+            matches!(&err, BackendError::SetupRejected(m) if m.contains("team")),
+            "{err:?}"
+        );
+        assert!(!err.to_string().contains("secret-abc"), "the error carries no secret");
+
+        config.mcp_inline_forbidden = false;
+        let (arg, file) = prepare_claude_mcp_config(&config).expect("user servers: inline");
+        assert!(file.is_none());
+        let args = build_claude_init_args(&config, arg.as_deref());
+        assert!(args.iter().any(|a| a.contains("\"mcpServers\"")), "inline JSON");
+        assert!(!args.iter().any(|a| a == "--strict-mcp-config"));
+        let left: Vec<_> = std::fs::read_dir(tmp.path())
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name())
+            .collect();
+        assert_eq!(left, vec![std::ffi::OsString::from("blocker")], "nothing else on disk");
     }
 
     /// The assistant preset must NOT replace claude's default system prompt.
@@ -6682,6 +6832,68 @@ mod tests {
             spec.args
         );
         drop(backend); // idle timer + (Dormant) controller tear down cleanly
+    }
+
+    /// C16 success path: the MCP config file exists once the backend is up, a
+    /// suspend→wake re-spawns with the SAME path (re-writing the file if it went
+    /// missing meanwhile), and the file is removed only when the LAST handle to the
+    /// backend drops.
+    #[tokio::test]
+    async fn mcp_config_file_survives_suspend_wake_and_goes_with_the_last_handle() {
+        use crate::testing::FakeSpawner;
+        let dir = tempfile::tempdir().unwrap();
+        let spawner = Arc::new(FakeSpawner::new());
+        let mut config = mcp_fs_config(Some(dir.path().to_path_buf()));
+        config.idle_ttl_ms = Some(40);
+        let backend = Arc::new(
+            ClaudeSessionBackend::build_with_io_suspending_config(
+                "logical-mcp-wake",
+                Box::new(FakeAgentIo::never_exits(Vec::new())),
+                spawner.clone(),
+                config,
+            )
+            .await
+            .expect("backend builds"),
+        );
+        let path = backend
+            .wake
+            .mcp_config_file
+            .as_ref()
+            .expect("the open wrote a file")
+            .path()
+            .to_path_buf();
+        assert!(path.exists(), "file present while the backend lives");
+        let open_args = backend.wake.extra_args.clone();
+        assert!(open_args.iter().any(|a| std::path::Path::new(a) == path));
+
+        assert!(
+            backend
+                .suspend
+                .suspend_if_idle(aionui_common::now_ms() + 10_000, false)
+                .await
+        );
+        // Something removed the file while dormant: the wake must re-write it.
+        std::fs::remove_file(&path).unwrap();
+        let _ = backend
+            .dispatch(Command::Send {
+                content: vec![ContentBlock::Text("wake up".into())],
+                metadata: CommandMeta::default(),
+            })
+            .await
+            .expect_err("FakeSpawner cannot make a real process");
+        let spec = spawner.last_command().await.expect("wake reached the spawner");
+        let i = spec.args.iter().position(|a| a == "--mcp-config").expect("flag");
+        assert_eq!(std::path::Path::new(&spec.args[i + 1]), path, "same path on wake");
+        assert!(!spec.args.iter().any(|a| a == "--strict-mcp-config"));
+        assert!(path.exists(), "the wake re-wrote the missing file");
+        let json: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(json["mcpServers"]["fs"]["env"]["TOKEN"], "secret-abc");
+
+        let second = backend.clone();
+        drop(backend);
+        assert!(path.exists(), "another handle still holds the backend");
+        drop(second);
+        assert!(!path.exists(), "the last handle dropping removes the file");
     }
 
     /// Await the next `UsageDelta` on the event stream and return its `cost_usd`.

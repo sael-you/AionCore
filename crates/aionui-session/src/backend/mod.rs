@@ -12,6 +12,8 @@ mod acp_conn;
 mod antigravity;
 mod claude_conn;
 mod claude_mcp_file;
+#[cfg(test)]
+mod claude_mcp_live_tests;
 mod cli_version;
 mod codex_conn;
 mod codex_title;
@@ -28,6 +30,9 @@ pub use acp_conn::{AcpConnection, AcpSessionBackend, acp_capabilities};
 pub(crate) use acp_conn::map_plan_status;
 pub use antigravity::{AntigravityConnection, AntigravitySessionBackend, antigravity_capabilities};
 pub use claude_conn::{ClaudeConnection, ClaudeSessionBackend};
+pub use claude_mcp_file::{
+    MCP_CONFIG_FILE_PREFIX, SESSION_SCRATCH_DIR_NAME, is_mcp_config_file_name, session_scratch_root, sweep_scratch_root,
+};
 pub use cli_version::{
     VERIFIED_AGY_VERSION, VERIFIED_CLAUDE_VERSION, VERIFIED_CODEX_VERSION, VersionDrift, VersionVerdict,
     classify as classify_cli_version, parse_version as parse_cli_version, version_drift,
@@ -342,4 +347,16 @@ pub struct SessionConfig {
     /// env/header values stay out of `ps`. `None` ⇒ claude falls back to the
     /// inline JSON flag and warns. Other backends ignore it.
     pub runtime_dir: Option<std::path::PathBuf>,
+    /// Fallback for [`Self::runtime_dir`]: the AionUi data-dir scratch root
+    /// (`{data_dir}/session-runtime`, see [`session_scratch_root`]). When the
+    /// runtime dir is missing or unwritable, claude writes its `--mcp-config` file
+    /// into a FRESH 0700 directory here instead of falling back to inline argv.
+    /// Swept at app startup ([`sweep_scratch_root`]).
+    pub runtime_scratch_root: Option<std::path::PathBuf>,
+    /// `true` ⇒ claude must NEVER pass its MCP config inline: if neither private
+    /// location can be written, the open FAILS instead. The orchestration layer
+    /// sets it when the Team coordination server is injected, because its token
+    /// must not reach argv. `false` (default) ⇒ inline JSON + a warn as the last
+    /// resort for user-configured servers.
+    pub mcp_inline_forbidden: bool,
 }

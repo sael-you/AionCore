@@ -314,6 +314,44 @@ pub async fn cleanup_orphan_views(data_dir: &Path, live: &HashSet<(String, Strin
     Ok(removed)
 }
 
+/// Remove, from EVERY view directory (live conversations included), the regular
+/// files directly inside it whose name matches `is_leftover`. Returns how many
+/// were removed.
+///
+/// For files other owners park in a view, such as claude's private
+/// `--mcp-config` file: a hard exit skips their `Drop`, and
+/// [`cleanup_orphan_views`] keeps live views intact. Only safe while no session
+/// runs (startup, data-dir instance lock held). Never touches the `skills/`
+/// subtree or the plugin manifest — only top-level regular files.
+pub async fn remove_view_files(data_dir: &Path, is_leftover: impl Fn(&str) -> bool) -> Result<usize, ExtensionError> {
+    let root = view_root(data_dir);
+    let mut users = match tokio::fs::read_dir(&root).await {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(0),
+        Err(e) => return Err(ExtensionError::Io(e)),
+    };
+
+    let mut removed = 0usize;
+    while let Some(user_entry) = users.next_entry().await? {
+        let Ok(mut conversations) = tokio::fs::read_dir(user_entry.path()).await else {
+            continue;
+        };
+        while let Some(view) = conversations.next_entry().await? {
+            let Ok(mut files) = tokio::fs::read_dir(view.path()).await else {
+                continue;
+            };
+            while let Some(file) = files.next_entry().await? {
+                let matches = file.file_name().to_str().is_some_and(&is_leftover);
+                let regular = file.file_type().await.is_ok_and(|t| t.is_file());
+                if matches && regular && tokio::fs::remove_file(file.path()).await.is_ok() {
+                    removed += 1;
+                }
+            }
+        }
+    }
+    Ok(removed)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -653,5 +691,42 @@ mod tests {
             HashSet::from(["alpha".to_owned()]),
             "a dropped skill must actually disappear"
         );
+    }
+
+    #[tokio::test]
+    async fn remove_view_files_clears_matching_top_level_files_in_live_views() {
+        let data = tempfile::tempdir().unwrap();
+        let src = tempfile::tempdir().unwrap();
+        let skill = write_source_skill(src.path(), "cron");
+        rebuild_view(data.path(), "u1", "c1", std::slice::from_ref(&skill))
+            .await
+            .unwrap();
+        let view = view_dir(data.path(), "u1", "c1").unwrap();
+        std::fs::write(view.join("claude-mcp-config-a.json"), "secret").unwrap();
+        std::fs::write(view.join("keep.json"), "x").unwrap();
+        std::fs::create_dir(view.join("claude-mcp-config-dir.json")).unwrap();
+
+        let removed = remove_view_files(data.path(), |name| name.starts_with("claude-mcp-config-"))
+            .await
+            .unwrap();
+
+        assert_eq!(removed, 1, "only the matching regular file");
+        assert!(!view.join("claude-mcp-config-a.json").exists());
+        assert!(view.join("keep.json").exists());
+        assert!(
+            view.join("claude-mcp-config-dir.json").is_dir(),
+            "directories are never removed"
+        );
+        assert!(
+            view.join("skills").join("cron").exists(),
+            "the live view keeps its skills"
+        );
+        assert!(view.join(".claude-plugin").join("plugin.json").exists());
+    }
+
+    #[tokio::test]
+    async fn remove_view_files_without_a_view_root_removes_nothing() {
+        let data = tempfile::tempdir().unwrap();
+        assert_eq!(remove_view_files(data.path(), |_| true).await.unwrap(), 0);
     }
 }

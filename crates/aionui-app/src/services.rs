@@ -341,6 +341,35 @@ impl AppServices {
             }
         }
 
+        // claude writes its `--mcp-config` file (plaintext MCP env/headers, the
+        // team token) into the view dir or, as a fallback, the session scratch
+        // root, and deletes it when the backend drops. SIGKILL/OOM/watchdog exits
+        // skip that, and the orphan reap above keeps LIVE views, so sweep both
+        // locations here: no session backend exists yet, and the data-dir instance
+        // lock keeps a second process from owning these files.
+        match aionui_extension::skill_view::remove_view_files(&data_dir, aionui_session::is_mcp_config_file_name).await
+        {
+            Ok(removed) if removed > 0 => {
+                tracing::info!(
+                    removed,
+                    "startup: removed leftover claude MCP config files from skill views"
+                );
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(error = %error, "startup: claude MCP config file sweep failed");
+            }
+        }
+        match aionui_session::sweep_scratch_root(&aionui_session::session_scratch_root(&data_dir)) {
+            Ok(removed) if removed > 0 => {
+                tracing::info!(removed, "startup: removed leftover session scratch directories");
+            }
+            Ok(_) => {}
+            Err(error) => {
+                tracing::warn!(error = %error, "startup: session scratch root sweep failed");
+            }
+        }
+
         // Absolute path to this process's binary. Reused as the `command` for
         // the stdio MCP bridge spawned by ACP CLIs when a team session is
         // attached to a conversation (phase1 mcp.md §4.6 single-binary model).

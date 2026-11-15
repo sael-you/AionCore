@@ -1989,6 +1989,11 @@ pub async fn build_session_instance(
         // claude writes its `--mcp-config` file here (0600) instead of putting
         // MCP env/header values on the command line. codex ignores it.
         runtime_dir: skill_delivery.runtime_dir.clone(),
+        runtime_scratch_root: skill_delivery.runtime_scratch_root.clone(),
+        // The team coordination token must never reach argv: with the team MCP
+        // injected, an unwritable MCP config file fails the open instead of
+        // degrading to the inline flag.
+        mcp_inline_forbidden: config.team_mcp_stdio_config.is_some(),
         ..Default::default()
     };
 
