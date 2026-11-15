@@ -182,6 +182,10 @@ fn data() -> Value {
                 "description": "Human/developer self-check for agent backend availability."
             },
             {
+                "name": "mcp",
+                "description": "MCP market launcher (`mcp exec`), spawned by CLI MCP configs to start an assigned market server behind a filtering stdio proxy; not invoked by agents."
+            },
+            {
                 "name": "mcp-team-stdio",
                 "description": "Internal team MCP stdio server."
             },
