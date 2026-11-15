@@ -116,11 +116,7 @@ async fn end_reason_from_client_is_recorded_and_relayed() {
 async fn hello_before_ready_is_armed_without_reason_then_ready() {
     let mut timings = fast_timings();
     timings.engine.config_gate = Duration::from_secs(2);
-    let h = Harness::new(Options {
-        timings,
-        ..Default::default()
-    })
-    .await;
+    let h = Harness::new(Options { timings }).await;
     let user = h.enabled_user("alice").await;
     // Hold the config gate open so the call stays "not ready" for a while.
     h.fake.set_ack_session_update(false);
@@ -527,11 +523,7 @@ async fn idle_hard_cap_and_rotation_timers_hang_up() {
     for (reason, tweak) in cases {
         let mut timings = fast_timings();
         tweak(&mut timings);
-        let h = Harness::new(Options {
-            timings,
-            ..Default::default()
-        })
-        .await;
+        let h = Harness::new(Options { timings }).await;
         let user = h.enabled_user("alice").await;
         let (session, call_id) = live_session(&h, &user).await;
         let row = h.wait_ended(&user, &session).await;
@@ -562,11 +554,7 @@ async fn device_frozen_or_silent_hangs_up_the_call() {
     // No heartbeat for the stale window.
     let mut timings = fast_timings();
     timings.heartbeat_stale = Duration::from_millis(400);
-    let h = Harness::new(Options {
-        timings,
-        ..Default::default()
-    })
-    .await;
+    let h = Harness::new(Options { timings }).await;
     let user = h.enabled_user("alice").await;
     let (session, _) = live_session(&h, &user).await;
     let row = h.wait_ended(&user, &session).await;
@@ -579,11 +567,7 @@ async fn device_frozen_or_silent_hangs_up_the_call() {
 async fn call_revalidation_hangs_up_after_session_revocation() {
     let mut timings = fast_timings();
     timings.revalidate_every = Duration::from_millis(300);
-    let h = Harness::new(Options {
-        timings,
-        ..Default::default()
-    })
-    .await;
+    let h = Harness::new(Options { timings }).await;
     let user = h.enabled_user("alice").await;
     let (session, call_id) = live_session(&h, &user).await;
     h.revoke_sessions(&user).await;

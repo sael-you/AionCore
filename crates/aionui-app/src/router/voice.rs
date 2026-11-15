@@ -121,9 +121,6 @@ pub fn voice_guards(services: &AppServices) -> VoiceHttpGuards {
     }
     VoiceHttpGuards {
         auth_state: voice_auth_state(services),
-        cookie_config: services.cookie_config.clone(),
-        // Non-local modes already run the global CSRF layer.
-        add_csrf: services.identity_mode.is_local(),
         origins: Arc::new(origins),
     }
 }

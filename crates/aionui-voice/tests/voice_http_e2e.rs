@@ -28,11 +28,7 @@ async fn unauthenticated_requests_are_rejected() {
 /// even for the local default user's id.
 #[tokio::test]
 async fn local_mode_default_user_is_not_trusted() {
-    let h = Harness::new(Options {
-        local: true,
-        ..Default::default()
-    })
-    .await;
+    let h = Harness::new(Options::default()).await;
     let (status, body) = h
         .send(Req::new("GET", "/api/voice/settings").header("origin", ORIGIN).build())
         .await;
@@ -99,7 +95,7 @@ async fn non_cookie_credentials_are_rejected_with_400() {
 }
 
 /// §3.5 test: cookie + no CSRF header + dummy runtime-token header → rejected
-/// (the CSRF layer exempts runtime-token requests; precedence must not).
+/// (the global CSRF layer exempts runtime-token requests; precedence must not).
 #[tokio::test]
 async fn cookie_without_csrf_plus_runtime_token_header_is_rejected() {
     let h = Harness::new(Options::default()).await;
@@ -119,21 +115,43 @@ async fn cookie_without_csrf_plus_runtime_token_header_is_rejected() {
     assert!(h.fake.call_ids().is_empty(), "no provider call was made");
 }
 
-// ------------------------------------------------------------------- CSRF
+// ------------------------------------------------------- Origin, not CSRF
 
+/// Voice has no CSRF layer of its own (the C11 UI sends no CSRF header in
+/// local identity): every write passes with the cookie + an allowed Origin
+/// and no `x-csrf-token`, and is refused without an Origin or with a foreign
+/// one. The webui identity's global CSRF layer is covered in the app e2e.
 #[tokio::test]
-async fn local_mode_post_without_csrf_header_is_403() {
-    let h = Harness::new(Options {
-        local: true,
-        ..Default::default()
-    })
-    .await;
+async fn writes_need_an_allowed_origin_not_a_csrf_token() {
+    let h = Harness::new(Options::default()).await;
     let user = h.enabled_user("alice").await;
-    for (method, uri, body) in [
-        ("POST", "/api/voice/sessions", json!({"sdp_offer": SDP})),
-        ("PUT", "/api/voice/settings", json!({"enabled": false})),
-        ("POST", "/api/voice/sessions/vs_x/end", json!({})),
-    ] {
+    let writes = [
+        (
+            "PUT",
+            "/api/voice/settings".to_owned(),
+            json!({"daily_budget_usd": 2.0}),
+            200,
+        ),
+        ("POST", "/api/voice/sessions".to_owned(), json!({"sdp_offer": SDP}), 201),
+    ];
+    let mut session = String::new();
+    for (method, uri, body, ok) in &writes {
+        let (status, resp) = h
+            .send(Req::new(method, uri).cookie(&user).json(body.clone()).build())
+            .await;
+        assert_eq!(status, 403, "{method} {uri} without Origin: {resp}");
+        assert_eq!(resp["code"], "VOICE_ORIGIN_REQUIRED");
+        let (status, resp) = h
+            .send(
+                Req::new(method, uri)
+                    .cookie(&user)
+                    .header("origin", "https://evil.test")
+                    .json(body.clone())
+                    .build(),
+            )
+            .await;
+        assert_eq!(status, 403, "{method} {uri} foreign Origin: {resp}");
+        assert_eq!(resp["code"], "VOICE_ORIGIN_DENIED");
         let (status, resp) = h
             .send(
                 Req::new(method, uri)
@@ -143,43 +161,18 @@ async fn local_mode_post_without_csrf_header_is_403() {
                     .build(),
             )
             .await;
-        assert_eq!(status, 403, "{method} {uri}: {resp}");
-        assert_eq!(resp["code"], "CSRF_INVALID");
-        let (status, resp) = h
-            .send(
-                Req::new(method, uri)
-                    .cookie(&user)
-                    .header("origin", ORIGIN)
-                    .header("x-csrf-token", "wrong")
-                    .json(body)
-                    .build(),
-            )
-            .await;
-        assert_eq!(status, 403, "{method} {uri} mismatched token: {resp}");
+        assert_eq!(status, *ok, "{method} {uri} allowed Origin, no CSRF header: {resp}");
+        if let Some(id) = resp["data"]["voice_session_id"].as_str() {
+            session = id.to_owned();
+        }
     }
-    assert!(h.fake.call_ids().is_empty());
-}
-
-/// UserSession mode relies on the app's global CSRF layer, so the voice
-/// router must not add a second one (no double cookie issuance).
-#[tokio::test]
-async fn non_local_mode_router_has_no_own_csrf_layer() {
-    let h = Harness::new(Options {
-        local: false,
-        ..Default::default()
-    })
-    .await;
-    let user = h.user("alice").await;
-    let (status, body) = h
-        .send(
-            Req::new("PUT", "/api/voice/settings")
-                .cookie(&user)
-                .header("origin", ORIGIN)
-                .json(json!({"daily_budget_usd": 2.0}))
-                .build(),
-        )
+    let end = format!("/api/voice/sessions/{session}/end");
+    let (status, resp) = h.send(Req::new("POST", &end).cookie(&user).build()).await;
+    assert_eq!((status, resp["code"].as_str()), (403, Some("VOICE_ORIGIN_REQUIRED")));
+    let (status, resp) = h
+        .send(Req::new("POST", &end).cookie(&user).header("origin", ORIGIN).build())
         .await;
-    assert_eq!(status, 200, "{body}");
+    assert_eq!(status, 200, "end with an allowed Origin, no CSRF header: {resp}");
 }
 
 // ----------------------------------------------------------------- Origin
@@ -204,7 +197,6 @@ async fn origin_allowlist_is_enforced() {
         .send(
             Req::new("POST", "/api/voice/sessions")
                 .cookie(&user)
-                .header("x-csrf-token", CSRF)
                 .json(json!({"sdp_offer": SDP}))
                 .build(),
         )
@@ -432,11 +424,7 @@ async fn ws_oversized_frame_closes_the_socket() {
 async fn ws_revalidation_closes_socket_and_call_after_session_revocation() {
     let mut timings = fast_timings();
     timings.revalidate_every = Duration::from_millis(300);
-    let h = Harness::new(Options {
-        timings,
-        ..Default::default()
-    })
-    .await;
+    let h = Harness::new(Options { timings }).await;
     let user = h.enabled_user("alice").await;
     let (session, call_id) = live_session(&h, &user).await;
     let addr = h.serve().await;

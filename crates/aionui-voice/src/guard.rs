@@ -1,12 +1,15 @@
 //! HTTP guards of the voice user router (§3.5): credential precedence,
-//! Origin allowlist, CSRF in local mode, and the cookie session check.
+//! Origin allowlist and the cookie session check. No CSRF layer of its own:
+//! in local identity the strict Origin check is the cross-site defence (a
+//! cross-site browser write or upgrade always carries `Origin`); in webui
+//! identity the app's global C11 CSRF layer also applies.
 #![allow(clippy::disallowed_types)]
 
 use std::sync::Arc;
 
 use aionui_auth::{
-    AuthState, CookieConfig, CsrfState, OriginPolicy, RUNTIME_CONVERSATION_ID_HEADER, RUNTIME_TOKEN_HEADER,
-    RUNTIME_USER_ID_HEADER, auth_middleware, authenticate_session_token, csrf_middleware,
+    AuthState, OriginPolicy, RUNTIME_CONVERSATION_ID_HEADER, RUNTIME_TOKEN_HEADER, RUNTIME_USER_ID_HEADER,
+    auth_middleware, authenticate_session_token,
 };
 use aionui_common::ApiError;
 use axum::Router;
@@ -34,10 +37,6 @@ pub struct VoiceHttpGuards {
     /// Must use `UserSession` (or `AionPro`) identity — never `Local`, so the
     /// local default user is never accepted (§3.5 identity row).
     pub auth_state: AuthState,
-    pub cookie_config: Arc<CookieConfig>,
-    /// Add `csrf_middleware` here: only when the app runs in local mode
-    /// (other modes already have the global CSRF layer).
-    pub add_csrf: bool,
     /// Trusted browser origins (the app's `OriginPolicy` plus the voice
     /// allow-list), never derived from `Host`.
     pub origins: Arc<OriginPolicy>,
@@ -136,22 +135,13 @@ pub async fn origin_guard(
 }
 
 /// Wrap the voice routes with the guards. Outermost first: precedence →
-/// Origin → CSRF (local mode only) → session cookie → handler.
+/// Origin → session cookie → handler.
 pub fn guard_voice_router<S>(routes: Router<S>, guards: VoiceHttpGuards) -> Router<S>
 where
     S: Clone + Send + Sync + 'static,
 {
-    let mut router = routes.route_layer(from_fn_with_state(guards.auth_state, auth_middleware));
-    if guards.add_csrf {
-        // Voice runs its own (stricter) Origin check, so only the double
-        // submit is needed here.
-        let csrf = CsrfState {
-            cookie_config: guards.cookie_config,
-            origin_policy: None,
-        };
-        router = router.route_layer(from_fn_with_state(csrf, csrf_middleware));
-    }
-    router
+    routes
+        .route_layer(from_fn_with_state(guards.auth_state, auth_middleware))
         .route_layer(from_fn_with_state(guards.origins, origin_guard))
         .route_layer(from_fn(credential_precedence_guard))
 }

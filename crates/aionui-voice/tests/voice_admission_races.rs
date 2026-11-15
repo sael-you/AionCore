@@ -149,11 +149,7 @@ async fn mark_live_failure_hangs_up_the_provider_call() {
 async fn socket_token_failure_ends_only_its_own_calls() {
     let mut timings = fast_timings();
     timings.revalidate_every = Duration::from_millis(300);
-    let h = Harness::new(Options {
-        timings,
-        ..Default::default()
-    })
-    .await;
+    let h = Harness::new(Options { timings }).await;
     let user = h.enabled_user("alice").await;
     // The call runs on cookie A (the creating request).
     let (session, _) = live_session(&h, &user).await;
@@ -190,24 +186,12 @@ async fn socket_token_failure_ends_only_its_own_calls() {
 async fn recovered_call_adopts_the_binding_socket_cookie() {
     let mut timings = fast_timings();
     timings.revalidate_every = Duration::from_millis(300);
-    let first = Harness::new(Options {
-        timings,
-        ..Default::default()
-    })
-    .await;
+    let first = Harness::new(Options { timings }).await;
     let user = first.enabled_user("alice").await;
     let (session, _) = live_session(&first, &user).await;
     first.service.simulate_crash();
 
-    let second = Harness::with_db(
-        first.db.clone(),
-        first.fake.clone(),
-        Options {
-            timings,
-            ..Default::default()
-        },
-    )
-    .await;
+    let second = Harness::with_db(first.db.clone(), first.fake.clone(), Options { timings }).await;
     assert_eq!(second.service.recover_open_sessions().await, 1);
     let addr = second.serve().await;
     let mut ws = ws_connect(&addr, &user, Some(ORIGIN)).await.unwrap();

@@ -5,7 +5,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use aionui_auth::{AuthIdentityMode, AuthState, CookieConfig, CookieNames, JwtService, OriginPolicy};
+use aionui_auth::{AuthIdentityMode, AuthState, CookieNames, JwtService, OriginPolicy};
 use aionui_db::{Database, IUserRepository, SqliteUserRepository, SqliteVoiceRepository, init_database_memory};
 use aionui_realtime::WebSocketManager;
 use aionui_voice::fake_provider::FakeOpenAi;
@@ -26,7 +26,6 @@ use tokio::net::TcpListener;
 use tower::ServiceExt;
 
 pub const ORIGIN: &str = "https://voice.test";
-pub const CSRF: &str = "csrf-token-value";
 pub const SDP: &str = "v=0\r\no=- 4611731400430051336 2 IN IP4 127.0.0.1\r\ns=-\r\nm=audio 9 UDP/TLS/RTP/SAVPF 111\r\n";
 /// Key handed out by the fake credential port; must never appear in responses or logs.
 pub const API_KEY_PREFIX: &str = "sk-test-SECRETKEY-";
@@ -57,15 +56,12 @@ impl CredentialPort for FakeCredentials {
 }
 
 pub struct Options {
-    /// App runs `--local` → the voice router adds its own CSRF layer.
-    pub local: bool,
     pub timings: VoiceTimings,
 }
 
 impl Default for Options {
     fn default() -> Self {
         Self {
-            local: true,
             timings: fast_timings(),
         }
     }
@@ -137,8 +133,6 @@ impl Harness {
         });
         let guards = VoiceHttpGuards {
             auth_state: auth_state.clone(),
-            cookie_config: Arc::new(CookieConfig::from_env()),
-            add_csrf: options.local,
             origins: Arc::new(OriginPolicy::new(None, &[ORIGIN])),
         };
         let router = voice_routes(
@@ -243,8 +237,8 @@ pub async fn split(response: Response<Body>) -> (u16, Value) {
     (status, json)
 }
 
-/// Request builder with the browser defaults: session cookie + CSRF double
-/// submit + allowed Origin. Tests remove pieces to probe each guard.
+/// Request builder with the browser defaults: session cookie + allowed
+/// Origin (no CSRF header: voice has no CSRF layer of its own). Tests remove pieces to probe each guard.
 pub struct Req {
     builder: axum::http::request::Builder,
     body: Option<Value>,
@@ -259,17 +253,11 @@ impl Req {
     }
 
     pub fn browser(method: &str, uri: &str, user: &TestUser) -> Self {
-        Self::new(method, uri)
-            .cookie(user)
-            .header("x-csrf-token", CSRF)
-            .header("origin", ORIGIN)
+        Self::new(method, uri).cookie(user).header("origin", ORIGIN)
     }
 
     pub fn cookie(self, user: &TestUser) -> Self {
-        self.header(
-            "cookie",
-            &format!("aionui-session={}; aionui-csrf-token={CSRF}", user.token),
-        )
+        self.header("cookie", &format!("aionui-session={}", user.token))
     }
 
     pub fn header(mut self, name: &str, value: &str) -> Self {
