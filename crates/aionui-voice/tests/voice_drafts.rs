@@ -789,3 +789,59 @@ async fn agent_ask_is_rate_limited_and_one_per_conversation() {
             .await;
     assert!(matches!(over, Err(aionui_voice::VoiceError::RateLimited)), "{over:?}");
 }
+
+/// TASK-64: while a draft waits for its spoken confirmation, "send it" is the
+/// draft's, never the answer to a pending agent ask.
+#[tokio::test]
+async fn a_pending_ask_never_swallows_the_draft_confirmation() {
+    let mut c = call().await;
+    // Make c-build a voice conversation (one send), so it may ask.
+    let (first, _) = c.request_draft("tell the kanban build to report back", "call_a").await;
+    ws_send(
+        &mut c.ws,
+        json!({"name": "voice.confirmTap", "data": {"voiceSessionId": c.session,
+        "draftId": first["draftId"], "version": 1, "hash": first["hash"]}}),
+    )
+    .await;
+    c.wait_state(first["draftId"].as_str().unwrap(), 1, "sending").await;
+
+    let (draft, readback) = c
+        .request_draft("tell the kanban build to run the linter", "call_b")
+        .await;
+    let (id, version) = (
+        draft["draftId"].as_str().unwrap().to_owned(),
+        draft["version"].as_i64().unwrap(),
+    );
+    let service = c.h.service.clone();
+    let uid = c.user.id.clone();
+    let ask = tokio::spawn(async move {
+        service
+            .agent_ask(&uid, "c-build", "Which port should I use?", Duration::from_secs(4))
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let rb = readback["readbackId"].as_str().unwrap().to_owned();
+    ws_send(
+        &mut c.ws,
+        json!({"name": "voice.playbackFinished",
+        "data": {"voiceSessionId": c.session, "readbackId": rb, "tEnd": 10.0}}),
+    )
+    .await;
+    ws_send(
+        &mut c.ws,
+        json!({"name": "voice.speechOnset", "data": {"voiceSessionId": c.session, "t": 10.6}}),
+    )
+    .await;
+    c.draft_in("pending_transcript").await;
+    c.h.fake.push_event(
+        &c.call_id,
+        json!({"type": "input_audio_buffer.speech_started", "audio_start_ms": 100}),
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    c.say("send it");
+    c.draft_in("committing").await;
+    c.wait_state(&id, version, "sending").await;
+    let answer = ask.await.unwrap().unwrap();
+    assert_eq!(answer.status, "pending", "the confirmation was not taken as the answer");
+}

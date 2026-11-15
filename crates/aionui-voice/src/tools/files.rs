@@ -10,7 +10,6 @@ use std::time::{Duration, Instant};
 use aionui_project::types::FileOp;
 use aionui_project::{canonical, containment};
 use ignore::WalkBuilder;
-use ignore::gitignore::Gitignore;
 
 use super::policy::{
     MAX_FILE_BYTES, MAX_READ_LINES, MAX_SEARCH_MATCHES, dir_name_allowed, file_name_allowed, looks_binary, path_allowed,
@@ -67,28 +66,39 @@ pub fn resolve_in_project(root: &Path, relative: &str) -> Result<PathBuf, FileTo
     Ok(real)
 }
 
-/// Whether the project's `.gitignore` files (root down to the file's folder,
-/// the deepest decisive rule wins) ignore `relative`. Ignored files are build
-/// output or local config the search never shows either.
+/// Whether the project's ignore rules hide `relative`, with the same sources
+/// as [`search`]: `.git/info/exclude` at the root, then `.gitignore` and
+/// `.ignore` from the root down to the file's folder (the deepest decisive
+/// rule wins), with or without a git repository, never the global gitignore.
 fn gitignored(root: &Path, relative: &Path) -> bool {
     let target = root.join(relative);
     let mut ignored = false;
+    let mut apply = |file: &Path, base: &Path| {
+        if !file.is_file() {
+            return;
+        }
+        let mut builder = ignore::gitignore::GitignoreBuilder::new(base);
+        if builder.add(file).is_some() {
+            return;
+        }
+        let Ok(matcher) = builder.build() else {
+            return;
+        };
+        match matcher.matched_path_or_any_parents(&target, false) {
+            ignore::Match::Ignore(_) => ignored = true,
+            ignore::Match::Whitelist(_) => ignored = false,
+            ignore::Match::None => {}
+        }
+    };
+    apply(&root.join(".git/info/exclude"), root);
     let mut dir = root.to_path_buf();
     let parents: Vec<_> = relative.parent().map(|p| p.components().collect()).unwrap_or_default();
     for step in std::iter::once(None).chain(parents.into_iter().map(Some)) {
         if let Some(component) = step {
             dir.push(component);
         }
-        let file = dir.join(".gitignore");
-        if !file.is_file() {
-            continue;
-        }
-        let (matcher, _) = Gitignore::new(&file);
-        match matcher.matched_path_or_any_parents(&target, false) {
-            ignore::Match::Ignore(_) => ignored = true,
-            ignore::Match::Whitelist(_) => ignored = false,
-            ignore::Match::None => {}
-        }
+        apply(&dir.join(".gitignore"), &dir);
+        apply(&dir.join(".ignore"), &dir);
     }
     ignored
 }
@@ -138,9 +148,12 @@ pub fn search(root: &Path, query: &str) -> Vec<SearchMatch> {
     };
     let deadline = Instant::now() + SEARCH_TIMEOUT;
     let mut matches = Vec::new();
+    // Same ignore sources as `read_file` (see `gitignored`).
     let walker = WalkBuilder::new(root)
         .hidden(true)
         .follow_links(false)
+        .require_git(false)
+        .git_global(false)
         .filter_entry(|entry| {
             let name = entry.file_name().to_string_lossy();
             if entry.file_type().is_some_and(|t| t.is_dir()) {
@@ -292,6 +305,28 @@ mod tests {
             std::os::unix::fs::symlink(root.join("local.yaml"), root.join("src/cfg.yaml")).unwrap();
             assert_eq!(read_lines(&root, "src/cfg.yaml", 1), Err(FileToolError::Denied));
         }
+    }
+
+    /// TASK-79: `read_file` and the search hide the same files: `.gitignore`
+    /// and `.ignore` rules, with or without a git repository.
+    #[test]
+    fn read_file_and_search_share_the_ignore_rules() {
+        let dir = project();
+        let root = project_root(dir.path().to_str().unwrap()).unwrap();
+        std::fs::write(root.join(".gitignore"), "local.txt\n").unwrap();
+        std::fs::write(root.join(".ignore"), "scratch.txt\n").unwrap();
+        for name in ["local.txt", "scratch.txt", "kept.txt"] {
+            std::fs::write(root.join(name), "kanban shared needle\n").unwrap();
+        }
+        let hits: Vec<String> = search(&root, "shared needle").into_iter().map(|m| m.path).collect();
+        assert_eq!(
+            hits,
+            vec!["kept.txt".to_owned()],
+            "no git repo: .gitignore and .ignore still apply"
+        );
+        assert_eq!(read_lines(&root, "local.txt", 1), Err(FileToolError::Denied));
+        assert_eq!(read_lines(&root, "scratch.txt", 1), Err(FileToolError::Denied));
+        assert!(read_lines(&root, "kept.txt", 1).is_ok());
     }
 
     #[test]

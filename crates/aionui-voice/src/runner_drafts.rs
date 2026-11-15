@@ -248,12 +248,15 @@ impl CallRunner {
             })
             .await;
 
-        // An `ask` answer is never a command or an approval.
-        if let Some(ask_id) = self.inner.asks.answer_next(&self.call.user_id, text) {
+        // An `ask` answer is never a command or an approval, and while a draft
+        // awaits its confirmation or holds, the utterance belongs to the draft
+        // ("yes, send it" must never be swallowed as an answer).
+        if self.turn.active.is_none()
+            && self.turn.hold.is_none()
+            && let Some(ask_id) = self.inner.asks.answer_next(&self.call.user_id, text)
+        {
             tracing::info!(session_id = %self.call.session_id, ask_id = %ask_id, "voice ask answered");
-            if self.turn.active.is_none() {
-                self.set_manual(false).await;
-            }
+            self.set_manual(false).await;
             return None;
         }
         if self.call.mode.is_conversation() {

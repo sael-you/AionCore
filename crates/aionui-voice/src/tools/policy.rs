@@ -111,8 +111,6 @@ static SECRET_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
         r"\bnpm_[A-Za-z0-9]{36}\b",
         r"\bglpat-[A-Za-z0-9_\-]{20,}",
         r"\bhf_[A-Za-z0-9]{30,}\b",
-        // Generic secret assignments (`password = …`, `_authToken=…`, `api_key: …`).
-        r#"(?i)(password|passwd|secret|api[_\-]?key|access[_\-]?token|auth[_\-]?token|_authtoken)["']?\s*[:=]\s*["']?[^\s"']{8,}"#,
     ]
     .iter()
     .map(|p| Regex::new(p).expect("valid secret pattern"))
@@ -120,6 +118,34 @@ static SECRET_PATTERNS: LazyLock<Vec<Regex>> = LazyLock::new(|| {
 });
 
 /// Replace anything that looks like a credential with `[REDACTED]`.
+/// Secret assignments (`password = "…"`, `_authToken=…`, `api_key: '…'`):
+/// key, separator, optional opening quote, value.
+static SECRET_ASSIGNMENT: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(
+        r#"(?i)(password|passwd|secret|api[_\-]?key|access[_\-]?token|auth[_\-]?token|_authtoken)(["']?\s*[:=]\s*)(["']?)([^\s"',;()]{8,})"#,
+    )
+    .expect("valid secret assignment pattern")
+});
+
+/// Only the value of an assignment is redacted, and only when it is a literal:
+/// a quoted string, or an unquoted token with a digit and no code punctuation.
+/// `secret: config.secret_value` or `password = user_password` in code keep
+/// their names and expressions.
+fn redact_assignments(text: &str) -> String {
+    SECRET_ASSIGNMENT
+        .replace_all(text, |caps: &regex::Captures<'_>| {
+            let value = &caps[4];
+            let quoted = !caps[3].is_empty();
+            let literal = quoted || (value.chars().any(|c| c.is_ascii_digit()) && !value.contains('.'));
+            if literal {
+                format!("{}{}{}[REDACTED]", &caps[1], &caps[2], &caps[3])
+            } else {
+                caps[0].to_owned()
+            }
+        })
+        .into_owned()
+}
+
 pub fn redact_secrets(text: &str) -> String {
     let mut out = text.to_owned();
     for pattern in SECRET_PATTERNS.iter() {
@@ -127,7 +153,7 @@ pub fn redact_secrets(text: &str) -> String {
             out = pattern.replace_all(&out, "[REDACTED]").into_owned();
         }
     }
-    out
+    redact_assignments(&out)
 }
 
 /// Cut to `MAX_RESULT_CHARS` on a char boundary.
@@ -228,6 +254,18 @@ mod tests {
             assert!(!out.contains(leaked), "{leaked} leaked: {out}");
         }
         assert!(redact_secrets(text).contains("fn main() {}"), "ordinary code survives");
+    }
+
+    /// TASK-78: code that merely names a secret field keeps its names.
+    #[test]
+    fn assignments_redact_only_literal_values() {
+        let code = "let password = user_password;\nsecret: config.secret_value,\napi_key: process.env.API_KEY";
+        assert_eq!(redact_secrets(code), code, "field names and expressions survive");
+        let out = redact_secrets("password = \"hunter2hunter2\"\n//registry.npmjs.org/:_authToken=abcdef123456");
+        assert_eq!(
+            out,
+            "password = \"[REDACTED]\"\n//registry.npmjs.org/:_authToken=[REDACTED]"
+        );
     }
 
     #[test]
