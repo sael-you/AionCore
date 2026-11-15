@@ -225,3 +225,64 @@ async fn leases_states_tool_calls_and_purge() {
     let row = repo.get_draft(USER, "d1", 1).await.unwrap().unwrap();
     assert!(row.text.is_none() && row.payload_hash == "h", "text purged, hash kept");
 }
+
+#[tokio::test]
+async fn recent_transcripts_and_session_rebind() {
+    let (repo, _db) = repo().await;
+    for (turn_no, role, text, expires_at) in [
+        (1, "user", "expired turn", 1_000),
+        (2, "user", "tell the kanban build to rerun", i64::MAX),
+        (3, "assistant", "Sure.", i64::MAX),
+        (4, "user", "thanks", i64::MAX),
+    ] {
+        repo.add_transcript(&NewVoiceTranscript {
+            session_id: "vs_1",
+            user_id: USER,
+            turn_no,
+            role,
+            text,
+            expires_at,
+        })
+        .await
+        .unwrap();
+    }
+    assert_eq!(
+        repo.recent_transcripts("vs_1", 2).await.unwrap(),
+        vec![("assistant".into(), "Sure.".into()), ("user".into(), "thanks".into())],
+        "last turns, oldest first"
+    );
+    assert_eq!(
+        repo.recent_transcripts("vs_1", 10).await.unwrap().len(),
+        3,
+        "expired skipped"
+    );
+    assert!(repo.recent_transcripts("vs_other", 10).await.unwrap().is_empty());
+
+    // A pending draft is re-bound to the next call under the same CAS.
+    repo.create_starting(CreateVoiceSessionParams {
+        id: "vs_2",
+        user_id: USER,
+        engine: "openai-realtime",
+        model: "gpt-realtime-2.1",
+        resume_of: Some("vs_1"),
+        device: None,
+        instructions_hash: None,
+    })
+    .await
+    .unwrap();
+    repo.insert_draft(&draft("d1", 1, "drafted")).await.unwrap();
+    let rebind = DraftTransition {
+        to: None,
+        patch: DraftPatch {
+            session_id: Some(Some("vs_2")),
+            ..Default::default()
+        },
+        ..to("d1", 1, &["drafted"], "drafted")
+    };
+    assert!(repo.transition_draft(&rebind).await.unwrap());
+    let row = repo.get_draft(USER, "d1", 1).await.unwrap().unwrap();
+    assert_eq!(
+        (row.state.as_str(), row.session_id.as_deref()),
+        ("drafted", Some("vs_2"))
+    );
+}

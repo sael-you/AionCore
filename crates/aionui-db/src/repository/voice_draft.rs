@@ -54,6 +54,10 @@ pub trait IVoiceDraftRepository: Send + Sync {
 
     async fn add_transcript(&self, entry: &NewVoiceTranscript<'_>) -> Result<(), DbError>;
 
+    /// The last `limit` transcript turns of a session, oldest first, as
+    /// `(role, text)`; expired turns are skipped.
+    async fn recent_transcripts(&self, session_id: &str, limit: u32) -> Result<Vec<(String, String)>, DbError>;
+
     /// Delete expired transcripts and blank draft texts older than
     /// `draft_text_before` (the payload hash stays). Returns rows touched.
     async fn purge_voice_data(&self, now: TimestampMs, draft_text_before: TimestampMs) -> Result<u64, DbError>;
@@ -62,6 +66,8 @@ pub trait IVoiceDraftRepository: Send + Sync {
 /// Fields a transition may change. `None` keeps the value; `Some(None)` clears it.
 #[derive(Debug, Clone, Default)]
 pub struct DraftPatch<'a> {
+    /// Rebind the draft to another voice session (re-announced to a new call).
+    pub session_id: Option<Option<&'a str>>,
     pub queued_reason: Option<Option<&'a str>>,
     pub readback_id: Option<Option<&'a str>>,
     pub readback_text: Option<Option<&'a str>>,

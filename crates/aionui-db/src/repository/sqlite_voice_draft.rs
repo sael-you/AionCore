@@ -104,6 +104,7 @@ impl IVoiceDraftRepository for SqliteVoiceRepository {
                 }
             };
         }
+        set_opt!("session_id", p.session_id.map(|v| v.map(str::to_owned)));
         set_opt!("queued_reason", p.queued_reason.map(|v| v.map(str::to_owned)));
         set_opt!("readback_id", p.readback_id.map(|v| v.map(str::to_owned)));
         set_opt!("readback_text", p.readback_text.map(|v| v.map(str::to_owned)));
@@ -235,6 +236,20 @@ impl IVoiceDraftRepository for SqliteVoiceRepository {
         .execute(self.pool())
         .await?;
         Ok(())
+    }
+
+    async fn recent_transcripts(&self, session_id: &str, limit: u32) -> Result<Vec<(String, String)>, DbError> {
+        let mut rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT role, text FROM voice_transcripts WHERE session_id = ? AND expires_at > ? \
+             ORDER BY turn_no DESC, id DESC LIMIT ?",
+        )
+        .bind(session_id)
+        .bind(aionui_common::now_ms())
+        .bind(i64::from(limit))
+        .fetch_all(self.pool())
+        .await?;
+        rows.reverse();
+        Ok(rows)
     }
 
     async fn purge_voice_data(&self, now: TimestampMs, draft_text_before: TimestampMs) -> Result<u64, DbError> {
