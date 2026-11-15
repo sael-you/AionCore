@@ -172,6 +172,7 @@ impl StreamPersistenceAdapter {
             "canSendMessage": true,
             "runtime": runtime,
             "last_outcome": outcome.as_str(),
+            "last_outcome_at": now,
         });
         broadcaster.broadcast(WebSocketMessage::new("turn.completed", payload));
 

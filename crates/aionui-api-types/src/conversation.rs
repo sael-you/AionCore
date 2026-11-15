@@ -374,6 +374,12 @@ pub struct ConversationResponse {
     /// `None` on list responses. See [`PromptCapabilityView`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_capability: Option<PromptCapabilityView>,
+    /// List-path post-fill (C21): present only for a conversation whose agent
+    /// is alive and doing something (a turn, a pending approval or question,
+    /// background work), so the sidebar is right right after a reload. `None`
+    /// everywhere else; read from memory, never the database.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub live: Option<ConversationLiveState>,
     pub created_at: TimestampMs,
     pub modified_at: TimestampMs,
     pub extra: serde_json::Value,
@@ -385,6 +391,17 @@ pub struct ConversationResponse {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OutcomeSeenResponse {
     pub last_outcome_seen_at: TimestampMs,
+}
+
+/// What a live conversation is doing right now (see [`ConversationResponse::live`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ConversationLiveState {
+    /// A turn is in flight (starting, running, cancelling or waiting).
+    pub is_processing: bool,
+    /// Approvals / questions waiting on the owner.
+    pub pending_confirmations: usize,
+    /// Subagents, background tasks and workflows still running.
+    pub background_active: usize,
 }
 
 /// Paginated list of conversations.
@@ -798,6 +815,7 @@ mod tests {
             extra: json!({ "workspace": "/project" }),
             fork_capability: None,
             prompt_capability: None,
+            live: None,
             parent_conversation_id: None,
             depth: 0,
         };
@@ -842,6 +860,7 @@ mod tests {
             extra: json!({}),
             fork_capability: None,
             prompt_capability: None,
+            live: None,
             parent_conversation_id: None,
             depth: 0,
         };
@@ -880,6 +899,7 @@ mod tests {
             extra: json!({}),
             fork_capability: None,
             prompt_capability: None,
+            live: None,
             parent_conversation_id: None,
             depth: 0,
         };
@@ -972,6 +992,7 @@ mod tests {
                 extra: json!({}),
                 fork_capability: None,
                 prompt_capability: None,
+                live: None,
                 parent_conversation_id: None,
                 depth: 0,
             },
@@ -1015,6 +1036,7 @@ mod tests {
                 extra: json!({}),
                 fork_capability: None,
                 prompt_capability: None,
+                live: None,
                 parent_conversation_id: None,
                 depth: 0,
             },
@@ -1110,6 +1132,7 @@ mod tests {
                 extra: json!({}),
                 fork_capability: None,
                 prompt_capability: None,
+                live: None,
                 parent_conversation_id: None,
                 depth: 0,
             }],
@@ -1168,6 +1191,7 @@ mod tests {
                     extra: json!({}),
                     fork_capability: None,
                     prompt_capability: None,
+                    live: None,
                     parent_conversation_id: None,
                     depth: 0,
                 },
