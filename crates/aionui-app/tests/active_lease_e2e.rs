@@ -22,11 +22,14 @@ fn empty_post_with_token(uri: &str, token: &str, csrf: &str) -> Request<Body> {
         .unwrap()
 }
 
+/// A browser session (session cookie + Bearer) without the CSRF pair. The cookie
+/// matters: a cookieless Bearer client is exempt from CSRF (C11-switch).
 fn empty_post_with_auth_without_csrf(uri: &str, token: &str) -> Request<Body> {
     Request::builder()
         .method("POST")
         .uri(uri)
         .header("authorization", format!("Bearer {token}"))
+        .header("cookie", format!("aionui-session={token}"))
         .body(Body::empty())
         .unwrap()
 }

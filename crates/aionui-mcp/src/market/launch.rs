@@ -220,8 +220,17 @@ pub fn child_env<I>(parent: I, runtime: &[(String, String)], plan: &LaunchPlan) 
 where
     I: IntoIterator<Item = (String, String)>,
 {
+    child_env_with(parent, runtime, &plan.env)
+}
+
+/// [`child_env`] for an explicit instance env (the market connection test
+/// spawns the same env as the launcher, TASK-70).
+pub fn child_env_with<I>(parent: I, runtime: &[(String, String)], env: &[(String, String)]) -> Vec<(String, String)>
+where
+    I: IntoIterator<Item = (String, String)>,
+{
     let mut out: Vec<(String, String)> = parent.into_iter().filter(|(k, _)| inherit_env_allowed(k)).collect();
-    for (k, v) in runtime.iter().chain(plan.env.iter()) {
+    for (k, v) in runtime.iter().chain(env.iter()) {
         out.retain(|(existing, _)| existing != k);
         out.push((k.clone(), v.clone()));
     }

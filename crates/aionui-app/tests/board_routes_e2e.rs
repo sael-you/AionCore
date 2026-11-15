@@ -62,6 +62,8 @@ fn token(services: &aionui_app::AppServices, user: &str, conversation: &str) -> 
 #[derive(Clone, Default)]
 struct Auth {
     bearer: Option<String>,
+    /// Also send the bearer as the session cookie (a browser session).
+    session_cookie: bool,
     csrf: Option<String>,
     supervisor: bool,
     runtime: Option<(String, String, String)>,
@@ -72,10 +74,16 @@ fn request(method: &str, uri: &str, body: Option<Value>, auth: &Auth) -> Request
     if let Some(bearer) = &auth.bearer {
         builder = builder.header("authorization", format!("Bearer {bearer}"));
     }
+    let mut cookies = Vec::new();
+    if let (true, Some(bearer)) = (auth.session_cookie, &auth.bearer) {
+        cookies.push(format!("aionui-session={bearer}"));
+    }
     if let Some(csrf) = &auth.csrf {
-        builder = builder
-            .header("x-csrf-token", csrf)
-            .header("cookie", format!("aionui-csrf-token={csrf}"));
+        builder = builder.header("x-csrf-token", csrf);
+        cookies.push(format!("aionui-csrf-token={csrf}"));
+    }
+    if !cookies.is_empty() {
+        builder = builder.header("cookie", cookies.join("; "));
     }
     if auth.supervisor {
         builder = builder.header("x-aionui-board-actor", "supervisor");
@@ -319,8 +327,11 @@ async fn user_session_mode_enforces_auth_channels_csrf_and_isolation() {
     )
     .await;
     assert_eq!(status, StatusCode::UNAUTHORIZED);
+    // A browser session (cookie) without CSRF; a cookieless Bearer client is
+    // exempt from CSRF (C11-switch).
     let no_csrf = Auth {
         bearer: Some(bearer.clone()),
+        session_cookie: true,
         ..Default::default()
     };
     let (status, _) = create_card(&app, &no_csrf, "x").await;

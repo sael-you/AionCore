@@ -411,3 +411,103 @@ async fn batch_import_preserves_enabled_in_database() {
     assert_eq!(listed.len(), 1);
     assert!(listed[0].enabled);
 }
+
+// ---------------------------------------------------------------------------
+// TASK-69: masked values only restored onto an unchanged destination
+// ---------------------------------------------------------------------------
+
+fn update_transport(transport: McpTransport) -> aionui_api_types::UpdateMcpServerRequest {
+    aionui_api_types::UpdateMcpServerRequest {
+        name: None,
+        description: None,
+        transport: Some(transport),
+        original_json: None,
+        builtin: None,
+    }
+}
+
+#[tokio::test]
+async fn edit_http_with_masked_header_and_changed_url_is_refused() {
+    let svc = make_service().await;
+    let created = svc.add_server(TEST_USER_ID, http_req("mask-http")).await.unwrap();
+    let masked = HashMap::from([("Auth".to_owned(), "•••".to_owned())]);
+    let err = svc
+        .edit_server(
+            TEST_USER_ID,
+            &created.id,
+            update_transport(McpTransport::Http {
+                url: "https://evil.example/mcp".into(),
+                headers: masked.clone(),
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(err, aionui_mcp::McpError::MaskedValue(_)), "{err:?}");
+    // Same URL: the mask round-trip keeps the stored header.
+    svc.edit_server(
+        TEST_USER_ID,
+        &created.id,
+        update_transport(McpTransport::Http {
+            url: "https://example.com/mcp".into(),
+            headers: masked,
+        }),
+    )
+    .await
+    .unwrap();
+    match svc.stored_transport(TEST_USER_ID, &created.id).await.unwrap().unwrap() {
+        aionui_mcp::McpServerTransport::Http { url, headers } => {
+            assert_eq!(url, "https://example.com/mcp");
+            assert_eq!(headers["Auth"], "Bearer tok");
+        }
+        other => panic!("expected Http, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn edit_stdio_with_masked_env_and_changed_command_is_refused() {
+    let svc = make_service().await;
+    let mut req = stdio_req("mask-stdio");
+    if let McpTransport::Stdio { env, .. } = &mut req.transport {
+        env.insert("PADDLE_API_KEY".into(), "pdl_live_FAKEFAKEFAKE1234567890".into());
+    }
+    let created = svc.add_server(TEST_USER_ID, req).await.unwrap();
+    let masked = HashMap::from([("PADDLE_API_KEY".to_owned(), "•••".to_owned())]);
+    for (command, args) in [
+        ("evil", vec!["-y", "@test/server"]),
+        ("npx", vec!["-y", "@evil/server"]),
+    ] {
+        let err = svc
+            .edit_server(
+                TEST_USER_ID,
+                &created.id,
+                update_transport(McpTransport::Stdio {
+                    command: command.into(),
+                    args: args.into_iter().map(String::from).collect(),
+                    env: masked.clone(),
+                }),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, aionui_mcp::McpError::MaskedValue(_)),
+            "{command}: {err:?}"
+        );
+    }
+    svc.edit_server(
+        TEST_USER_ID,
+        &created.id,
+        update_transport(McpTransport::Stdio {
+            command: "npx".into(),
+            args: vec!["-y".into(), "@test/server".into()],
+            env: masked,
+        }),
+    )
+    .await
+    .unwrap();
+    match svc.stored_transport(TEST_USER_ID, &created.id).await.unwrap().unwrap() {
+        aionui_mcp::McpServerTransport::Stdio { env, .. } => {
+            assert_eq!(env["PADDLE_API_KEY"], "pdl_live_FAKEFAKEFAKE1234567890")
+        }
+        other => panic!("expected Stdio, got {other:?}"),
+    }
+}

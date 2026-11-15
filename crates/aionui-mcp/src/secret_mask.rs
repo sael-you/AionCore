@@ -349,21 +349,40 @@ fn unmask_args(incoming: &mut [String], existing: &[String]) {
     }
 }
 
+/// `origin + path` of a URL (scheme, host, port, path), or the whole string
+/// when it does not parse.
+fn url_destination(url: &str) -> String {
+    match reqwest::Url::parse(url) {
+        Ok(parsed) => format!("{}{}", parsed.origin().ascii_serialization(), parsed.path()),
+        Err(_) => url.to_owned(),
+    }
+}
+
 /// Restore stored values for every field the client sent back masked (the
 /// mask round-trip of `PUT /api/mcp/servers/{id}` and `test-connection {id}`).
-/// Only values whose masked form equals what the client sent are restored.
+/// Only values whose masked form equals what the client sent are restored,
+/// and only while the destination is unchanged: the same command and args
+/// (stdio) or the same URL origin + path (http/sse). A masked value sent with
+/// a changed destination stays masked, so the caller refuses it with
+/// `MCP_MASKED_VALUE` — a stored secret never travels to a new command or
+/// host (train-2 review C2 #2, TASK-69).
 pub fn unmask_transport(incoming: &mut McpServerTransport, existing: &McpServerTransport) {
     match (incoming, existing) {
         (
-            McpServerTransport::Stdio { args, env, .. },
+            McpServerTransport::Stdio { command, args, env },
             McpServerTransport::Stdio {
+                command: old_command,
                 args: old_args,
                 env: old_env,
-                ..
             },
         ) => {
+            let mut restored_args = args.clone();
+            unmask_args(&mut restored_args, old_args);
+            if command != old_command || restored_args != *old_args {
+                return;
+            }
+            *args = restored_args;
             unmask_map(env, old_env);
-            unmask_args(args, old_args);
         }
         (
             McpServerTransport::Http { url, headers },
@@ -379,10 +398,16 @@ pub fn unmask_transport(incoming: &mut McpServerTransport, existing: &McpServerT
                 headers: old_headers,
             },
         ) => {
-            unmask_map(headers, old_headers);
-            if *url != *old_url && *url == mask_url(old_url) {
-                url.clone_from(old_url);
+            let restored_url = if *url != *old_url && *url == mask_url(old_url) {
+                old_url.clone()
+            } else {
+                url.clone()
+            };
+            if url_destination(&restored_url) != url_destination(old_url) {
+                return;
             }
+            *url = restored_url;
+            unmask_map(headers, old_headers);
         }
         _ => {}
     }
@@ -459,5 +484,74 @@ mod tests {
         let clean = r#"{"name":"stdio-full"}"#;
         assert_eq!(mask_original_json(clean).as_deref(), Some(clean));
         assert_eq!(mask_original_json("not json"), None);
+    }
+
+    /// TASK-69: a masked value is restored only while the destination
+    /// (stdio command + args, http/sse URL origin + path) is unchanged.
+    #[test]
+    fn masked_values_are_not_restored_onto_a_changed_destination() {
+        let stdio = McpServerTransport::Stdio {
+            command: "npx".into(),
+            args: vec!["-y".into(), "srv".into()],
+            env: HashMap::from([("PADDLE_API_KEY".into(), FAKE_KEY.into())]),
+        };
+        let masked_env = HashMap::from([("PADDLE_API_KEY".to_owned(), MASK.to_owned())]);
+        for (command, args) in [("evil", vec!["-y", "srv"]), ("npx", vec!["-y", "evil-srv"])] {
+            let mut back = McpServerTransport::Stdio {
+                command: command.into(),
+                args: args.into_iter().map(String::from).collect(),
+                env: masked_env.clone(),
+            };
+            unmask_transport(&mut back, &stdio);
+            assert!(transport_contains_mask(&back), "{command}: secret must stay masked");
+        }
+        let mut same = McpServerTransport::Stdio {
+            command: "npx".into(),
+            args: vec!["-y".into(), "srv".into()],
+            env: masked_env,
+        };
+        unmask_transport(&mut same, &stdio);
+        assert_eq!(same, stdio);
+
+        let headers = HashMap::from([("Authorization".to_owned(), "Bearer SECRETSECRET99".to_owned())]);
+        let masked_headers = HashMap::from([("Authorization".to_owned(), MASK.to_owned())]);
+        for make in [
+            |url: &str, headers: HashMap<String, String>| McpServerTransport::Http {
+                url: url.into(),
+                headers,
+            },
+            |url: &str, headers: HashMap<String, String>| McpServerTransport::Sse {
+                url: url.into(),
+                headers,
+            },
+        ] {
+            let stored = make("https://mcp.example.com/mcp?x=1", headers.clone());
+            for url in [
+                "https://evil.example/mcp?x=1",
+                "https://mcp.example.com/other?x=1",
+                "http://mcp.example.com/mcp?x=1",
+            ] {
+                let mut back = make(url, masked_headers.clone());
+                unmask_transport(&mut back, &stored);
+                assert!(transport_contains_mask(&back), "{url}: header must stay masked");
+            }
+            // Same origin + path, other non-secret query: restored.
+            let mut back = make("https://mcp.example.com/mcp?x=2", masked_headers.clone());
+            unmask_transport(&mut back, &stored);
+            assert_eq!(back, make("https://mcp.example.com/mcp?x=2", headers.clone()));
+        }
+        // A masked secret query value moved to another host is not restored.
+        let stored = McpServerTransport::Http {
+            url: "https://mcp.example.com/mcp?tavilyApiKey=tvly-SECRETSECRET".into(),
+            headers: HashMap::new(),
+        };
+        let moved = mask_url("https://mcp.example.com/mcp?tavilyApiKey=tvly-SECRETSECRET")
+            .replace("mcp.example.com", "evil.example");
+        let mut back = McpServerTransport::Http {
+            url: moved,
+            headers: HashMap::new(),
+        };
+        unmask_transport(&mut back, &stored);
+        assert!(transport_contains_mask(&back));
     }
 }

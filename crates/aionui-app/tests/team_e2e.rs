@@ -1749,6 +1749,8 @@ async fn context_reset_requires_csrf() {
         .method("POST")
         .uri(path)
         .header("authorization", format!("Bearer {token}"))
+        // A browser session (cookie) still needs CSRF; a cookieless Bearer client is exempt (C11-switch).
+        .header("cookie", format!("aionui-session={token}"))
         .header("content-type", "application/json")
         .body(axum::body::Body::from("{}"))
         .unwrap();
@@ -1946,6 +1948,8 @@ async fn sm1d_team_send_rejects_missing_csrf() {
         .method("POST")
         .uri(format!("/api/teams/{team_id}/messages"))
         .header("authorization", format!("Bearer {token}"))
+        // A browser session (cookie) still needs CSRF; a cookieless Bearer client is exempt (C11-switch).
+        .header("cookie", format!("aionui-session={token}"))
         .header("content-type", "application/json")
         .body(axum::body::Body::from(r#"{"content":"x"}"#))
         .unwrap();
