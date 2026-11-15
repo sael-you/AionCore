@@ -324,6 +324,9 @@ impl VoiceService {
     /// it (§3.6.4, §6 "Deploy restarts AionUi mid-call"). Returns how many
     /// calls were handed to a runner.
     pub async fn recover_open_sessions(&self) -> usize {
+        // The backend serves again: device liveness of recovered calls counts
+        // from now, even if no device ever reconnects (else never stale).
+        self.inner.mark_listening();
         let rows = match self.inner.sessions.list_open().await {
             Ok(rows) => rows,
             Err(err) => {
