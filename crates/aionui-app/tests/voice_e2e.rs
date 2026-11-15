@@ -146,3 +146,82 @@ async fn session_mode_voice_is_behind_the_global_csrf_layer() {
     assert_eq!(body_json(resp).await["code"], "VOICE_DISABLED");
     services.database.close().await;
 }
+
+/// S1b mounts: the agent `say` route sits on the runtime-token router and
+/// only speaks for conversations the user sent to by voice; clips are behind
+/// the voice user guards.
+#[tokio::test]
+async fn voice_agent_route_and_clip_endpoint_are_mounted() {
+    use aionui_ai_agent::{RuntimeTokenScope, TEAM_RUNTIME_TOKEN_SESSION_GENERATION};
+    set_origin_env();
+    let db = aionui_db::init_database_memory().await.unwrap();
+    let services = aionui_app::AppServices::from_config(db, &aionui_app::AppConfig::default())
+        .await
+        .unwrap();
+    let mut router = aionui_app::create_router(&services).await.expect("router");
+    let (token, csrf) = setup_and_login(&mut router, &services, "voiceuser", "Voice-Test-Pass-1").await;
+    let user_id: String = sqlx::query_scalar("SELECT id FROM users WHERE username = 'voiceuser'")
+        .fetch_one(services.database.pool())
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO conversations (id, user_id, name, type, extra, status, created_at, updated_at)
+         VALUES ('conv-voice-agent', ?, 'Kanban build', 'acp', '{}', 'finished', 1, 1)",
+    )
+    .bind(&user_id)
+    .execute(services.database.pool())
+    .await
+    .unwrap();
+    sqlx::query("INSERT INTO voice_settings (user_id, enabled, updated_at) VALUES (?, 1, 1)")
+        .bind(&user_id)
+        .execute(services.database.pool())
+        .await
+        .unwrap();
+    let say = |headers: Option<(&str, &str)>| {
+        let mut builder = Request::builder()
+            .method("POST")
+            .uri("/api/runtime/voice/say")
+            .header("content-type", "application/json");
+        if let Some((user, token)) = headers {
+            builder = builder
+                .header("x-aionui-user-id", user)
+                .header("x-aionui-conversation-id", "conv-voice-agent")
+                .header("x-aionui-runtime-token", token);
+        }
+        builder.body(Body::from(r#"{"text":"tests are green"}"#)).unwrap()
+    };
+    let resp = router.clone().oneshot(say(None)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let resp = router.clone().oneshot(say(Some((&user_id, "forged")))).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+
+    let runtime_token = services
+        .runtime_token_service
+        .issue(
+            &user_id,
+            "conv-voice-agent",
+            TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
+            [RuntimeTokenScope::ConversationHelper],
+        )
+        .token;
+    let resp = router
+        .clone()
+        .oneshot(say(Some((&user_id, &runtime_token))))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN, "no voice request was sent to it");
+
+    let cookie = format!("aionui-session={token}; aionui-csrf-token={csrf}");
+    let resp = router
+        .oneshot(
+            Request::builder()
+                .uri("/api/voice/readbacks/rb_missing")
+                .header("cookie", &cookie)
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    services.database.close().await;
+}

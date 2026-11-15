@@ -399,6 +399,13 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     // Voice (card C9) carries its own guards: cookie session in every mode,
     // credential precedence, Origin allowlist, CSRF when local. It sits inside
     // the global CSRF layer like the other user routes.
+    // Agent → user voice (`say`/`ask`): runtime-token router, outside auth/CSRF.
+    let voice_agent = aionui_voice::voice_agent_routes(aionui_voice::VoiceAgentRouterState {
+        service: states.voice.service.clone(),
+        verifier: Arc::new(ConversationHelperTokenVerifier {
+            runtime_token_service: services.runtime_token_service.clone(),
+        }),
+    });
     let voice_user = aionui_voice::voice_routes(states.voice, super::voice::voice_guards(services));
     tracing::info!(elapsed_ms = boot.elapsed().as_millis(), "startup: route groups built");
 
@@ -462,6 +469,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     .merge(runtime_team_tools)
     .merge(session_message_runtime)
     .merge(conversation_runtime)
+    .merge(voice_agent)
     .merge(board_runtime)
     .merge(office_proxy)
     .merge(public_assets)

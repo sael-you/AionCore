@@ -343,6 +343,8 @@ pub async fn build_module_states(
     // Re-attach sidebands to calls persisted as live by the previous process
     // (or hang them up); runs in the background so startup never waits on it.
     let voice_service = states.voice.service.clone();
+    // Draft worker (queued retries, start checks, recovery) and follow-ups.
+    voice_service.start_background(services.event_bus.clone());
     tokio::spawn(async move {
         let resumed = voice_service.recover_open_sessions().await;
         tracing::info!(resumed, "voice: startup recovery finished");

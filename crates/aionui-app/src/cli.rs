@@ -123,6 +123,10 @@ pub(crate) enum Command {
     /// Agent-facing project board CLI (Kanban of this conversation's project),
     /// plus the operator-only `board recover`.
     Board(BoardArgs),
+    /// Voice Concierge helper: agents `say`/`ask` on the user's voice device
+    /// (`wait` continues an `ask`); `status` reads live calls from the
+    /// database read-only (deploy script).
+    Voice(VoiceArgs),
     /// Agent-facing read-only runtime CLI for THIS conversation's skills.
     /// Channel A of skill delivery: a normal tool call instead of the
     /// `[LOAD_SKILL]` text-protocol round trip.
@@ -168,6 +172,7 @@ impl Command {
             Self::Session(_) => "session",
             Self::Conversation(_) => "conversation",
             Self::Board(_) => "board",
+            Self::Voice(_) => "voice",
             Self::Skills(_) => "skills",
             Self::AntigravityHook => "antigravity-hook",
             Self::McpTeamStdio => "mcp-team-stdio",
@@ -264,6 +269,28 @@ pub(crate) enum ConversationCommand {
     Create,
     #[command(external_subcommand)]
     Unknown(Vec<OsString>),
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct VoiceArgs {
+    #[command(subcommand)]
+    pub command: VoiceCommand,
+}
+
+/// `aioncore voice …`. `say`/`ask` read one JSON object on stdin
+/// (`{"text"}` / `{"question", "timeout_s"?}`).
+#[derive(Subcommand, Debug, Clone)]
+pub(crate) enum VoiceCommand {
+    /// Print the agent-readable voice CLI contract.
+    Capabilities,
+    /// Speak a line on the user's armed voice device.
+    Say,
+    /// Ask the user by voice; blocks up to 50 s, then returns `pending`.
+    Ask,
+    /// Keep waiting for the answer of a pending `ask`.
+    Wait { id: String },
+    /// Live voice calls (all users) from `--data-dir`, read-only, as JSON.
+    Status,
 }
 
 #[derive(Args, Debug, Clone)]

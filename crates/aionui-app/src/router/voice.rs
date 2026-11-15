@@ -5,13 +5,13 @@
 use std::sync::Arc;
 
 use aionui_auth::{AuthIdentityMode, AuthState};
-use aionui_db::{SqliteProviderRepository, SqliteVoiceRepository};
+use aionui_db::{SqliteProviderRepository, SqliteSidebarStore, SqliteVoiceRepository};
 use aionui_realtime::WebSocketManager;
 use aionui_system::ProviderService;
 use aionui_voice::{
     ApiKey, CredentialPolicy, CredentialPort, OpenAiRealtimeEngine, OriginAllowlist, ProviderCredential,
-    SessionTokenVerifier, VoiceHttpGuards, VoiceRouterState, VoiceService, VoiceServiceDeps, VoiceSockets,
-    VoiceTimings,
+    ProviderSpeechFactory, SessionTokenVerifier, VoiceHttpGuards, VoiceRouterState, VoiceService, VoiceServiceDeps,
+    VoiceSockets, VoiceTimings,
 };
 
 use crate::config::{IdentityMode, derive_encryption_key};
@@ -67,21 +67,34 @@ pub fn build_voice_state(services: &AppServices) -> VoiceRouterState {
     let pool = services.database.pool().clone();
     let voice_repo = Arc::new(SqliteVoiceRepository::new(pool.clone()));
     let providers = ProviderService::new(
-        Arc::new(SqliteProviderRepository::new(pool)),
+        Arc::new(SqliteProviderRepository::new(pool.clone())),
         derive_encryption_key(&services.encryption_secret_raw),
     );
+    let credentials: Arc<dyn CredentialPort> = Arc::new(ProviderCredentialAdapter { providers });
+    let policy = CredentialPolicy::from_env();
     let timings = VoiceTimings::default();
     let service = VoiceService::new(VoiceServiceDeps {
         settings: voice_repo.clone(),
         sessions: voice_repo.clone(),
-        audit: voice_repo,
-        credentials: Arc::new(ProviderCredentialAdapter { providers }),
-        credential_policy: CredentialPolicy::from_env(),
+        audit: voice_repo.clone(),
+        credentials: credentials.clone(),
+        credential_policy: policy.clone(),
         engine: Arc::new(OpenAiRealtimeEngine::new(timings.engine)),
         verifier: Arc::new(SessionTokenVerifier::new(voice_auth_state(services))),
         // Voice sockets get their own manager so app-wide broadcasts never reach them.
         sockets: VoiceSockets::new(Arc::new(WebSocketManager::new())),
         timings,
+        conversations: Arc::new(super::voice_conversations::VoiceConversationAdapter {
+            service: services.conversation_service.clone(),
+            task_manager: services.worker_task_manager.clone(),
+            sidebar: Arc::new(SqliteSidebarStore::new(pool)),
+        }),
+        drafts: voice_repo,
+        speech: Arc::new(ProviderSpeechFactory {
+            credentials,
+            policy,
+            http: reqwest::Client::new(),
+        }),
     });
     VoiceRouterState { service }
 }
