@@ -81,13 +81,17 @@ fn detected_to_response(detected: DetectedServer) -> DetectedMcpServerEntry {
     let normalized_skip_reason = detected.import_skip_reason.as_deref().map(normalize_import_skip_reason);
     let importable = detected.importable || normalized_skip_reason.as_deref() == Some("Connected");
 
+    // R1 #11: detected CLI configs carry literal env/header values; never
+    // return them (import of a masked value is refused by the import route).
+    let mut transport: aionui_api_types::McpTransport = detected.transport.into();
+    crate::secret_mask::mask_transport(&mut transport);
     DetectedMcpServerEntry {
         server: aionui_api_types::McpServerResponse {
             id: format!("detected_{}", detected.name),
             name: detected.name,
             description: None,
             enabled: false,
-            transport: detected.transport.into(),
+            transport,
             tools: None,
             last_test_status: aionui_common::McpServerStatus::Disconnected,
             last_connected: None,

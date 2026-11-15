@@ -24,6 +24,7 @@ mod extension;
 mod file;
 mod lifecycle;
 mod mcp;
+mod mcp_market;
 mod office;
 mod project;
 mod provider;
@@ -51,8 +52,8 @@ pub use acp::{
 };
 pub use acp_prompt_hook::AcpPromptHookWarningPayload;
 pub use agent_build_extra::{
-    AcpBuildExtra, AcpModelInfo, AionrsBuildExtra, ForkSpec, SessionMcpServer, SessionMcpTransport,
-    SlashCommandCompletionBehavior, SlashCommandItem,
+    AcpBuildExtra, AcpModelInfo, AionrsBuildExtra, ForkSpec, SessionMcpServer, SessionMcpToolFilter,
+    SessionMcpTransport, SlashCommandCompletionBehavior, SlashCommandItem,
 };
 pub use agent_discovery::{
     AgentEnvEntry, AgentHandshake, AgentLogoEntry, AgentManagementRow, AgentManagementStatus, AgentMetadata,
@@ -156,6 +157,13 @@ pub use mcp::{
     ImportMcpServerRequest, McpAuthMethod, McpConnectionTestErrorCode, McpConnectionTestResult, McpServerResponse,
     McpToolResponse, McpTransport, OAuthCheckStatusRequest, OAuthLoginRequest, OAuthLoginResponse, OAuthLogoutRequest,
     OAuthStatusResponse, TestMcpConnectionRequest, UpdateMcpServerRequest,
+};
+pub use mcp_market::{
+    CreateMcpMarketAssignmentRequest, CreateMcpMarketInstanceRequest, DuplicateMcpMarketInstanceRequest,
+    ListMcpMarketAssignmentsQuery, McpMarketAssignmentResponse, McpMarketCommand, McpMarketEnvField, McpMarketEnvKind,
+    McpMarketInstanceResponse, McpMarketInstanceStatus, McpMarketSecretStatus, McpMarketSnapshotQuery,
+    McpMarketStatusResponse, McpMarketTemplate, SetMcpMarketApprovalRequest, SetMcpMarketSecretRequest,
+    UpdateMcpMarketInstanceRequest,
 };
 pub use office::{
     CellCoord, CellRange, ConversionResultDto, ConversionTarget, DocumentConversionRequest, DocumentConversionResponse,

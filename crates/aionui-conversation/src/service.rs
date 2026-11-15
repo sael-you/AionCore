@@ -5407,6 +5407,16 @@ impl ConversationService {
                     .await
                     .map_err(|e| ConversationError::internal(format!("Failed to list MCP servers: {e}")))?,
             };
+            // The ONE market gate (R1 #5), snapshot time: inactive or deleted
+            // market rows never enter the frozen snapshot; the spawn path and
+            // the launcher check the assignment again.
+            let rows = repo
+                .market_gate(user_id, &aionui_db::McpMarketScope::default(), rows)
+                .await
+                .map_err(|e| ConversationError::internal(format!("Failed to gate MCP servers: {e}")))?
+                .into_iter()
+                .map(|gated| gated.row)
+                .collect::<Vec<_>>();
             let selected_rows = rows
                 .into_iter()
                 .filter(|row| !row.builtin && row.name != TEAM_MCP_SERVER_NAME)
@@ -5504,6 +5514,14 @@ impl ConversationService {
             .list_by_ids_any(user_id, &selected_ids)
             .await
             .map_err(|e| ConversationError::internal(format!("Failed to load selected MCP servers: {e}")))?;
+        // Same market gate as every other selection path (R1 #5).
+        let rows = repo
+            .market_gate(user_id, &aionui_db::McpMarketScope::default(), rows)
+            .await
+            .map_err(|e| ConversationError::internal(format!("Failed to gate MCP servers: {e}")))?
+            .into_iter()
+            .map(|gated| gated.row)
+            .collect::<Vec<_>>();
         let mut rows_by_id = rows
             .into_iter()
             .map(|row| (row.id.clone(), row))
@@ -6275,6 +6293,7 @@ mod tests {
                     url: "https://example.com/mcp".into(),
                     headers: HashMap::new(),
                 },
+                tool_filter: Default::default(),
             },
             McpSupportPolicy {
                 stdio: true,
@@ -6298,6 +6317,7 @@ mod tests {
                     args: Vec::new(),
                     env: HashMap::new(),
                 },
+                tool_filter: Default::default(),
             },
             McpSupportPolicy::AIONRS,
         );

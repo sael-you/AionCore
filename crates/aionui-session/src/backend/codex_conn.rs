@@ -654,6 +654,18 @@ fn build_codex_mcp_servers(servers: &[crate::backend::McpServerSpec]) -> Value {
                 continue;
             }
         };
+        let mut entry = entry;
+        // Market tool filters (R1 #6): codex config keys `enabled_tools` /
+        // `disabled_tools` (verified with codex 0.169 app-server, which hides a
+        // tool outside `enabled_tools`: clauterm-studio/tools/studio
+        // test/cli-golden.test.js "codex app-server (P1)"). Omitted when empty
+        // so non-market servers serialize exactly as before.
+        if let Some(enabled) = &s.tool_filter.enabled_tools {
+            entry["enabled_tools"] = json!(enabled);
+        }
+        if !s.tool_filter.disabled_tools.is_empty() {
+            entry["disabled_tools"] = json!(s.tool_filter.disabled_tools);
+        }
         map.insert(s.name.clone(), entry);
     }
     Value::Object(map)
@@ -8039,6 +8051,7 @@ mod tests {
                             args: vec!["s.js".into()],
                             env: vec![("TOKEN".into(), "x".into())],
                         },
+                        tool_filter: Default::default(),
                     },
                     McpServerSpec {
                         name: "remote".into(),
@@ -8046,6 +8059,7 @@ mod tests {
                             url: "https://mcp.example/api".into(),
                             headers: vec![],
                         },
+                        tool_filter: Default::default(),
                     },
                     McpServerSpec {
                         name: "unsupported-sse".into(),
@@ -8053,6 +8067,7 @@ mod tests {
                             url: "https://mcp.example/sse".into(),
                             headers: vec![],
                         },
+                        tool_filter: Default::default(),
                     },
                 ],
                 preset_context: Some("You are a helpful assistant.".into()),
@@ -8076,6 +8091,44 @@ mod tests {
         // (replace) — see preset_context_rides_developer_instructions_not_base.
         assert_eq!(frame["params"]["developerInstructions"], "You are a helpful assistant.");
         assert!(frame["params"].get("baseInstructions").is_none());
+    }
+
+    /// MCP market (R1 #6): the per-server tool filter rides the codex config
+    /// map as `enabled_tools` / `disabled_tools`; an empty filter adds neither key.
+    #[test]
+    fn codex_mcp_map_forwards_market_tool_filters() {
+        use crate::backend::{McpServerSpec, McpToolFilter, McpTransport};
+        let stdio = |name: &str, tool_filter: McpToolFilter| McpServerSpec {
+            name: name.into(),
+            transport: McpTransport::Stdio {
+                command: "/opt/aioncore".into(),
+                args: vec!["mcp".into(), "exec".into(), name.into()],
+                env: vec![],
+            },
+            tool_filter,
+        };
+        let map = build_codex_mcp_servers(&[
+            stdio(
+                "tb-read",
+                McpToolFilter {
+                    enabled_tools: Some(vec!["list_products".into()]),
+                    disabled_tools: vec!["create_refund".into()],
+                },
+            ),
+            stdio(
+                "tb-write",
+                McpToolFilter {
+                    enabled_tools: None,
+                    disabled_tools: vec!["delete_product".into()],
+                },
+            ),
+            stdio("plain", McpToolFilter::default()),
+        ]);
+        assert_eq!(map["tb-read"]["enabled_tools"], serde_json::json!(["list_products"]));
+        assert_eq!(map["tb-read"]["disabled_tools"], serde_json::json!(["create_refund"]));
+        assert!(map["tb-write"].get("enabled_tools").is_none());
+        assert_eq!(map["tb-write"]["disabled_tools"], serde_json::json!(["delete_product"]));
+        assert!(map["plain"].get("enabled_tools").is_none() && map["plain"].get("disabled_tools").is_none());
     }
 
     /// The assistant preset must NOT replace codex's built-in system prompt.
@@ -8144,6 +8197,7 @@ mod tests {
                         args: vec!["s.js".into()],
                         env: vec![],
                     },
+                    tool_filter: Default::default(),
                 }],
                 preset_context: Some("preset".into()),
                 ..Default::default()

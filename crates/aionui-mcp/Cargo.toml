@@ -27,7 +27,10 @@ serde_json.workspace = true
 
 [dev-dependencies]
 axum.workspace = true
+http-body-util.workspace = true
 serde_json.workspace = true
+sqlx.workspace = true
+tower = { workspace = true, features = ["util"] }
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt"] }
 tracing-subscriber.workspace = true

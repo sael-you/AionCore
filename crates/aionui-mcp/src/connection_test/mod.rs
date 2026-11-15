@@ -79,7 +79,12 @@ impl McpConnectionTestService {
         user_id: Option<&str>,
         runtime_scope_id: Option<&str>,
     ) -> McpConnectionTestResult {
-        debug!(name, ?transport, "starting MCP connection test");
+        // Never log the transport itself: it carries env/header values (R1 #11).
+        debug!(
+            name,
+            transport_type = mcp_transport_type(transport),
+            "starting MCP connection test"
+        );
         let transport_type = mcp_transport_type(transport);
         let mcp_server_id = runtime_scope_id.unwrap_or(name);
         log_mcp_transport_start(mcp_server_id, transport_type);

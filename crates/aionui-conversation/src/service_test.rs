@@ -10025,3 +10025,70 @@ mod session_mentions_integration {
         }
     }
 }
+
+/// MCP market (R1 #5): the conversation snapshot path runs the same market
+/// gate — an explicitly selected dormant/revoked market row never enters the
+/// frozen `mcp_server_ids`; active market rows and ordinary rows do.
+#[tokio::test]
+async fn create_snapshot_drops_inactive_market_rows() {
+    use aionui_db::{
+        CreateMcpServerParams, IMcpMarketRepository, IMcpServerRepository, MarketInstanceParams,
+        SqliteMcpMarketRepository, SqliteMcpServerRepository,
+    };
+    let (svc, _broadcaster, _repo, _task_mgr) = make_service();
+    let db = init_database_memory().await.unwrap();
+    seed_test_user(db.pool(), "user_1").await;
+    let market = SqliteMcpMarketRepository::new(db.pool().clone());
+    let servers = Arc::new(SqliteMcpServerRepository::new(db.pool().clone()));
+    svc.with_mcp_server_repo(servers.clone());
+    let mut ids = Vec::new();
+    for (name, status) in [("tb-on", "active"), ("tb-off", "dormant"), ("tb-gone", "revoked")] {
+        let row = market
+            .create_instance(&MarketInstanceParams {
+                user_id: "user_1",
+                name,
+                description: None,
+                transport_type: "stdio",
+                transport_config: r#"{"command":"aioncore","args":[],"env":{}}"#,
+                status,
+                template_id: "fake",
+                template_json: "{}",
+                environment: "local",
+                tier: "read",
+                enforcement: "server",
+                clis_json: r#"["claude"]"#,
+                plain_env_json: "{}",
+                secret_refs_json: "{}",
+                tools_allow_json: Some("[]"),
+                tools_block_json: "[]",
+                approval_ref: None,
+            })
+            .await
+            .unwrap();
+        ids.push(row.id);
+    }
+    let plain = servers
+        .create(CreateMcpServerParams {
+            user_id: "user_1",
+            name: "plain",
+            description: None,
+            enabled: false,
+            transport_type: "stdio",
+            transport_config: r#"{"command":"/bin/true"}"#,
+            tools: None,
+            original_json: None,
+            builtin: false,
+        })
+        .await
+        .unwrap();
+    ids.push(plain.id.clone());
+
+    let workspace = ensure_test_workspace_path();
+    let req: CreateConversationRequest = serde_json::from_value(json!({
+        "type": "acp",
+        "extra": { "workspace": workspace, "selected_mcp_server_ids": ids }
+    }))
+    .unwrap();
+    let resp = svc.create("user_1", req).await.unwrap();
+    assert_eq!(resp.extra["mcp_server_ids"], json!([ids[0], plain.id]));
+}

@@ -179,6 +179,17 @@ pub trait BackendConnection: Send + Sync {
 pub struct McpServerSpec {
     pub name: String,
     pub transport: McpTransport,
+    /// Per-server tool filter (MCP market, R1 #6), forwarded by backends whose
+    /// wire has native fields for it (codex). Empty = no filter.
+    pub tool_filter: McpToolFilter,
+}
+
+/// Tool allow/block list carried with an [`McpServerSpec`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct McpToolFilter {
+    /// Allowlist; `None` = every tool not in `disabled_tools`.
+    pub enabled_tools: Option<Vec<String>>,
+    pub disabled_tools: Vec<String>,
 }
 
 /// MCP transport variants (SDK-free mirror of the neutral session-snapshot shape).

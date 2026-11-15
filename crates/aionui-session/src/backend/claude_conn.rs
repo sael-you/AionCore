@@ -3888,6 +3888,7 @@ mod tests {
                         args: vec!["--root".into(), "/tmp".into()],
                         env: vec![("TOKEN".into(), "secret-abc".into())],
                     },
+                    tool_filter: Default::default(),
                 }],
                 ..Default::default()
             },
@@ -4010,6 +4011,7 @@ mod tests {
                     args: vec!["mcp-team-stdio".into()],
                     env: vec![("AIONUI_TEAM_TOKEN".into(), "team-tok-123".into())],
                 },
+                tool_filter: Default::default(),
             },
         );
         let (arg, file) = prepare_claude_mcp_config(&config).expect("prepare");
@@ -4259,6 +4261,7 @@ mod tests {
                 url: "https://example.com/mcp".into(),
                 headers: vec![("Authorization".into(), "Bearer x".into())],
             },
+            tool_filter: Default::default(),
         }])
         .expect("http server → some json");
         let json: serde_json::Value = serde_json::from_str(&json_str).unwrap();
@@ -4280,6 +4283,7 @@ mod tests {
                 url: "https://example.com/events".into(),
                 headers: vec![("Authorization".into(), "Bearer x".into())],
             },
+            tool_filter: Default::default(),
         }])
         .expect("sse server -> some json");
         let json: serde_json::Value = serde_json::from_str(&json_str).unwrap();
@@ -4305,6 +4309,7 @@ mod tests {
                     args: vec![],
                     env: vec![],
                 },
+                tool_filter: Default::default(),
             },
             McpServerSpec {
                 name: "fs".into(), // same name → collapses
@@ -4313,6 +4318,7 @@ mod tests {
                     args: vec![],
                     env: vec![],
                 },
+                tool_filter: Default::default(),
             },
         ])
         .expect("two servers → some json");

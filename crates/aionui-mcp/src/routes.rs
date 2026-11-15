@@ -50,6 +50,9 @@ pub struct McpRouterState {
     pub sync_service: McpSyncService,
     pub connection_test_service: McpConnectionTestService,
     pub oauth_service: McpOAuthService,
+    /// MCP market: `test-connection {id}` of a market row resolves its real
+    /// transport and secrets server-side (R1 #12).
+    pub market: crate::market::McpMarketService,
 }
 
 // ---------------------------------------------------------------------------
@@ -199,7 +202,37 @@ async fn test_connection(
     body: Result<Json<TestMcpConnectionRequest>, JsonRejection>,
 ) -> Result<Response, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    let transport = McpServerTransport::from(req.transport);
+    let market_row = match req.id.as_deref() {
+        Some(id) => state
+            .market
+            .is_market_row(&user.id, id)
+            .await
+            .map_err(crate::market_routes::market_api_error)?,
+        None => false,
+    };
+    let transport = match req.id.as_deref() {
+        // R1 #12: a market row is tested with its template command, plain env and
+        // decrypted secrets; the client-supplied transport is ignored.
+        Some(id) if market_row => state
+            .market
+            .test_transport(&user.id, id)
+            .await
+            .map_err(crate::market_routes::market_api_error)?,
+        Some(id) => {
+            // Mask round-trip (R1 #11): masked values the UI sends back are the stored ones.
+            let mut transport = McpServerTransport::from(req.transport);
+            if let Some(stored) = state
+                .config_service
+                .stored_transport(&user.id, id)
+                .await
+                .map_err(ApiError::from)?
+            {
+                crate::secret_mask::unmask_transport(&mut transport, &stored);
+            }
+            transport
+        }
+        None => McpServerTransport::from(req.transport),
+    };
     let result = state
         .connection_test_service
         .test_connection_with_runtime_scope(

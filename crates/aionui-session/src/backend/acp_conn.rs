@@ -2692,6 +2692,7 @@ mod tests {
                             args: vec!["server.js".into()],
                             env: vec![("TOKEN".into(), "x".into())],
                         },
+                        tool_filter: Default::default(),
                     },
                     McpServerSpec {
                         name: "remote".into(),
@@ -2699,6 +2700,7 @@ mod tests {
                             url: "https://mcp.example/api".into(),
                             headers: vec![("Authorization".into(), "Bearer y".into())],
                         },
+                        tool_filter: Default::default(),
                     },
                 ],
                 ..Default::default()
