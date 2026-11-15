@@ -461,25 +461,33 @@ impl IConversationRepository for SqliteConversationRepository {
         Ok(())
     }
 
-    async fn set_extra_keys(
+    async fn patch_extra_keys(
         &self,
         user_id: &str,
         id: &str,
-        entries: &[(&str, serde_json::Value)],
+        set: &[(&str, serde_json::Value)],
+        remove: &[&str],
         status: Option<&str>,
         updated_at: Option<TimestampMs>,
     ) -> Result<bool, DbError> {
-        crate::repository::conversation::validate_extra_keys(entries)?;
-        // One statement: json_set on the CURRENT extra, so a concurrent writer
-        // (e.g. a model-failure recovery removing a key) is never undone.
+        crate::repository::conversation::validate_extra_keys(
+            set.iter().map(|(key, _)| *key).chain(remove.iter().copied()),
+        )?;
+        // One statement on the CURRENT extra, so a concurrent writer (e.g. a
+        // model-failure recovery removing a key) is never undone.
         let mut set_parts: Vec<String> = Vec::new();
-        if !entries.is_empty() {
-            let paths: Vec<String> = entries.iter().map(|(key, _)| format!("'$.{key}', json(?)")).collect();
-            set_parts.push(format!(
-                "extra = json_set(CASE WHEN json_valid(extra) AND json_type(extra) = 'object' \
-                 THEN extra ELSE '{{}}' END, {})",
-                paths.join(", ")
-            ));
+        if !set.is_empty() || !remove.is_empty() {
+            let mut expr =
+                "CASE WHEN json_valid(extra) AND json_type(extra) = 'object' THEN extra ELSE '{}' END".to_owned();
+            if !set.is_empty() {
+                let paths: Vec<String> = set.iter().map(|(key, _)| format!("'$.\"{key}\"', json(?)")).collect();
+                expr = format!("json_set({expr}, {})", paths.join(", "));
+            }
+            if !remove.is_empty() {
+                let paths: Vec<String> = remove.iter().map(|key| format!("'$.\"{key}\"'")).collect();
+                expr = format!("json_remove({expr}, {})", paths.join(", "));
+            }
+            set_parts.push(format!("extra = {expr}"));
         }
         if status.is_some() {
             set_parts.push("status = ?".to_owned());
@@ -495,7 +503,7 @@ impl IConversationRepository for SqliteConversationRepository {
             set_parts.join(", ")
         );
         let mut query = sqlx::query(&sql);
-        for (_, value) in entries {
+        for (_, value) in set {
             query = query.bind(value.to_string());
         }
         if let Some(status) = status {

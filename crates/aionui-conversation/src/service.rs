@@ -18,13 +18,13 @@ use aionui_api_types::{
     ASSISTANT_MCP_BINDING_CHANGED_EVENT, ApprovalCheckResponse, AssistantConversationOverridesRequest,
     AssistantMcpBindingChanged, CancelConversationResponse, CloneConversationRequest, ConfirmRequest,
     ConfirmationListResponse, ConversationArtifactKind, ConversationArtifactListResponse, ConversationArtifactResponse,
-    ConversationArtifactStatus, ConversationListResponse, ConversationMcpStatus, ConversationMcpStatusKind,
-    ConversationNameUpdatedPayload, ConversationResponse, ConversationRuntimeSummary, CreateConversationRequest,
-    EnsureConversationRuntimeResponse, ForkCapabilityView, ForkConversationRequest, ListConversationsQuery,
-    ListMessagesQuery, McpRuntimeSnapshot, MessageListResponse, MessageResponse, MessageSearchResponse,
-    PromptCapabilityView, SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SessionMcpServer,
-    SessionMcpTransport, TEAM_MCP_SERVER_NAME, TeamMcpSelection, TeamSessionBinding, UpdateConversationArtifactRequest,
-    UpdateConversationRequest, WebSocketMessage, assistant_avatar_response_value,
+    ConversationArtifactStatus, ConversationListResponse, ConversationLiveState, ConversationMcpStatus,
+    ConversationMcpStatusKind, ConversationNameUpdatedPayload, ConversationResponse, ConversationRuntimeSummary,
+    CreateConversationRequest, EnsureConversationRuntimeResponse, ForkCapabilityView, ForkConversationRequest,
+    ListConversationsQuery, ListMessagesQuery, McpRuntimeSnapshot, MessageListResponse, MessageResponse,
+    MessageSearchResponse, PromptCapabilityView, SearchMessagesQuery, SendMessageRequest, SendMessageResponse,
+    SessionMcpServer, SessionMcpTransport, TEAM_MCP_SERVER_NAME, TeamMcpSelection, TeamSessionBinding,
+    UpdateConversationArtifactRequest, UpdateConversationRequest, WebSocketMessage, assistant_avatar_response_value,
     assistant_avatar_response_value_with_version, assistant_mcp_binding_fingerprint,
 };
 use aionui_api_types::{ChatFileRef, SessionRef};
@@ -815,6 +815,29 @@ impl ConversationService {
 
     pub(crate) fn task_manager(&self) -> &Arc<dyn IWorkerTaskManager> {
         &self.task_manager
+    }
+
+    /// What a conversation's live agent is doing, for list rows (C21): `None`
+    /// without a live agent or when it is idle with nothing pending and no
+    /// background work. In-memory only (no database read), so the list stays
+    /// one query.
+    pub fn live_state_for(&self, conversation_id: &str) -> Option<ConversationLiveState> {
+        let agent = self.task_manager.get_task(conversation_id)?;
+        let pending_confirmations = agent.get_confirmations().len();
+        let background_active = agent.live_background_tasks();
+        let summary = self.runtime_state.summary_from_parts(
+            conversation_id,
+            agent.status(),
+            true,
+            pending_confirmations,
+            agent.supports_midturn_delivery(),
+        );
+        let live = ConversationLiveState {
+            is_processing: summary.is_processing,
+            pending_confirmations,
+            background_active,
+        };
+        (live.is_processing || pending_confirmations > 0 || background_active > 0).then_some(live)
     }
 
     pub async fn runtime_summary_for(&self, conversation_id: &str) -> ConversationRuntimeSummary {
@@ -2288,6 +2311,7 @@ impl ConversationService {
             match row_to_response_with_extra(row, extra, &self.workspace_root) {
                 Ok(mut resp) => {
                     self.attach_assistant_identity(user_id, &mut resp).await?;
+                    resp.live = self.live_state_for(&resp.id);
                     items.push(resp);
                 }
                 Err(err) => warn!(
@@ -2375,24 +2399,46 @@ impl ConversationService {
 
         // Merge extra if provided. For aionrs, strip `extra.model` post-merge
         // so the row keeps a single canonical model source (top-level column).
+        // Preferred: the patch's top-level keys set (and `user_id` / aionrs
+        // `model` removed) in ONE statement on the current extra, after the
+        // column update below; the whole-object merge is only the fallback for
+        // keys a JSON path cannot address.
+        let mut atomic_extra: Option<AtomicExtraPatch> = None;
         let merged_extra = if let Some(new_extra) = &req.extra {
-            let mut existing_extra: serde_json::Value =
-                serde_json::from_str(&existing.extra).unwrap_or_else(|_| serde_json::json!({}));
-            merge_json(&mut existing_extra, new_extra);
-            strip_request_owner_user_id(&mut existing_extra);
-            if existing_type == AgentType::Aionrs
-                && let Some(obj) = existing_extra.as_object_mut()
-                && obj.remove("model").is_some()
-            {
-                warn!("aionrs update: stripped legacy `extra.model` from merged extra");
+            if let Some(mut entries) = atomic_extra_entries(new_extra)? {
+                let mut remove = vec!["user_id"];
+                entries.retain(|(key, _)| key != "user_id");
+                if existing_type == AgentType::Aionrs {
+                    entries.retain(|(key, _)| key != "model");
+                    remove.push("model");
+                    let had_model = serde_json::from_str::<serde_json::Value>(&existing.extra)
+                        .ok()
+                        .is_some_and(|extra| extra.get("model").is_some());
+                    if had_model || new_extra.get("model").is_some() {
+                        warn!("aionrs update: stripped legacy `extra.model` from merged extra");
+                    }
+                }
+                atomic_extra = Some((entries, remove));
+                None
+            } else {
+                let mut existing_extra: serde_json::Value =
+                    serde_json::from_str(&existing.extra).unwrap_or_else(|_| serde_json::json!({}));
+                merge_json(&mut existing_extra, new_extra);
+                strip_request_owner_user_id(&mut existing_extra);
+                if existing_type == AgentType::Aionrs
+                    && let Some(obj) = existing_extra.as_object_mut()
+                    && obj.remove("model").is_some()
+                {
+                    warn!("aionrs update: stripped legacy `extra.model` from merged extra");
+                }
+                if new_extra.get("workspace").is_some() {
+                    normalize_workspace_extra(&mut existing_extra)?;
+                }
+                Some(
+                    serde_json::to_string(&existing_extra)
+                        .map_err(|e| ConversationError::internal(format!("Failed to serialize merged extra: {e}")))?,
+                )
             }
-            if new_extra.get("workspace").is_some() {
-                normalize_workspace_extra(&mut existing_extra)?;
-            }
-            Some(
-                serde_json::to_string(&existing_extra)
-                    .map_err(|e| ConversationError::internal(format!("Failed to serialize merged extra: {e}")))?,
-            )
         } else {
             None
         };
@@ -2439,6 +2485,12 @@ impl ConversationService {
         };
 
         self.conversation_repo.update(user_id, id, &updates).await?;
+        if let Some((entries, remove)) = &atomic_extra {
+            let set: Vec<(&str, serde_json::Value)> = entries.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+            self.conversation_repo
+                .patch_extra_keys(user_id, id, &set, remove, None, None)
+                .await?;
+        }
 
         if let Some(model) = req.model.as_ref() {
             let selected_model = model.use_model.as_deref().unwrap_or(model.model.as_str());
@@ -2506,6 +2558,17 @@ impl ConversationService {
             .ok_or_else(|| ConversationError::NotFound {
                 id: conversation_id.to_owned(),
             })?;
+
+        // Top-level keys only (the same shallow merge as `merge_json`), set in
+        // one statement on the current extra; never a whole-object rewrite.
+        if let Some(entries) = atomic_extra_entries(&patch)? {
+            let set: Vec<(&str, serde_json::Value)> = entries.iter().map(|(k, v)| (k.as_str(), v.clone())).collect();
+            self.conversation_repo
+                .patch_extra_keys(user_id, conversation_id, &set, &[], None, Some(now_ms()))
+                .await?;
+            debug!("Conversation extra merged");
+            return Ok(());
+        }
 
         let mut merged: serde_json::Value =
             serde_json::from_str(&existing.extra).unwrap_or_else(|_| serde_json::json!({}));
@@ -6081,6 +6144,31 @@ fn prompt_capability_view(capabilities: &serde_json::Value) -> Option<PromptCapa
     })
 }
 
+/// Keys to set and keys to remove in one atomic `extra` write.
+type AtomicExtraPatch = (Vec<(String, serde_json::Value)>, Vec<&'static str>);
+
+/// The top-level entries of an `extra` patch for an atomic
+/// `patch_extra_keys`, with `workspace` normalized like a merged write would.
+/// `None` when the patch is not an object or has a key a JSON path cannot
+/// address (the caller then falls back to the merge).
+fn atomic_extra_entries(
+    patch: &serde_json::Value,
+) -> Result<Option<Vec<(String, serde_json::Value)>>, ConversationError> {
+    let Some(object) = patch.as_object() else {
+        return Ok(None);
+    };
+    if !object.keys().all(|key| aionui_db::is_valid_extra_key(key)) {
+        return Ok(None);
+    }
+    let mut normalized = serde_json::Value::Object(object.clone());
+    if object.contains_key("workspace") {
+        normalize_workspace_extra(&mut normalized)?;
+    }
+    Ok(normalized
+        .as_object()
+        .map(|o| o.iter().map(|(k, v)| (k.clone(), v.clone())).collect()))
+}
+
 fn merge_json(base: &mut serde_json::Value, patch: &serde_json::Value) {
     if let (Some(base_obj), Some(patch_obj)) = (base.as_object_mut(), patch.as_object()) {
         for (key, value) in patch_obj {
@@ -6368,6 +6456,7 @@ mod tests {
             project_id: None,
             fork_capability: None,
             prompt_capability: None,
+            live: None,
             created_at: 0,
             modified_at: 0,
             extra: json!({}),

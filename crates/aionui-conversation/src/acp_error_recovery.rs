@@ -2,7 +2,7 @@ use std::sync::Arc;
 
 use aionui_api_types::AgentErrorCode;
 use aionui_common::{AgentKillReason, AgentType, ConversationSource, now_ms};
-use aionui_db::{ConversationRowUpdate, SaveRuntimeStateParams};
+use aionui_db::SaveRuntimeStateParams;
 use tracing::{info, warn};
 
 use crate::convert::string_to_enum;
@@ -95,26 +95,21 @@ impl ConversationService {
             );
         }
 
-        let extra_json = match serde_json::to_string(&extra) {
-            Ok(json) => json,
-            Err(err) => {
-                warn!(
-                    conversation_id,
-                    ?previous_model_id,
-                    error = %err,
-                    error_code = ?error_code,
-                    reason = ?AgentKillReason::AgentErrorRecovery,
-                    "Failed to serialize conversation extra after clearing ACP model seed"
-                );
-                return;
-            }
-        };
-        let update = ConversationRowUpdate {
-            extra: Some(extra_json),
-            updated_at: Some(now_ms()),
-            ..Default::default()
-        };
-        if let Err(err) = self.conversation_repo().update(user_id, conversation_id, &update).await {
+        // Remove the key in ONE statement on the current extra (the read above
+        // only decides whether there is anything to clear): a concurrent extra
+        // write since that read is kept.
+        let cleared = self
+            .conversation_repo()
+            .patch_extra_keys(
+                user_id,
+                conversation_id,
+                &[],
+                &["current_model_id"],
+                None,
+                Some(now_ms()),
+            )
+            .await;
+        if let Err(err) = cleared {
             warn!(
                 conversation_id,
                 ?previous_model_id,

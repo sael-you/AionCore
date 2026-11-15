@@ -10121,6 +10121,10 @@ async fn turn_end_records_outcome_and_open_marks_it_seen() {
         .find(|event| event.name == "turn.completed")
         .expect("turn.completed");
     assert_eq!(completed.data["last_outcome"], "finished");
+    assert_eq!(
+        completed.data["last_outcome_at"], outcome_at,
+        "the UI's seen mark uses this server time"
+    );
 
     let updated_before = row.updated_at;
     let seen_at = svc.mark_outcome_seen("user_1", &conv.id).await.unwrap();
@@ -10133,4 +10137,40 @@ async fn turn_end_records_outcome_and_open_marks_it_seen() {
 
     let missing = svc.mark_outcome_seen("user_1", "nope").await.unwrap_err();
     assert!(matches!(missing, ConversationError::NotFound { .. }));
+}
+
+/// TASK-81: the list itself says which conversations are live, so the sidebar
+/// is right after a reload. Core never writes status "running" to the row
+/// (turn ends write "finished"); the signal comes from the live agent.
+#[tokio::test]
+async fn list_rows_carry_live_state_for_conversations_waiting_on_the_owner() {
+    let task_mgr = Arc::new(MockTaskManager::new());
+    let (svc, _broadcaster, _repo) = make_service_with_mock_task_manager(task_mgr.clone());
+    let waiting = svc.create("user_1", make_create_req()).await.unwrap();
+    let idle_agent = svc.create("user_1", make_create_req()).await.unwrap();
+    let no_agent = svc.create("user_1", make_create_req()).await.unwrap();
+    task_mgr.insert_agent(
+        &waiting.id,
+        AgentInstance::Mock(Arc::new(MockAgent::with_confirmations(
+            &waiting.id,
+            make_test_confirmations(),
+        ))),
+    );
+    task_mgr.insert_agent(
+        &idle_agent.id,
+        AgentInstance::Mock(Arc::new(MockAgent::new(&idle_agent.id))),
+    );
+
+    let result = svc.list("user_1", ListConversationsQuery::default()).await.unwrap();
+    let by_id = |id: &str| result.items.iter().find(|c| c.id == id).unwrap().clone();
+
+    let live = by_id(&waiting.id).live.expect("waiting conversation is live");
+    assert!(live.pending_confirmations > 0);
+    assert_ne!(by_id(&waiting.id).status, aionui_common::ConversationStatus::Running);
+    assert!(by_id(&idle_agent.id).live.is_none(), "an idle agent is not live");
+    assert!(by_id(&no_agent.id).live.is_none());
+    let json = serde_json::to_value(by_id(&no_agent.id)).unwrap();
+    assert!(json.get("live").is_none(), "absent, not null: {json}");
+    let json = serde_json::to_value(by_id(&waiting.id)).unwrap();
+    assert!(json["live"]["pending_confirmations"].as_u64().unwrap() > 0, "{json}");
 }
