@@ -2102,6 +2102,7 @@ async fn remove_project_previews_and_deletes_the_board() {
 
     let result = fx.service.remove_project(USER, "proj-std", false).await.unwrap();
     assert_eq!(result.board_cards, 2);
+    assert!(!result.partial);
     assert!(*ports.board_deleted.lock().unwrap());
     assert!(*ports.project_deleted.lock().unwrap());
 }
@@ -2116,7 +2117,8 @@ async fn remove_project_keeps_the_record_when_the_board_delete_fails() {
     let ports = FakePorts::new(pool.clone(), uo_store(pool), &["board:proj-std"]);
     fx.service.set_remove_project_ports(ports.clone());
 
-    fx.service.remove_project(USER, "proj-std", false).await.unwrap();
+    let result = fx.service.remove_project(USER, "proj-std", false).await.unwrap();
+    assert!(result.partial, "a failed board delete is not reported as success");
     assert!(!*ports.project_deleted.lock().unwrap(), "record kept for the retry");
     let proj_left: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM projects WHERE project_id = 'proj-std'")
         .fetch_one(pool)

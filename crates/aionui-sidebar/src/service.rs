@@ -449,6 +449,7 @@ impl SidebarService {
                 teams_deleted: team_ids.len() as i64,
                 conversations_deleted: conv_ids.len() as i64,
                 board_cards,
+                partial: false,
                 items,
             });
         }
@@ -507,6 +508,7 @@ impl SidebarService {
             teams_deleted,
             conversations_deleted,
             board_cards: board_cards.unwrap_or(0),
+            partial: board_cards.is_none(),
             items: Vec::new(),
         })
     }
