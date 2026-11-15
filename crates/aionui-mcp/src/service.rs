@@ -373,7 +373,7 @@ impl McpConfigService {
 /// (e.g. a masked `agent-configs` entry sent to create/import).
 fn reject_masked(transport: &McpServerTransport) -> Result<(), McpError> {
     if crate::secret_mask::transport_contains_mask(transport) {
-        return Err(McpError::InvalidTransport(
+        return Err(McpError::MaskedValue(
             "a value is masked (\"•••\"); enter the real value".to_owned(),
         ));
     }

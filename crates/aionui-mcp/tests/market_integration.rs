@@ -696,7 +696,7 @@ async fn r1_11_legacy_rows_are_masked_and_round_trip() {
         )
         .await
         .unwrap_err();
-    assert!(matches!(err, McpError::InvalidTransport(_)));
+    assert!(matches!(err, McpError::MaskedValue(_)), "{err:?}");
 }
 
 #[tokio::test]
@@ -953,4 +953,132 @@ fn which_node() -> Option<String> {
         .into_iter()
         .find(|p| std::path::Path::new(p).exists())
         .map(str::to_owned)
+}
+
+// -- template refresh (R10) -------------------------------------------------------------
+
+struct SwappableCatalog(std::sync::Mutex<Vec<serde_json::Value>>);
+
+#[async_trait::async_trait]
+impl aionui_mcp::IMcpTemplateCatalog for SwappableCatalog {
+    async fn entries(&self, _user_id: &str) -> Result<Vec<serde_json::Value>, String> {
+        Ok(self.0.lock().unwrap().clone())
+    }
+}
+
+fn paddle_version(version: &str, pkg: &str, env: serde_json::Value) -> serde_json::Value {
+    json!({"id": "paddle", "name": "Paddle", "market": {
+        "version": version, "transport": "stdio",
+        "command": {"command": "npx", "args": ["-y", pkg]},
+        "env": env, "tiers": ["read"], "enforcement": "server", "clis": ["claude"]
+    }})
+}
+
+#[tokio::test]
+async fn template_refresh_keeps_secrets_and_assignments_and_needs_new_secrets_first() {
+    let db = init_database_memory().await.unwrap();
+    sqlx::query("INSERT INTO projects (project_id, user_id, name, kind, created_at, updated_at) VALUES ('proj-a', 'system_default_user', 'A', 'standard', 1, 1)")
+        .execute(db.pool())
+        .await
+        .unwrap();
+    let repo: Arc<dyn IMcpMarketRepository> = Arc::new(SqliteMcpMarketRepository::new(db.pool().clone()));
+    let servers: Arc<dyn IMcpServerRepository> = Arc::new(SqliteMcpServerRepository::new(db.pool().clone()));
+    let v1 = paddle_version(
+        "0.1.0",
+        "@paddle/paddle-mcp@0.1.0",
+        json!({"PADDLE_API_KEY": {"kind": "secret", "required": true}, "OLD_PLAIN": {"kind": "plain"}}),
+    );
+    let catalog = Arc::new(SwappableCatalog(std::sync::Mutex::new(vec![v1])));
+    let market = McpMarketService::new(repo.clone(), servers, catalog.clone(), KEY);
+    let mut req = paddle_read("tb-refresh");
+    req.clis = vec!["claude".into()];
+    req.plain_env = BTreeMap::from([("OLD_PLAIN".into(), "x".into())]);
+    let inst = market.create_instance(USER, req).await.unwrap();
+    market
+        .set_secret(USER, &inst.id, "PADDLE_API_KEY", FIXTURE_SECRET)
+        .await
+        .unwrap();
+    market
+        .update_instance(
+            USER,
+            &inst.id,
+            UpdateMcpMarketInstanceRequest {
+                status: Some("active".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    market
+        .create_assignments(
+            USER,
+            CreateMcpMarketAssignmentRequest {
+                instance_id: inst.id.clone(),
+                project_id: Some("proj-a".into()),
+                assistant_id: None,
+                clis: vec!["claude".into()],
+            },
+        )
+        .await
+        .unwrap();
+
+    // v2: OLD_PLAIN removed, NEW_SECRET (required) and NEW_MODE (default) added, new package pin.
+    *catalog.0.lock().unwrap() = vec![paddle_version(
+        "0.2.0",
+        "@paddle/paddle-mcp@0.2.0",
+        json!({"PADDLE_API_KEY": {"kind": "secret", "required": true},
+               "NEW_SECRET": {"kind": "secret", "required": true},
+               "NEW_MODE": {"kind": "plain", "default": "safe"}}),
+    )];
+    let launch = LaunchRequest {
+        user_id: USER,
+        instance: "tb-refresh",
+        scope: project("proj-a"),
+        cli: "claude",
+    };
+
+    // A required new secret is missing: refused, the instance keeps v1.
+    let err = market.refresh_template(USER, &inst.id).await.unwrap_err();
+    assert!(
+        matches!(&err, MarketError::TemplateSecretMissing(m) if m.contains("NEW_SECRET")),
+        "{err:?}"
+    );
+    let plan = resolve_launch(repo.as_ref(), &KEY, &launch).await.unwrap();
+    assert_eq!(plan.args, vec!["-y", "@paddle/paddle-mcp@0.1.0"]);
+
+    // The new secret can be set before the refresh; the running v1 never receives it.
+    market
+        .set_secret(USER, &inst.id, "NEW_SECRET", "new_secret_value_FIXTURE_v2")
+        .await
+        .unwrap();
+    let plan = resolve_launch(repo.as_ref(), &KEY, &launch).await.unwrap();
+    assert!(!plan.env.iter().any(|(k, _)| k == "NEW_SECRET"));
+
+    let refreshed = market.refresh_template(USER, &inst.id).await.unwrap();
+    assert!(refreshed.changed);
+    assert_eq!(refreshed.from_version.as_deref(), Some("0.1.0"));
+    assert_eq!(refreshed.to_version.as_deref(), Some("0.2.0"));
+    assert_eq!(refreshed.added_keys, vec!["NEW_MODE", "NEW_SECRET"]);
+    assert_eq!(refreshed.removed_keys, vec!["OLD_PLAIN"]);
+    assert_eq!(refreshed.instance.status, "active");
+    assert!(!refreshed.instance.plain_env.contains_key("OLD_PLAIN"));
+    assert_eq!(refreshed.instance.plain_env["NEW_MODE"], "safe");
+    assert!(refreshed.instance.secrets.iter().all(|s| s.set), "secrets kept");
+    assert_eq!(
+        market.list_assignments(USER, None, Some(&inst.id)).await.unwrap().len(),
+        1,
+        "assignments kept"
+    );
+    let plan = resolve_launch(repo.as_ref(), &KEY, &launch).await.unwrap();
+    assert_eq!(plan.args, vec!["-y", "@paddle/paddle-mcp@0.2.0"]);
+    assert!(
+        plan.env
+            .contains(&("PADDLE_API_KEY".to_owned(), FIXTURE_SECRET.to_owned()))
+    );
+    assert!(plan.env.iter().any(|(k, _)| k == "NEW_SECRET"));
+    assert!(!serde_json::to_string(&refreshed).unwrap().contains("FIXTURE"));
+
+    // Refreshing again is a no-op.
+    let again = market.refresh_template(USER, &inst.id).await.unwrap();
+    assert!(!again.changed && again.added_keys.is_empty() && again.removed_keys.is_empty());
 }

@@ -18,8 +18,8 @@ use axum::routing::{get, post, put};
 use aionui_api_types::{
     ApiResponse, CreateMcpMarketAssignmentRequest, CreateMcpMarketInstanceRequest, DuplicateMcpMarketInstanceRequest,
     ListMcpMarketAssignmentsQuery, McpMarketAssignmentResponse, McpMarketInstanceResponse, McpMarketSecretStatus,
-    McpMarketSnapshotQuery, McpMarketStatusResponse, McpMarketTemplate, SetMcpMarketApprovalRequest,
-    SetMcpMarketSecretRequest, UpdateMcpMarketInstanceRequest,
+    McpMarketSnapshotQuery, McpMarketStatusResponse, McpMarketTemplate, McpMarketTemplateRefreshResponse,
+    SetMcpMarketApprovalRequest, SetMcpMarketSecretRequest, UpdateMcpMarketInstanceRequest,
 };
 use aionui_auth::{AuthChannel, CurrentUser};
 use aionui_common::ApiError;
@@ -33,10 +33,13 @@ pub struct McpMarketRouterState {
 
 pub(crate) fn market_api_error(err: MarketError) -> ApiError {
     match err {
-        MarketError::Invalid(msg) => ApiError::BadRequest(msg),
+        MarketError::Invalid(msg) => ApiError::coded(StatusCode::BAD_REQUEST, "MCP_MARKET_INVALID", msg, None),
+        MarketError::TemplateSecretMissing(msg) => {
+            ApiError::coded(StatusCode::CONFLICT, "MCP_TEMPLATE_SECRET_MISSING", msg, None)
+        }
         MarketError::NotFound(msg) => ApiError::NotFound(msg),
         MarketError::Conflict(msg) => ApiError::Conflict(msg),
-        MarketError::Forbidden(msg) => ApiError::Forbidden(msg),
+        MarketError::Forbidden(msg) => ApiError::coded(StatusCode::FORBIDDEN, "MCP_MARKET_FORBIDDEN", msg, None),
         MarketError::Unavailable(msg) => {
             ApiError::coded(StatusCode::SERVICE_UNAVAILABLE, "MCP_MARKET_UNAVAILABLE", msg, None)
         }
@@ -91,6 +94,10 @@ pub fn mcp_market_write_routes(state: McpMarketRouterState) -> Router {
         )
         .route("/api/mcp/market/instances/{id}/duplicate", post(duplicate_instance))
         .route("/api/mcp/market/instances/{id}/revoke", post(revoke_instance))
+        .route(
+            "/api/mcp/market/instances/{id}/refresh-template",
+            post(refresh_template),
+        )
         .route("/api/mcp/market/instances/{id}/approval", put(set_approval))
         .route(
             "/api/mcp/market/instances/{id}/secrets/{key}",
@@ -261,6 +268,21 @@ async fn revoke_instance(
         .await
         .map_err(market_api_error)?;
     Ok(Json(ApiResponse::ok(inst)))
+}
+
+async fn refresh_template(
+    State(state): State<McpMarketRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    channel: Channel,
+    Path(id): Path<String>,
+) -> Result<Json<ApiResponse<McpMarketTemplateRefreshResponse>>, ApiError> {
+    require_session(&channel)?;
+    let refreshed = state
+        .market
+        .refresh_template(&user.id, &id)
+        .await
+        .map_err(market_api_error)?;
+    Ok(Json(ApiResponse::ok(refreshed)))
 }
 
 async fn set_approval(

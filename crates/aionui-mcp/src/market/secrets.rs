@@ -21,23 +21,40 @@ impl McpMarketService {
         Ok(out)
     }
 
-    fn secret_slot<'a>(&self, inst: &'a StoredInstance, key: &str) -> Result<(&'a String, bool), MarketError> {
-        let field = inst
-            .template
-            .env
-            .get(key)
-            .filter(|f| f.kind == McpMarketEnvKind::Secret)
-            .ok_or_else(|| {
-                MarketError::NotFound(format!(
-                    "secret key {key} is not declared by template {}",
-                    inst.template.id
-                ))
-            })?;
-        let name = inst
-            .secret_refs
-            .get(key)
-            .ok_or_else(|| MarketError::Internal(format!("instance {} has no ref for {key}", inst.row.name)))?;
-        Ok((name, field.required))
+    /// The ref name and `required` flag of secret `key`: declared by the
+    /// instance's template snapshot, or by the catalogue's current version of
+    /// that template (so a secret a refresh will need can be set first; the
+    /// launcher only ever decrypts keys of the snapshot it runs).
+    async fn secret_slot(
+        &self,
+        user_id: &str,
+        inst: &StoredInstance,
+        key: &str,
+    ) -> Result<(String, bool), MarketError> {
+        let declared = |t: &aionui_api_types::McpMarketTemplate| {
+            t.env
+                .get(key)
+                .filter(|f| f.kind == McpMarketEnvKind::Secret)
+                .map(|f| f.required)
+        };
+        if let Some(required) = declared(&inst.template) {
+            let name = inst
+                .secret_refs
+                .get(key)
+                .cloned()
+                .unwrap_or_else(|| super::rules::secret_ref_name(&inst.row.name, key));
+            return Ok((name, required));
+        }
+        let current = super::template::find_template(self.catalog.as_ref(), user_id, &inst.template.id)
+            .await
+            .ok();
+        match current.as_ref().and_then(declared) {
+            Some(required) => Ok((super::rules::secret_ref_name(&inst.row.name, key), required)),
+            None => Err(MarketError::NotFound(format!(
+                "secret key {key} is not declared by template {}",
+                inst.template.id
+            ))),
+        }
     }
 
     /// Set or replace one secret. The value is encrypted before it reaches the
@@ -50,7 +67,7 @@ impl McpMarketService {
         value: &str,
     ) -> Result<McpMarketSecretStatus, MarketError> {
         let inst = self.load(user_id, instance_id).await?;
-        let (name, required) = self.secret_slot(&inst, key)?;
+        let (name, required) = self.secret_slot(user_id, &inst, key).await?;
         if value.is_empty() {
             return Err(invalid("secret value must not be empty; use DELETE to clear it"));
         }
@@ -62,7 +79,10 @@ impl McpMarketService {
         }
         let encrypted = encrypt_string(value, &self.encryption_key)
             .map_err(|_| MarketError::Internal("secret encryption failed".to_owned()))?;
-        let row = self.repo.upsert_secret(user_id, &inst.row.id, name, &encrypted).await?;
+        let row = self
+            .repo
+            .upsert_secret(user_id, &inst.row.id, &name, &encrypted)
+            .await?;
         info!(instance = %inst.row.name, secret = %name, "mcp market: secret set");
         Ok(McpMarketSecretStatus {
             key: key.to_owned(),
@@ -84,9 +104,9 @@ impl McpMarketService {
         key: &str,
     ) -> Result<McpMarketSecretStatus, MarketError> {
         let inst = self.load(user_id, instance_id).await?;
-        let (name, required) = self.secret_slot(&inst, key)?;
-        let removed = self.repo.delete_secret(user_id, &inst.row.id, name).await?;
-        if removed && required && inst.status == "active" {
+        let (name, required) = self.secret_slot(user_id, &inst, key).await?;
+        let removed = self.repo.delete_secret(user_id, &inst.row.id, &name).await?;
+        if removed && required && inst.status == "active" && inst.template.env.contains_key(key) {
             self.repo
                 .update_instance(
                     user_id,

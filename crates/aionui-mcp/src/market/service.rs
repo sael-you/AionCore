@@ -407,6 +407,110 @@ impl McpMarketService {
         Ok(to_response(&inst, &secrets))
     }
 
+    /// Re-apply the catalogue's current version of the instance's template
+    /// (R10). Secrets and assignments are kept; plain values of keys the new
+    /// template no longer declares are dropped, new plain defaults and the
+    /// tier's forced env are applied, and new secret keys get their refs.
+    /// Refused (instance unchanged) when a required secret of the new version
+    /// is not set, or when the instance would break a rule under it.
+    pub async fn refresh_template(
+        &self,
+        user_id: &str,
+        id: &str,
+    ) -> Result<aionui_api_types::McpMarketTemplateRefreshResponse, MarketError> {
+        let mut inst = self.load(user_id, id).await?;
+        let current = find_template(self.catalog.as_ref(), user_id, &inst.template.id).await?;
+        let old = std::mem::replace(&mut inst.template, current.clone());
+        let added_keys: Vec<String> = current
+            .env
+            .keys()
+            .filter(|k| !old.env.contains_key(*k))
+            .cloned()
+            .collect();
+        let removed_keys: Vec<String> = old
+            .env
+            .keys()
+            .filter(|k| !current.env.contains_key(*k))
+            .cloned()
+            .collect();
+        let changed = old != current;
+
+        // Plain env: only keys the new template declares plain; then defaults + forced tier env.
+        inst.plain_env
+            .retain(|k, _| current.env.get(k).is_some_and(|f| f.kind == McpMarketEnvKind::Plain));
+        let tier = inst.tier.clone();
+        apply_defaults(&current, &tier, &mut inst.plain_env);
+        // Secret refs: existing names kept, new secret keys get derived names.
+        inst.secret_refs = secret_keys(&current)
+            .into_iter()
+            .map(|k| {
+                let name = inst
+                    .secret_refs
+                    .get(&k)
+                    .cloned()
+                    .unwrap_or_else(|| secret_ref_name(&inst.row.name, &k));
+                (k, name)
+            })
+            .collect();
+        let stored = self.repo.list_instance_secrets(user_id, id).await?;
+        let missing: Vec<&String> = current
+            .env
+            .iter()
+            .filter(|(_, f)| f.kind == McpMarketEnvKind::Secret && f.required)
+            .map(|(k, _)| k)
+            .filter(|k| {
+                !inst
+                    .secret_refs
+                    .get(*k)
+                    .is_some_and(|n| stored.iter().any(|s| &s.name == n))
+            })
+            .collect();
+        if !missing.is_empty() {
+            return Err(MarketError::TemplateSecretMissing(format!(
+                "template {} {} needs secret {} first; the instance stays on its current version",
+                current.id,
+                current.version.as_deref().unwrap_or("(unversioned)"),
+                missing.iter().map(|k| k.as_str()).collect::<Vec<_>>().join(", ")
+            )));
+        }
+        let secrets_set: Vec<String> = inst
+            .secret_refs
+            .iter()
+            .filter(|(_, n)| stored.iter().any(|s| &s.name == *n))
+            .map(|(k, _)| k.clone())
+            .collect();
+        reject(instance_problems(&inst.spec(), &current, &secrets_set))?;
+
+        let template_json = serde_json::to_string(&current)?;
+        let plain_env_json = serde_json::to_string(&inst.plain_env)?;
+        let secret_refs_json = serde_json::to_string(&inst.secret_refs)?;
+        let row = self
+            .repo
+            .update_instance(
+                user_id,
+                id,
+                &UpdateMarketInstanceParams {
+                    template_json: Some(&template_json),
+                    plain_env_json: Some(&plain_env_json),
+                    secret_refs_json: Some(&secret_refs_json),
+                    enforcement: Some(&current.enforcement),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        info!(instance = %inst.row.name, template = %current.id, changed, added = added_keys.len(), removed = removed_keys.len(), "mcp market: template refreshed");
+        let inst = StoredInstance::from_row(row)?;
+        let secrets = self.repo.list_instance_secrets(user_id, id).await?;
+        Ok(aionui_api_types::McpMarketTemplateRefreshResponse {
+            instance: to_response(&inst, &secrets),
+            from_version: old.version,
+            to_version: current.version,
+            added_keys,
+            removed_keys,
+            changed,
+        })
+    }
+
     /// Whether `id` is a (non-deleted) market row.
     pub async fn is_market_row(&self, user_id: &str, id: &str) -> Result<bool, MarketError> {
         Ok(self.repo.find_instance(user_id, id).await?.is_some())

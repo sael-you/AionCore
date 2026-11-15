@@ -3,9 +3,13 @@ use aionui_db::DbError;
 /// Market service errors. Messages name keys, ids and rules, never a value.
 #[derive(Debug, thiserror::Error)]
 pub enum MarketError {
-    /// A rule (R1–R11) or input check failed (HTTP 400).
+    /// A rule (R1–R11) or input check failed (HTTP 400, `MCP_MARKET_INVALID`).
     #[error("{0}")]
     Invalid(String),
+    /// A template refresh needs a required secret that is not set yet
+    /// (HTTP 409, `MCP_TEMPLATE_SECRET_MISSING`); the instance is unchanged.
+    #[error("{0}")]
+    TemplateSecretMissing(String),
     #[error("not found: {0}")]
     NotFound(String),
     #[error("conflict: {0}")]

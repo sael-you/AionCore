@@ -128,6 +128,8 @@ pub struct MarketInstanceParams<'a> {
 #[derive(Debug, Clone, Default)]
 pub struct UpdateMarketInstanceParams<'a> {
     pub description: Option<Option<&'a str>>,
+    /// New template snapshot (template refresh, R10).
+    pub template_json: Option<&'a str>,
     pub status: Option<&'a str>,
     pub environment: Option<&'a str>,
     pub tier: Option<&'a str>,

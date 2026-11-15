@@ -54,6 +54,10 @@ pub struct McpMarketCommand {
 pub struct McpMarketTemplate {
     pub id: String,
     pub name: String,
+    /// Catalogue version of the template (e.g. the pinned package version);
+    /// instances keep the snapshot they were created or last refreshed with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub version: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
     /// `stdio` or `http`.
@@ -190,6 +194,24 @@ pub struct UpdateMcpMarketInstanceRequest {
 #[serde(deny_unknown_fields)]
 pub struct DuplicateMcpMarketInstanceRequest {
     pub name: String,
+}
+
+/// `POST /api/mcp/market/instances/{id}/refresh-template` — the instance now
+/// runs the catalogue's current template; secrets and assignments are kept.
+#[derive(Debug, Clone, Serialize)]
+pub struct McpMarketTemplateRefreshResponse {
+    pub instance: McpMarketInstanceResponse,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub from_version: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub to_version: Option<String>,
+    /// Env keys the new template declares that the old one did not.
+    pub added_keys: Vec<String>,
+    /// Env keys the old template declared that the new one does not (their
+    /// plain values are dropped; stored secrets are kept but no longer used).
+    pub removed_keys: Vec<String>,
+    /// Whether anything in the template snapshot changed.
+    pub changed: bool,
 }
 
 /// `PUT /api/mcp/market/instances/{id}/approval` — the owner's exception

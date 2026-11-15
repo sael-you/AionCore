@@ -296,5 +296,6 @@ async fn session_writes_succeed_and_never_echo_secrets() {
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST);
+    assert_eq!(resp["code"], "MCP_MARKET_INVALID");
     assert!(resp.to_string().contains("R2"), "{resp}");
 }

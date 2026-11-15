@@ -29,6 +29,7 @@ impl From<McpError> for ApiError {
             McpError::Conflict(msg) => ApiError::Conflict(msg),
             McpError::InvalidEdit(msg) => ApiError::BadRequest(msg),
             McpError::InvalidTransport(msg) => ApiError::BadRequest(msg),
+            McpError::MaskedValue(msg) => ApiError::coded(StatusCode::BAD_REQUEST, "MCP_MASKED_VALUE", msg, None),
             McpError::AgentNotInstalled(msg) => ApiError::BadRequest(msg),
             McpError::AgentOperationFailed(msg) => ApiError::Internal(msg),
             McpError::ConnectionFailed(msg) => ApiError::BadGateway(msg),
@@ -389,6 +390,14 @@ mod error_mapping_tests {
     fn invalid_transport_maps_to_bad_request() {
         let err = ApiError::from(McpError::InvalidTransport("missing command".into()));
         assert!(matches!(err, ApiError::BadRequest(_)));
+    }
+
+    #[test]
+    fn masked_value_maps_to_coded_bad_request() {
+        let err = ApiError::from(McpError::MaskedValue("masked".into()));
+        assert_eq!(err.error_code(), "MCP_MASKED_VALUE");
+        let response = axum::response::IntoResponse::into_response(err);
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[test]

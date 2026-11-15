@@ -194,13 +194,14 @@ impl IMcpMarketRepository for SqliteMcpMarketRepository {
         let pick_nullable =
             |new: Option<Option<&str>>, old: &Option<String>| new.map(|v| v.map(str::to_owned)).unwrap_or(old.clone());
         sqlx::query(
-            "UPDATE mcp_servers SET description = ?, updated_at = ?, market_status = ?, market_environment = ?, \
+            "UPDATE mcp_servers SET description = ?, updated_at = ?, market_template = ?, market_status = ?, market_environment = ?, \
              market_tier = ?, market_enforcement = ?, market_clis = ?, market_plain_env = ?, \
              market_secret_refs = ?, market_tools_allow = ?, market_tools_block = ?, market_approval_ref = ? \
              WHERE user_id = ? AND id = ? AND deleted_at IS NULL",
         )
         .bind(pick_nullable(p.description, &current.description))
         .bind(aionui_common::now_ms())
+        .bind(pick(p.template_json, &current.market_template))
         .bind(pick(p.status, &current.market_status))
         .bind(pick(p.environment, &current.market_environment))
         .bind(pick(p.tier, &current.market_tier))

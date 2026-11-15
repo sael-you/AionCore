@@ -13,6 +13,11 @@ pub enum McpError {
     #[error("Invalid transport configuration: {0}")]
     InvalidTransport(String),
 
+    /// A create/import/edit still carries the response mask ("•••") where a
+    /// real value is needed (HTTP 400, code `MCP_MASKED_VALUE`).
+    #[error("{0}")]
+    MaskedValue(String),
+
     #[error("Agent CLI not installed: {0}")]
     AgentNotInstalled(String),
 

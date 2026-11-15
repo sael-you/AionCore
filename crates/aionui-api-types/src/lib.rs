@@ -162,8 +162,8 @@ pub use mcp_market::{
     CreateMcpMarketAssignmentRequest, CreateMcpMarketInstanceRequest, DuplicateMcpMarketInstanceRequest,
     ListMcpMarketAssignmentsQuery, McpMarketAssignmentResponse, McpMarketCommand, McpMarketEnvField, McpMarketEnvKind,
     McpMarketInstanceResponse, McpMarketInstanceStatus, McpMarketSecretStatus, McpMarketSnapshotQuery,
-    McpMarketStatusResponse, McpMarketTemplate, SetMcpMarketApprovalRequest, SetMcpMarketSecretRequest,
-    UpdateMcpMarketInstanceRequest,
+    McpMarketStatusResponse, McpMarketTemplate, McpMarketTemplateRefreshResponse, SetMcpMarketApprovalRequest,
+    SetMcpMarketSecretRequest, UpdateMcpMarketInstanceRequest,
 };
 pub use office::{
     CellCoord, CellRange, ConversionResultDto, ConversionTarget, DocumentConversionRequest, DocumentConversionResponse,
