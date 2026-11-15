@@ -5,12 +5,12 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use aionui_auth::{AuthIdentityMode, AuthState, CookieConfig, JwtService};
+use aionui_auth::{AuthIdentityMode, AuthState, CookieConfig, CookieNames, JwtService, OriginPolicy};
 use aionui_db::{Database, IUserRepository, SqliteUserRepository, SqliteVoiceRepository, init_database_memory};
 use aionui_realtime::WebSocketManager;
 use aionui_voice::fake_provider::FakeOpenAi;
 use aionui_voice::{
-    ApiKey, CredentialPolicy, CredentialPort, EngineTimings, OpenAiRealtimeEngine, OriginAllowlist, ProviderCredential,
+    ApiKey, CredentialPolicy, CredentialPort, EngineTimings, OpenAiRealtimeEngine, ProviderCredential,
     SessionTokenVerifier, VoiceHttpGuards, VoiceRouterState, VoiceService, VoiceServiceDeps, VoiceSockets,
     VoiceTimings, voice_routes,
 };
@@ -116,6 +116,7 @@ impl Harness {
             user_repo: users.clone(),
             identity_mode: AuthIdentityMode::UserSession,
             runtime_token_verifier: None,
+            cookie_names: CookieNames::LEGACY,
         };
         let voice_repo = Arc::new(SqliteVoiceRepository::new(db.pool().clone()));
         let conversations = Arc::new(FakeConversations::default());
@@ -138,11 +139,12 @@ impl Harness {
             auth_state: auth_state.clone(),
             cookie_config: Arc::new(CookieConfig::from_env()),
             add_csrf: options.local,
-            origins: Arc::new(OriginAllowlist::parse(ORIGIN)),
+            origins: Arc::new(OriginPolicy::new(None, &[ORIGIN])),
         };
         let router = voice_routes(
             VoiceRouterState {
                 service: service.clone(),
+                session_cookie: "aionui-session",
             },
             guards,
         );

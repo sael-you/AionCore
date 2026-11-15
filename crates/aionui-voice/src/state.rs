@@ -4,4 +4,7 @@ use crate::service::VoiceService;
 #[derive(Clone)]
 pub struct VoiceRouterState {
     pub service: VoiceService,
+    /// Session cookie name in use (`CookieConfig::names.session`: prefixed
+    /// over HTTPS in webui mode).
+    pub session_cookie: &'static str,
 }

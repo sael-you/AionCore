@@ -11,7 +11,6 @@ use aionui_api_types::{
 };
 use aionui_auth::{CurrentUser, RateLimiter, authenticated_action_rate_limit_middleware, extract_cookie_value};
 use aionui_common::ApiError;
-use aionui_common::constants::COOKIE_NAME;
 use axum::body::Bytes;
 use axum::extract::rejection::JsonRejection;
 use axum::extract::{Extension, Path, State, WebSocketUpgrade};
@@ -83,8 +82,8 @@ pub fn voice_routes(state: VoiceRouterState, guards: VoiceHttpGuards) -> Router 
     guard_voice_router(routes, guards).with_state(state)
 }
 
-fn session_token(headers: &HeaderMap) -> Option<String> {
-    extract_cookie_value(headers, COOKIE_NAME)
+fn session_token(state: &VoiceRouterState, headers: &HeaderMap) -> Option<String> {
+    extract_cookie_value(headers, state.session_cookie)
 }
 
 async fn create_session(
@@ -96,7 +95,7 @@ async fn create_session(
     let Json(req) = body.map_err(ApiError::from)?;
     let created = state
         .service
-        .create_session(&user.id, session_token(&headers), req)
+        .create_session(&user.id, session_token(&state, &headers), req)
         .await?;
     Ok((StatusCode::CREATED, Json(ApiResponse::ok(created))))
 }
@@ -179,7 +178,7 @@ async fn voice_ws(
     headers: HeaderMap,
     upgrade: WebSocketUpgrade,
 ) -> Response {
-    let token = session_token(&headers);
+    let token = session_token(&state, &headers);
     let service = state.service.clone();
     upgrade
         .max_message_size(MAX_CONTROL_FRAME_BYTES)

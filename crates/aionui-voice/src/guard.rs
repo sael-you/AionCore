@@ -5,8 +5,8 @@
 use std::sync::Arc;
 
 use aionui_auth::{
-    AuthState, CookieConfig, RUNTIME_CONVERSATION_ID_HEADER, RUNTIME_TOKEN_HEADER, RUNTIME_USER_ID_HEADER,
-    auth_middleware, authenticate_session_token, csrf_middleware,
+    AuthState, CookieConfig, CsrfState, OriginPolicy, RUNTIME_CONVERSATION_ID_HEADER, RUNTIME_TOKEN_HEADER,
+    RUNTIME_USER_ID_HEADER, auth_middleware, authenticate_session_token, csrf_middleware,
 };
 use aionui_common::ApiError;
 use axum::Router;
@@ -28,46 +28,6 @@ const FORBIDDEN_CREDENTIAL_HEADERS: &[&str] = &[
     "sec-websocket-protocol",
 ];
 
-/// `voice.allowed_origins`: exact `scheme://host[:port]` matches, never derived
-/// from `Host` (the web host rewrites it).
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-pub struct OriginAllowlist {
-    origins: Vec<String>,
-}
-
-impl OriginAllowlist {
-    pub fn new<I, S>(origins: I) -> Self
-    where
-        I: IntoIterator<Item = S>,
-        S: AsRef<str>,
-    {
-        let origins = origins
-            .into_iter()
-            .map(|o| normalize_origin(o.as_ref()))
-            .filter(|o| !o.is_empty())
-            .collect();
-        Self { origins }
-    }
-
-    /// Comma-separated list (env/config value).
-    pub fn parse(list: &str) -> Self {
-        Self::new(list.split(','))
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.origins.is_empty()
-    }
-
-    pub fn allows(&self, origin: &str) -> bool {
-        let origin = normalize_origin(origin);
-        self.origins.contains(&origin)
-    }
-}
-
-fn normalize_origin(origin: &str) -> String {
-    origin.trim().trim_end_matches('/').to_ascii_lowercase()
-}
-
 /// How the voice user router is protected; built by the composition layer.
 #[derive(Clone)]
 pub struct VoiceHttpGuards {
@@ -78,7 +38,9 @@ pub struct VoiceHttpGuards {
     /// Add `csrf_middleware` here: only when the app runs in local mode
     /// (other modes already have the global CSRF layer).
     pub add_csrf: bool,
-    pub origins: Arc<OriginAllowlist>,
+    /// Trusted browser origins (the app's `OriginPolicy` plus the voice
+    /// allow-list), never derived from `Host`.
+    pub origins: Arc<OriginPolicy>,
 }
 
 /// [`AuthVerifier`] over `aionui_auth::authenticate_session_token`: the very
@@ -128,7 +90,7 @@ pub async fn credential_precedence_guard(request: Request, next: Next) -> Result
 /// 403 for a non-allowlisted `Origin`; unsafe methods and WebSocket upgrades
 /// must carry one.
 pub async fn origin_guard(
-    State(origins): State<Arc<OriginAllowlist>>,
+    State(origins): State<Arc<OriginPolicy>>,
     request: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
@@ -148,7 +110,7 @@ pub async fn origin_guard(
         },
     };
     match origin {
-        Some(origin) if origins.allows(origin) => {}
+        Some(origin) if origins.is_trusted(origin) => {}
         Some(_) => {
             tracing::warn!(path = %request.uri().path(), "voice request refused: origin not allowed");
             return Err(reject(
@@ -181,7 +143,13 @@ where
 {
     let mut router = routes.route_layer(from_fn_with_state(guards.auth_state, auth_middleware));
     if guards.add_csrf {
-        router = router.route_layer(from_fn_with_state(guards.cookie_config, csrf_middleware));
+        // Voice runs its own (stricter) Origin check, so only the double
+        // submit is needed here.
+        let csrf = CsrfState {
+            cookie_config: guards.cookie_config,
+            origin_policy: None,
+        };
+        router = router.route_layer(from_fn_with_state(csrf, csrf_middleware));
     }
     router
         .route_layer(from_fn_with_state(guards.origins, origin_guard))
@@ -193,14 +161,13 @@ mod tests {
     use super::*;
 
     #[test]
-    fn origin_allowlist_is_exact_and_normalised() {
-        let list = OriginAllowlist::parse(" https://y.example.com/ , http://localhost:5173 ,,");
-        assert!(list.allows("https://y.example.com"));
-        assert!(list.allows("HTTPS://Y.EXAMPLE.COM"));
-        assert!(list.allows("http://localhost:5173"));
-        assert!(!list.allows("https://y.example.com.evil.test"));
-        assert!(!list.allows("http://y.example.com"));
-        assert!(!list.allows("null"));
-        assert!(OriginAllowlist::parse("").is_empty());
+    fn origin_trust_is_exact_and_normalised() {
+        let policy = OriginPolicy::new(Some("https://y.example.com/"), &["http://localhost:5173"]);
+        assert!(policy.is_trusted("https://y.example.com"));
+        assert!(policy.is_trusted("HTTPS://Y.EXAMPLE.COM"));
+        assert!(policy.is_trusted("http://localhost:5173"));
+        assert!(!policy.is_trusted("https://y.example.com.evil.test"));
+        assert!(!policy.is_trusted("http://y.example.com"));
+        assert!(!policy.is_trusted("null"));
     }
 }

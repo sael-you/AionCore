@@ -21,10 +21,10 @@ shape, implemented in a later slice.
 
 | Rule | Behaviour |
 |---|---|
-| Identity | Session cookie `aionui-session` only, validated like `auth_middleware` in UserSession mode — also when AionCore runs `--local` (the local default user is never accepted) → `401 UNAUTHORIZED` |
+| Identity | Session cookie only (`aionui-session`, or `__Host-aionui-session` in webui over HTTPS), validated like `auth_middleware` in UserSession mode — also when AionCore runs `--local` (the local default user is never accepted) → `401 UNAUTHORIZED` |
 | Credential precedence | Requests carrying `Authorization`, `x-aionui-runtime-token`, `x-aionui-user-id`, `x-aionui-conversation-id` or `Sec-WebSocket-Protocol` → `400 VOICE_CREDENTIAL_CONFLICT` |
 | CSRF | Unsafe methods need `x-csrf-token` = the `aionui-csrf-token` cookie → else `403 CSRF_INVALID` (voice adds the layer in local mode; other modes use the global one) |
-| Origin | `Origin` must be in `AIONUI_VOICE_ALLOWED_ORIGINS` (comma-separated, exact `scheme://host[:port]`) → `403 VOICE_ORIGIN_DENIED`; unsafe methods and WS upgrades without `Origin` → `403 VOICE_ORIGIN_REQUIRED`; same-origin GETs without `Origin` are allowed |
+| Origin | `Origin` must be trusted by the app's origin policy (`AIONUI_PUBLIC_ORIGIN`, `AIONUI_ALLOWED_ORIGINS`, card C11) or listed in `AIONUI_VOICE_ALLOWED_ORIGINS` (comma-separated, exact `scheme://host[:port]`; the voice-only list matters in local mode — in webui mode the global CSRF layer already requires the app policy for writes) → `403 VOICE_ORIGIN_DENIED`; unsafe methods and WS upgrades without `Origin` → `403 VOICE_ORIGIN_REQUIRED`; same-origin GETs without `Origin` are allowed |
 | Rate limit | `POST /api/voice/sessions` and `…/end`: 20/min per user → `429 RATE_LIMITED` |
 | Re-validation | Live sockets and calls re-check the cookie every 60 s; a revoked session (logout everywhere, password change) closes the socket (`voice.error AUTH_EXPIRED`) and hangs up the call (`voice.callEnded reason=auth_revoked`) |
 

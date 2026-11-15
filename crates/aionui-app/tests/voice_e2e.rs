@@ -15,7 +15,11 @@ const ORIGIN: &str = "https://voice-e2e.test";
 fn set_origin_env() {
     // SAFETY: each test sets the same value before building its router; no
     // test reads a different value concurrently.
-    unsafe { std::env::set_var("AIONUI_VOICE_ALLOWED_ORIGINS", ORIGIN) };
+    unsafe {
+        std::env::set_var("AIONUI_VOICE_ALLOWED_ORIGINS", ORIGIN);
+        // Non-local modes also check writes against the app policy (C11).
+        std::env::set_var("AIONUI_ALLOWED_ORIGINS", ORIGIN);
+    }
 }
 
 #[tokio::test]

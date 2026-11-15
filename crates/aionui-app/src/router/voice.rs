@@ -4,21 +4,22 @@
 
 use std::sync::Arc;
 
-use aionui_auth::{AuthIdentityMode, AuthState};
+use aionui_auth::{AuthIdentityMode, AuthState, OriginPolicy};
 use aionui_db::{SqliteProviderRepository, SqliteSidebarStore, SqliteVoiceRepository};
 use aionui_realtime::WebSocketManager;
 use aionui_system::ProviderService;
 use aionui_voice::{
-    ApiKey, CredentialPolicy, CredentialPort, OpenAiRealtimeEngine, OriginAllowlist, ProviderCredential,
-    ProviderSpeechFactory, SessionTokenVerifier, VoiceHttpGuards, VoiceRouterState, VoiceService, VoiceServiceDeps,
-    VoiceSockets, VoiceTimings,
+    ApiKey, CredentialPolicy, CredentialPort, OpenAiRealtimeEngine, ProviderCredential, ProviderSpeechFactory,
+    SessionTokenVerifier, VoiceHttpGuards, VoiceRouterState, VoiceService, VoiceServiceDeps, VoiceSockets,
+    VoiceTimings,
 };
 
 use crate::config::{IdentityMode, derive_encryption_key};
 use crate::services::AppServices;
 
-/// Comma-separated browser origins allowed on `/api/voice/*` (PLAN §3.5
-/// `voice.allowed_origins`): the public app origin and the desktop origin.
+/// Extra comma-separated browser origins allowed on `/api/voice/*` (PLAN §3.5
+/// `voice.allowed_origins`), on top of the app's `OriginPolicy`
+/// (`AIONUI_PUBLIC_ORIGIN` + `AIONUI_ALLOWED_ORIGINS`, card C11).
 pub const VOICE_ALLOWED_ORIGINS_ENV: &str = "AIONUI_VOICE_ALLOWED_ORIGINS";
 
 /// Backend-only credential adapter: decrypted provider rows straight from
@@ -60,6 +61,7 @@ fn voice_auth_state(services: &AppServices) -> AuthState {
             AuthIdentityMode::UserSession
         },
         runtime_token_verifier: None,
+        cookie_names: services.cookie_config.names,
     }
 }
 
@@ -96,13 +98,20 @@ pub fn build_voice_state(services: &AppServices) -> VoiceRouterState {
             http: reqwest::Client::new(),
         }),
     });
-    VoiceRouterState { service }
+    VoiceRouterState {
+        service,
+        session_cookie: services.cookie_config.names.session,
+    }
 }
 
 pub fn voice_guards(services: &AppServices) -> VoiceHttpGuards {
-    let origins = OriginAllowlist::parse(&std::env::var(VOICE_ALLOWED_ORIGINS_ENV).unwrap_or_default());
+    let app = &services.origin_policy;
+    let extra = std::env::var(VOICE_ALLOWED_ORIGINS_ENV).unwrap_or_default();
+    let mut allowed: Vec<&str> = app.allowed_origins.iter().map(String::as_str).collect();
+    allowed.extend(extra.split(','));
+    let origins = OriginPolicy::new(app.public_origin.as_deref(), &allowed);
     static WARN_ONCE: std::sync::Once = std::sync::Once::new();
-    if origins.is_empty() {
+    if origins.public_origin.is_none() && origins.allowed_origins.is_empty() {
         WARN_ONCE.call_once(|| {
             tracing::warn!(
                 env = VOICE_ALLOWED_ORIGINS_ENV,

@@ -51,7 +51,7 @@ pub use engine::{
 };
 pub use error::VoiceError;
 pub use frames::VoiceSockets;
-pub use guard::{OriginAllowlist, SessionTokenVerifier, VoiceHttpGuards};
+pub use guard::{SessionTokenVerifier, VoiceHttpGuards};
 pub use lifecycle::{EndReason, VoiceTimings};
 pub use ports::{ApiKey, AuthRejected, AuthVerifier, CredentialPort, ProviderCredential, VerifiedUser};
 pub use readback::{Clip, ClipVoice, SynthPort, TranscribePort};
