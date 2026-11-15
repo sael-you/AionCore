@@ -835,6 +835,8 @@ async fn extension_enablement_and_contributions_are_isolated_by_user() {
         .uri("/api/extensions/disable")
         .header("content-type", "application/json")
         .header("authorization", format!("Bearer {token_a}"))
+        // A browser session (cookie) still needs CSRF; a cookieless Bearer client is exempt (C11-switch).
+        .header("cookie", format!("aionui-session={token_a}"))
         .body(Body::from(r#"{"name":"legacy-suite"}"#))
         .unwrap();
     let response = app.clone().oneshot(missing_csrf).await.unwrap();

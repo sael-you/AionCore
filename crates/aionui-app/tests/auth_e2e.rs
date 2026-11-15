@@ -177,6 +177,8 @@ async fn t12_2_csrf_blocks_post_without_token() {
         .method("POST")
         .uri("/logout")
         .header("authorization", format!("Bearer {token}"))
+        // A browser session (cookie) still needs CSRF; a cookieless Bearer client is exempt (C11-switch).
+        .header("cookie", format!("aionui-session={token}"))
         .body(Body::empty())
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();

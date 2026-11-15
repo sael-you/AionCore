@@ -88,6 +88,8 @@ async fn runtime_ensure_requires_csrf() {
         .method("POST")
         .uri(format!("/api/conversations/{id}/runtime/ensure"))
         .header("authorization", format!("Bearer {token}"))
+        // A browser session (cookie) still needs CSRF; a cookieless Bearer client is exempt (C11-switch).
+        .header("cookie", format!("aionui-session={token}"))
         .body(Body::empty())
         .unwrap();
     let resp = app.oneshot(req).await.unwrap();
@@ -172,6 +174,8 @@ async fn set_config_option_requires_csrf() {
         .uri(format!("/api/conversations/{id}/config-options/model"))
         .header("content-type", "application/json")
         .header("authorization", format!("Bearer {token}"))
+        // A browser session (cookie) still needs CSRF; a cookieless Bearer client is exempt (C11-switch).
+        .header("cookie", format!("aionui-session={token}"))
         .body(Body::from(
             serde_json::to_vec(&json!({ "value": "mock-model-updated" })).unwrap(),
         ))
