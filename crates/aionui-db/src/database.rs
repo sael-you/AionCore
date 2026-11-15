@@ -103,6 +103,44 @@ impl Database {
     }
 }
 
+/// Open an EXISTING file-backed database read-only, for short-lived helpers
+/// that must never create, migrate or write it (the MCP market launcher,
+/// R1 #2): no `create_if_missing`, no migrator, no seed, `read_only(true)`.
+/// The journal mode is left as the server set it (WAL), so the server can keep
+/// writing while this connection reads.
+///
+/// Fails with `DbError::Init` when the file is missing, and with
+/// `DbError::Init` when any of `required_migrations` has not been applied
+/// successfully (an older schema than the caller understands).
+pub async fn open_database_read_only(path: &Path, required_migrations: &[i64]) -> Result<Database, DbError> {
+    if !path.is_file() {
+        return Err(DbError::Init(format!("database not found at {}", path.display())));
+    }
+    let opts = SqliteConnectOptions::new()
+        .filename(path)
+        .create_if_missing(false)
+        .read_only(true)
+        .busy_timeout(Duration::from_millis(BUSY_TIMEOUT_MS));
+    let pool = PoolOptions::<Sqlite>::new()
+        .max_connections(1)
+        .connect_with(opts)
+        .await
+        .map_err(DbError::Query)?;
+    for version in required_migrations {
+        let applied: Option<i64> =
+            sqlx::query_scalar("SELECT version FROM _sqlx_migrations WHERE version = ? AND success = 1")
+                .bind(version)
+                .fetch_optional(&pool)
+                .await
+                .map_err(DbError::Query)?;
+        if applied.is_none() {
+            pool.close().await;
+            return Err(DbError::Init(format!("database schema lacks migration {version}")));
+        }
+    }
+    Ok(Database { pool })
+}
+
 /// Initialize a file-backed SQLite database.
 ///
 /// Creates the database file and parent directories if they don't exist,

@@ -6,7 +6,9 @@ use sqlx::SqlitePool;
 
 use crate::error::DbError;
 use crate::models::McpServerRow;
-use crate::repository::mcp_server::{CreateMcpServerParams, IMcpServerRepository, UpdateMcpServerParams};
+use crate::repository::mcp_server::{
+    CreateMcpServerParams, GatedMcpRow, IMcpServerRepository, MarketDelivery, McpMarketScope, UpdateMcpServerParams,
+};
 
 /// SQLite-backed implementation of [`IMcpServerRepository`].
 #[derive(Clone, Debug)]
@@ -295,6 +297,113 @@ impl IMcpServerRepository for SqliteMcpServerRepository {
 
         Ok(())
     }
+
+    async fn market_gate(
+        &self,
+        user_id: &str,
+        scope: &McpMarketScope<'_>,
+        rows: Vec<McpServerRow>,
+    ) -> Result<Vec<GatedMcpRow>, DbError> {
+        if rows.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut query = QueryBuilder::new(
+            "SELECT id, market_status, market_tier, market_tools_allow, market_tools_block FROM mcp_servers \
+             WHERE market_status IS NOT NULL AND user_id = ",
+        );
+        query.push_bind(user_id);
+        query.push(" AND id IN (");
+        let mut separated = query.separated(", ");
+        for row in &rows {
+            separated.push_bind(&row.id);
+        }
+        separated.push_unseparated(")");
+        let market: HashMap<String, MarketColumns> = query
+            .build_query_as::<MarketColumns>()
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .map(|m| (m.id.clone(), m))
+            .collect();
+        if market.is_empty() {
+            return Ok(rows.into_iter().map(|row| GatedMcpRow { row, market: None }).collect());
+        }
+
+        // Conversation scope: the project the conversation is bound to.
+        let project_id = match scope.conversation_id {
+            Some(conversation_id) => {
+                let project: Option<Option<String>> =
+                    sqlx::query_scalar("SELECT project_id FROM conversations WHERE user_id = ? AND id = ?")
+                        .bind(user_id)
+                        .bind(conversation_id)
+                        .fetch_optional(&self.pool)
+                        .await?;
+                project.flatten().filter(|p| !p.is_empty())
+            }
+            None => None,
+        };
+
+        let mut out = Vec::with_capacity(rows.len());
+        for row in rows {
+            let Some(m) = market.get(&row.id) else {
+                out.push(GatedMcpRow { row, market: None });
+                continue;
+            };
+            if m.market_status.as_deref() != Some("active") || row.deleted_at.is_some() {
+                continue;
+            }
+            let delivery = if scope.conversation_id.is_some() {
+                let (Some(project), Some(assistant), Some(cli)) =
+                    (project_id.as_deref(), scope.assistant_id, scope.cli)
+                else {
+                    continue;
+                };
+                let assigned: Option<i64> = sqlx::query_scalar(
+                    "SELECT 1 FROM mcp_assignments WHERE user_id = ? AND mcp_server_id = ? AND project_id = ? \
+                     AND assistant_id = ? AND cli = ? LIMIT 1",
+                )
+                .bind(user_id)
+                .bind(&row.id)
+                .bind(project)
+                .bind(assistant)
+                .bind(cli)
+                .fetch_optional(&self.pool)
+                .await?;
+                if assigned.is_none() {
+                    continue;
+                }
+                MarketDelivery {
+                    project_id: Some(project.to_owned()),
+                    assistant_id: Some(assistant.to_owned()),
+                    tier: m.market_tier.clone().unwrap_or_default(),
+                    tools_allow: m.market_tools_allow.clone(),
+                    tools_block: m.market_tools_block.clone(),
+                }
+            } else {
+                MarketDelivery {
+                    project_id: None,
+                    assistant_id: None,
+                    tier: m.market_tier.clone().unwrap_or_default(),
+                    tools_allow: m.market_tools_allow.clone(),
+                    tools_block: m.market_tools_block.clone(),
+                }
+            };
+            out.push(GatedMcpRow {
+                row,
+                market: Some(delivery),
+            });
+        }
+        Ok(out)
+    }
+}
+
+#[derive(sqlx::FromRow)]
+struct MarketColumns {
+    id: String,
+    market_status: Option<String>,
+    market_tier: Option<String>,
+    market_tools_allow: Option<String>,
+    market_tools_block: Option<String>,
 }
 
 /// Merge partial update params into an existing row, returning a new instance.
