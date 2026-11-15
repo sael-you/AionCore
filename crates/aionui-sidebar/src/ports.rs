@@ -76,3 +76,12 @@ pub trait ArchiveTeardownPorts: Send + Sync {
     /// rows.
     async fn stop_team(&self, user_id: &str, team_id: &str) -> Result<(), String>;
 }
+
+/// Live (in-memory) runtime state of a conversation, for the sidebar's roll-up
+/// counts. Synchronous and cheap: the adapter reads the running agent task,
+/// never the database. Same cross-crate seam rationale as the ports above.
+pub trait ConversationLivePorts: Send + Sync {
+    /// Approvals / questions the conversation's agent is waiting on (0 when
+    /// none, or when no agent is running).
+    fn pending_confirmations(&self, conversation_id: &str) -> usize;
+}
