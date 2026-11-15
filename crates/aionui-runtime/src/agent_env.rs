@@ -67,6 +67,12 @@ fn clean_agent_env(env: &mut BTreeMap<OsString, OsString>) {
         "CLAUDECODE",
         "SSL_CERT_FILE",
         "SSL_CERT_DIR",
+        // C11: the backend's own identity settings must not reach agents. An agent that starts another AionUi
+        // (dev/staging) would otherwise boot it in webui identity with the production origin.
+        "AIONUI_BACKEND_IDENTITY",
+        "AIONUI_PUBLIC_ORIGIN",
+        "AIONUI_ALLOWED_ORIGINS",
+        "AIONUI_HTTPS",
     ] {
         remove_env_key(env, key);
     }
@@ -263,6 +269,38 @@ mod tests {
     use std::path::Path;
 
     const CHILD_MARKER: &str = "AIONUI_RUNTIME_AGENT_ENV_TEST_CHILD";
+
+    #[test]
+    fn agent_env_drops_backend_identity_settings() {
+        let current = vec![
+            (OsString::from("PATH"), OsString::from("/usr/bin")),
+            (OsString::from("AIONUI_BACKEND_IDENTITY"), OsString::from("webui")),
+            (
+                OsString::from("AIONUI_PUBLIC_ORIGIN"),
+                OsString::from("https://example.test"),
+            ),
+            (
+                OsString::from("AIONUI_ALLOWED_ORIGINS"),
+                OsString::from("https://example.test"),
+            ),
+            (OsString::from("AIONUI_HTTPS"), OsString::from("true")),
+            (OsString::from("AIONUI_DATA_DIR"), OsString::from("/data")),
+        ];
+        let env = build_agent_process_env(current, Vec::new());
+        let keys: Vec<_> = env.iter().map(|(k, _)| k.to_string_lossy().into_owned()).collect();
+        for gone in [
+            "AIONUI_BACKEND_IDENTITY",
+            "AIONUI_PUBLIC_ORIGIN",
+            "AIONUI_ALLOWED_ORIGINS",
+            "AIONUI_HTTPS",
+        ] {
+            assert!(!keys.iter().any(|k| k == gone), "{gone} must not reach agents");
+        }
+        assert!(
+            keys.iter().any(|k| k == "AIONUI_DATA_DIR"),
+            "other AIONUI_ settings stay"
+        );
+    }
 
     #[cfg(unix)]
     #[tokio::test]
