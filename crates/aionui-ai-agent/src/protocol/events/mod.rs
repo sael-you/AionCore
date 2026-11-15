@@ -18,7 +18,8 @@ pub use session_updates::{
 pub use tool_call::{
     AcpToolCallContentItem, AcpToolCallEventData, AcpToolCallKind, AcpToolCallLocationItem,
     AcpToolCallSessionUpdateKind, AcpToolCallStatus, AcpToolCallTextBlock, AcpToolCallTextBlockType,
-    AcpToolCallUpdateData, ToolCallEventData, ToolCallStatus, ToolGroupEntry, ToolGroupStatus,
+    AcpToolCallUpdateData, ToolCallEventData, ToolCallStatus, ToolGroupEntry, ToolGroupStatus, ToolTaskInfo,
+    ToolTaskKind,
 };
 pub(crate) use translate::{permission_request_to_event_data, session_notification_to_events};
 
@@ -316,6 +317,7 @@ mod tests {
             output: None,
             description: None,
             parent_call_id: None,
+            task: None,
         });
         let json = serde_json::to_value(&event).unwrap();
         assert_eq!(json["type"], "tool_call");
@@ -334,6 +336,7 @@ mod tests {
             output: Some("src/main.rs\nsrc/lib.rs".into()),
             description: Some("Search for Rust files".into()),
             parent_call_id: Some("toolu_task".into()),
+            task: None,
         });
         let json = serde_json::to_value(&event).unwrap();
         assert_eq!(json["type"], "tool_call");
@@ -354,6 +357,7 @@ mod tests {
             output: None,
             description: None,
             parent_call_id: None,
+            task: None,
         });
         let json = serde_json::to_value(&event).unwrap();
         assert!(json["data"].get("input").is_none());

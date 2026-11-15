@@ -1555,6 +1555,7 @@ mod tests {
                     output: Some("Phase 1  Run   [0/1]".into()),
                     description: Some("Run [0/1] · run:A · 1 agents".into()),
                     parent_call_id: None,
+                    task: None,
                 },
                 agents: vec![ToolGroupEntry {
                     call_id: "1".into(),
@@ -1608,6 +1609,7 @@ mod tests {
             output: None,
             description: None,
             parent_call_id: None,
+            task: None,
         }))
         .await;
         assert_eq!(
@@ -1691,6 +1693,7 @@ mod tests {
             parent_call_id: None,
             input: None,
             output: None,
+            task: None,
         }))
         .unwrap();
         tx.send(AgentStreamEvent::Text(TextEventData { content: "Beta".into() }))
@@ -2048,6 +2051,7 @@ mod tests {
             output: None,
             description: None,
             parent_call_id: None,
+            task: None,
         }))
         .unwrap();
         tx.send(AgentStreamEvent::Error(ErrorEventData {
@@ -2309,6 +2313,7 @@ mod tests {
             parent_call_id: None,
             input: None,
             output: None,
+            task: None,
         }))
         .unwrap();
         tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();
@@ -2376,6 +2381,7 @@ mod tests {
             parent_call_id: None,
             input: None,
             output: None,
+            task: None,
         }))
         .unwrap();
         tx.send(AgentStreamEvent::Thinking(ThinkingEventData {
@@ -2642,6 +2648,7 @@ mod tests {
             output: None,
             description: Some("Generate image".into()),
             parent_call_id: None,
+            task: None,
         }))
         .unwrap();
         // Second event: Completed with output but no input
@@ -2654,6 +2661,7 @@ mod tests {
             output: Some("image.png".into()),
             description: None,
             parent_call_id: None,
+            task: None,
         }))
         .unwrap();
         tx.send(AgentStreamEvent::Finish(FinishEventData::default())).unwrap();

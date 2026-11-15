@@ -2965,6 +2965,7 @@ fn spawn_event_pump(
                     output: Some(acc.clone()),
                     description: None,
                     parent_call_id: None,
+                    task: None,
                 }));
                 continue;
             }
@@ -3174,6 +3175,7 @@ fn spawn_event_pump(
                                     output: None,
                                     description: None,
                                     parent_call_id: None,
+                                    task: None,
                                 }));
                             }
                             tool_output.clear();
@@ -3307,6 +3309,7 @@ fn spawn_event_pump(
                             output: None,
                             description: None,
                             parent_call_id: None,
+                            task: None,
                         }));
                     }
                     for (call_id, name) in kept_open {
@@ -3908,7 +3911,10 @@ fn update_workflow_cards(
                         .cloned()
                         .unwrap_or_else(|| "Workflow".to_owned());
                     let args = tool_args.get(&call_id).cloned().unwrap_or(serde_json::Value::Null);
-                    cards.insert(r#ref.clone(), WorkflowCard::new(call_id.clone(), name, args, now_ms));
+                    cards.insert(
+                        r#ref.clone(),
+                        WorkflowCard::new(call_id.clone(), name, args, now_ms).with_task_id(r#ref),
+                    );
                     tracing::info!(
                         conv_id = %conversation_id,
                         task_id = %r#ref,
@@ -4001,6 +4007,7 @@ fn update_workflow_cards(
                                 output: None,
                                 description: None,
                                 parent_call_id: None,
+                                task: None,
                             },
                             agents: Vec::new(),
                             settle_only: true,
@@ -4013,7 +4020,7 @@ fn update_workflow_cards(
                     SubagentStatus::Errored => CardStatus::Errored,
                     _ => CardStatus::Cancelled,
                 };
-                card.settle(status);
+                card.settle_at(status, now_ms);
                 tracing::info!(
                     conv_id = %conversation_id,
                     task_id = %r#ref,
@@ -4149,7 +4156,7 @@ fn settle_workflow_cards(
         .into_iter()
         .filter_map(|k| {
             let mut card = cards.remove(&k)?;
-            card.settle(status);
+            card.settle_at(status, now_ms);
             card.take_emission(now_ms, true)
                 .map(|(card, agents)| WorkflowProgressData {
                     card,
@@ -4284,6 +4291,7 @@ fn translate_event(event: SessionEvent, conversation_id: &str, terminal_result_s
                 // Subagent attribution (009 H5): persisted onto the row so the
                 // frontend can group a subagent's steps under its Task call.
                 parent_call_id: parent_tool_use_id,
+                task: None,
             })]
         }
         SessionEvent::ToolResult {
@@ -4307,6 +4315,7 @@ fn translate_event(event: SessionEvent, conversation_id: &str, terminal_result_s
                 output,
                 description: None,
                 parent_call_id: parent_tool_use_id,
+                task: None,
             })]
         }
         SessionEvent::TurnResult {
@@ -5603,6 +5612,7 @@ mod translate_tests {
             output: None,
             description: None,
             parent_call_id: None,
+            task: None,
         })
     }
 

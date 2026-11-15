@@ -26,7 +26,9 @@ use std::collections::BTreeMap;
 
 use aionui_session::WorkflowLoopState;
 
-use crate::protocol::events::tool_call::{ToolCallEventData, ToolCallStatus, ToolGroupEntry, ToolGroupStatus};
+use crate::protocol::events::tool_call::{
+    ToolCallEventData, ToolCallStatus, ToolGroupEntry, ToolGroupStatus, ToolTaskInfo, ToolTaskKind,
+};
 
 /// Minimum gap between two progress emissions for one workflow.
 ///
@@ -186,6 +188,13 @@ pub(crate) struct WorkflowCard {
     last_touched: Option<String>,
     last_render: Option<Rendered>,
     last_emit_ms: Option<i64>,
+    /// Structured identity sent with every frame (`ToolCallEventData::task`):
+    /// the kind, the CLI's task id and the launching call's description.
+    task_kind: ToolTaskKind,
+    task_id: String,
+    task_label: Option<String>,
+    /// Wall-clock settle time, set by [`Self::settle`].
+    ended_at_ms: Option<i64>,
 }
 
 impl WorkflowCard {
@@ -203,7 +212,25 @@ impl WorkflowCard {
             last_touched: None,
             last_render: None,
             last_emit_ms: None,
+            task_kind: ToolTaskKind::Workflow,
+            task_id: String::new(),
+            task_label: None,
+            ended_at_ms: None,
         }
+    }
+
+    /// Record the CLI's task id of a workflow container (the id is known only
+    /// to the pump, which opens the card) and the workflow's own description.
+    pub fn with_task_id(mut self, task_id: &str) -> Self {
+        self.task_id = task_id.to_owned();
+        self.task_label = self
+            .args
+            .get("description")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|d| !d.is_empty())
+            .map(str::to_owned);
+        self
     }
 
     /// A rosterless background task (`local_bash`). `desc` is the launching
@@ -226,7 +253,15 @@ impl WorkflowCard {
         desc: Option<String>,
         now_ms: i64,
     ) -> Self {
-        Self::new_task(call_id, tool_name, args, task_id, desc, now_ms, "bg task")
+        Self::new_task(
+            call_id,
+            tool_name,
+            args,
+            task_id,
+            desc,
+            now_ms,
+            ToolTaskKind::Background,
+        )
     }
 
     /// A Task subagent's card (`local_agent`, foreground or background — the
@@ -242,7 +277,7 @@ impl WorkflowCard {
         desc: Option<String>,
         now_ms: i64,
     ) -> Self {
-        Self::new_task(call_id, tool_name, args, task_id, desc, now_ms, "subagent")
+        Self::new_task(call_id, tool_name, args, task_id, desc, now_ms, ToolTaskKind::Subagent)
     }
 
     fn new_task(
@@ -252,10 +287,21 @@ impl WorkflowCard {
         task_id: &str,
         desc: Option<String>,
         now_ms: i64,
-        word: &str,
+        task_kind: ToolTaskKind,
     ) -> Self {
+        let word = match task_kind {
+            ToolTaskKind::Subagent => "subagent",
+            _ => "bg task",
+        };
         let mut card = Self::new(call_id, tool_name, args, now_ms);
         card.kind = CardKind::BackgroundTask;
+        card.task_kind = task_kind;
+        card.task_id = task_id.to_owned();
+        card.task_label = desc
+            .as_deref()
+            .map(str::trim)
+            .filter(|d| !d.is_empty())
+            .map(str::to_owned);
         card.bg_headline = match desc {
             Some(d) if d.trim() == card.tool_name.trim() => format!("{word} {task_id}"),
             Some(d) => format!("{} · {word} {task_id}", elide_middle(&d, SUMMARY_MAX)),
@@ -310,11 +356,19 @@ impl WorkflowCard {
         }
     }
 
-    /// Settle the container. Every still-running agent is forced to `Done`: the
+    /// [`Self::settle_at`] at the card's own start time (tests only).
+    #[cfg(test)]
+    pub fn settle(&mut self, status: CardStatus) {
+        self.settle_at(status, self.started_at_ms);
+    }
+
+    /// Settle the container at `now_ms` (the pump's wall clock, recorded as the
+    /// task's end). Every still-running agent is forced to `Done`: the
     /// workflow is over, so leaving them mid-loop would strand their rows on a
     /// spinner with nothing left to ever clear it.
-    pub fn settle(&mut self, status: CardStatus) {
+    pub fn settle_at(&mut self, status: CardStatus, now_ms: i64) {
         self.status = status;
+        self.ended_at_ms.get_or_insert(now_ms);
         for (_, entry) in &mut self.agents {
             if !entry.is_done() {
                 entry.loop_state = Some(WorkflowLoopState::Done);
@@ -359,11 +413,23 @@ impl WorkflowCard {
             // Cards ride a MAIN-STREAM launching call; absent (not null) so the
             // merge-patch never touches attribution persisted by the call itself.
             parent_call_id: None,
+            task: Some(self.task_info()),
         };
         let entries = rendered.entries.clone();
         self.last_render = Some(rendered);
         self.last_emit_ms = Some(now_ms);
         Some((card, entries))
+    }
+
+    /// The structured task fields carried by every frame of this card.
+    pub fn task_info(&self) -> ToolTaskInfo {
+        ToolTaskInfo {
+            kind: self.task_kind,
+            id: self.task_id.clone(),
+            label: self.task_label.clone(),
+            started_at: self.started_at_ms,
+            ended_at: self.ended_at_ms,
+        }
     }
 
     // ─────────────────────────── rendering ───────────────────────────
@@ -728,6 +794,63 @@ mod tests {
             "a subagent is not a bg task: {description:?}"
         );
         assert!(description.ends_with("00:09"), "lost the clock: {description:?}");
+    }
+
+    /// Every card frame carries the structured task fields (C21), so the UI
+    /// names the work instead of parsing "subagent <id> · 00:09".
+    #[test]
+    fn task_cards_carry_structured_task_fields() {
+        let mut c = WorkflowCard::new_subagent(
+            "toolu_task".into(),
+            "Build C15 MCP market core".into(),
+            serde_json::json!({"description": "Build C15 MCP market core"}),
+            "ae859b22dc5afbdca",
+            Some("Build C15 MCP market core".into()),
+            1_000,
+        );
+        let (f, _) = c.take_emission(2_000, true).unwrap();
+        assert_eq!(
+            f.task,
+            Some(ToolTaskInfo {
+                kind: ToolTaskKind::Subagent,
+                id: "ae859b22dc5afbdca".into(),
+                label: Some("Build C15 MCP market core".into()),
+                started_at: 1_000,
+                ended_at: None,
+            })
+        );
+        c.settle_at(CardStatus::Completed, 61_000);
+        let (f, _) = c.take_emission(61_000, true).unwrap();
+        let task = f.task.unwrap();
+        assert_eq!(task.ended_at, Some(61_000));
+        // Serialized snake_case under `task`, next to the old headline.
+        let json = serde_json::to_value(
+            WorkflowCard::new_background("toolu_bg".into(), "Bash".into(), serde_json::Value::Null, "b7", None, 5)
+                .take_emission(6, true)
+                .unwrap()
+                .0,
+        )
+        .unwrap();
+        assert_eq!(json["task"]["kind"], "background");
+        assert_eq!(json["task"]["id"], "b7");
+        assert!(json["task"].get("label").is_none(), "no description, no label: {json}");
+        assert!(json["task"].get("ended_at").is_none());
+    }
+
+    /// A workflow card reports kind `workflow` with the container's task id.
+    #[test]
+    fn workflow_card_task_fields() {
+        let c = WorkflowCard::new(
+            "toolu_wf".into(),
+            "Workflow".into(),
+            serde_json::json!({"description": "Review the diff"}),
+            0,
+        )
+        .with_task_id("w1");
+        let task = c.task_info();
+        assert_eq!(task.kind, ToolTaskKind::Workflow);
+        assert_eq!(task.id, "w1");
+        assert_eq!(task.label.as_deref(), Some("Review the diff"));
     }
 
     /// The other direction: where the label is still a BARE tool name, the desc

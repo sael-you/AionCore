@@ -570,6 +570,7 @@ mod tests {
             parent_call_id: None,
             input: None,
             output: None,
+            task: None,
         });
         let action = ChannelMessageService::process_stream_event(&event);
         match action {
