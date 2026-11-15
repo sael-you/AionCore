@@ -1,0 +1,104 @@
+//! Voice Concierge composition (card C9): adapters for the voice-owned ports
+//! and the guarded user router. Everything voice-specific lives in
+//! `aionui-voice`; this file only wires it to the app's services.
+
+use std::sync::Arc;
+
+use aionui_auth::{AuthIdentityMode, AuthState};
+use aionui_db::{SqliteProviderRepository, SqliteVoiceRepository};
+use aionui_realtime::WebSocketManager;
+use aionui_system::ProviderService;
+use aionui_voice::{
+    ApiKey, CredentialPolicy, CredentialPort, OpenAiRealtimeEngine, OriginAllowlist, ProviderCredential,
+    SessionTokenVerifier, VoiceHttpGuards, VoiceRouterState, VoiceService, VoiceServiceDeps, VoiceSockets,
+    VoiceTimings,
+};
+
+use crate::config::{IdentityMode, derive_encryption_key};
+use crate::services::AppServices;
+
+/// Comma-separated browser origins allowed on `/api/voice/*` (PLAN §3.5
+/// `voice.allowed_origins`): the public app origin and the desktop origin.
+pub const VOICE_ALLOWED_ORIGINS_ENV: &str = "AIONUI_VOICE_ALLOWED_ORIGINS";
+
+/// Backend-only credential adapter: decrypted provider rows straight from
+/// `ProviderService::backend_credentials` — never the `/api/providers` DTO.
+struct ProviderCredentialAdapter {
+    providers: ProviderService,
+}
+
+#[async_trait::async_trait]
+impl CredentialPort for ProviderCredentialAdapter {
+    async fn provider_credentials(&self, user_id: &str) -> Result<Vec<ProviderCredential>, String> {
+        let rows = self
+            .providers
+            .backend_credentials(user_id)
+            .await
+            .map_err(|e| format!("provider lookup failed: {e}"))?;
+        Ok(rows
+            .into_iter()
+            .map(|row| ProviderCredential {
+                api_key: ApiKey::new(row.api_key()),
+                provider_id: row.provider_id,
+                platform: row.platform,
+                base_url: row.base_url,
+                enabled: row.enabled,
+            })
+            .collect())
+    }
+}
+
+/// Identity for voice routes: a validated session cookie in every mode. In
+/// `--local` the rest of the app injects the default user; voice does not.
+fn voice_auth_state(services: &AppServices) -> AuthState {
+    AuthState {
+        jwt_service: services.jwt_service.clone(),
+        user_repo: services.user_repo.clone(),
+        identity_mode: if services.identity_mode == IdentityMode::AionPro {
+            AuthIdentityMode::AionPro
+        } else {
+            AuthIdentityMode::UserSession
+        },
+        runtime_token_verifier: None,
+    }
+}
+
+pub fn build_voice_state(services: &AppServices) -> VoiceRouterState {
+    let pool = services.database.pool().clone();
+    let voice_repo = Arc::new(SqliteVoiceRepository::new(pool.clone()));
+    let providers = ProviderService::new(
+        Arc::new(SqliteProviderRepository::new(pool)),
+        derive_encryption_key(&services.encryption_secret_raw),
+    );
+    let timings = VoiceTimings::default();
+    let service = VoiceService::new(VoiceServiceDeps {
+        settings: voice_repo.clone(),
+        sessions: voice_repo.clone(),
+        audit: voice_repo,
+        credentials: Arc::new(ProviderCredentialAdapter { providers }),
+        credential_policy: CredentialPolicy::from_env(),
+        engine: Arc::new(OpenAiRealtimeEngine::new(timings.engine)),
+        verifier: Arc::new(SessionTokenVerifier::new(voice_auth_state(services))),
+        // Voice sockets get their own manager so app-wide broadcasts never reach them.
+        sockets: VoiceSockets::new(Arc::new(WebSocketManager::new())),
+        timings,
+    });
+    VoiceRouterState { service }
+}
+
+pub fn voice_guards(services: &AppServices) -> VoiceHttpGuards {
+    let origins = OriginAllowlist::parse(&std::env::var(VOICE_ALLOWED_ORIGINS_ENV).unwrap_or_default());
+    if origins.is_empty() {
+        tracing::warn!(
+            env = VOICE_ALLOWED_ORIGINS_ENV,
+            "voice: no allowed origins configured; browser voice requests carrying an Origin are refused"
+        );
+    }
+    VoiceHttpGuards {
+        auth_state: voice_auth_state(services),
+        cookie_config: services.cookie_config.clone(),
+        // Non-local modes already run the global CSRF layer.
+        add_csrf: services.identity_mode.is_local(),
+        origins: Arc::new(origins),
+    }
+}
