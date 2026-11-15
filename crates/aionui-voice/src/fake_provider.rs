@@ -4,13 +4,17 @@
 //! → 201 + `Location`, sideband WebSocket with no `session.created` (the first
 //! event answers our first command), `session.update` → `session.updated`,
 //! `response.create` → `response.created` + `response.done` with usage,
-//! hangup → 200 then 404 and the sideband is closed. Knobs let tests inject
-//! 503s on attach, a missing `session.updated`, dropped sidebands and events.
+//! `output_audio_buffer.started` ≈ 0.5 s after `response.create` and
+//! `output_audio_buffer.stopped` 2.9–6.2 s after `response.done` (real-time
+//! paced playout), hangup → 200 then 404 with the sideband closed ≈ 2 s later,
+//! SDP answer as `text/plain`. Knobs let tests inject 503s on attach, a missing
+//! `session.updated`, dropped sidebands, events and shorter delays.
 #![allow(clippy::disallowed_types)]
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use axum::Router;
 use axum::extract::ws::{Message, WebSocket};
@@ -48,6 +52,10 @@ struct Knobs {
     ack_session_update: bool,
     create_status: Option<u16>,
     usage: Value,
+    audio_started_after: Duration,
+    audio_stopped_after_done: Duration,
+    hangup_close_after: Duration,
+    create_delay: Duration,
 }
 
 struct FakeState {
@@ -85,6 +93,10 @@ impl FakeOpenAi {
                 ack_session_update: true,
                 create_status: None,
                 usage: captured_usage(),
+                audio_started_after: Duration::from_millis(500),
+                audio_stopped_after_done: Duration::from_millis(2_900),
+                hangup_close_after: Duration::from_secs(2),
+                create_delay: Duration::ZERO,
             }),
             next_id: AtomicU64::new(1),
             attach_attempts: AtomicU32::new(0),
@@ -123,6 +135,23 @@ impl FakeOpenAi {
 
     pub fn set_create_status(&self, status: Option<u16>) {
         self.state.knobs.lock().unwrap().create_status = status;
+    }
+
+    /// Playout pacing of `output_audio_buffer.started/stopped`.
+    pub fn set_audio_pacing(&self, started_after: Duration, stopped_after_done: Duration) {
+        let mut knobs = self.state.knobs.lock().unwrap();
+        knobs.audio_started_after = started_after;
+        knobs.audio_stopped_after_done = stopped_after_done;
+    }
+
+    /// Delay before the call-creation answer (call already registered).
+    pub fn set_create_delay(&self, delay: Duration) {
+        self.state.knobs.lock().unwrap().create_delay = delay;
+    }
+
+    /// Delay between a hangup (200) and the provider closing the sidebands.
+    pub fn set_hangup_close_delay(&self, delay: Duration) {
+        self.state.knobs.lock().unwrap().hangup_close_after = delay;
     }
 
     /// `null` simulates a response whose usage is not reported.
@@ -253,11 +282,13 @@ async fn create_call(State(state): State<Arc<FakeState>>, headers: HeaderMap, mu
     state.created_sessions.lock().unwrap().push(session);
     let id = format!("rtc_fake_{}", state.next_id.fetch_add(1, Ordering::SeqCst));
     state.calls.lock().unwrap().insert(id.clone(), FakeCall::default());
+    let delay = state.knobs.lock().unwrap().create_delay;
+    tokio::time::sleep(delay).await;
     (
         StatusCode::CREATED,
         [
             (header::LOCATION, format!("/v1/realtime/calls/{id}")),
-            (header::CONTENT_TYPE, "application/sdp".to_owned()),
+            (header::CONTENT_TYPE, "text/plain".to_owned()),
         ],
         "v=0\r\no=fake-answer 1 1 IN IP4 127.0.0.1\r\n",
     )
@@ -270,9 +301,14 @@ async fn hangup(State(state): State<Arc<FakeState>>, Path(id): Path<String>) -> 
         Some(call) if !call.hung_up => {
             call.hung_up = true;
             call.hangups += 1;
-            for tx in call.sidebands.drain(..) {
-                let _ = tx.send(Outbound::Close);
-            }
+            let sidebands: Vec<_> = call.sidebands.drain(..).collect();
+            let delay = state.knobs.lock().unwrap().hangup_close_after;
+            tokio::spawn(async move {
+                tokio::time::sleep(delay).await;
+                for tx in sidebands {
+                    let _ = tx.send(Outbound::Close);
+                }
+            });
             StatusCode::OK.into_response()
         }
         Some(call) => {
@@ -339,6 +375,9 @@ async fn run_sideband(
                     call.received.push(value.clone());
                 }
                 for reply in replies(&state, &value, &mut event_no) {
+                    if reply["type"] == "response.done" {
+                        schedule_playout(&state, &call_id, &reply);
+                    }
                     if sink.send(Message::Text(reply.to_string().into())).await.is_err() {
                         return;
                     }
@@ -357,6 +396,32 @@ async fn run_sideband(
             },
         }
     }
+}
+
+/// Paced playout of a completed response, sent to every sideband of the call.
+fn schedule_playout(state: &Arc<FakeState>, call_id: &str, done: &Value) {
+    let Some(response_id) = done["response"]["id"].as_str().map(str::to_owned) else {
+        return;
+    };
+    let (started_after, stopped_after) = {
+        let knobs = state.knobs.lock().unwrap();
+        (knobs.audio_started_after, knobs.audio_stopped_after_done)
+    };
+    let state = state.clone();
+    let call_id = call_id.to_owned();
+    tokio::spawn(async move {
+        let send = |event: Value| {
+            if let Some(call) = state.calls.lock().unwrap().get(&call_id) {
+                for tx in &call.sidebands {
+                    let _ = tx.send(Outbound::Event(event.clone()));
+                }
+            }
+        };
+        tokio::time::sleep(started_after).await;
+        send(json!({"type": "output_audio_buffer.started", "response_id": response_id}));
+        tokio::time::sleep(stopped_after.saturating_sub(started_after)).await;
+        send(json!({"type": "output_audio_buffer.stopped", "response_id": response_id}));
+    });
 }
 
 fn replies(state: &FakeState, event: &Value, event_no: &mut u64) -> Vec<Value> {

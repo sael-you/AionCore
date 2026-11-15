@@ -88,11 +88,14 @@ pub fn build_voice_state(services: &AppServices) -> VoiceRouterState {
 
 pub fn voice_guards(services: &AppServices) -> VoiceHttpGuards {
     let origins = OriginAllowlist::parse(&std::env::var(VOICE_ALLOWED_ORIGINS_ENV).unwrap_or_default());
+    static WARN_ONCE: std::sync::Once = std::sync::Once::new();
     if origins.is_empty() {
-        tracing::warn!(
-            env = VOICE_ALLOWED_ORIGINS_ENV,
-            "voice: no allowed origins configured; browser voice requests carrying an Origin are refused"
-        );
+        WARN_ONCE.call_once(|| {
+            tracing::warn!(
+                env = VOICE_ALLOWED_ORIGINS_ENV,
+                "voice: no allowed origins configured; browser voice requests carrying an Origin are refused"
+            );
+        });
     }
     VoiceHttpGuards {
         auth_state: voice_auth_state(services),

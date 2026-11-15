@@ -6,6 +6,7 @@
 //! the §3.5 auth rules. Voice depends only on its own ports; `aionui-app`
 //! supplies the adapters.
 
+mod admission;
 mod budget;
 mod credentials;
 mod engine;

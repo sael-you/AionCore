@@ -105,3 +105,29 @@ silence) · `hard_cap` (55 min) · `rotation` (≥ 30 min at an idle point) ·
 within 20 s) · `provider_ended` · `restart` (could not recover after a backend
 restart). Setup/transport failures are stored with state `failed`, the rest
 `ended`.
+
+## Database (migrations) and manual rollback
+
+| Migration | Tables | Slice |
+|---|---|---|
+| `902_voice_concierge.sql` | `voice_settings`, `voice_sessions`, `voice_usage_daily` (spend per user/session/UTC day — the daily budget counts cost on the day it was charged), `voice_audit` | S1a |
+| `903_…` | `voice_drafts`, `voice_tool_calls`, `voice_transcripts`, and `message_idempotency_keys` (idempotent user-message sends) | S1b |
+| `906_…` | `voice_devices`, `voice_pairing_codes` | S3 (904/905 belong to the MCP market) |
+
+Migrations are immutable once they ran on a database: AionCore refuses to start
+when a recorded checksum changed. To roll back a voice migration on a
+development or staging database **before it was deployed** (e.g. after editing
+902 while it was still unshipped): stop AionCore, back up
+`aionui-backend.db`, then
+
+```sql
+DELETE FROM _sqlx_migrations WHERE version = 902;
+DROP TABLE IF EXISTS voice_audit;
+DROP TABLE IF EXISTS voice_usage_daily;
+DROP TABLE IF EXISTS voice_sessions;
+DROP TABLE IF EXISTS voice_settings;
+```
+
+and start AionCore again (it re-applies the current 902). Never do this on a
+database that holds real voice data; production rolls back by restoring the
+pre-deploy backup.

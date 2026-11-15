@@ -286,6 +286,7 @@ async fn daily_budget_cap_refuses_admission() {
                 cost_micros: 990_000,
                 ..Default::default()
             },
+            aionui_common::now_ms(),
         )
         .await
         .unwrap();

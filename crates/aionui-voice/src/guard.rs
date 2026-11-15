@@ -132,7 +132,21 @@ pub async fn origin_guard(
     request: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
-    let origin = request.headers().get(header::ORIGIN).and_then(|v| v.to_str().ok());
+    let origin = match request.headers().get(header::ORIGIN) {
+        None => None,
+        Some(value) => match value.to_str() {
+            Ok(text) => Some(text),
+            Err(_) => {
+                // Present but not visible ASCII: never treat it as "missing".
+                tracing::warn!(path = %request.uri().path(), "voice request refused: unparseable origin");
+                return Err(reject(
+                    StatusCode::FORBIDDEN,
+                    "VOICE_ORIGIN_DENIED",
+                    "Origin not allowed.",
+                ));
+            }
+        },
+    };
     match origin {
         Some(origin) if origins.allows(origin) => {}
         Some(_) => {

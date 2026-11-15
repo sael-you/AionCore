@@ -64,6 +64,16 @@ impl Usage {
     pub fn cached_tokens(&self) -> u64 {
         self.cached_text + self.cached_audio
     }
+
+    /// Text part of the context after this response (input + output).
+    pub fn context_text(&self) -> u64 {
+        self.input_text + self.output_text
+    }
+
+    /// Audio part of the context after this response, incl. shortfalls.
+    pub fn context_audio(&self) -> u64 {
+        self.input_audio + self.output_audio + self.input_shortfall() + self.output_shortfall()
+    }
 }
 
 /// Cost of `tokens` at `price` µUSD/1M tokens, rounded up.
@@ -71,35 +81,51 @@ fn tokens_cost(tokens: u64, price: u64) -> u64 {
     (tokens.saturating_mul(price)).div_ceil(1_000_000)
 }
 
-/// Exact cost of a reported usage block.
+impl Usage {
+    /// Input tokens the details do not account for (charged as audio).
+    pub fn input_shortfall(&self) -> u64 {
+        self.input_tokens.saturating_sub(self.input_text + self.input_audio)
+    }
+
+    /// Output tokens the details do not account for (charged as audio).
+    pub fn output_shortfall(&self) -> u64 {
+        self.output_tokens.saturating_sub(self.output_text + self.output_audio)
+    }
+}
+
+/// Exact cost of a reported usage block. Tokens missing from the details are
+/// charged at the (higher) audio rates.
 pub fn usage_cost_micros(pricing: &ModelPricing, usage: &Usage) -> i64 {
     let uncached_text = usage.input_text.saturating_sub(usage.cached_text);
     let uncached_audio = usage.input_audio.saturating_sub(usage.cached_audio);
     let cost = tokens_cost(uncached_text, pricing.text_in)
         + tokens_cost(usage.cached_text, pricing.text_cached)
-        + tokens_cost(uncached_audio, pricing.audio_in)
+        + tokens_cost(uncached_audio + usage.input_shortfall(), pricing.audio_in)
         + tokens_cost(usage.cached_audio, pricing.audio_cached)
         + tokens_cost(usage.output_text, pricing.text_out)
-        + tokens_cost(usage.output_audio, pricing.audio_out);
+        + tokens_cost(usage.output_audio + usage.output_shortfall(), pricing.audio_out);
     i64::try_from(cost).unwrap_or(i64::MAX)
 }
 
 /// What a response may cost at most, reserved before it runs (§3.5):
 /// `max_output_tokens × output rate + (context + audio since the last
-/// response) × uncached input rate + STT of the turn`. Audio rates are used
-/// for both because they are the higher ones.
+/// response) × uncached input rate + STT of the turn`. The output is priced at
+/// the audio rate (worst case); the context at the uncached rate of its
+/// modality.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ReservationInput {
     pub max_output_tokens: u64,
-    pub context_tokens: u64,
+    pub context_text_tokens: u64,
+    pub context_audio_tokens: u64,
     pub audio_tokens_since_last: u64,
     pub stt_seconds: u64,
 }
 
 pub fn reservation_micros(pricing: &ModelPricing, input: &ReservationInput) -> i64 {
     let cost = tokens_cost(input.max_output_tokens, pricing.audio_out)
+        + tokens_cost(input.context_text_tokens, pricing.text_in)
         + tokens_cost(
-            input.context_tokens.saturating_add(input.audio_tokens_since_last),
+            input.context_audio_tokens.saturating_add(input.audio_tokens_since_last),
             pricing.audio_in,
         )
         + input.stt_seconds.saturating_mul(STT_MICROS_PER_SECOND);
@@ -137,16 +163,39 @@ mod tests {
     }
 
     #[test]
-    fn reservation_follows_plan_formula() {
+    fn reservation_prices_context_per_modality() {
         let input = ReservationInput {
             max_output_tokens: 600,
-            context_tokens: 2_000,
+            context_text_tokens: 2_000,
+            context_audio_tokens: 500,
             audio_tokens_since_last: 50,
             stt_seconds: 5,
         };
-        // 600*64 + 2050*32 + 5*20 = 38_400 + 65_600 + 100
-        assert_eq!(reservation_micros(&PRICING_FULL, &input), 104_100);
-        assert!(reservation_micros(&PRICING_MINI, &input) < 104_100);
+        // 600*64 + 2000*4 + 550*32 + 5*20 = 38_400 + 8_000 + 17_600 + 100
+        assert_eq!(reservation_micros(&PRICING_FULL, &input), 64_100);
+        assert!(reservation_micros(&PRICING_MINI, &input) < 64_100);
+    }
+
+    #[test]
+    fn missing_details_are_charged_at_audio_rates() {
+        // Totals only, no breakdown.
+        let usage = Usage {
+            input_tokens: 1_000,
+            output_tokens: 100,
+            ..Default::default()
+        };
+        assert_eq!(usage.input_shortfall(), 1_000);
+        // 1000*32 + 100*64
+        assert_eq!(usage_cost_micros(&PRICING_FULL, &usage), 32_000 + 6_400);
+        // Partial details: the rest is audio.
+        let partial = Usage {
+            input_tokens: 1_000,
+            input_text: 600,
+            output_tokens: 100,
+            output_text: 100,
+            ..Default::default()
+        };
+        assert_eq!(usage_cost_micros(&PRICING_FULL, &partial), 2_400 + 12_800 + 2_400);
     }
 
     #[test]

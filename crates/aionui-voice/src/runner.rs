@@ -47,7 +47,6 @@ pub(crate) struct CallRunner {
     engine_call: Box<dyn EngineCall>,
     cmd_rx: mpsc::Receiver<CallCommand>,
     meter: BudgetMeter,
-    token: Option<String>,
     mode: RunMode,
     started: Instant,
     last_activity: Instant,
@@ -65,8 +64,8 @@ impl CallRunner {
         engine_call: Box<dyn EngineCall>,
         cmd_rx: mpsc::Receiver<CallCommand>,
         meter: BudgetMeter,
-        token: Option<String>,
         mode: RunMode,
+        started: Instant,
     ) -> Self {
         let now = Instant::now();
         Self {
@@ -75,9 +74,8 @@ impl CallRunner {
             engine_call,
             cmd_rx,
             meter,
-            token,
             mode,
-            started: now,
+            started,
             last_activity: now,
             last_revalidate: now,
             attached: false,
@@ -198,7 +196,12 @@ impl CallRunner {
         if let Err(err) = self
             .inner
             .sessions
-            .add_usage(&self.call.user_id, &self.call.session_id, delta)
+            .add_usage(
+                &self.call.user_id,
+                &self.call.session_id,
+                delta,
+                aionui_common::now_ms(),
+            )
             .await
         {
             tracing::warn!(error = %err, session_id = %self.call.session_id, "voice usage persist failed");
@@ -390,7 +393,7 @@ impl CallRunner {
 
     async fn on_tick(&mut self) -> Option<EndReason> {
         let timings = self.inner.timings;
-        if let Some(token) = self.token.clone()
+        if let Some(token) = self.call.token()
             && self.last_revalidate.elapsed() >= timings.revalidate_every
         {
             self.last_revalidate = Instant::now();
@@ -405,9 +408,14 @@ impl CallRunner {
                 }
             }
         }
-        let (since_heartbeat, frozen) = match self.call.liveness.lock() {
-            Ok(l) => (l.last_heartbeat.elapsed(), l.frozen),
-            Err(_) => (std::time::Duration::ZERO, false),
+        // Liveness counts from the later of the last heartbeat and the moment
+        // the HTTP listener came up: a recovered call is not "stale" because
+        // the backend itself took long to start.
+        let listening = self.inner.listening_since();
+        let (since_heartbeat, frozen) = match (self.call.liveness.lock(), listening) {
+            (Ok(l), Some(listening)) => (l.last_heartbeat.max(listening).elapsed(), l.frozen),
+            (Ok(l), None) => (std::time::Duration::ZERO, l.frozen),
+            (Err(_), _) => (std::time::Duration::ZERO, false),
         };
         let inputs = TickInputs {
             since_start: self.started.elapsed(),

@@ -16,7 +16,6 @@ use tokio::sync::mpsc;
 use tokio::time::Instant;
 
 use crate::frames::{error_frame, state_frame, to_text};
-use crate::lifecycle::EndReason;
 use crate::ports::AuthRejected;
 use crate::service::VoiceService;
 
@@ -160,8 +159,11 @@ impl Socket {
                     return Flow::Close;
                 }
                 self.hello_done = true;
-                tracing::debug!(user_id = %self.user_id, device = %hello.device, "voice socket hello");
+                tracing::debug!(user_id = %self.user_id, device = %log_safe(&hello.device), "voice socket hello");
                 self.service.note_heartbeat(&self.user_id, session.as_deref());
+                if let (Some(id), Some(token)) = (session.as_deref(), self.token.as_deref()) {
+                    self.service.adopt_token(&self.user_id, id, token);
+                }
                 match session
                     .as_deref()
                     .and_then(|id| self.service.ready_call(&self.user_id, id).map(|r| (id.to_owned(), r)))
@@ -210,10 +212,12 @@ impl Socket {
     }
 
     async fn revalidate(&mut self) -> Flow {
-        let Some(token) = self.token.clone() else {
-            return Flow::Continue;
+        let verdict = match self.token.as_deref() {
+            // No cookie to re-check: fail closed.
+            None => Err(AuthRejected::Rejected),
+            Some(token) => self.service.verify_token(token).await,
         };
-        match self.service.verify_token(&token).await {
+        match verdict {
             Ok(user) if user.id == self.user_id => Flow::Continue,
             Ok(_) | Err(AuthRejected::Rejected) => {
                 tracing::warn!(user_id = %self.user_id, "voice socket session re-validation failed; closing");
@@ -222,7 +226,10 @@ impl Socket {
                     "session ended",
                 )
                 .await;
-                self.service.end_user_calls(&self.user_id, EndReason::AuthRevoked).await;
+                // Only the calls on this cookie or bound to this socket.
+                self.service
+                    .end_calls_for_socket(&self.user_id, self.token.as_deref(), self.bound_session.as_deref())
+                    .await;
                 Flow::Close
             }
             Err(AuthRejected::Unavailable) => {
@@ -233,8 +240,14 @@ impl Socket {
     }
 }
 
+/// Client-supplied text for logs: at most 64 printable characters.
+fn log_safe(value: &str) -> String {
+    value.chars().filter(|c| !c.is_control()).take(64).collect()
+}
+
 /// Drive one upgraded voice socket until it closes.
 pub async fn handle_voice_socket(socket: WebSocket, user_id: String, token: Option<String>, service: VoiceService) {
+    service.mark_listening();
     let (sink, mut stream) = socket.split();
     let (tx, rx) = mpsc::channel(PER_CONNECTION_BUFFER);
     let conn_id =
@@ -307,6 +320,12 @@ mod tests {
             assert_eq!(limits.check_control(10), FrameVerdict::Ok);
         }
         assert_eq!(limits.check_control(10), FrameVerdict::RateLimited);
+    }
+
+    #[test]
+    fn logged_device_names_are_capped_and_printable() {
+        assert_eq!(log_safe("phone\u{0}\n"), "phone");
+        assert_eq!(log_safe(&"x".repeat(500)).len(), 64);
     }
 
     #[test]

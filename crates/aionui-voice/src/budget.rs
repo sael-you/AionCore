@@ -40,14 +40,15 @@ pub struct BudgetMeter {
     reservations: HashMap<String, i64>,
     /// Reserved by a backend-issued `response.create` whose id is not known yet.
     pending_own: Vec<i64>,
-    context_tokens: u64,
+    context_text_tokens: u64,
+    context_audio_tokens: u64,
     audio_ms_since_last: u64,
     warned: bool,
 }
 
 impl BudgetMeter {
-    /// `context_tokens` is the estimated size of the instructions + tools prefix.
-    pub fn new(pricing: ModelPricing, limit_micros: i64, base_used_micros: i64, context_tokens: u64) -> Self {
+    /// `prefix_tokens` is the estimated size of the (text) instructions + tools prefix.
+    pub fn new(pricing: ModelPricing, limit_micros: i64, base_used_micros: i64, prefix_tokens: u64) -> Self {
         Self {
             pricing,
             limit_micros,
@@ -55,7 +56,8 @@ impl BudgetMeter {
             session_cost_micros: 0,
             reservations: HashMap::new(),
             pending_own: Vec::new(),
-            context_tokens,
+            context_text_tokens: prefix_tokens,
+            context_audio_tokens: 0,
             audio_ms_since_last: 0,
             warned: false,
         }
@@ -88,7 +90,8 @@ impl BudgetMeter {
             &self.pricing,
             &ReservationInput {
                 max_output_tokens: VOICE_MAX_OUTPUT_TOKENS,
-                context_tokens: self.context_tokens,
+                context_text_tokens: self.context_text_tokens,
+                context_audio_tokens: self.context_audio_tokens,
                 audio_tokens_since_last: audio_tokens,
                 stt_seconds: self.audio_ms_since_last.div_ceil(1000),
             },
@@ -145,7 +148,8 @@ impl BudgetMeter {
         let reserved = self.reservations.remove(response_id);
         let delta = match usage {
             Some(usage) => {
-                self.context_tokens = usage.input_tokens + usage.output_tokens;
+                self.context_text_tokens = usage.context_text();
+                self.context_audio_tokens = usage.context_audio();
                 VoiceUsageDelta {
                     input_tokens: to_i64(usage.input_tokens),
                     cached_input_tokens: to_i64(usage.cached_tokens()),
