@@ -5,8 +5,8 @@
 use std::sync::Arc;
 
 use aionui_auth::{
-    AuthIdentityMode, AuthState, CookieNames, IRuntimeTokenVerifier, JwtService, OriginPolicy, auth_middleware,
-    require_trusted_origin_middleware,
+    AuthIdentityMode, AuthState, CookieNames, IRuntimeTokenVerifier, JwtService, OriginGuard, OriginPolicy,
+    auth_middleware, require_trusted_origin_middleware,
 };
 use aionui_db::{
     IMcpMarketRepository, IMcpServerRepository, IUserRepository, SqliteMcpMarketRepository, SqliteMcpServerRepository,
@@ -67,8 +67,11 @@ fn auth(f: &Fx, mode: AuthIdentityMode, verifier: Option<Arc<dyn IRuntimeTokenVe
     }
 }
 
-fn policy() -> Arc<OriginPolicy> {
-    Arc::new(OriginPolicy::new(Some(ORIGIN), &[]))
+fn origin_guard() -> OriginGuard {
+    OriginGuard {
+        policy: Arc::new(OriginPolicy::new(Some(ORIGIN), &[])),
+        same_origin_via_web_host: true,
+    }
 }
 
 /// Writes as `aionui-app` mounts them: session-only state, then the strict
@@ -76,7 +79,7 @@ fn policy() -> Arc<OriginPolicy> {
 fn write_router(f: &Fx, write_auth: AuthState) -> Router {
     mcp_market_write_routes(f.state.clone())
         .route_layer(from_fn_with_state(write_auth, auth_middleware))
-        .route_layer(from_fn_with_state(policy(), require_trusted_origin_middleware))
+        .route_layer(from_fn_with_state(origin_guard(), require_trusted_origin_middleware))
 }
 
 /// The composition used by `aionui-app` in `--local`: reads with the Local
