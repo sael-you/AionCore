@@ -157,6 +157,24 @@ fn data() -> Value {
                 }
             },
             {
+                "name": "voice",
+                "mode": "agent-to-user-voice",
+                "description": "Speak a short line (say) or ask a question (ask, wait) on the user's armed voice device, for conversations the user sent a voice request to. Operators: `voice status --data-dir` reads the live-call count.",
+                "contract": "agent-facing-voice-cli",
+                "contract_command": "voice capabilities",
+                "invocation": "aioncore voice capabilities",
+                "runtime_required": ["AIONUI_BASE_URL", "AIONUI_CONVERSATION_ID", "AIONUI_USER_ID", "AIONUI_RUNTIME_TOKEN"],
+                "runtime_free_commands": ["voice capabilities"],
+                "operator_commands": ["voice status"],
+                "safety": {
+                    "can_write": true,
+                    "runtime_token_required_for_context_and_call": true,
+                    "does_not_accept_identity_authority_from_stdin": true,
+                    "scoped_to_voice_requesting_conversations": true,
+                    "answer_is_never_approval": true
+                }
+            },
+            {
                 "name": "skills",
                 "mode": "read-only",
                 "description": "Read the skills enabled in THIS conversation: list them, get a skill's full body plus its absolute directory, and read its supplementary files.",
@@ -228,7 +246,7 @@ mod tests {
     use super::*;
     use crate::cli::Cli;
     use crate::commands::{
-        board_capabilities, config_capabilities, conversation_capabilities, diagnose_capabilities,
+        board_capabilities, cmd_voice, config_capabilities, conversation_capabilities, diagnose_capabilities,
         session_capabilities, skills_capabilities, team_capabilities,
     };
 
@@ -314,6 +332,7 @@ mod tests {
             ("conversation", conversation_capabilities::data()),
             ("board", board_capabilities::data()),
             ("skills", skills_capabilities::data()),
+            ("voice", cmd_voice::capabilities_data()),
         ] {
             let entry = domains
                 .iter()

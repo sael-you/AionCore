@@ -72,7 +72,7 @@ pub use origin::{
 // Auth middleware
 pub use middleware::{
     AuthChannel, AuthIdentityMode, AuthState, CurrentUser, IRuntimeTokenVerifier, RUNTIME_CONVERSATION_ID_HEADER,
-    RUNTIME_TOKEN_HEADER, RUNTIME_USER_ID_HEADER, auth_middleware, local_auth_middleware,
+    RUNTIME_TOKEN_HEADER, RUNTIME_USER_ID_HEADER, auth_middleware, authenticate_session_token, local_auth_middleware,
 };
 
 // QR token store

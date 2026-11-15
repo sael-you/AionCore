@@ -4,13 +4,13 @@ use aionui_common::{PaginatedResult, TimestampMs};
 
 use crate::error::DbError;
 use crate::models::{
-    ConversationArtifactRow, ConversationAssistantSnapshotRow, ConversationRow, MessageRow,
+    ConversationArtifactRow, ConversationAssistantSnapshotRow, ConversationRow, IdempotentSendRow, MessageRow,
     UpsertConversationAssistantSnapshotParams,
 };
 use crate::repository::conversation::{
-    ConversationFilters, ConversationRowUpdate, IConversationRepository, MentionableCandidatesParams,
+    ConversationFilters, ConversationRowUpdate, IConversationRepository, IdempotentInsert, MentionableCandidatesParams,
     MessagePageCursor, MessagePageDirection, MessagePageParams, MessagePageResult, MessageRowUpdate, MessageSearchRow,
-    StaleRuntimeMessageRow,
+    NewIdempotentSend, StaleRuntimeMessageRow,
 };
 
 /// Bump `conversations.updated_at` so the conversation-list sort
@@ -51,6 +51,22 @@ impl SqliteConversationRepository {
     }
 
     async fn insert_message_once(&self, user_id: &str, message: &MessageRow) -> Result<(), DbError> {
+        match self.insert_message_keyed(user_id, message, None).await? {
+            IdempotentInsert::Inserted => Ok(()),
+            // Unreachable without a key; never panic on a write path.
+            IdempotentInsert::Existing(_) => Ok(()),
+        }
+    }
+
+    /// `insert_message_once`, optionally recording an idempotency key in the
+    /// same transaction. An existing key wins: nothing is written and the
+    /// original ids are returned.
+    async fn insert_message_keyed(
+        &self,
+        user_id: &str,
+        message: &MessageRow,
+        key: Option<&NewIdempotentSend<'_>>,
+    ) -> Result<IdempotentInsert, DbError> {
         // BEGIN IMMEDIATE claims the writer lock up front (same pattern as
         // `claim_run`) so concurrent inserters queue on SQLite's busy handler
         // instead of a read-then-write transaction failing with "database is
@@ -58,7 +74,7 @@ impl SqliteConversationRepository {
         let mut connection = self.pool.acquire().await?;
         sqlx::query("BEGIN IMMEDIATE").execute(&mut *connection).await?;
 
-        let result: Result<(), DbError> = async {
+        let result: Result<IdempotentInsert, DbError> = async {
             // Ownership check inside the same transaction as the insert +
             // bump, so parent-chain authorization and the write are atomic.
             let exists: i64 =
@@ -72,6 +88,32 @@ impl SqliteConversationRepository {
                     "Conversation '{}' not found",
                     message.conversation_id
                 )));
+            }
+            if let Some(key) = key {
+                let existing = sqlx::query_as::<_, IdempotentSendRow>(
+                    "SELECT * FROM message_idempotency_keys WHERE conversation_id = ? AND idempotency_key = ?",
+                )
+                .bind(&message.conversation_id)
+                .bind(key.idempotency_key)
+                .fetch_optional(&mut *connection)
+                .await?;
+                if let Some(existing) = existing {
+                    return Ok(IdempotentInsert::Existing(existing));
+                }
+                sqlx::query(
+                    "INSERT INTO message_idempotency_keys \
+                        (conversation_id, idempotency_key, user_id, msg_id, turn_id, delivered_midturn, created_at) \
+                     VALUES (?, ?, ?, ?, ?, ?, ?)",
+                )
+                .bind(&message.conversation_id)
+                .bind(key.idempotency_key)
+                .bind(user_id)
+                .bind(message.msg_id.as_deref().unwrap_or(&message.id))
+                .bind(key.turn_id)
+                .bind(key.delivered_midturn)
+                .bind(message.created_at)
+                .execute(&mut *connection)
+                .await?;
             }
             sqlx::query(
                 "INSERT INTO messages \
@@ -100,14 +142,18 @@ impl SqliteConversationRepository {
                 .bind(&message.conversation_id)
                 .execute(&mut *connection)
                 .await?;
-            Ok(())
+            Ok(IdempotentInsert::Inserted)
         }
         .await;
 
         match result {
-            Ok(()) => {
+            Ok(IdempotentInsert::Inserted) => {
                 sqlx::query("COMMIT").execute(&mut *connection).await?;
-                Ok(())
+                Ok(IdempotentInsert::Inserted)
+            }
+            Ok(existing @ IdempotentInsert::Existing(_)) => {
+                let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
+                Ok(existing)
             }
             Err(error) => {
                 let _ = sqlx::query("ROLLBACK").execute(&mut *connection).await;
@@ -1034,6 +1080,55 @@ impl IConversationRepository for SqliteConversationRepository {
 
     async fn insert_message(&self, user_id: &str, message: &MessageRow) -> Result<(), DbError> {
         self.insert_message_once(user_id, message).await
+    }
+
+    async fn find_idempotent_send(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        idempotency_key: &str,
+    ) -> Result<Option<IdempotentSendRow>, DbError> {
+        let row = sqlx::query_as::<_, IdempotentSendRow>(
+            "SELECT * FROM message_idempotency_keys \
+             WHERE user_id = ? AND conversation_id = ? AND idempotency_key = ?",
+        )
+        .bind(user_id)
+        .bind(conversation_id)
+        .bind(idempotency_key)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row)
+    }
+
+    async fn insert_message_idempotent(
+        &self,
+        user_id: &str,
+        message: &MessageRow,
+        key: &NewIdempotentSend<'_>,
+    ) -> Result<IdempotentInsert, DbError> {
+        self.insert_message_keyed(user_id, message, Some(key)).await
+    }
+
+    async fn update_idempotent_send_turn(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        idempotency_key: &str,
+        turn_id: &str,
+        delivered_midturn: bool,
+    ) -> Result<(), DbError> {
+        sqlx::query(
+            "UPDATE message_idempotency_keys SET turn_id = ?, delivered_midturn = ? \
+             WHERE user_id = ? AND conversation_id = ? AND idempotency_key = ?",
+        )
+        .bind(turn_id)
+        .bind(delivered_midturn)
+        .bind(user_id)
+        .bind(conversation_id)
+        .bind(idempotency_key)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
     }
 
     async fn upsert_message(&self, user_id: &str, message: &MessageRow) -> Result<(), DbError> {
@@ -2713,3 +2808,7 @@ mod tests {
         assert_eq!(f.effective_limit(), 50);
     }
 }
+
+#[cfg(test)]
+#[path = "sqlite_conversation_idempotency_test.rs"]
+mod sqlite_conversation_idempotency_test;

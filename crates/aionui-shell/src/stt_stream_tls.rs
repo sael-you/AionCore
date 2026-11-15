@@ -20,7 +20,7 @@ use crate::error::SttError;
 /// Explicitly sets ALPN to `http/1.1` only — WebSocket requires an HTTP/1.1
 /// upgrade handshake and is incompatible with h2. Without this, some servers
 /// negotiate h2 via ALPN and the WebSocket upgrade never completes.
-pub(crate) fn build_ws_connector() -> Result<tokio_tungstenite::Connector, SttError> {
+pub fn build_ws_connector() -> Result<tokio_tungstenite::Connector, SttError> {
     let certs = rustls_native_certs::load_native_certs();
     let mut root_store = rustls::RootCertStore::empty();
     root_store.add_parsable_certificates(certs.certs);

@@ -426,6 +426,17 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     // The `@@` picker's outlet goes through ordinary user auth.
     let session_message_authenticated = session_message_user_routes(states.session_message)
         .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
+    // Voice (card C9) carries its own guards: cookie session in every mode,
+    // credential precedence, Origin allowlist, CSRF when local. It sits inside
+    // the global CSRF layer like the other user routes.
+    // Agent → user voice (`say`/`ask`): runtime-token router, outside auth/CSRF.
+    let voice_agent = aionui_voice::voice_agent_routes(aionui_voice::VoiceAgentRouterState {
+        service: states.voice.service.clone(),
+        verifier: Arc::new(ConversationHelperTokenVerifier {
+            runtime_token_service: services.runtime_token_service.clone(),
+        }),
+    });
+    let voice_user = aionui_voice::voice_routes(states.voice, super::voice::voice_guards(services));
     tracing::info!(elapsed_ms = boot.elapsed().as_millis(), "startup: route groups built");
 
     // Antigravity permission hook callback. Deliberately NOT behind
@@ -465,7 +476,8 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         .merge(office_authenticated)
         .merge(shell_authenticated)
         .merge(assistant_authenticated)
-        .merge(session_message_authenticated);
+        .merge(session_message_authenticated)
+        .merge(voice_user);
 
     // Conditionally merge WeChat login SSE route (feature-gated)
     #[cfg(feature = "weixin")]
@@ -489,6 +501,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     .merge(runtime_team_tools)
     .merge(session_message_runtime)
     .merge(conversation_runtime)
+    .merge(voice_agent)
     .merge(board_runtime)
     .merge(office_proxy)
     .merge(public_assets)

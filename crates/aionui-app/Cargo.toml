@@ -16,6 +16,8 @@ dingtalk = ["aionui-channel/dingtalk"]
 weixin = ["aionui-channel/weixin"]
 slack = ["aionui-channel/slack"]
 discord = ["aionui-channel/discord"]
+# Voice test seam: fake OpenAI provider + AIONUI_VOICE_FAKE_PROVIDER_URL (never in releases).
+voice-test = ["aionui-voice/voice-test"]
 
 [dependencies]
 aionui-common.workspace = true
@@ -43,6 +45,7 @@ aionui-project.workspace = true
 aionui-sidebar.workspace = true
 aionui-board.workspace = true
 aionui-assistant.workspace = true
+aionui-voice.workspace = true
 aionui-runtime.workspace = true
 aionui-process.workspace = true
 aion-config.workspace = true

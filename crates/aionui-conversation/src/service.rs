@@ -3737,6 +3737,7 @@ impl ConversationService {
         agent: AgentInstance,
         active_turn_id: String,
         inject_skills: Vec<String>,
+        idempotency_key: Option<&str>,
     ) -> Result<MidturnOutcome, ConversationError> {
         let user_msg_id = Self::mint_msg_id();
         let persisted = self
@@ -3755,9 +3756,41 @@ impl ConversationService {
                 created_at: now_ms(),
                 backend_turn_id: None,
             };
-            if let Err(e) = self.conversation_repo.insert_message(user_id, &user_msg).await {
-                warn!(msg_id = %user_msg_id, error = %ErrorChain(&e), "Failed to insert mid-turn user message");
-                return Err(e.into());
+            let inserted = match idempotency_key {
+                Some(key) => {
+                    self.conversation_repo
+                        .insert_message_idempotent(
+                            user_id,
+                            &user_msg,
+                            &aionui_db::NewIdempotentSend {
+                                idempotency_key: key,
+                                turn_id: &active_turn_id,
+                                delivered_midturn: true,
+                            },
+                        )
+                        .await
+                }
+                None => self
+                    .conversation_repo
+                    .insert_message(user_id, &user_msg)
+                    .await
+                    .map(|()| aionui_db::IdempotentInsert::Inserted),
+            };
+            match inserted {
+                Ok(aionui_db::IdempotentInsert::Inserted) => {}
+                Ok(aionui_db::IdempotentInsert::Existing(original)) => {
+                    // A concurrent send with the same key won the race: answer
+                    // with its ids and deliver nothing.
+                    info!(conversation_id = %conversation_id, msg_id = %original.msg_id,
+                        "idempotent send matched an earlier mid-turn send");
+                    return Ok(MidturnOutcome::Delivered(
+                        self.idempotent_replay(conversation_id, original).await,
+                    ));
+                }
+                Err(e) => {
+                    warn!(msg_id = %user_msg_id, error = %ErrorChain(&e), "Failed to insert mid-turn user message");
+                    return Err(e.into());
+                }
             }
             info!(msg_id = %user_msg_id, "Mid-turn user message persisted");
             self.broadcaster.broadcast(WebSocketMessage::new(
@@ -3872,6 +3905,58 @@ impl ConversationService {
         req: SendMessageRequest,
         task_manager: &Arc<dyn IWorkerTaskManager>,
     ) -> Result<SendMessageResponse, ConversationError> {
+        self.send_message_keyed(user_id, conversation_id, req, task_manager, None)
+            .await
+    }
+
+    /// [`Self::send_message`] with an idempotency key (voice: `draft_id:version`).
+    ///
+    /// The key is looked up first — before attachment resolution, mid-turn
+    /// delivery and the turn claim: a hit returns the stored `{msg_id, turn_id}`
+    /// with no claim, no broadcast and no new turn. The key is stored in the
+    /// same transaction as the user message (mid-turn and new-turn inserts);
+    /// a concurrent duplicate that loses the insert releases its claim and
+    /// returns the original ids.
+    #[tracing::instrument(skip_all, fields(user_id = %user_id, conversation_id = %conversation_id))]
+    pub async fn send_message_idempotent(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        req: SendMessageRequest,
+        task_manager: &Arc<dyn IWorkerTaskManager>,
+        idempotency_key: &str,
+    ) -> Result<SendMessageResponse, ConversationError> {
+        let key = idempotency_key.trim();
+        if key.is_empty() || key.len() > 200 {
+            return Err(ConversationError::BadRequest {
+                reason: "idempotency key must be 1-200 characters".into(),
+            });
+        }
+        self.send_message_keyed(user_id, conversation_id, req, task_manager, Some(key))
+            .await
+    }
+
+    /// Response for a send that matched a stored idempotency key.
+    async fn idempotent_replay(
+        &self,
+        conversation_id: &str,
+        original: aionui_db::IdempotentSendRow,
+    ) -> SendMessageResponse {
+        let mut response = self
+            .send_message_response(conversation_id, original.msg_id, original.turn_id)
+            .await;
+        response.delivered_midturn = original.delivered_midturn;
+        response
+    }
+
+    async fn send_message_keyed(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        req: SendMessageRequest,
+        task_manager: &Arc<dyn IWorkerTaskManager>,
+        idempotency_key: Option<&str>,
+    ) -> Result<SendMessageResponse, ConversationError> {
         if req.content.trim().is_empty() {
             return Err(ConversationError::BadRequest {
                 reason: "Message content must not be empty".into(),
@@ -3902,6 +3987,17 @@ impl ConversationService {
         }
 
         reject_deprecated_runtime_row(&row)?;
+
+        if let Some(key) = idempotency_key
+            && let Some(original) = self
+                .conversation_repo
+                .find_idempotent_send(user_id, conversation_id, key)
+                .await?
+        {
+            info!(conversation_id = %conversation_id, msg_id = %original.msg_id, turn_id = %original.turn_id,
+                "idempotent send matched an earlier send; nothing re-sent");
+            return Ok(self.idempotent_replay(conversation_id, original).await);
+        }
 
         // `@@` references resolve at the same boundary and with the same
         // atomicity as file attachments. Sender workspace comes from the row so
@@ -3980,6 +4076,7 @@ impl ConversationService {
                         agent,
                         active_turn_id,
                         req.inject_skills.clone(),
+                        idempotency_key,
                     )
                     .await?
                 {
@@ -4033,10 +4130,53 @@ impl ConversationService {
         // The TurnEnded fallback already persisted + broadcast this message
         // (with the statusChanged flip) — doing it again would duplicate the
         // row and the live-view bubble.
-        if !was_fallback {
-            if let Err(e) = self.conversation_repo.insert_message(user_id, &user_msg).await {
-                warn!(msg_id = %user_msg_id, error = %ErrorChain(&e), "Failed to insert user message");
-                return Err(e.into());
+        if was_fallback {
+            if let Some(key) = idempotency_key
+                && let Err(e) = self
+                    .conversation_repo
+                    .update_idempotent_send_turn(user_id, conversation_id, key, &turn_id, false)
+                    .await
+            {
+                warn!(msg_id = %user_msg_id, error = %ErrorChain(&e), "Failed to re-point idempotency key to the new turn");
+            }
+        } else {
+            let inserted = match idempotency_key {
+                Some(key) => {
+                    self.conversation_repo
+                        .insert_message_idempotent(
+                            user_id,
+                            &user_msg,
+                            &aionui_db::NewIdempotentSend {
+                                idempotency_key: key,
+                                turn_id: &turn_id,
+                                delivered_midturn: false,
+                            },
+                        )
+                        .await
+                }
+                None => self
+                    .conversation_repo
+                    .insert_message(user_id, &user_msg)
+                    .await
+                    .map(|()| aionui_db::IdempotentInsert::Inserted),
+            };
+            match inserted {
+                Ok(aionui_db::IdempotentInsert::Inserted) => {}
+                Ok(aionui_db::IdempotentInsert::Existing(original)) => {
+                    // Lost the race to a concurrent send with the same key:
+                    // give the claim back and answer with the original ids.
+                    let mut turn_claim = turn_claim;
+                    let was_deleting = turn_claim.release();
+                    self.complete_released_turn(user_id, conversation_id, &turn_id, was_deleting)
+                        .await;
+                    info!(conversation_id = %conversation_id, msg_id = %original.msg_id,
+                        "idempotent send lost the insert race; returning the original ids");
+                    return Ok(self.idempotent_replay(conversation_id, original).await);
+                }
+                Err(e) => {
+                    warn!(msg_id = %user_msg_id, error = %ErrorChain(&e), "Failed to insert user message");
+                    return Err(e.into());
+                }
             }
 
             info!(msg_id = %user_msg_id, "User message persisted");

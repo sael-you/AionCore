@@ -267,3 +267,120 @@ async fn midturn_send_to_non_supporting_backend_stays_409() {
         "the running-conversation error is preserved, got: {err}"
     );
 }
+
+// ── Idempotent sends (voice, PLAN v15 §3.3.6) ────────────────────────────────
+
+fn keyed_request(content: &str) -> aionui_api_types::SendMessageRequest {
+    serde_json::from_value(json!({ "content": content })).unwrap()
+}
+
+async fn user_messages(services: &AppServices, conv_id: &str) -> i64 {
+    sqlx::query_scalar("SELECT COUNT(*) FROM messages WHERE conversation_id = ? AND position = 'right'")
+        .bind(conv_id)
+        .fetch_one(services.database.pool())
+        .await
+        .unwrap()
+}
+
+async fn admin_id(services: &AppServices) -> String {
+    sqlx::query_scalar("SELECT id FROM users WHERE username = 'admin'")
+        .fetch_one(services.database.pool())
+        .await
+        .unwrap()
+}
+
+/// A re-send with the same key while the original's turn is still running
+/// returns the original ids: no second row, no new turn, nothing delivered.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn keyed_resend_during_the_running_turn_returns_the_original_ids() {
+    let MidturnRig {
+        mut app,
+        services,
+        delivered,
+    } = build_midturn_app(true).await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "pw").await;
+    let conv_id = create_conversation(&mut app, &token, &csrf).await;
+    let user_id = admin_id(&services).await;
+    let tm = services.worker_task_manager.clone();
+    let svc = &services.conversation_service;
+
+    let first = svc
+        .send_message_idempotent(&user_id, &conv_id, keyed_request("voice draft"), &tm, "draft-1:1")
+        .await
+        .unwrap();
+    assert!(!first.delivered_midturn);
+    wait_for_agent_registered(&services, &conv_id).await;
+
+    let again = svc
+        .send_message_idempotent(&user_id, &conv_id, keyed_request("voice draft"), &tm, "draft-1:1")
+        .await
+        .unwrap();
+    assert_eq!(
+        (again.msg_id.as_str(), again.turn_id.as_str()),
+        (first.msg_id.as_str(), first.turn_id.as_str())
+    );
+    assert!(!again.delivered_midturn);
+    assert_eq!(user_messages(&services, &conv_id).await, 1);
+    assert!(
+        delivered.lock().await.is_empty(),
+        "the retry was not steered into the turn"
+    );
+
+    // A different key during the running turn steers (mid-turn) and is
+    // itself idempotent.
+    let steer = svc
+        .send_message_idempotent(&user_id, &conv_id, keyed_request("change it"), &tm, "draft-1:2")
+        .await
+        .unwrap();
+    assert!(steer.delivered_midturn);
+    assert_eq!(steer.turn_id, first.turn_id);
+    let steer_again = svc
+        .send_message_idempotent(&user_id, &conv_id, keyed_request("change it"), &tm, "draft-1:2")
+        .await
+        .unwrap();
+    assert_eq!(steer_again.msg_id, steer.msg_id);
+    assert!(steer_again.delivered_midturn);
+    assert_eq!(delivered.lock().await.len(), 1, "delivered once");
+    assert_eq!(user_messages(&services, &conv_id).await, 2);
+}
+
+/// Two concurrent sends with the same key persist one message.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn concurrent_keyed_sends_persist_one_message() {
+    let MidturnRig { mut app, services, .. } = build_midturn_app(false).await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "pw").await;
+    let conv_id = create_conversation(&mut app, &token, &csrf).await;
+    let user_id = admin_id(&services).await;
+    let tm = services.worker_task_manager.clone();
+    let svc = &services.conversation_service;
+
+    let (a, b) = tokio::join!(
+        svc.send_message_idempotent(&user_id, &conv_id, keyed_request("once"), &tm, "draft-2:1"),
+        svc.send_message_idempotent(&user_id, &conv_id, keyed_request("once"), &tm, "draft-2:1"),
+    );
+    let ok: Vec<_> = [a, b].into_iter().filter_map(Result::ok).collect();
+    assert!(!ok.is_empty(), "at least one send succeeded");
+    if let [x, y] = ok.as_slice() {
+        assert_eq!(x.msg_id, y.msg_id, "both answers name the same message");
+    }
+    assert_eq!(user_messages(&services, &conv_id).await, 1);
+}
+
+/// Keys are validated; an unkeyed send is unaffected.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn idempotency_keys_are_validated() {
+    let MidturnRig { mut app, services, .. } = build_midturn_app(false).await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "pw").await;
+    let conv_id = create_conversation(&mut app, &token, &csrf).await;
+    let user_id = admin_id(&services).await;
+    let tm = services.worker_task_manager.clone();
+    let err = services
+        .conversation_service
+        .send_message_idempotent(&user_id, &conv_id, keyed_request("x"), &tm, "  ")
+        .await
+        .unwrap_err();
+    assert!(
+        matches!(err, aionui_conversation::ConversationError::BadRequest { .. }),
+        "{err:?}"
+    );
+}

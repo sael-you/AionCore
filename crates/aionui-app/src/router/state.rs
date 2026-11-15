@@ -150,6 +150,8 @@ pub struct ModuleStates {
     pub office: OfficeRouterState,
     pub shell: ShellRouterState,
     pub assistant: AssistantRouterState,
+    /// Voice Concierge (card C9).
+    pub voice: aionui_voice::VoiceRouterState,
 }
 
 fn default_allowed_roots(work_dir: Option<&std::path::Path>) -> Vec<std::path::PathBuf> {
@@ -342,7 +344,17 @@ pub async fn build_module_states(
         office: build_module_state_phase(&boot, "office", || build_office_state(services)),
         shell: build_module_state_phase(&boot, "shell", || build_shell_state(services)),
         assistant,
+        voice: build_module_state_phase(&boot, "voice", || super::voice::build_voice_state(services)),
     };
+    // Re-attach sidebands to calls persisted as live by the previous process
+    // (or hang them up); runs in the background so startup never waits on it.
+    let voice_service = states.voice.service.clone();
+    // Draft worker (queued retries, start checks, recovery) and follow-ups.
+    voice_service.start_background(services.event_bus.clone());
+    tokio::spawn(async move {
+        let resumed = voice_service.recover_open_sessions().await;
+        tracing::info!(resumed, "voice: startup recovery finished");
+    });
     tracing::info!(
         elapsed_ms = boot.elapsed().as_millis(),
         "startup: module state build completed"
