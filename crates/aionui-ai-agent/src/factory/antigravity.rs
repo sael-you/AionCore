@@ -153,6 +153,8 @@ pub(super) async fn build(
             session_snapshot: build_context.session_snapshot.as_ref(),
             backend_session_id: build_context.session_id.clone(),
             mcp_server_repo: deps.mcp_server_repo.as_ref(),
+            // Antigravity receives no market MCPs (it reads no MCP config, R§1.15).
+            mcp_market: None,
             runtime_env: &runtime_env,
             broadcaster: deps.broadcaster.clone(),
             // Keyed by the resolved catalog row so discovered models/modes

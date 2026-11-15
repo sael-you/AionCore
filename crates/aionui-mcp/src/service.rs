@@ -5,7 +5,7 @@ use aionui_api_types::{
     UpdateMcpServerRequest,
 };
 use aionui_common::now_ms;
-use aionui_db::{CreateMcpServerParams, IMcpServerRepository, UpdateMcpServerParams};
+use aionui_db::{CreateMcpServerParams, IMcpMarketRepository, IMcpServerRepository, UpdateMcpServerParams};
 use tracing::{info, warn};
 
 use crate::error::McpError;
@@ -29,6 +29,10 @@ const SPLITTABLE_STDIO_LAUNCHERS: &[&str] = &["npx", "pnpx", "bunx", "uvx", "uv"
 #[derive(Clone)]
 pub struct McpConfigService {
     repo: Arc<dyn IMcpServerRepository>,
+    /// MCP market rows are managed by the market service only: the generic
+    /// routes refuse their names (409) so an upsert can never revive or
+    /// rewrite one (R1 #10). `None` in tests that have no market.
+    market_repo: Option<Arc<dyn IMcpMarketRepository>>,
 }
 
 struct UpsertMcpServer<'a> {
@@ -43,7 +47,53 @@ struct UpsertMcpServer<'a> {
 
 impl McpConfigService {
     pub fn new(repo: Arc<dyn IMcpServerRepository>) -> Self {
-        Self { repo }
+        Self {
+            repo,
+            market_repo: None,
+        }
+    }
+
+    /// Enable the market-name guard (see [`McpConfigService::market_repo`]).
+    pub fn with_market_repo(mut self, market_repo: Arc<dyn IMcpMarketRepository>) -> Self {
+        self.market_repo = Some(market_repo);
+        self
+    }
+
+    /// 409 when `name` belongs to a market instance (active, dormant, revoked or soft-deleted).
+    pub async fn reject_market_name(&self, user_id: &str, name: &str) -> Result<(), McpError> {
+        if let Some(market) = &self.market_repo
+            && market
+                .find_by_name_any(user_id, name)
+                .await?
+                .is_some_and(|row| row.is_market())
+        {
+            return Err(McpError::Conflict(format!(
+                "'{name}' is an MCP market instance; manage it through /api/mcp/market"
+            )));
+        }
+        Ok(())
+    }
+
+    async fn reject_market_id(&self, user_id: &str, id: &str) -> Result<(), McpError> {
+        if self.market_repo.is_none() {
+            return Ok(());
+        }
+        if let Some(row) = self.repo.find_by_id_any(user_id, id).await? {
+            self.reject_market_name(user_id, &row.name).await?;
+        }
+        Ok(())
+    }
+
+    /// The stored transport of a non-market row, for the mask round-trip of
+    /// `test-connection {id}`. `None` when the row is unknown or a market row.
+    pub async fn stored_transport(&self, user_id: &str, id: &str) -> Result<Option<McpServerTransport>, McpError> {
+        let Some(row) = self.repo.find_by_id(user_id, id).await? else {
+            return Ok(None);
+        };
+        if self.reject_market_name(user_id, &row.name).await.is_err() {
+            return Ok(None);
+        }
+        Ok(Some(McpServer::from_row(row)?.transport))
     }
 
     /// List all MCP servers.
@@ -70,7 +120,9 @@ impl McpConfigService {
     /// If a server with the same name already exists, it is updated
     /// (transport, description, original_json) rather than creating a duplicate.
     pub async fn add_server(&self, user_id: &str, req: CreateMcpServerRequest) -> Result<McpServerResponse, McpError> {
+        self.reject_market_name(user_id, &req.name).await?;
         let transport = normalize_transport(McpServerTransport::from(req.transport))?;
+        reject_masked(&transport)?;
         self.upsert_server(UpsertMcpServer {
             user_id,
             name: &req.name,
@@ -119,12 +171,33 @@ impl McpConfigService {
             return Err(McpError::Conflict(new_name.clone()));
         }
 
-        // Build transport fields if provided
-        let transport = req
+        self.reject_market_name(user_id, &existing_server.name).await?;
+
+        // Build transport fields if provided. Values the client sends back as
+        // the response mask ("•••") keep the stored value (R1 #11).
+        let mut transport = req
             .transport
             .map(McpServerTransport::from)
             .map(normalize_transport)
             .transpose()?;
+        if let Some(incoming) = transport.as_mut()
+            && let Ok(stored) =
+                McpServerTransport::from_db(&existing_server.transport_type, &existing_server.transport_config)
+        {
+            crate::secret_mask::unmask_transport(incoming, &stored);
+        }
+        if let Some(incoming) = transport.as_ref() {
+            reject_masked(incoming)?;
+        }
+        // A masked original_json sent back unchanged keeps the stored text.
+        let masked_original = existing_server
+            .original_json
+            .as_deref()
+            .and_then(crate::secret_mask::mask_original_json);
+        let original_json = match req.original_json {
+            Some(Some(ref text)) if masked_original.as_deref() == Some(text.as_str()) => None,
+            other => other,
+        };
         let config_json = transport.as_ref().map(McpServerTransport::to_config_json).transpose()?;
 
         let params = UpdateMcpServerParams {
@@ -132,7 +205,7 @@ impl McpConfigService {
             description: req.description.as_ref().map(|opt| opt.as_deref()),
             transport_type: transport.as_ref().map(McpServerTransport::transport_type),
             transport_config: config_json.as_deref(),
-            original_json: req.original_json.as_ref().map(|opt| opt.as_deref()),
+            original_json: original_json.as_ref().map(|opt| opt.as_deref()),
             builtin: req.builtin,
             ..Default::default()
         };
@@ -146,6 +219,7 @@ impl McpConfigService {
     ///
     /// Returns whether the deleted server was enabled.
     pub async fn delete_server(&self, user_id: &str, id: &str) -> Result<bool, McpError> {
+        self.reject_market_id(user_id, id).await?;
         let row = self
             .repo
             .find_by_id(user_id, id)
@@ -160,6 +234,8 @@ impl McpConfigService {
     ///
     /// Returns the updated server response.
     pub async fn toggle_server(&self, user_id: &str, id: &str) -> Result<McpServerResponse, McpError> {
+        // R8: market rows stay enabled = false; their delivery is an assignment.
+        self.reject_market_id(user_id, id).await?;
         let row = self
             .repo
             .find_by_id(user_id, id)
@@ -189,6 +265,7 @@ impl McpConfigService {
         let mut rows = Vec::with_capacity(requested_count);
         let mut skipped_reserved_count = 0usize;
         for server_req in req.servers {
+            self.reject_market_name(user_id, &server_req.name).await?;
             if let Some(existing) = self.repo.find_by_name_any(user_id, &server_req.name).await?
                 && existing.builtin
             {
@@ -201,6 +278,7 @@ impl McpConfigService {
             }
 
             let transport = normalize_transport(McpServerTransport::from(server_req.transport))?;
+            reject_masked(&transport)?;
             let server = self
                 .upsert_server(UpsertMcpServer {
                     user_id,
@@ -289,6 +367,17 @@ impl McpConfigService {
         let server = McpServer::from_row(row)?;
         Ok(server.into_response())
     }
+}
+
+/// A transport still holding the response mask has no real value to store
+/// (e.g. a masked `agent-configs` entry sent to create/import).
+fn reject_masked(transport: &McpServerTransport) -> Result<(), McpError> {
+    if crate::secret_mask::transport_contains_mask(transport) {
+        return Err(McpError::MaskedValue(
+            "a value is masked (\"•••\"); enter the real value".to_owned(),
+        ));
+    }
+    Ok(())
 }
 
 fn normalize_transport(transport: McpServerTransport) -> Result<McpServerTransport, McpError> {

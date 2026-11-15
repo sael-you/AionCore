@@ -43,6 +43,16 @@ fn run_main() -> Result<ExitCode, MainError> {
         aionui_runtime::set_managed_resources_mode(cli.managed_resources_mode.into());
         aionui_runtime::init(&cli.data_dir);
     }
+    // The MCP market launcher resolves `npx`/`node` through the bundled
+    // runtime, anchored at the AionUi data dir it serves (R1 #2).
+    if let Some(Command::Mcp(cli::McpArgs {
+        command: cli::McpCommand::Exec(ref args),
+    })) = cli.command
+        && let Some(data_dir) = commands::cmd_mcp::resolve_data_dir(args)
+    {
+        aionui_runtime::set_managed_resources_mode(aionui_runtime::ManagedResourcesMode::Bundled);
+        aionui_runtime::init(&data_dir);
+    }
 
     // SAFETY: called before any worker thread exists (including the tokio
     // runtime constructed below). Rust 2024 requires `unsafe` for
@@ -91,6 +101,7 @@ async fn async_main(merged_path: String, cli: Cli) -> Result<ExitCode, MainError
         Some(Command::Doctor) => Ok(commands::run_doctor(&cli, &merged_path).await?),
         Some(Command::User(ref args)) => Ok(commands::run_user(&cli, args).await?),
         Some(Command::Secret(ref args)) => Ok(commands::run_secret(&cli, args).await?),
+        Some(Command::Mcp(args)) => Ok(commands::run_mcp(args).await),
         Some(Command::PrepareManagedResources(args)) => Ok(commands::run_prepare_managed_resources(args).await?),
         None => {
             let mut env = bootstrap::init_environment(&cli, &merged_path)?;

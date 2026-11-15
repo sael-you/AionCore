@@ -65,8 +65,8 @@ pub use csrf::{CsrfState, csrf_middleware};
 
 // Browser-origin policy (CORS allow-list, unsafe-method and WebSocket checks)
 pub use origin::{
-    ALLOWED_ORIGINS_ENV, OriginPolicy, PUBLIC_ORIGIN_ENV, is_unsafe_method, normalize_origin, parse_origin,
-    websocket_origin_middleware,
+    ALLOWED_ORIGINS_ENV, FORWARDED_HOST_HEADER, OriginGuard, OriginPolicy, OriginRefusal, PUBLIC_ORIGIN_ENV,
+    is_unsafe_method, normalize_origin, parse_origin, require_trusted_origin_middleware, websocket_origin_middleware,
 };
 
 // Auth middleware

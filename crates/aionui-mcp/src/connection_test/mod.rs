@@ -79,7 +79,20 @@ impl McpConnectionTestService {
         user_id: Option<&str>,
         runtime_scope_id: Option<&str>,
     ) -> McpConnectionTestResult {
-        debug!(name, ?transport, "starting MCP connection test");
+        // A market row's placeholder (`aioncore mcp exec ...`) runs through the
+        // real launcher binary, never a PATH lookup of `aioncore`.
+        let mut transport = std::borrow::Cow::Borrowed(transport);
+        if matches!(transport.as_ref(), McpServerTransport::Stdio { command, args, .. } if crate::market::launcher::is_placeholder(command, args))
+        {
+            crate::market::resolve_placeholder_transport(transport.to_mut());
+        }
+        let transport = transport.as_ref();
+        // Never log the transport itself: it carries env/header values (R1 #11).
+        debug!(
+            name,
+            transport_type = mcp_transport_type(transport),
+            "starting MCP connection test"
+        );
         let transport_type = mcp_transport_type(transport);
         let mcp_server_id = runtime_scope_id.unwrap_or(name);
         log_mcp_transport_start(mcp_server_id, transport_type);

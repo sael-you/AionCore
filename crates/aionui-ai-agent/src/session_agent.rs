@@ -1543,6 +1543,9 @@ pub struct SessionBuildInputs<'a> {
     /// User-configured MCP server repository (feature ELECTRON-1JG). `None` on
     /// paths that never inject MCP (tests) ⇒ no injection.
     pub mcp_server_repo: Option<&'a Arc<dyn IMcpServerRepository>>,
+    /// MCP market delivery context (launcher path, data dir, assistant, CLI).
+    /// `None` ⇒ every market row is dropped (fail closed).
+    pub mcp_market: Option<crate::mcp_resolve::McpMarketLaunch>,
     /// The conversation runtime context env (`AIONUI_USER_ID` /
     /// `AIONUI_CONVERSATION_ID` / `AIONUI_HELPER_BIN` / `AIONUI_BASE_URL` /
     /// `AIONUI_RUNTIME_TOKEN`, filled by `apply_conversation_runtime_context`).
@@ -1767,6 +1770,7 @@ pub async fn build_antigravity_instance(
         session_snapshot,
         backend_session_id,
         mcp_server_repo,
+        mcp_market,
         runtime_env,
         broadcaster,
         catalog_writeback,
@@ -1789,6 +1793,7 @@ pub async fn build_antigravity_instance(
                 &user_id,
                 config.mcp_server_ids.as_deref(),
                 &conversation_id,
+                mcp_market.as_ref(),
                 broadcaster.clone(),
             )
             .await
@@ -1895,6 +1900,7 @@ pub async fn build_session_instance(
         session_snapshot,
         backend_session_id,
         mcp_server_repo,
+        mcp_market,
         runtime_env,
         broadcaster,
         catalog_writeback,
@@ -1921,6 +1927,7 @@ pub async fn build_session_instance(
                 &user_id,
                 config.mcp_server_ids.as_deref(),
                 &conversation_id,
+                mcp_market.as_ref(),
                 broadcaster.clone(),
             )
             .await
@@ -2330,6 +2337,11 @@ fn session_server_to_spec(server: &aionui_api_types::SessionMcpServer) -> aionui
     McpServerSpec {
         name: server.name.clone(),
         transport,
+        // R1 #6: the neutral filter reaches the backend unchanged.
+        tool_filter: aionui_session::McpToolFilter {
+            enabled_tools: server.tool_filter.enabled_tools.clone(),
+            disabled_tools: server.tool_filter.disabled_tools.clone(),
+        },
     }
 }
 
@@ -2350,6 +2362,7 @@ fn team_mcp_server_spec(cfg: &aionui_api_types::TeamMcpStdioConfig) -> aionui_se
                 (C::ENV_SLOT_ID.to_owned(), cfg.slot_id.clone()),
             ],
         },
+        tool_filter: Default::default(),
     }
 }
 
@@ -4797,6 +4810,7 @@ mod build_mapping_tests {
                         args: vec!["srv.js".into()],
                         env: vec![("K".into(), "V".into())],
                     },
+                    tool_filter: Default::default(),
                 }],
                 resume: true,
                 ..Default::default()
@@ -5027,6 +5041,7 @@ mod build_mapping_tests {
                         args: vec!["chrome-devtools-mcp".into()],
                         env: Default::default(),
                     },
+                    tool_filter: Default::default(),
                 },
                 SessionMcpServer {
                     id: "mcp-inline-collision".into(),
@@ -5036,6 +5051,7 @@ mod build_mapping_tests {
                         args: vec!["malicious".into()],
                         env: Default::default(),
                     },
+                    tool_filter: Default::default(),
                 },
             ],
             team_mcp_stdio_config: Some(TeamMcpStdioConfig {
@@ -5081,6 +5097,7 @@ mod build_mapping_tests {
                 session_snapshot: None,
                 backend_session_id: None,
                 mcp_server_repo: Some(&repo),
+                mcp_market: None,
                 runtime_env: &[],
                 broadcaster,
                 catalog_writeback: None,
@@ -5479,6 +5496,7 @@ mod build_mapping_tests {
                 args: vec!["s.js".into()],
                 env: HashMap::from([("B".into(), "2".into()), ("A".into(), "1".into())]),
             },
+            tool_filter: Default::default(),
         });
         assert_eq!(stdio.name, "fs");
         match stdio.transport {
@@ -5507,6 +5525,7 @@ mod build_mapping_tests {
                 id: "2".into(),
                 name: "h".into(),
                 transport: t,
+                tool_filter: Default::default(),
             });
             assert!(
                 matches!(spec.transport, McpTransport::Http { .. }),

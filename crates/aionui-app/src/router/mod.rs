@@ -6,6 +6,7 @@ mod clipboard_writer;
 mod fs_monitor;
 mod health;
 mod item_revealer;
+mod mcp_market;
 mod routes;
 mod runtime_team_tools;
 mod scm_monitor;

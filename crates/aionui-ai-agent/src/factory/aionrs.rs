@@ -557,10 +557,16 @@ async fn load_user_mcp_servers(
     conversation_id: &str,
     broadcaster: Arc<dyn EventBroadcaster>,
 ) -> HashMap<String, McpServerConfig> {
-    let rows_result = match selected_ids {
-        Some(ids) => repo.list_by_ids_any(user_id, ids).await,
-        None => repo.list(user_id).await,
-    };
+    // The ONE market gate (R1 #5): aionrs has no market delivery, so every
+    // market row is dropped here; ordinary rows pass unchanged.
+    let rows_result = crate::mcp_resolve::load_gated_rows(repo, user_id, selected_ids, conversation_id, None)
+        .await
+        .map(|rows| {
+            rows.into_iter()
+                .filter(|g| g.market.is_none())
+                .map(|g| g.row)
+                .collect::<Vec<_>>()
+        });
     let rows = match rows_result {
         Ok(r) => r,
         Err(err) => {
@@ -1085,6 +1091,21 @@ mod tests {
 
     fn test_broadcaster() -> Arc<dyn EventBroadcaster> {
         Arc::new(BroadcastEventBus::new(16))
+    }
+
+    /// MCP market (R1 #5): aionrs has no market delivery; market rows never
+    /// reach it even when explicitly selected, ordinary rows still do.
+    #[tokio::test]
+    async fn load_user_mcp_servers_drops_market_rows() {
+        use crate::mcp_resolve::market_test_support::{CONV, USER, market_fx};
+        let fx = market_fx().await;
+        let market = fx.instance("tb-aionrs", "active").await;
+        fx.assign(&market, Some("asst-1"), "claude").await;
+        let plain = fx.plain("plain-aionrs").await;
+        let selected = vec![market, plain];
+        let servers = load_user_mcp_servers(&fx.servers, Some(&selected), USER, CONV, test_broadcaster()).await;
+        let names: Vec<&String> = servers.keys().collect();
+        assert_eq!(names, vec!["plain-aionrs"]);
     }
 
     #[tokio::test]
@@ -1940,6 +1961,7 @@ mod tests {
                     args: vec![],
                     env: Default::default(),
                 },
+                tool_filter: Default::default(),
             },
             // A snapshot entry colliding with the team coordination MCP name
             // must be skipped: the inline merge OVERWRITES on name collision,
@@ -1952,6 +1974,7 @@ mod tests {
                     args: vec![],
                     env: Default::default(),
                 },
+                tool_filter: Default::default(),
             },
         ];
         let mut extra_mcp_servers = resolve_mcp_servers(&AionrsBuildExtra {
@@ -2035,6 +2058,7 @@ mod tests {
                     args: vec!["chrome-devtools-mcp".into()],
                     env: Default::default(),
                 },
+                tool_filter: Default::default(),
             },
             SessionMcpServer {
                 id: "mcp-collision".into(),
@@ -2044,6 +2068,7 @@ mod tests {
                     args: vec!["malicious".into()],
                     env: Default::default(),
                 },
+                tool_filter: Default::default(),
             },
         ];
         merge_session_snapshot_mcp_servers(
@@ -2099,6 +2124,7 @@ mod tests {
                 args: vec!["new-server".into()],
                 env: HashMap::from([("TOKEN".into(), "abc".into())]),
             },
+            tool_filter: Default::default(),
         }];
 
         merge_session_snapshot_mcp_servers(

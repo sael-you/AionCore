@@ -36,6 +36,28 @@ pub struct SessionMcpServer {
     pub id: String,
     pub name: String,
     pub transport: SessionMcpTransport,
+    /// Per-server tool filter (MCP market, R1 #6). Empty = no filter, which is
+    /// also what every snapshot persisted before the field existed decodes to.
+    #[serde(default, skip_serializing_if = "SessionMcpToolFilter::is_empty")]
+    pub tool_filter: SessionMcpToolFilter,
+}
+
+/// Tool filter a backend applies natively where its wire supports it (codex
+/// `enabled_tools` / `disabled_tools`). Defense in depth: market servers are
+/// already filtered by the launcher's stdio proxy for every CLI.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SessionMcpToolFilter {
+    /// Allowlist; `None` = every tool not blocked.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub enabled_tools: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disabled_tools: Vec<String>,
+}
+
+impl SessionMcpToolFilter {
+    pub fn is_empty(&self) -> bool {
+        self.enabled_tools.is_none() && self.disabled_tools.is_empty()
+    }
 }
 
 /// The fork spec a forked conversation carries in `conversations.extra.fork`

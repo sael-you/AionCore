@@ -1453,6 +1453,7 @@ mod tests {
                     args: vec!["-y".into(), "chrome-devtools-mcp@latest".into()],
                     env: Default::default(),
                 },
+                tool_filter: Default::default(),
             }],
             mcp_servers: vec!["mcp-docs".into(), "chrome-devtools".into()],
             mcp_statuses: Vec::new(),

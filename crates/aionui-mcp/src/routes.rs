@@ -29,6 +29,7 @@ impl From<McpError> for ApiError {
             McpError::Conflict(msg) => ApiError::Conflict(msg),
             McpError::InvalidEdit(msg) => ApiError::BadRequest(msg),
             McpError::InvalidTransport(msg) => ApiError::BadRequest(msg),
+            McpError::MaskedValue(msg) => ApiError::coded(StatusCode::BAD_REQUEST, "MCP_MASKED_VALUE", msg, None),
             McpError::AgentNotInstalled(msg) => ApiError::BadRequest(msg),
             McpError::AgentOperationFailed(msg) => ApiError::Internal(msg),
             McpError::ConnectionFailed(msg) => ApiError::BadGateway(msg),
@@ -50,6 +51,9 @@ pub struct McpRouterState {
     pub sync_service: McpSyncService,
     pub connection_test_service: McpConnectionTestService,
     pub oauth_service: McpOAuthService,
+    /// MCP market: `test-connection {id}` of a market row resolves its real
+    /// transport and secrets server-side (R1 #12).
+    pub market: crate::market::McpMarketService,
 }
 
 // ---------------------------------------------------------------------------
@@ -199,7 +203,37 @@ async fn test_connection(
     body: Result<Json<TestMcpConnectionRequest>, JsonRejection>,
 ) -> Result<Response, ApiError> {
     let Json(req) = body.map_err(ApiError::from)?;
-    let transport = McpServerTransport::from(req.transport);
+    let market_row = match req.id.as_deref() {
+        Some(id) => state
+            .market
+            .is_market_row(&user.id, id)
+            .await
+            .map_err(crate::market_routes::market_api_error)?,
+        None => false,
+    };
+    let transport = match req.id.as_deref() {
+        // R1 #12: a market row is tested with its template command, plain env and
+        // decrypted secrets; the client-supplied transport is ignored.
+        Some(id) if market_row => state
+            .market
+            .test_transport(&user.id, id)
+            .await
+            .map_err(crate::market_routes::market_api_error)?,
+        Some(id) => {
+            // Mask round-trip (R1 #11): masked values the UI sends back are the stored ones.
+            let mut transport = McpServerTransport::from(req.transport);
+            if let Some(stored) = state
+                .config_service
+                .stored_transport(&user.id, id)
+                .await
+                .map_err(ApiError::from)?
+            {
+                crate::secret_mask::unmask_transport(&mut transport, &stored);
+            }
+            transport
+        }
+        None => McpServerTransport::from(req.transport),
+    };
     let result = state
         .connection_test_service
         .test_connection_with_runtime_scope(
@@ -356,6 +390,14 @@ mod error_mapping_tests {
     fn invalid_transport_maps_to_bad_request() {
         let err = ApiError::from(McpError::InvalidTransport("missing command".into()));
         assert!(matches!(err, ApiError::BadRequest(_)));
+    }
+
+    #[test]
+    fn masked_value_maps_to_coded_bad_request() {
+        let err = ApiError::from(McpError::MaskedValue("masked".into()));
+        assert_eq!(err.error_code(), "MCP_MASKED_VALUE");
+        let response = axum::response::IntoResponse::into_response(err);
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
     }
 
     #[test]

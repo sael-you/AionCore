@@ -56,7 +56,7 @@ pub use backend::{
     AcpConnection, AcpSessionBackend, Admission, AntigravityConnection, AntigravitySessionBackend,
     BackendCapabilityDescriptor, BackendConnection, BackendError, CancelTarget, ClaudeConnection, ClaudeSessionBackend,
     CodexConnection, CodexSessionBackend, Command, CommandMeta, CommandReceipt, ContentBlock, ConversationSession,
-    MCP_CONFIG_FILE_PREFIX, McpServerSpec, McpTransport, MsgStatus, Orchestrator, PendingMessage,
+    MCP_CONFIG_FILE_PREFIX, McpServerSpec, McpToolFilter, McpTransport, MsgStatus, Orchestrator, PendingMessage,
     PendingPermissionView, PermissionDecision, QuestionAnswer, SESSION_SCRATCH_DIR_NAME, SessionBackend, SessionConfig,
     SessionEnvelope, SessionInfoKind, SessionInit, SessionSpec, SkillDirSpec, StateSnapshot, Tier2Checkpoint,
     TransitionReason, VERIFIED_AGY_VERSION, VERIFIED_CLAUDE_VERSION, VERIFIED_CODEX_VERSION, VersionDrift,

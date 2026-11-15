@@ -3586,6 +3586,7 @@ async fn team_assistant_mcp_selection_wins_over_frozen_preset_defaults() {
                     args: vec!["-y".into(), "chrome-devtools-mcp@latest".into()],
                     env: Default::default(),
                 },
+                tool_filter: Default::default(),
             }],
             mcp_statuses: Vec::new(),
         },

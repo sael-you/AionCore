@@ -70,6 +70,7 @@ async fn mcp_config_entry_wins_a_name_clash_and_project_servers_stay() {
                     args: vec![script.to_string_lossy().into_owned(), "from_flag".into()],
                     env: vec![],
                 },
+                tool_filter: Default::default(),
             }],
             ..Default::default()
         },

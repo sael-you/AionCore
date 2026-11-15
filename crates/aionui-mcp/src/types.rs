@@ -228,24 +228,31 @@ impl McpServer {
         })
     }
 
-    /// Converts to the API response DTO.
+    /// Converts to the API response DTO. Secret-looking env/header/url/arg
+    /// values and `original_json` are masked (R1 #11); a later update that
+    /// sends the mask back keeps the stored value.
     pub fn into_response(self) -> McpServerResponse {
         let tools = if self.tools.is_empty() {
             None
         } else {
             Some(self.tools.into_iter().map(McpToolResponse::from).collect())
         };
+        let mut transport: McpTransport = self.transport.into();
+        crate::secret_mask::mask_transport(&mut transport);
 
         McpServerResponse {
             id: self.id,
             name: self.name,
             description: self.description,
             enabled: self.enabled,
-            transport: self.transport.into(),
+            transport,
             tools,
             last_test_status: self.last_test_status,
             last_connected: self.last_connected,
-            original_json: self.original_json,
+            original_json: self
+                .original_json
+                .as_deref()
+                .and_then(crate::secret_mask::mask_original_json),
             builtin: self.builtin,
             created_at: self.created_at,
             updated_at: self.updated_at,

@@ -76,6 +76,64 @@ pub trait IMcpServerRepository: Send + Sync {
     /// Updates only the tools JSON for a server.
     /// Returns `DbError::NotFound` if the ID doesn't exist.
     async fn update_tools(&self, user_id: &str, id: &str, tools: Option<&str>) -> Result<(), DbError>;
+
+    /// The ONE market predicate (MCP market, R1 #5) every session MCP
+    /// selection path runs its rows through before delivery.
+    ///
+    /// Non-market rows pass unchanged (`market: None`). A market row passes
+    /// only when its `market_status` is `active` and it is not soft-deleted,
+    /// even when it was explicitly selected; with a conversation in `scope` it
+    /// must also have an assistant-channel assignment for (instance, the
+    /// conversation's project, `scope.assistant_id`, `scope.cli`) — whole-project
+    /// and global assignments are delivered by the native files, never by AionUi
+    /// (R7). Without a conversation (snapshot time) only the status is checked;
+    /// the spawn path and the launcher check the assignment again.
+    ///
+    /// The default keeps every row as non-market: only the SQLite repository can
+    /// see the market columns, and test doubles hold no market rows.
+    async fn market_gate(
+        &self,
+        _user_id: &str,
+        _scope: &McpMarketScope<'_>,
+        rows: Vec<McpServerRow>,
+    ) -> Result<Vec<GatedMcpRow>, DbError> {
+        Ok(rows.into_iter().map(|row| GatedMcpRow { row, market: None }).collect())
+    }
+}
+
+/// Where a set of MCP rows is about to be delivered (see
+/// [`IMcpServerRepository::market_gate`]).
+#[derive(Debug, Clone, Copy, Default)]
+pub struct McpMarketScope<'a> {
+    /// The conversation being spawned; its `project_id` scopes the assignment
+    /// check. `None` = snapshot time (status check only).
+    pub conversation_id: Option<&'a str>,
+    /// The conversation's assistant (`preset_assistant_id`).
+    pub assistant_id: Option<&'a str>,
+    /// The backend CLI label (`claude`, `codex`, `gemini`, ...).
+    pub cli: Option<&'a str>,
+}
+
+/// A row that passed [`IMcpServerRepository::market_gate`].
+#[derive(Debug, Clone)]
+pub struct GatedMcpRow {
+    pub row: McpServerRow,
+    /// `Some` for a market row: how the launcher must be invoked for it.
+    pub market: Option<MarketDelivery>,
+}
+
+/// Launcher scope of a market row that passed the gate.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MarketDelivery {
+    /// `None` at snapshot time (no conversation in scope).
+    pub project_id: Option<String>,
+    pub assistant_id: Option<String>,
+    /// `read` or `write`.
+    pub tier: String,
+    /// JSON array (read tier allowlist), as stored.
+    pub tools_allow: Option<String>,
+    /// JSON array (blocklist), as stored.
+    pub tools_block: Option<String>,
 }
 
 /// Parameters for creating a new MCP server.

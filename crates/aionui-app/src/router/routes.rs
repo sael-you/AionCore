@@ -20,9 +20,9 @@ use aionui_api_types::{ErrorResponse, WebSocketMessage};
 use aionui_assets::{AssetRouterState, asset_routes};
 use aionui_assistant::assistant_routes;
 use aionui_auth::{
-    AuthIdentityMode, AuthRouterState, AuthState, CsrfState, IRuntimeTokenVerifier, RefreshCoalescer,
-    SystemDefaultFilesystemAdopter, auth_middleware, auth_routes, csrf_middleware, security_headers_middleware,
-    websocket_origin_middleware,
+    AuthIdentityMode, AuthRouterState, AuthState, CsrfState, IRuntimeTokenVerifier, OriginGuard, RefreshCoalescer,
+    SystemDefaultFilesystemAdopter, auth_middleware, auth_routes, csrf_middleware, require_trusted_origin_middleware,
+    security_headers_middleware, websocket_origin_middleware,
 };
 use aionui_channel::channel_routes;
 #[cfg(feature = "weixin")]
@@ -318,6 +318,36 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     let sidebar_authenticated =
         sidebar_routes(states.sidebar).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
+    // MCP market: reads behind the ordinary auth middleware; every market write
+    // behind a session-only auth state (never the agent runtime-token channel,
+    // never `--local`'s default user, R1 #1), plus CSRF in local mode (the
+    // global CSRF layer covers the other modes).
+    let market_state = aionui_mcp::McpMarketRouterState {
+        market: states.mcp.market.clone(),
+    };
+    let mcp_market_read = aionui_mcp::mcp_market_read_routes(market_state.clone())
+        .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
+    // Market writes (C15): a verified browser session in every identity, and
+    // an allowed Origin in every identity (missing or foreign → 403; in local
+    // identity same-origin counts, see `OriginGuard`). No
+    // market CSRF layer: in local identity the UI sends no CSRF header (C11
+    // csrf.ts) and the strict Origin rule is the cross-site defence (as
+    // voice); in webui the global C11 CSRF + origin layer below also applies.
+    let mcp_market_write = aionui_mcp::mcp_market_write_routes(market_state)
+        .route_layer(from_fn_with_state(
+            super::mcp_market::market_write_auth_state(services),
+            auth_middleware,
+        ))
+        .route_layer(from_fn_with_state(
+            OriginGuard {
+                policy: services.origin_policy.clone(),
+                // Local identity: same-origin via the web host's
+                // X-Forwarded-Host (production sets no origin list there).
+                same_origin_via_web_host: services.identity_mode.is_local(),
+            },
+            require_trusted_origin_middleware,
+        ));
+
     // MCP routes protected by auth middleware
     let mcp_authenticated =
         mcp_routes(states.mcp).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
@@ -423,6 +453,8 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         .merge(sidebar_authenticated)
         .merge(board_authenticated)
         .merge(mcp_authenticated)
+        .merge(mcp_market_read)
+        .merge(mcp_market_write)
         .merge(extension_authenticated)
         .merge(hub_authenticated)
         .merge(skill_authenticated)

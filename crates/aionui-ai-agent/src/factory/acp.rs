@@ -132,6 +132,14 @@ pub(super) async fn build(
                 session_snapshot: build_context.session_snapshot.as_ref(),
                 backend_session_id: build_context.session_id.clone(),
                 mcp_server_repo: deps.mcp_server_repo.as_ref(),
+                // MCP market: rows assigned to this conversation's (project,
+                // assistant, CLI) are rewritten to the launcher (R1 #4, R9).
+                mcp_market: Some(crate::mcp_resolve::McpMarketLaunch::new(
+                    &aionui_mcp::market::launcher_program(),
+                    &deps.data_dir,
+                    config.preset_assistant_id.as_deref(),
+                    backend_label,
+                )),
                 // The AIONUI_* conversation runtime context the legacy path
                 // injects via apply_acp_launch_policy — forwarded into
                 // SessionConfig.spawn_env so direct-CLI spawns get it too.
@@ -220,11 +228,20 @@ pub(super) async fn build(
 
     let user_mcp_servers = match deps.mcp_server_repo.as_ref() {
         Some(repo) => {
+            let market = config.backend.as_deref().map(|cli| {
+                crate::mcp_resolve::McpMarketLaunch::new(
+                    &aionui_mcp::market::launcher_program(),
+                    &deps.data_dir,
+                    config.preset_assistant_id.as_deref(),
+                    cli,
+                )
+            });
             load_user_mcp_servers(
                 repo.as_ref(),
                 config.mcp_server_ids.as_deref(),
                 &ctx.user_id,
                 &ctx.conversation_id,
+                market.as_ref(),
                 &mcp_capabilities,
             )
             .await
@@ -417,12 +434,12 @@ async fn load_user_mcp_servers(
     selected_ids: Option<&[String]>,
     user_id: &str,
     conversation_id: &str,
+    market: Option<&crate::mcp_resolve::McpMarketLaunch>,
     capabilities: &AcpMcpCapabilities,
 ) -> Vec<McpServer> {
-    let rows_result = match selected_ids {
-        Some(ids) => repo.list_by_ids_any(user_id, ids).await,
-        None => repo.list(user_id).await,
-    };
+    // The ONE market gate (R1 #5): inactive/unassigned market rows never pass,
+    // assigned ones are rewritten to the launcher below.
+    let rows_result = crate::mcp_resolve::load_gated_rows(repo, user_id, selected_ids, conversation_id, market).await;
     let rows = match rows_result {
         Ok(r) => r,
         Err(err) => {
@@ -436,7 +453,7 @@ async fn load_user_mcp_servers(
     };
 
     let mut servers = Vec::with_capacity(rows.len());
-    for row in rows {
+    for aionui_db::GatedMcpRow { row, market: delivery } in rows {
         let selected = selected_ids
             .map(|ids| ids.iter().any(|id| id == &row.id))
             .unwrap_or(row.enabled);
@@ -444,6 +461,23 @@ async fn load_user_mcp_servers(
         // that collides with it is never injected here (the team bridge is
         // folded in separately and must win).
         if !selected || row.builtin || row.name == TEAM_MCP_SERVER_NAME {
+            continue;
+        }
+        if let (Some(delivery), Some(launch)) = (delivery.as_ref(), market) {
+            let launched = crate::mcp_resolve::market_session_server(&row, delivery, launch);
+            match launched {
+                Some(server) if session_server_supported_by_capabilities(&server, capabilities) => {
+                    match session_server_to_sdk_mcp_server(&server).await {
+                        Ok(server) => servers.push(server),
+                        Err(err) => {
+                            warn!(conversation_id, server_name = %row.name, error = %err, "user_mcp: market launcher entry failed; skipping")
+                        }
+                    }
+                }
+                _ => {
+                    warn!(conversation_id, server_name = %row.name, "user_mcp: market row not deliverable here; skipping")
+                }
+            }
             continue;
         }
         if !row_supported_by_capabilities(&row, capabilities) {
@@ -1137,6 +1171,43 @@ mod tests {
         }
     }
 
+    /// MCP market (R1 #4, #5, R9): the ACP path (gemini, ...) runs the same
+    /// gate; an assigned market row becomes the launcher, inactive ones vanish.
+    #[tokio::test]
+    async fn load_user_mcp_servers_gates_and_rewrites_market_rows() {
+        use crate::mcp_resolve::market_test_support::{CONV, USER, market_fx};
+        let fx = market_fx().await;
+        let active = fx.instance("tb-gem", "active").await;
+        let dormant = fx.instance("tb-gem-off", "dormant").await;
+        fx.assign(&active, Some("asst-1"), "gemini").await;
+        fx.assign(&dormant, Some("asst-1"), "gemini").await;
+        let caps = AcpMcpCapabilities {
+            stdio: true,
+            http: true,
+            sse: true,
+        };
+        let launch = crate::mcp_resolve::McpMarketLaunch::new(
+            std::path::Path::new("/bin/true"),
+            std::path::Path::new("/data/aionui"),
+            Some("asst-1"),
+            "gemini",
+        );
+        let selected = vec![active, dormant];
+        let servers = load_user_mcp_servers(&fx.servers, Some(&selected), USER, CONV, Some(&launch), &caps).await;
+        assert_eq!(servers.len(), 1);
+        match &servers[0] {
+            McpServer::Stdio(s) => {
+                assert_eq!(s.name, "tb-gem");
+                assert_eq!(s.command, std::path::PathBuf::from("/bin/true"));
+                assert!(s.args.iter().any(|a| a == "--cli") && s.args.iter().any(|a| a == "gemini"));
+                assert!(s.env.is_empty());
+            }
+            _ => panic!("expected stdio"),
+        }
+        let none = load_user_mcp_servers(&fx.servers, Some(&selected), USER, CONV, None, &caps).await;
+        assert!(none.is_empty(), "no market context = no market rows");
+    }
+
     #[tokio::test]
     async fn load_user_mcp_servers_skips_disabled_and_builtin() {
         let stdio_config = stdio_config_for_existing_command();
@@ -1159,7 +1230,7 @@ mod tests {
             ],
             fail: false,
         });
-        let servers = load_user_mcp_servers(repo.as_ref(), None, TEST_USER_ID, "conv-1", &caps).await;
+        let servers = load_user_mcp_servers(repo.as_ref(), None, TEST_USER_ID, "conv-1", None, &caps).await;
         assert_eq!(servers.len(), 1);
         match &servers[0] {
             McpServer::Stdio(s) => assert_eq!(s.name, "user-enabled"),
@@ -1184,7 +1255,7 @@ mod tests {
             ],
             fail: false,
         });
-        let servers = load_user_mcp_servers(repo.as_ref(), None, TEST_USER_ID, "conv-1", &caps).await;
+        let servers = load_user_mcp_servers(repo.as_ref(), None, TEST_USER_ID, "conv-1", None, &caps).await;
         assert_eq!(servers.len(), 1);
         match &servers[0] {
             McpServer::Stdio(s) => assert_eq!(s.name, "user-enabled"),
@@ -1203,7 +1274,7 @@ mod tests {
             rows: vec![],
             fail: true,
         });
-        let servers = load_user_mcp_servers(repo.as_ref(), None, TEST_USER_ID, "conv-1", &caps).await;
+        let servers = load_user_mcp_servers(repo.as_ref(), None, TEST_USER_ID, "conv-1", None, &caps).await;
         assert!(servers.is_empty());
     }
 
@@ -1222,7 +1293,7 @@ mod tests {
             ],
             fail: false,
         });
-        let servers = load_user_mcp_servers(repo.as_ref(), None, TEST_USER_ID, "conv-1", &caps).await;
+        let servers = load_user_mcp_servers(repo.as_ref(), None, TEST_USER_ID, "conv-1", None, &caps).await;
         assert_eq!(servers.len(), 1);
         match &servers[0] {
             McpServer::Stdio(s) => assert_eq!(s.name, "good"),
@@ -1247,7 +1318,7 @@ mod tests {
         });
 
         let selected = vec!["mcp_disabled-picked".to_owned()];
-        let servers = load_user_mcp_servers(repo.as_ref(), Some(&selected), TEST_USER_ID, "conv-1", &caps).await;
+        let servers = load_user_mcp_servers(repo.as_ref(), Some(&selected), TEST_USER_ID, "conv-1", None, &caps).await;
 
         assert_eq!(servers.len(), 1);
         match &servers[0] {
@@ -1274,7 +1345,7 @@ mod tests {
             fail: false,
         });
 
-        let servers = load_user_mcp_servers(repo.as_ref(), None, TEST_USER_ID, "conv-1", &caps).await;
+        let servers = load_user_mcp_servers(repo.as_ref(), None, TEST_USER_ID, "conv-1", None, &caps).await;
         assert!(servers.is_empty());
     }
 

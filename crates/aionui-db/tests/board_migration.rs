@@ -109,7 +109,10 @@ async fn a_database_at_044_and_900_upgrades_to_901_through_the_startup_path() {
         .await
         .expect("901 applies on top of 900");
     let versions = applied_versions(db.pool()).await;
-    assert_eq!(versions.last(), Some(&901));
+    // 901 applied on top of 900; later youssef migrations (904/905, MCP
+    // market) may follow it, so assert membership, not "last".
+    assert!(versions.contains(&901), "{versions:?}");
+    assert_eq!(versions.last().copied(), aionui_db::latest_known_migration_version());
     for table in [
         "board_settings",
         "board_columns",

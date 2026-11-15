@@ -108,9 +108,16 @@ async fn create_http_with_headers() {
     match resp.transport {
         McpTransport::Http { ref url, ref headers } => {
             assert_eq!(url, "https://example.com/mcp");
-            assert_eq!(headers.get("Auth").unwrap(), "Bearer tok");
+            // MCP market R1 #11 (intentional contract change): secret-looking
+            // header values are masked in responses...
+            assert_eq!(headers.get("Auth").unwrap(), "•••");
         }
         _ => panic!("expected Http"),
+    }
+    // ...while the stored value is unchanged.
+    match svc.stored_transport(TEST_USER_ID, &resp.id).await.unwrap().unwrap() {
+        aionui_mcp::McpServerTransport::Http { headers, .. } => assert_eq!(headers["Auth"], "Bearer tok"),
+        other => panic!("expected Http, got {other:?}"),
     }
 }
 

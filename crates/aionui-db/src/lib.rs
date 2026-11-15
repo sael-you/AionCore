@@ -17,7 +17,7 @@ pub use agent_binding::{
 pub use database::{
     DATABASE_NEWER_THAN_APP_STAGE, Database, DatabaseInitError, DatabaseInitOptions, init_database,
     init_database_memory, init_database_staged, init_database_staged_with_options, init_database_with_options,
-    latest_known_migration_version, maybe_copy_legacy_database,
+    latest_known_migration_version, maybe_copy_legacy_database, open_database_read_only,
 };
 pub use error::{
     DbError, SQLITE_BUSY_MESSAGE_MARKERS, SQLITE_UNIQUE_VIOLATION_MARKER, message_indicates_busy,
@@ -43,7 +43,10 @@ pub use repository::conversation::{
 pub use repository::cron::{
     ClaimCronRunParams, CronRunClaimResult, FinishCronRunParams, RecoverableCronRun, UpdateCronJobParams,
 };
-pub use repository::mcp_server::{CreateMcpServerParams, UpdateMcpServerParams};
+pub use repository::mcp_market::{CreateAssignmentParams, MarketInstanceParams, UpdateMarketInstanceParams};
+pub use repository::mcp_server::{
+    CreateMcpServerParams, GatedMcpRow, MarketDelivery, McpMarketScope, UpdateMcpServerParams,
+};
 pub use repository::oauth_token::UpsertOAuthTokenParams;
 pub use repository::provider::{CreateProviderParams, UpdateProviderParams};
 pub use repository::remote_agent::{CreateRemoteAgentParams, UpdateRemoteAgentParams};
@@ -61,17 +64,17 @@ pub use repository::{
     IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
     IAssistantOverrideRepository, IAssistantPreferenceRepository, IAssistantRepository, IBoardStore, IBoardTx,
     IChannelRepository, IClientPreferenceRepository, IConversationRepository, ICronRepository,
-    IFeedbackDiagnosticsRepository, IMcpServerRepository, IOAuthTokenRepository, IProjectStore, IProviderRepository,
-    IRemoteAgentRepository, ISettingsRepository, ISidebarStore, ISkillRepository, ITeamRepository, IUserOrderStore,
-    IUserRepository, MoveOutcome, NewBoardEvent, OrderItemRef, PageDirection, PersistedSessionState, PinOutcome,
-    PinnedCursor, SaveRuntimeStateParams, SidebarConversationThin, SidebarProjectMeta, SidebarTeamThin,
+    IFeedbackDiagnosticsRepository, IMcpMarketRepository, IMcpServerRepository, IOAuthTokenRepository, IProjectStore,
+    IProviderRepository, IRemoteAgentRepository, ISettingsRepository, ISidebarStore, ISkillRepository, ITeamRepository,
+    IUserOrderStore, IUserRepository, MoveOutcome, NewBoardEvent, OrderItemRef, PageDirection, PersistedSessionState,
+    PinOutcome, PinnedCursor, SaveRuntimeStateParams, SidebarConversationThin, SidebarProjectMeta, SidebarTeamThin,
     SqliteAcpSessionRepository, SqliteAgentMetadataRepository, SqliteAssistantDefinitionRepository,
     SqliteAssistantOverlayRepository, SqliteAssistantOverrideRepository, SqliteAssistantPreferenceRepository,
     SqliteAssistantRepository, SqliteBoardStore, SqliteChannelRepository, SqliteClientPreferenceRepository,
-    SqliteConversationRepository, SqliteCronRepository, SqliteFeedbackDiagnosticsRepository, SqliteMcpServerRepository,
-    SqliteOAuthTokenRepository, SqliteProjectStore, SqliteProviderRepository, SqliteRemoteAgentRepository,
-    SqliteSettingsRepository, SqliteSidebarStore, SqliteSkillRepository, SqliteTeamRepository, SqliteUserOrderStore,
-    SqliteUserRepository,
+    SqliteConversationRepository, SqliteCronRepository, SqliteFeedbackDiagnosticsRepository, SqliteMcpMarketRepository,
+    SqliteMcpServerRepository, SqliteOAuthTokenRepository, SqliteProjectStore, SqliteProviderRepository,
+    SqliteRemoteAgentRepository, SqliteSettingsRepository, SqliteSidebarStore, SqliteSkillRepository,
+    SqliteTeamRepository, SqliteUserOrderStore, SqliteUserRepository,
 };
 
 // Re-export sqlx pool type for downstream crates
