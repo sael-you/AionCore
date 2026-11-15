@@ -741,6 +741,10 @@ pub struct BoardStatusResponse {
     /// columns).
     #[serde(default)]
     pub keeper: bool,
+    /// The project's Board Keeper (Butler) conversation: where agents report
+    /// progress. `null` when the board is missing, disabled or has none.
+    #[serde(default)]
+    pub keeper_conversation_id: Option<String>,
 }
 
 /// Agent `update <N>` body (block state goes through `block`/`unblock`).
