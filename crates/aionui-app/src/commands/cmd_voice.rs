@@ -38,7 +38,14 @@ pub(crate) async fn run_voice(cli: &Cli, args: &VoiceArgs) -> ExitCode {
 }
 
 fn capabilities() -> Value {
-    json!({"success": true, "data": {
+    json!({"success": true, "data": capabilities_data(), "meta": {"schema_version": 1}})
+}
+
+/// The voice CLI contract (also checked by the top-level capability index).
+pub(crate) fn capabilities_data() -> Value {
+    json!({
+        "schema_version": 1,
+        "contract": "agent-facing-voice-cli",
         "commands": {
             "say": {"stdin": {"text": "string (≤ 500 chars, no confirmation words)"}},
             "ask": {"stdin": {"question": "string", "timeout_s": "integer, optional (≤ 50)"},
@@ -53,7 +60,7 @@ fn capabilities() -> Value {
             "Only conversations the user sent a voice request to (or opted in) may speak.",
             "A voice answer is never permission for a destructive action; ask for an approval instead.",
         ],
-    }})
+    })
 }
 
 fn print(value: &Value) -> Result<(), ExitCode> {
