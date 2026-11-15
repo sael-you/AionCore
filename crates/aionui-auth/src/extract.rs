@@ -36,21 +36,33 @@ pub fn extract_client_ip_from_headers(headers: &HeaderMap) -> String {
 ///
 /// Priority: `Authorization: Bearer <token>` > `aionui-session` cookie.
 pub fn extract_token_from_headers(headers: &HeaderMap) -> Option<String> {
+    extract_token_named(headers, COOKIE_NAME)
+}
+
+/// [`extract_token_from_headers`] with the session cookie name in use
+/// (prefixed names in webui-over-HTTPS — un-prefixed cookies are then
+/// ignored).
+pub fn extract_token_named(headers: &HeaderMap, session_cookie: &str) -> Option<String> {
     if let Some(token) = extract_bearer_token(headers) {
         return Some(token);
     }
-    extract_cookie_value(headers, COOKIE_NAME)
+    extract_cookie_value(headers, session_cookie)
 }
 
 /// Extract bearer token from WebSocket upgrade request headers.
 ///
 /// Priority: `Authorization` > `Cookie` > `Sec-WebSocket-Protocol` (first value).
 pub fn extract_token_from_ws_headers(headers: &HeaderMap) -> Option<String> {
+    extract_ws_token_named(headers, COOKIE_NAME)
+}
+
+/// [`extract_token_from_ws_headers`] with the session cookie name in use.
+pub fn extract_ws_token_named(headers: &HeaderMap, session_cookie: &str) -> Option<String> {
     if let Some(token) = extract_bearer_token(headers) {
         return Some(token);
     }
 
-    if let Some(token) = extract_cookie_value(headers, COOKIE_NAME) {
+    if let Some(token) = extract_cookie_value(headers, session_cookie) {
         return Some(token);
     }
 
@@ -79,6 +91,26 @@ pub fn extract_cookie_value(headers: &HeaderMap, name: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Every non-empty value of a named cookie, in header order (a tossed cookie
+/// from a sibling domain can share the name of the real one).
+pub fn extract_cookie_values(headers: &HeaderMap, name: &str) -> Vec<String> {
+    let mut values = Vec::new();
+    for cookie_header in headers.get_all(header::COOKIE) {
+        let Ok(cookie_header) = cookie_header.to_str() else {
+            continue;
+        };
+        for part in cookie_header.split(';') {
+            if let Some((key, value)) = part.trim().split_once('=')
+                && key.trim() == name
+                && !value.trim().is_empty()
+            {
+                values.push(value.trim().to_owned());
+            }
+        }
+    }
+    values
 }
 
 /// Extract the bearer token from the `Authorization` header.

@@ -41,13 +41,32 @@ async fn test_app_with_options_and_hook(
     aionpro_mode: bool,
     session_revoked_hook: Option<Arc<SessionRevokedHook>>,
 ) -> (Router, TestContext) {
+    let cookie_config = CookieConfig {
+        secure: false,
+        same_site: "Lax",
+        names: aionui_auth::CookieNames::LEGACY,
+    };
+    test_app_with_cookies(
+        local,
+        bootstrap_secret,
+        aionpro_mode,
+        session_revoked_hook,
+        cookie_config,
+    )
+    .await
+}
+
+async fn test_app_with_cookies(
+    local: bool,
+    bootstrap_secret: Option<&str>,
+    aionpro_mode: bool,
+    session_revoked_hook: Option<Arc<SessionRevokedHook>>,
+    cookie_config: CookieConfig,
+) -> (Router, TestContext) {
     let db = init_database_memory().await.unwrap();
     let user_repo = Arc::new(SqliteUserRepository::new(db.pool().clone())) as Arc<dyn IUserRepository>;
     let jwt_service = Arc::new(JwtService::new("test_secret_for_routes".into()));
-    let cookie_config = Arc::new(CookieConfig {
-        secure: false,
-        same_site: "Lax",
-    });
+    let cookie_config = Arc::new(cookie_config);
     let qr_token_store = Arc::new(QrTokenStore::new());
 
     let state = AuthRouterState {
@@ -662,11 +681,13 @@ async fn t8_7_change_password_missing_fields() {
 // T9. Refresh Token (POST /api/auth/refresh)
 // ===========================================================================
 
+/// The legacy body path refreshes with a REFRESH token outside local mode.
 #[tokio::test]
 async fn t9_1_refresh_token_success() {
     let (mut app, ctx) = test_app().await;
     create_test_user(&ctx, "admin", "StrongP@ss1").await;
-    let (token, _) = login(&mut app, "admin", "StrongP@ss1").await;
+    let (_access, user_id) = login(&mut app, "admin", "StrongP@ss1").await;
+    let token = ctx.jwt_service.sign_refresh(&user_id, "admin", 0).unwrap();
 
     let body = format!(r#"{{"token":"{token}"}}"#);
     let req = json_post("/api/auth/refresh", &body);
@@ -680,6 +701,87 @@ async fn t9_1_refresh_token_success() {
     // New token should be valid
     let new_token = json["token"].as_str().unwrap();
     assert!(ctx.jwt_service.verify(new_token).is_ok());
+}
+
+/// C11 change 3c: an ACCESS token posted in the body no longer refreshes
+/// outside local mode.
+#[tokio::test]
+async fn refresh_body_refuses_an_access_token_outside_local_mode() {
+    let (mut app, ctx) = test_app().await;
+    create_test_user(&ctx, "admin", "StrongP@ss1").await;
+    let (access, _) = login(&mut app, "admin", "StrongP@ss1").await;
+    let resp = app
+        .oneshot(json_post("/api/auth/refresh", &format!(r#"{{"token":"{access}"}}"#)))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+}
+
+/// Local mode keeps the historical lenient body path (no behaviour change).
+#[tokio::test]
+async fn refresh_body_still_accepts_an_access_token_in_local_mode() {
+    let (app, ctx) = test_app_with_local(true).await;
+    let access = ctx
+        .jwt_service
+        .sign_with_session_generation("system_default_user", "admin", 0)
+        .unwrap();
+    let resp = app
+        .oneshot(json_post("/api/auth/refresh", &format!(r#"{{"token":"{access}"}}"#)))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+}
+
+/// Value of the named cookie in the response's `Set-Cookie` headers.
+fn set_cookie_value(resp: &axum::response::Response, name: &str) -> Option<String> {
+    let prefix = format!("{name}=");
+    set_cookie_values(resp).iter().find_map(|cookie| {
+        cookie
+            .strip_prefix(&prefix)
+            .map(|rest| rest.split(';').next().unwrap_or("").to_owned())
+    })
+}
+
+/// Webui with prefixed cookies (C11 change 6 + L2/L3): login sets the
+/// prefixed names, refresh reads `__Secure-aionui-refresh` only (the legacy
+/// name is ignored), and a tossed same-name cookie does not shadow the real one.
+#[tokio::test]
+async fn refresh_reads_the_prefixed_cookie_and_skips_a_tossed_one() {
+    let (app, ctx) = test_app_with_cookies(false, None, false, None, CookieConfig::for_identity(true, true)).await;
+    create_test_user(&ctx, "admin", "StrongP@ss1").await;
+    let resp = app
+        .clone()
+        .oneshot(json_post("/login", r#"{"username":"admin","password":"StrongP@ss1"}"#))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(set_cookie_value(&resp, "__Host-aionui-session").is_some());
+    let refresh = set_cookie_value(&resp, "__Secure-aionui-refresh").expect("prefixed refresh cookie");
+    assert!(set_cookie_value(&resp, "aionui-refresh").is_none());
+    assert!(set_cookie_values(&resp).iter().all(|cookie| cookie.contains("Secure")));
+
+    // Legacy name only: ignored, so the handler falls back to the (empty) body.
+    let legacy = app
+        .clone()
+        .oneshot(post_with_cookie(
+            "/api/auth/refresh",
+            &format!("aionui-refresh={refresh}"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(legacy.status(), StatusCode::BAD_REQUEST);
+
+    // A tossed junk cookie under the same prefixed name, sent first: the real one still wins.
+    let tossed = app
+        .clone()
+        .oneshot(post_with_cookie(
+            "/api/auth/refresh",
+            &format!("__Secure-aionui-refresh=junk.jwt.value; __Secure-aionui-refresh={refresh}"),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(tossed.status(), StatusCode::OK);
+    assert!(set_cookie_value(&tossed, "__Secure-aionui-refresh").is_some());
 }
 
 #[tokio::test]
@@ -707,9 +809,10 @@ async fn t9_3_refresh_missing_token() {
 #[tokio::test]
 async fn refresh_rejects_local_user_token_in_aionpro_mode() {
     let (app, ctx) = test_app_with_options_and_hook(false, Some("bootstrap-secret"), true, None).await;
+    // A refresh token (C11 3c: the body path takes refresh tokens only).
     let token = ctx
         .jwt_service
-        .sign_with_session_generation("system_default_user", "system_default_user", 0)
+        .sign_refresh("system_default_user", "system_default_user", 0)
         .unwrap();
 
     let body = format!(r#"{{"token":"{token}"}}"#);

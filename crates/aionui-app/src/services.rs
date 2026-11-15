@@ -34,6 +34,10 @@ pub struct AppServices {
     pub jwt_service: Arc<JwtService>,
     pub user_repo: Arc<dyn IUserRepository>,
     pub cookie_config: Arc<CookieConfig>,
+    /// Trusted browser origins (`AIONUI_PUBLIC_ORIGIN`,
+    /// `AIONUI_ALLOWED_ORIGINS`): CORS allow-list, unsafe-method and
+    /// WebSocket origin checks in non-local modes (card C11).
+    pub origin_policy: Arc<aionui_auth::OriginPolicy>,
     pub qr_token_store: Arc<QrTokenStore>,
     pub ws_manager: Arc<WebSocketManager>,
     pub event_bus: Arc<BroadcastEventBus>,
@@ -105,6 +109,47 @@ pub struct AppServices {
 ///
 /// Pure so its full truth table is unit-testable: `from_config` hard-constructs
 /// the repo, so the guard branch cannot be exercised with a mock.
+/// Browser-facing auth settings (card C11): the origin policy and the cookie
+/// configuration for one identity mode.
+///
+/// Local mode keeps the historical behaviour (lenient env read, legacy cookie
+/// names, Secure only with `AIONUI_HTTPS`). Outside local mode the origin
+/// values are parsed strictly (`scheme://host[:port]`; `null`, `*` and
+/// malformed values refuse startup), and an `https://` public origin implies
+/// Secure, prefixed cookies even without `AIONUI_HTTPS`.
+///
+/// Pure (env values are parameters) so startup refusal is unit-testable.
+fn browser_auth_settings(
+    identity_mode: IdentityMode,
+    public_origin: Option<&str>,
+    allowed_origins: &str,
+    https_env: bool,
+) -> anyhow::Result<(aionui_auth::OriginPolicy, CookieConfig)> {
+    if identity_mode.is_local() {
+        let allowed: Vec<&str> = allowed_origins.split(',').collect();
+        let policy = aionui_auth::OriginPolicy::new(public_origin, &allowed);
+        return Ok((policy, CookieConfig::for_identity(false, https_env)));
+    }
+    let policy = aionui_auth::OriginPolicy::parse(public_origin, allowed_origins)
+        .map_err(|error| anyhow::anyhow!("invalid browser origin configuration: {error}"))?;
+    let webui = identity_mode == IdentityMode::WebUi;
+    let https = https_env || policy.public_is_https();
+    if webui && policy.public_origin.is_none() {
+        tracing::error!(
+            "webui mode without {}: browser writes are only checked against Sec-Fetch-Site; \
+             set it to the public origin (e.g. https://host)",
+            aionui_auth::PUBLIC_ORIGIN_ENV
+        );
+    }
+    if webui && !https {
+        tracing::warn!(
+            "webui mode without Secure cookies: set AIONUI_HTTPS=1 or an https:// {}",
+            aionui_auth::PUBLIC_ORIGIN_ENV
+        );
+    }
+    Ok((policy, CookieConfig::for_identity(webui, https)))
+}
+
 fn must_refuse_startup_on_unreadable_system_user(
     is_new: bool,
     system_user_present: bool,
@@ -169,6 +214,12 @@ impl AppServices {
         let work_dir = config.work_dir.clone();
         let identity_mode = config.effective_identity_mode();
         let local = identity_mode.is_local();
+        let (origin_policy, cookie_config) = browser_auth_settings(
+            identity_mode,
+            std::env::var(aionui_auth::PUBLIC_ORIGIN_ENV).ok().as_deref(),
+            &std::env::var(aionui_auth::ALLOWED_ORIGINS_ENV).unwrap_or_default(),
+            CookieConfig::https_from_env(),
+        )?;
         let dump_prompts = config.dump_prompts;
         let app_version = config.app_version.clone();
         let user_repo: Arc<dyn IUserRepository> = Arc::new(SqliteUserRepository::new(database.pool().clone()));
@@ -471,7 +522,8 @@ impl AppServices {
             jwt_service: Arc::new(JwtService::new(secret.clone())),
             antigravity_hook_tokens,
             user_repo,
-            cookie_config: Arc::new(CookieConfig::from_env()),
+            cookie_config: Arc::new(cookie_config),
+            origin_policy: Arc::new(origin_policy),
             qr_token_store: Arc::new(QrTokenStore::new()),
             ws_manager: Arc::new(WebSocketManager::new()),
             event_bus,
@@ -647,6 +699,48 @@ mod tests {
     // dangerous state — a freshly generated secret while the system-user read
     // came back empty but the row is really present — must refuse startup; every
     // other combination must proceed.
+    #[test]
+    fn startup_refuses_null_wildcard_and_malformed_origins_outside_local_mode() {
+        for mode in [IdentityMode::WebUi, IdentityMode::AionPro] {
+            for bad in [
+                "null",
+                "*",
+                "https://a.example/path",
+                "a.example",
+                "https://a.example:0",
+            ] {
+                assert!(
+                    browser_auth_settings(mode, Some(bad), "", false).is_err(),
+                    "{mode:?} public {bad}"
+                );
+                assert!(
+                    browser_auth_settings(mode, None, bad, false).is_err(),
+                    "{mode:?} allowed {bad}"
+                );
+            }
+        }
+        // Local mode never refuses startup over these values (no behaviour change).
+        assert!(browser_auth_settings(IdentityMode::Local, Some("null"), "*", false).is_ok());
+    }
+
+    #[test]
+    fn https_public_origin_implies_prefixed_secure_cookies_in_webui_mode() {
+        let (_, cookies) = browser_auth_settings(IdentityMode::WebUi, Some("https://a.example"), "", false).unwrap();
+        assert!(cookies.secure);
+        assert_eq!(cookies.names, aionui_auth::CookieNames::PREFIXED);
+        let (_, cookies) = browser_auth_settings(IdentityMode::WebUi, Some("http://a.example"), "", false).unwrap();
+        assert!(!cookies.secure);
+        assert_eq!(cookies.names, aionui_auth::CookieNames::LEGACY);
+        // Local mode: legacy names and Secure only from AIONUI_HTTPS, as before.
+        let (_, cookies) = browser_auth_settings(IdentityMode::Local, Some("https://a.example"), "", false).unwrap();
+        assert!(!cookies.secure);
+        assert_eq!(cookies.names, aionui_auth::CookieNames::LEGACY);
+        // AionPro: Secure follows the https origin, names stay legacy.
+        let (_, cookies) = browser_auth_settings(IdentityMode::AionPro, Some("https://a.example"), "", false).unwrap();
+        assert!(cookies.secure);
+        assert_eq!(cookies.names, aionui_auth::CookieNames::LEGACY);
+    }
+
     #[test]
     fn refuse_startup_only_when_fresh_secret_masks_an_unread_existing_row() {
         // is_new, system_user_present, existing_row_present

@@ -8,6 +8,7 @@ mod error;
 mod extract;
 mod jwt;
 pub mod middleware;
+mod origin;
 mod password;
 pub mod qr_token;
 mod rate_limit;
@@ -49,18 +50,24 @@ pub use rate_limit::{
 
 // Token / IP extraction
 pub use extract::{
-    extract_client_ip, extract_client_ip_from_headers, extract_cookie_value, extract_token_from_headers,
-    extract_token_from_ws_headers,
+    extract_client_ip, extract_client_ip_from_headers, extract_cookie_value, extract_cookie_values,
+    extract_token_from_headers, extract_token_from_ws_headers, extract_token_named, extract_ws_token_named,
 };
 
 // Cookie configuration
-pub use cookie::CookieConfig;
+pub use cookie::{CookieConfig, CookieNames};
 
 // Security headers
 pub use security::security_headers_middleware;
 
 // CSRF protection
-pub use csrf::csrf_middleware;
+pub use csrf::{CsrfState, csrf_middleware};
+
+// Browser-origin policy (CORS allow-list, unsafe-method and WebSocket checks)
+pub use origin::{
+    ALLOWED_ORIGINS_ENV, OriginPolicy, PUBLIC_ORIGIN_ENV, is_unsafe_method, normalize_origin, parse_origin,
+    websocket_origin_middleware,
+};
 
 // Auth middleware
 pub use middleware::{

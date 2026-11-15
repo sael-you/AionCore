@@ -20,8 +20,9 @@ use aionui_api_types::{ErrorResponse, WebSocketMessage};
 use aionui_assets::{AssetRouterState, asset_routes};
 use aionui_assistant::assistant_routes;
 use aionui_auth::{
-    AuthIdentityMode, AuthRouterState, AuthState, IRuntimeTokenVerifier, RefreshCoalescer,
+    AuthIdentityMode, AuthRouterState, AuthState, CsrfState, IRuntimeTokenVerifier, RefreshCoalescer,
     SystemDefaultFilesystemAdopter, auth_middleware, auth_routes, csrf_middleware, security_headers_middleware,
+    websocket_origin_middleware,
 };
 use aionui_channel::channel_routes;
 #[cfg(feature = "weixin")]
@@ -274,6 +275,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         runtime_token_verifier: Some(Arc::new(ConversationHelperTokenVerifier {
             runtime_token_service: services.runtime_token_service.clone(),
         })),
+        cookie_names: services.cookie_config.names,
     };
 
     // System routes protected by auth middleware
@@ -441,7 +443,13 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         router
     } else {
         router.layer(middleware::from_fn_with_state(
-            services.cookie_config.clone(),
+            CsrfState {
+                cookie_config: services.cookie_config.clone(),
+                // The C11 origin rules apply to webui only; AionPro keeps
+                // the upstream CSRF behaviour.
+                origin_policy: (services.identity_mode == crate::config::IdentityMode::WebUi)
+                    .then(|| services.origin_policy.clone()),
+            },
             csrf_middleware,
         ))
     }
@@ -460,6 +468,17 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     let router = router.layer(DefaultBodyLimit::max(aionui_common::constants::BODY_LIMIT));
     let router = router.layer(middleware::from_fn(normalize_boundary_error_response));
 
+    // Every WebSocket upgrade (/ws, /api/stt/stream, /api/voice/ws, …) from a
+    // browser must come from a trusted origin (C11 change 4b). Webui only:
+    // local and AionPro modes are unchanged.
+    let router = if services.identity_mode == crate::config::IdentityMode::WebUi {
+        router.layer(middleware::from_fn_with_state(
+            services.origin_policy.clone(),
+            websocket_origin_middleware,
+        ))
+    } else {
+        router
+    };
     let router = with_access_log(router);
     tracing::info!(
         elapsed_ms = boot.elapsed().as_millis(),
@@ -479,15 +498,46 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
             ])
             .allow_headers(Any);
         router.layer(cors)
-    } else {
-        // Non-local (external identity) mode: the desktop renderer is a
-        // cross-origin browser context (localhost:5173 in dev, file:// when
-        // packaged) authenticating with the session cookie, so responses must
-        // opt in to credentialed CORS. Credentialed mode forbids wildcards:
-        // reflect the request origin and enumerate headers explicitly
-        // (x-csrf-token is required by the CSRF double-submit middleware).
+    } else if services.identity_mode != crate::config::IdentityMode::WebUi {
+        // AionPro (external identity) mode, unchanged upstream behaviour: the
+        // desktop renderer is a cross-origin browser context (localhost:5173
+        // in dev, file:// when packaged) authenticating with the session
+        // cookie, so responses must opt in to credentialed CORS. Credentialed
+        // mode forbids wildcards: reflect the request origin and enumerate
+        // headers explicitly (x-csrf-token is required by the CSRF
+        // double-submit middleware).
         let cors = CorsLayer::new()
             .allow_origin(AllowOrigin::mirror_request())
+            .allow_credentials(true)
+            .allow_methods([
+                Method::GET,
+                Method::POST,
+                Method::PUT,
+                Method::PATCH,
+                Method::DELETE,
+                Method::OPTIONS,
+            ])
+            .allow_headers([
+                header::CONTENT_TYPE,
+                header::AUTHORIZATION,
+                HeaderName::from_static("x-csrf-token"),
+            ]);
+        router.layer(cors)
+    } else if services.origin_policy.allowed_origins.is_empty() {
+        // Webui mode without AIONUI_ALLOWED_ORIGINS: same-origin only, no
+        // CORS layer at all — no credentialed cross-origin reads (C11
+        // change 2).
+        router
+    } else {
+        // Webui mode with an explicit allow-list: credentialed CORS for
+        // exactly those origins (e.g. the desktop renderer's dev origin).
+        // Credentialed mode forbids wildcards: enumerate headers explicitly
+        // (x-csrf-token is required by the CSRF double-submit middleware).
+        let policy = services.origin_policy.clone();
+        let cors = CorsLayer::new()
+            .allow_origin(AllowOrigin::predicate(move |origin, _| {
+                origin.to_str().is_ok_and(|origin| policy.is_cors_allowed(origin))
+            }))
             .allow_credentials(true)
             .allow_methods([
                 Method::GET,

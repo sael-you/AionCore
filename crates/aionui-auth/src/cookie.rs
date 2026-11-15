@@ -3,6 +3,35 @@ use aionui_common::constants::{
     REFRESH_COOKIE_PATH,
 };
 
+/// The cookie names in use.
+///
+/// Webui mode over HTTPS uses prefixed names (card C11, change 6):
+/// `__Host-` cookies must be `Secure`, `Path=/` and carry no `Domain`, so a
+/// dev server on a sibling sub-domain cannot plant ("toss") a session or CSRF
+/// cookie the backend would read; the path-scoped refresh cookie can only be
+/// `__Secure-`. Un-prefixed names are then never read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CookieNames {
+    pub session: &'static str,
+    pub csrf: &'static str,
+    pub refresh: &'static str,
+}
+
+impl CookieNames {
+    /// The historical names (local mode, plain-HTTP webui, AionPro).
+    pub const LEGACY: CookieNames = CookieNames {
+        session: COOKIE_NAME,
+        csrf: CSRF_COOKIE_NAME,
+        refresh: REFRESH_COOKIE_NAME,
+    };
+    /// Webui over HTTPS.
+    pub const PREFIXED: CookieNames = CookieNames {
+        session: "__Host-aionui-session",
+        csrf: "__Host-aionui-csrf-token",
+        refresh: "__Secure-aionui-refresh",
+    };
+}
+
 /// Cookie security configuration derived from the deployment environment.
 #[derive(Debug, Clone)]
 pub struct CookieConfig {
@@ -10,21 +39,39 @@ pub struct CookieConfig {
     pub secure: bool,
     /// `SameSite` policy: `"Strict"` for HTTPS, `"Lax"` for HTTP.
     pub same_site: &'static str,
+    /// Names written and read.
+    pub names: CookieNames,
 }
 
 impl CookieConfig {
+    /// Cookie config for an identity mode: `https` sets `Secure` and
+    /// `SameSite=Strict`; webui over HTTPS also switches to the prefixed
+    /// names (the prefixes require `Secure`).
+    pub fn for_identity(webui: bool, https: bool) -> Self {
+        Self {
+            secure: https,
+            same_site: if https { "Strict" } else { "Lax" },
+            names: if webui && https {
+                CookieNames::PREFIXED
+            } else {
+                CookieNames::LEGACY
+            },
+        }
+    }
+
+    /// Whether `AIONUI_HTTPS=true` is set.
+    pub fn https_from_env() -> bool {
+        std::env::var("AIONUI_HTTPS")
+            .map(|v| v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false)
+    }
+
     /// Create cookie config from environment variables.
     ///
     /// - `AIONUI_HTTPS=true` → Secure flag, SameSite=Strict
     /// - Otherwise → no Secure flag, SameSite=Lax (for remote HTTP access)
     pub fn from_env() -> Self {
-        let https = std::env::var("AIONUI_HTTPS")
-            .map(|v| v.eq_ignore_ascii_case("true"))
-            .unwrap_or(false);
-        Self {
-            secure: https,
-            same_site: if https { "Strict" } else { "Lax" },
-        }
+        Self::for_identity(false, Self::https_from_env())
     }
 
     /// Build `Set-Cookie` header value for the session token.
@@ -33,7 +80,8 @@ impl CookieConfig {
     pub fn build_session_cookie(&self, token: &str) -> String {
         let max_age = u64::from(COOKIE_MAX_AGE_DAYS) * 24 * 60 * 60;
         format!(
-            "{COOKIE_NAME}={token}; Path=/; HttpOnly; SameSite={}{}; Max-Age={max_age}",
+            "{}={token}; Path=/; HttpOnly; SameSite={}{}; Max-Age={max_age}",
+            self.names.session,
             self.same_site,
             if self.secure { "; Secure" } else { "" },
         )
@@ -42,7 +90,8 @@ impl CookieConfig {
     /// Build `Set-Cookie` header value that clears the session cookie.
     pub fn clear_session_cookie(&self) -> String {
         format!(
-            "{COOKIE_NAME}=; Path=/; HttpOnly; SameSite={}{}; Max-Age=0",
+            "{}=; Path=/; HttpOnly; SameSite={}{}; Max-Age=0",
+            self.names.session,
             self.same_site,
             if self.secure { "; Secure" } else { "" },
         )
@@ -55,7 +104,8 @@ impl CookieConfig {
     pub fn build_csrf_cookie(&self, token: &str) -> String {
         let max_age = u64::from(COOKIE_MAX_AGE_DAYS) * 24 * 60 * 60;
         format!(
-            "{CSRF_COOKIE_NAME}={token}; Path=/; SameSite={}{}; Max-Age={max_age}",
+            "{}={token}; Path=/; SameSite={}{}; Max-Age={max_age}",
+            self.names.csrf,
             self.same_site,
             if self.secure { "; Secure" } else { "" },
         )
@@ -70,7 +120,8 @@ impl CookieConfig {
     pub fn build_refresh_cookie(&self, token: &str) -> String {
         let max_age = u64::from(REFRESH_COOKIE_MAX_AGE_DAYS) * 24 * 60 * 60;
         format!(
-            "{REFRESH_COOKIE_NAME}={token}; Path={REFRESH_COOKIE_PATH}; HttpOnly; SameSite={}{}; Max-Age={max_age}",
+            "{}={token}; Path={REFRESH_COOKIE_PATH}; HttpOnly; SameSite={}{}; Max-Age={max_age}",
+            self.names.refresh,
             self.same_site,
             if self.secure { "; Secure" } else { "" },
         )
@@ -83,7 +134,8 @@ impl CookieConfig {
     /// the refresh cookie in place.
     pub fn clear_refresh_cookie(&self) -> String {
         format!(
-            "{REFRESH_COOKIE_NAME}=; Path={REFRESH_COOKIE_PATH}; HttpOnly; SameSite={}{}; Max-Age=0",
+            "{}=; Path={REFRESH_COOKIE_PATH}; HttpOnly; SameSite={}{}; Max-Age=0",
+            self.names.refresh,
             self.same_site,
             if self.secure { "; Secure" } else { "" },
         )
@@ -98,6 +150,7 @@ mod tests {
         CookieConfig {
             secure: false,
             same_site: "Lax",
+            names: CookieNames::LEGACY,
         }
     }
 
@@ -105,6 +158,7 @@ mod tests {
         CookieConfig {
             secure: true,
             same_site: "Strict",
+            names: CookieNames::LEGACY,
         }
     }
 
@@ -198,5 +252,25 @@ mod tests {
         assert!(cookie.contains("HttpOnly"));
         // Deletion only takes effect when the path matches the set cookie.
         assert!(cookie.contains("Path=/api/auth/refresh"));
+    }
+
+    #[test]
+    fn prefixed_names_are_secure_host_cookies_without_domain() {
+        let config = CookieConfig {
+            secure: true,
+            same_site: "Strict",
+            names: CookieNames::PREFIXED,
+        };
+        let session = config.build_session_cookie("t");
+        assert!(session.starts_with("__Host-aionui-session=t; Path=/;"));
+        assert!(session.contains("; Secure") && !session.contains("Domain"));
+        let csrf = config.build_csrf_cookie("c");
+        assert!(csrf.starts_with("__Host-aionui-csrf-token=c; Path=/;"));
+        assert!(csrf.contains("; Secure") && !csrf.contains("Domain"));
+        let refresh = config.build_refresh_cookie("r");
+        assert!(refresh.starts_with("__Secure-aionui-refresh=r; Path=/api/auth/refresh;"));
+        assert!(refresh.contains("; Secure"));
+        assert!(config.clear_session_cookie().starts_with("__Host-aionui-session=;"));
+        assert!(config.clear_refresh_cookie().starts_with("__Secure-aionui-refresh=;"));
     }
 }

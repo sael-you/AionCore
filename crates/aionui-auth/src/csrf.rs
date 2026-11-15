@@ -4,15 +4,26 @@ use std::fmt::Write as _;
 use std::sync::Arc;
 
 use axum::extract::{Request, State};
-use axum::http::{HeaderValue, Method, header};
+use axum::http::{HeaderValue, header};
 use axum::middleware::Next;
 use axum::response::Response;
 
 use aionui_common::ApiError;
-use aionui_common::constants::{CSRF_COOKIE_NAME, CSRF_HEADER_NAME};
+use aionui_common::constants::{COOKIE_NAME, CSRF_HEADER_NAME};
+use axum::http::StatusCode;
 
 use crate::cookie::CookieConfig;
 use crate::extract::extract_cookie_value;
+use crate::origin::{OriginPolicy, is_unsafe_method};
+
+/// State of [`csrf_middleware`] (installed in non-local modes only).
+#[derive(Clone)]
+pub struct CsrfState {
+    pub cookie_config: Arc<CookieConfig>,
+    /// `Some` = webui hardening (card C11: browser-origin rules, strict
+    /// runtime-token exemption); `None` = upstream behaviour (AionPro).
+    pub origin_policy: Option<Arc<OriginPolicy>>,
+}
 
 /// CSRF protection middleware using the Double Submit Cookie pattern.
 ///
@@ -20,27 +31,56 @@ use crate::extract::extract_cookie_value;
 /// - Safe methods (GET, HEAD, OPTIONS) bypass validation.
 /// - Exempt paths (`/login`, `/api/auth/qr-login`, Bootstrap-secret internal auth) bypass validation.
 /// - All other requests must include an `x-csrf-token` header whose value
-///   matches the `aionui-csrf-token` cookie.
+///   matches the CSRF cookie.
+/// - Every state-changing request must pass the browser-origin rule
+///   ([`OriginPolicy::allows_unsafe_request`], card C11 change 3b), exempt
+///   paths included.
 /// - Sets the CSRF cookie on responses if the client does not have one.
 pub async fn csrf_middleware(
-    State(cookie_config): State<Arc<CookieConfig>>,
+    State(state): State<CsrfState>,
     request: Request,
     next: Next,
 ) -> Result<Response, ApiError> {
+    let cookie_config = &state.cookie_config;
     let method = request.method().clone();
     let path = request.uri().path().to_owned();
 
     // Extract CSRF cookie before consuming the request
-    let csrf_cookie = extract_cookie_value(request.headers(), CSRF_COOKIE_NAME);
+    let csrf_cookie = extract_cookie_value(request.headers(), cookie_config.names.csrf);
 
     // Validate CSRF for state-changing requests
-    let needs_validation = matches!(method, Method::POST | Method::PUT | Method::DELETE | Method::PATCH);
+    let needs_validation = is_unsafe_method(&method);
+    if let Some(policy) = &state.origin_policy {
+        let allowed = if needs_validation {
+            policy.allows_unsafe_request(request.headers())
+        } else {
+            !path.starts_with("/api/") || policy.allows_safe_api_request(request.headers())
+        };
+        if !allowed {
+            tracing::warn!(path = %path, method = %method, "request refused: untrusted browser origin");
+            return Err(ApiError::coded(
+                StatusCode::FORBIDDEN,
+                "ORIGIN_FORBIDDEN",
+                "Cross-site request refused.",
+                None,
+            ));
+        }
+    }
     // Requests on the runtime-token channel are exempt: CSRF defends against
     // cookie-bearing cross-site requests, while the helper CLI authenticates
     // via an explicit custom header (never ambient cookies) that browsers
     // cannot attach cross-site without a CORS preflight. The token itself is
     // still fully validated by the auth middleware behind this layer.
-    let is_runtime_token_request = request.headers().contains_key(crate::middleware::RUNTIME_TOKEN_HEADER);
+    //
+    // Only a request that carries no ambient credential qualifies (C11 change
+    // 3a): with a session cookie or an Authorization header present, a junk
+    // runtime header must not switch the CSRF check off.
+    let headers = request.headers();
+    let has_session_credential = headers.contains_key(header::AUTHORIZATION)
+        || extract_cookie_value(headers, cookie_config.names.session).is_some()
+        || extract_cookie_value(headers, COOKIE_NAME).is_some();
+    let is_runtime_token_request = headers.contains_key(crate::middleware::RUNTIME_TOKEN_HEADER)
+        && (state.origin_policy.is_none() || !has_session_credential);
     // agy's PreToolUse callback. A local `aioncore antigravity-hook` process
     // posts here for every tool the agent wants to run; it has no user session
     // and no CSRF token to present. The route is already deliberately outside
@@ -72,7 +112,9 @@ pub async fn csrf_middleware(
             .map(|s| s.to_owned());
 
         match (&csrf_cookie, header_token) {
-            (Some(cookie), Some(ref hdr)) if !cookie.is_empty() && cookie == hdr => {
+            (Some(cookie), Some(ref hdr))
+                if !cookie.is_empty() && constant_time_eq(cookie.as_bytes(), hdr.as_bytes()) =>
+            {
                 // Valid: cookie and header match
             }
             _ => {
@@ -95,6 +137,14 @@ pub async fn csrf_middleware(
     Ok(response)
 }
 
+/// Compare two byte strings without an early exit on the first difference.
+fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
+    if a.len() != b.len() {
+        return false;
+    }
+    a.iter().zip(b).fold(0u8, |diff, (x, y)| diff | (x ^ y)) == 0
+}
+
 /// Generate a cryptographically random 32-byte CSRF token as a hex string.
 fn generate_csrf_token() -> String {
     let mut buf = [0u8; 32];
@@ -115,6 +165,13 @@ mod tests {
         let token = generate_csrf_token();
         assert_eq!(token.len(), 64);
         assert!(token.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn constant_time_compare_matches_equality() {
+        assert!(constant_time_eq(b"abc", b"abc"));
+        assert!(!constant_time_eq(b"abc", b"abd"));
+        assert!(!constant_time_eq(b"abc", b"abcd"));
     }
 
     #[test]
