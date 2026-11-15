@@ -110,6 +110,8 @@ pub(crate) struct ServiceInner {
     pub tools: ToolRunner,
     pub asks: AskRegistry,
     pub say_limiter: aionui_auth::RateLimiter,
+    /// `voice.wake` per user per hour, shared with the follow-up watcher.
+    pub wake_limiter: Arc<aionui_auth::RateLimiter>,
     pub live: DashMap<String, Arc<LiveCall>>,
     pub tasks: DashMap<String, tokio::task::AbortHandle>,
     /// Per-user admission lock: an admission, a resume and the kill switch of
@@ -182,6 +184,7 @@ impl VoiceService {
                     crate::agent::SAY_PER_MINUTE,
                     std::time::Duration::from_secs(60),
                 ),
+                wake_limiter: crate::followup::wake_limiter(),
                 settings: deps.settings,
                 sessions: deps.sessions,
                 audit: deps.audit,
@@ -528,6 +531,7 @@ impl VoiceService {
             self.inner.drafts.clone(),
             self.inner.sockets.clone(),
             Arc::new(self.clone()),
+            self.inner.wake_limiter.clone(),
         )
         .spawn();
     }
