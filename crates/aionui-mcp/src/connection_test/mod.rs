@@ -79,6 +79,31 @@ impl McpConnectionTestService {
         user_id: Option<&str>,
         runtime_scope_id: Option<&str>,
     ) -> McpConnectionTestResult {
+        self.run_test(name, transport, user_id, runtime_scope_id, false).await
+    }
+
+    /// Test a market instance: a stdio child gets the launcher's env only
+    /// (cleared, then the allowlisted parent vars, the runtime's own env and
+    /// the instance env), never AionCore's `AIONUI_*` or other secrets
+    /// (train-2 review C2 #3, TASK-70).
+    pub async fn test_market_connection(
+        &self,
+        name: &str,
+        transport: &McpServerTransport,
+        user_id: Option<&str>,
+        runtime_scope_id: Option<&str>,
+    ) -> McpConnectionTestResult {
+        self.run_test(name, transport, user_id, runtime_scope_id, true).await
+    }
+
+    async fn run_test(
+        &self,
+        name: &str,
+        transport: &McpServerTransport,
+        user_id: Option<&str>,
+        runtime_scope_id: Option<&str>,
+        isolated_env: bool,
+    ) -> McpConnectionTestResult {
         // A market row's placeholder (`aioncore mcp exec ...`) runs through the
         // real launcher binary, never a PATH lookup of `aioncore`.
         let mut transport = std::borrow::Cow::Borrowed(transport);
@@ -98,7 +123,8 @@ impl McpConnectionTestService {
         log_mcp_transport_start(mcp_server_id, transport_type);
         let result = match transport {
             McpServerTransport::Stdio { command, args, env } => {
-                self.test_stdio(command, args, env, user_id, runtime_scope_id).await
+                self.test_stdio(command, args, env, user_id, runtime_scope_id, isolated_env)
+                    .await
             }
             McpServerTransport::Http { url, headers } => self.test_http(url, headers).await,
             McpServerTransport::Sse { url, headers } => self.test_sse(url, headers).await,
@@ -116,8 +142,9 @@ impl McpConnectionTestService {
         env: &HashMap<String, String>,
         user_id: Option<&str>,
         runtime_scope_id: Option<&str>,
+        isolated_env: bool,
     ) -> McpConnectionTestResult {
-        self.test_stdio_inner(command, args, env, user_id, runtime_scope_id)
+        self.test_stdio_inner(command, args, env, user_id, runtime_scope_id, isolated_env)
             .await
     }
 
@@ -128,15 +155,22 @@ impl McpConnectionTestService {
         env: &HashMap<String, String>,
         user_id: Option<&str>,
         runtime_scope_id: Option<&str>,
+        isolated_env: bool,
     ) -> McpConnectionTestResult {
         let reporter =
             runtime_scope_id.map(|scope_id| self.runtime_reporter(user_id.map(str::to_owned), scope_id.to_owned()));
+        let mut runtime_env: Vec<(String, String)> = Vec::new();
         let mut cmd = match probe_runtime_command(command) {
             RuntimeCommandProbe::NodeTool { .. } => {
                 let resolved = match ensure_runtime_command_with_reporter(command, reporter.as_deref()).await {
                     Ok(resolved) => resolved,
                     Err(error) => return spawn_error_result(command, &runtime_resolution_error(&error.to_string())),
                 };
+                runtime_env = resolved
+                    .env
+                    .iter()
+                    .map(|(k, v)| (k.to_string_lossy().into_owned(), v.to_string_lossy().into_owned()))
+                    .collect();
                 CmdBuilder::from_resolved(&resolved)
             }
             _ => {
@@ -144,8 +178,17 @@ impl McpConnectionTestService {
                 CmdBuilder::new(&program)
             }
         };
+        if isolated_env {
+            let instance_env: Vec<(String, String)> = env.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
+            cmd.env_clear().envs(crate::market::child_env_with(
+                std::env::vars(),
+                &runtime_env,
+                &instance_env,
+            ));
+        } else {
+            cmd.envs(env.iter());
+        }
         cmd.args(args)
-            .envs(env.iter())
             .stdin(std::process::Stdio::piped())
             .stdout(std::process::Stdio::piped())
             .stderr(std::process::Stdio::null());
