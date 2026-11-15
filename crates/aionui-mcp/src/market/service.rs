@@ -580,7 +580,21 @@ struct NewInstance<'a> {
 }
 
 /// Fill plain defaults and the tier's forced env (a forced key always wins).
+/// Keys only another tier forces are dropped first, so a tier change never
+/// keeps the old tier's forced value (e.g. a write flag on a read instance,
+/// TASK-72); a declared default then applies again.
 fn apply_defaults(template: &McpMarketTemplate, tier: &str, plain_env: &mut BTreeMap<String, String>) {
+    let current = template.tier_env.get(tier);
+    for (other, forced) in &template.tier_env {
+        if other == tier {
+            continue;
+        }
+        for key in forced.keys() {
+            if current.is_none_or(|c| !c.contains_key(key)) {
+                plain_env.remove(key);
+            }
+        }
+    }
     for (key, field) in &template.env {
         if field.kind == McpMarketEnvKind::Plain
             && let Some(default) = &field.default
