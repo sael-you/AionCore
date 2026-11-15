@@ -1,0 +1,1678 @@
+{
+  "//": "Curated catalogue of the studio-mcp-catalog (D49, owner review D50). contributes.mcpServers[] is the live list, seeded by AionCore as the built-in catalogue (crates/aionui-mcp/catalogue/). market.category/vendor/official/optional/summary/billing drive the library browse; read_tools pins the proxy read allowlist (enforcement proxy, GAPS G3); a plain env key with a pattern is a launch parameter (GAPS G1). No secret values: only env keys of kind secret.",
+  "name": "studio-mcp-catalog",
+  "version": "1.0.0-2026-11-15",
+  "contributes": {
+    "mcpServers": [
+      {
+        "id": "github",
+        "name": "GitHub",
+        "description": "GitHub official remote MCP with a fine-grained PAT. Read tier forces X-MCP-Readonly; lockdown hides untrusted public content.",
+        "market": {
+          "version": "remote-2026-11-15 (server v2.1.0)",
+          "transport": "http",
+          "url": "https://api.githubcopilot.com/mcp/",
+          "bridge": {
+            "command": "npx",
+            "args": [
+              "-y",
+              "mcp-remote@0.16.6",
+              "https://api.githubcopilot.com/mcp/",
+              "--transport",
+              "http-only",
+              "--silent",
+              "--header",
+              "Authorization:Bearer ${GITHUB_PAT}",
+              "--header",
+              "X-MCP-Readonly:${GITHUB_MCP_READONLY}",
+              "--header",
+              "X-MCP-Toolsets:${GITHUB_MCP_TOOLSETS}",
+              "--header",
+              "X-MCP-Lockdown:${GITHUB_MCP_LOCKDOWN}"
+            ]
+          },
+          "env": {
+            "GITHUB_PAT": {
+              "kind": "secret",
+              "required": true,
+              "description": "GitHub fine-grained PAT (read tier: read-only repository permissions)"
+            },
+            "GITHUB_MCP_READONLY": {
+              "kind": "plain",
+              "required": true,
+              "description": "Server read-only switch",
+              "enum": [
+                "true",
+                "false"
+              ],
+              "default": "true"
+            },
+            "GITHUB_MCP_TOOLSETS": {
+              "kind": "plain",
+              "required": true,
+              "description": "Comma-separated toolsets",
+              "default": "context,repos,issues,pull_requests,actions"
+            },
+            "GITHUB_MCP_LOCKDOWN": {
+              "kind": "plain",
+              "required": true,
+              "description": "Lockdown mode (hide public content from non-pushers)",
+              "enum": [
+                "true",
+                "false"
+              ],
+              "default": "true"
+            }
+          },
+          "tiers": [
+            "read",
+            "write"
+          ],
+          "enforcement": "server",
+          "clis": [
+            "claude",
+            "codex",
+            "gemini"
+          ],
+          "headers": {
+            "Authorization": "GITHUB_PAT",
+            "X-MCP-Readonly": "GITHUB_MCP_READONLY",
+            "X-MCP-Toolsets": "GITHUB_MCP_TOOLSETS",
+            "X-MCP-Lockdown": "GITHUB_MCP_LOCKDOWN"
+          },
+          "tier_env": {
+            "read": {
+              "GITHUB_MCP_READONLY": "true",
+              "GITHUB_MCP_LOCKDOWN": "true"
+            },
+            "write": {
+              "GITHUB_MCP_READONLY": "false",
+              "GITHUB_MCP_LOCKDOWN": "true"
+            }
+          },
+          "category": "developer",
+          "vendor": "GitHub",
+          "official": true,
+          "optional": false,
+          "summary": "Repos, issues, pull requests and CI"
+        }
+      },
+      {
+        "id": "context7",
+        "name": "Context7",
+        "description": "Up-to-date library and framework docs (Upstash, official). Read-only; one of the two global ids (R2).",
+        "market": {
+          "version": "4.7.0",
+          "transport": "stdio",
+          "command": {
+            "command": "npx",
+            "args": [
+              "-y",
+              "@upstash/context7-mcp@4.7.0"
+            ]
+          },
+          "env": {
+            "CONTEXT7_API_KEY": {
+              "kind": "secret",
+              "required": false,
+              "description": "Context7 API key (optional: without it, lower rate limits)"
+            }
+          },
+          "tiers": [
+            "read"
+          ],
+          "enforcement": "server",
+          "clis": [
+            "claude",
+            "codex",
+            "gemini"
+          ],
+          "tool_classes": {
+            "resolve-library-id": "read",
+            "query-docs": "read"
+          },
+          "category": "developer",
+          "vendor": "Upstash",
+          "official": true,
+          "optional": false,
+          "summary": "Up-to-date library and framework docs"
+        }
+      },
+      {
+        "id": "deepwiki",
+        "name": "DeepWiki",
+        "description": "Ask questions about any public GitHub repo (Cognition, official, free, no auth).",
+        "market": {
+          "version": "remote-2026-11-15",
+          "transport": "http",
+          "url": "https://mcp.deepwiki.com/mcp",
+          "bridge": {
+            "command": "npx",
+            "args": [
+              "-y",
+              "mcp-remote@0.16.6",
+              "https://mcp.deepwiki.com/mcp",
+              "--transport",
+              "http-only",
+              "--silent"
+            ]
+          },
+          "env": {},
+          "tiers": [
+            "read"
+          ],
+          "enforcement": "server",
+          "clis": [
+            "claude",
+            "codex",
+            "gemini"
+          ],
+          "category": "developer",
+          "vendor": "Cognition",
+          "official": true,
+          "optional": false,
+          "summary": "Ask questions about any public GitHub repo"
+        }
+      },
+      {
+        "id": "supabase",
+        "name": "Supabase",
+        "description": "Supabase official remote MCP, pinned per instance to one project (project_ref, G1). Write tier: migrations, execute_sql, functions, branching. Read tier forces read_only=true (queries run as a read-only Postgres user). The PAT is account-wide, so the project_ref is required before an instance can be active.",
+        "market": {
+          "version": "remote-2026-11-15",
+          "transport": "http",
+          "url": "https://mcp.supabase.com/mcp?project_ref=${SUPABASE_PROJECT_REF}&read_only=${SUPABASE_READ_ONLY}&features=database,debugging,development,docs,functions,branching",
+          "bridge": {
+            "command": "npx",
+            "args": [
+              "-y",
+              "mcp-remote@0.16.6",
+              "https://mcp.supabase.com/mcp?project_ref=${SUPABASE_PROJECT_REF}&read_only=${SUPABASE_READ_ONLY}&features=database,debugging,development,docs,functions,branching",
+              "--transport",
+              "http-only",
+              "--silent",
+              "--header",
+              "Authorization:Bearer ${SUPABASE_ACCESS_TOKEN}"
+            ]
+          },
+          "env": {
+            "SUPABASE_ACCESS_TOKEN": {
+              "kind": "secret",
+              "required": true,
+              "description": "Supabase personal access token (account-wide)"
+            },
+            "SUPABASE_PROJECT_REF": {
+              "kind": "plain",
+              "required": true,
+              "pattern": "^[a-z]{20}$",
+              "description": "Project ref of the one Supabase project this instance may reach (20 lowercase letters, from the dashboard URL)"
+            },
+            "SUPABASE_READ_ONLY": {
+              "kind": "plain",
+              "required": true,
+              "enum": [
+                "true",
+                "false"
+              ],
+              "pattern": "^(true|false)$",
+              "default": "true",
+              "description": "Server read-only switch (set by the tier)"
+            }
+          },
+          "tiers": [
+            "read",
+            "write"
+          ],
+          "enforcement": "server",
+          "clis": [
+            "claude",
+            "codex",
+            "gemini"
+          ],
+          "headers": {
+            "Authorization": "SUPABASE_ACCESS_TOKEN"
+          },
+          "tier_env": {
+            "read": {
+              "SUPABASE_READ_ONLY": "true"
+            },
+            "write": {
+              "SUPABASE_READ_ONLY": "false"
+            }
+          },
+          "tool_classes": {
+            "apply_migration": "write",
+            "execute_sql": "write"
+          },
+          "category": "developer",
+          "vendor": "Supabase",
+          "official": true,
+          "optional": false,
+          "summary": "Database, SQL and migrations of one Supabase project"
+        }
+      },
+      {
+        "id": "sentry",
+        "name": "Sentry",
+        "description": "Sentry official MCP (getsentry/toolkit). Read tier forces MCP_SKILLS=inspect; pair with a read-scoped token.",
+        "market": {
+          "version": "0.49.0",
+          "transport": "stdio",
+          "command": {
+            "command": "npx",
+            "args": [
+              "-y",
+              "@sentry/mcp-server@0.49.0"
+            ]
+          },
+          "env": {
+            "SENTRY_AUTH_TOKEN": {
+              "kind": "secret",
+              "required": true,
+              "description": "Sentry user auth token (read tier: org:read, project:read, event:read)"
+            },
+            "SENTRY_HOST": {
+              "kind": "plain",
+              "required": false,
+              "description": "Sentry host",
+              "default": "sentry.io"
+            },
+            "MCP_SKILLS": {
+              "kind": "plain",
+              "required": true,
+              "description": "Enabled skill groups",
+              "enum": [
+                "inspect",
+                "inspect,seer",
+                "inspect,seer,triage"
+              ],
+              "default": "inspect"
+            }
+          },
+          "tiers": [
+            "read",
+            "write"
+          ],
+          "enforcement": "server",
+          "clis": [
+            "claude",
+            "codex",
+            "gemini"
+          ],
+          "tier_env": {
+            "read": {
+              "MCP_SKILLS": "inspect"
+            },
+            "write": {
+              "MCP_SKILLS": "inspect,seer,triage"
+            }
+          },
+          "category": "developer",
+          "vendor": "Sentry",
+          "official": true,
+          "optional": false,
+          "summary": "Errors, issues and performance monitoring"
+        }
+      },
+      {
+        "id": "cloudflare",
+        "name": "Cloudflare API",
+        "description": "Cloudflare official code-mode MCP (search/execute over the whole API). Read-only only through a read-only API token.",
+        "market": {
+          "version": "remote-2026-11-15",
+          "transport": "http",
+          "url": "https://mcp.cloudflare.com/mcp",
+          "bridge": {
+            "command": "npx",
+            "args": [
+              "-y",
+              "mcp-remote@0.16.6",
+              "https://mcp.cloudflare.com/mcp",
+              "--transport",
+              "http-only",
+              "--silent",
+              "--header",
+              "Authorization:Bearer ${CLOUDFLARE_API_TOKEN}"
+            ]
+          },
+          "env": {
+            "CLOUDFLARE_API_TOKEN": {
+              "kind": "secret",
+              "required": true,
+              "description": "Cloudflare API token (read tier: read-only permissions; no IP filter)"
+            }
+          },
+          "tiers": [
+            "read",
+            "write"
+          ],
+          "enforcement": "credential",
+          "clis": [
+            "claude",
+            "codex",
+            "gemini"
+          ],
+          "headers": {
+            "Authorization": "CLOUDFLARE_API_TOKEN"
+          },
+          "tool_classes": {
+            "search": "read",
+            "docs": "read",
+            "whoami": "read",
+            "execute": "write"
+          },
+          "category": "developer",
+          "vendor": "Cloudflare",
+          "official": true,
+          "optional": false,
+          "summary": "DNS, WAF, Workers and the whole Cloudflare API"
+        }
+      },
+      {
+        "id": "chrome-devtools",
+        "name": "Chrome DevTools",
+        "description": "Chrome DevTools official MCP: Lighthouse, performance traces, console/network. Headless, isolated profile, no usage stats, no CrUX lookups.",
+        "market": {
+          "version": "1.13.0",
+          "transport": "stdio",
+          "command": {
+            "command": "npx",
+            "args": [
+              "-y",
+              "chrome-devtools-mcp@1.13.0",
+              "--headless",
+              "--isolated",
+              "--no-usage-statistics",
+              "--no-performance-crux"
+            ]
+          },
+          "env": {},
+          "tiers": [
+            "read",
+            "write"
+          ],
+          "enforcement": "proxy",
+          "clis": [
+            "claude",
+            "codex",
+            "gemini"
+          ],
+          "tool_classes": {
+            "list_pages": "read",
+            "navigate_page": "read",
+            "new_page": "read",
+            "select_page": "read",
+            "close_page": "read",
+            "wait_for": "read",
+            "emulate": "read",
+            "resize_page": "read",
+            "performance_start_trace": "read",
+            "performance_stop_trace": "read",
+            "performance_analyze_insight": "read",
+            "list_network_requests": "read",
+            "get_network_request": "read",
+            "list_console_messages": "read",
+            "get_console_message": "read",
+            "get_css_styles": "read",
+            "lighthouse_audit": "read",
+            "take_screenshot": "read",
+            "take_snapshot": "read",
+            "click": "write",
+            "click_at": "write",
+            "drag": "write",
+            "fill": "write",
+            "fill_form": "write",
+            "handle_dialog": "write",
+            "hover": "write",
+            "press_key": "write",
+            "type_text": "write",
+            "upload_file": "write",
+            "evaluate_script": "write",
+            "mock_network": "write",
+            "remove_network_mock": "write",
+            "install_extension": "write",
+            "uninstall_extension": "write",
+            "install_pwa": "write",
+            "uninstall_pwa": "write",
+            "configure_webauthn": "write",
+            "execute_3p_developer_tool": "write",
+            "execute_webmcp_tool": "write"
+          },
+          "read_tools": [
+            "close_page",
+            "emulate",
+            "get_console_message",
+            "get_css_styles",
+            "get_network_request",
+            "lighthouse_audit",
+            "list_console_messages",
+            "list_network_requests",
+            "list_pages",
+            "navigate_page",
+            "new_page",
+            "performance_analyze_insight",
+            "performance_start_trace",
+            "performance_stop_trace",
+            "resize_page",
+            "select_page",
+            "take_screenshot",
+            "take_snapshot",
+            "wait_for"
+          ],
+          "category": "developer",
+          "vendor": "Google Chrome",
+          "official": true,
+          "optional": false,
+          "summary": "Lighthouse audits, performance traces, console and network"
+        }
+      },
+      {
+        "id": "paddle",
+        "name": "Paddle (live)",
+        "description": "Paddle official hosted MCP, live environment. Read tier = an API key with read permissions only (no server switch).",
+        "market": {
+          "version": "remote-2026-11-15",
+          "transport": "http",
+          "url": "https://mcp.paddle.com/mcp",
+          "bridge": {
+            "command": "npx",
+            "args": [
+              "-y",
+              "mcp-remote@0.16.6",
+              "https://mcp.paddle.com/mcp",
+              "--transport",
+              "http-only",
+              "--silent",
+              "--header",
+              "Authorization:Bearer ${PADDLE_API_KEY}"
+            ]
+          },
+          "env": {
+            "PADDLE_API_KEY": {
+              "kind": "secret",
+              "required": true,
+              "description": "Paddle live API key (read tier: read permissions only)"
+            }
+          },
+          "tiers": [
+            "read",
+            "write"
+          ],
+          "enforcement": "credential",
+          "clis": [
+            "claude",
+            "codex",
+            "gemini"
+          ],
+          "headers": {
+            "Authorization": "PADDLE_API_KEY"
+          },
+          "tool_classes": {
+            "search": "read",
+            "show_metrics_chart": "read",
+            "report_missing_tool": "read",
+            "execute": "write"
+          },
+          "category": "payments",
+          "vendor": "Paddle",
+          "official": true,
+          "optional": false,
+          "summary": "Paddle live: customers, subscriptions, transactions"
+        }
+      },
+      {
+        "id": "paddle-sandbox",
+        "name": "Paddle (sandbox)",
+        "description": "Paddle official hosted MCP, sandbox environment (key starts pdl_sdbx_).",
+        "market": {
+          "version": "remote-2026-11-15",
+          "transport": "http",
+          "url": "https://sandbox-mcp.paddle.com/mcp",
+          "bridge": {
+            "command": "npx",
+            "args": [
+              "-y",
+              "mcp-remote@0.16.6",
+              "https://sandbox-mcp.paddle.com/mcp",
+              "--transport",
+              "http-only",
+              "--silent",
+              "--header",
+              "Authorization:Bearer ${PADDLE_API_KEY}"
+            ]
+          },
+          "env": {
+            "PADDLE_API_KEY": {
+              "kind": "secret",
+              "required": true,
+              "description": "Paddle sandbox API key"
+            }
+          },
+          "tiers": [
+            "read",
+            "write"
+          ],
+          "enforcement": "credential",
+          "clis": [
+            "claude",
+            "codex",
+            "gemini"
+          ],
+          "headers": {
+            "Authorization": "PADDLE_API_KEY"
+          },
+          "tool_classes": {
+            "search": "read",
+            "show_metrics_chart": "read",
+            "report_missing_tool": "read",
+            "execute": "write"
+          },
+          "category": "payments",
+          "vendor": "Paddle",
+          "official": true,
+          "optional": false,
+          "summary": "Paddle sandbox for tests"
+        }
+      },
+      {
+        "id": "stripe",
+        "name": "Stripe",
+        "description": "Stripe official hosted MCP with an Agent-tagged restricted key. From 2026-11-30 the hosted server accepts only Agent keys: older rk_live_ restricted keys stop working. Test-mode key for staging, live key for production.",
+        "market": {
+          "version": "remote-2026-11-15",
+          "transport": "http",
+          "url": "https://mcp.stripe.com",
+          "bridge": {
+            "command": "npx",
+            "args": [
+              "-y",
+              "mcp-remote@0.16.6",
+              "https://mcp.stripe.com",
+              "--transport",
+              "http-only",
+              "--silent",
+              "--header",
+              "Authorization:Bearer ${STRIPE_AGENT_KEY}"
+            ]
+          },
+          "env": {
+            "STRIPE_AGENT_KEY": {
+              "kind": "secret",
+              "required": true,
+              "description": "Stripe Agent-tagged restricted key. From 2026-11-30 only Agent keys work (older restricted keys are refused); read tier: read permissions only"
+            }
+          },
+          "tiers": [
+            "read",
+            "write"
+          ],
+          "enforcement": "credential",
+          "clis": [
+            "claude",
+            "codex",
+            "gemini"
+          ],
+          "headers": {
+            "Authorization": "STRIPE_AGENT_KEY"
+          },
+          "tool_classes": {
+            "stripe_api_write": "write",
+            "send_money": "write",
+            "transfer_money": "write",
+            "convert_currency": "write",
+            "atlas_company_formation": "write"
+          },
+          "category": "payments",
+          "vendor": "Stripe",
+          "official": true,
+          "optional": false,
+          "summary": "Stripe payments, customers and subscriptions"
+        }
+      },
+      {
+        "id": "posthog",
+        "name": "PostHog",
+        "description": "PostHog official MCP. Read tier forces the x-posthog-read-only header (server removes create/update/delete tools); one instance per project.",
+        "market": {
+          "version": "remote-2026-11-15",
+          "transport": "http",
+          "url": "https://mcp.posthog.com/mcp",
+          "bridge": {
+            "command": "npx",
+            "args": [
+              "-y",
+              "mcp-remote@0.16.6",
+              "https://mcp.posthog.com/mcp",
+              "--transport",
+              "http-only",
+              "--silent",
+              "--header",
+              "Authorization:Bearer ${POSTHOG_API_KEY}",
+              "--header",
+              "x-posthog-read-only:${POSTHOG_READ_ONLY}",
+              "--header",
+              "x-posthog-project-id:${POSTHOG_PROJECT_ID}"
+            ]
+          },
+          "env": {
+            "POSTHOG_API_KEY": {
+              "kind": "secret",
+              "required": true,
+              "description": "PostHog personal API key (preset 'MCP Server')"
+            },
+            "POSTHOG_READ_ONLY": {
+              "kind": "plain",
+              "required": true,
+              "description": "Server read-only switch",
+              "enum": [
+                "true",
+                "false"
+              ],
+              "default": "true"
+            },
+            "POSTHOG_PROJECT_ID": {
+              "kind": "plain",
+              "required": true,
+              "description": "PostHog project id to pin",
+              "pattern": "^[0-9]{1,12}$"
+            }
+          },
+          "tiers": [
+            "read",
+            "write"
+          ],
+          "enforcement": "server",
+          "clis": [
+            "claude",
+            "codex",
+            "gemini"
+          ],
+          "headers": {
+            "Authorization": "POSTHOG_API_KEY",
+            "x-posthog-read-only": "POSTHOG_READ_ONLY",
+            "x-posthog-project-id": "POSTHOG_PROJECT_ID"
+          },
+          "tier_env": {
+            "read": {
+              "POSTHOG_READ_ONLY": "true"
+            },
+            "write": {
+              "POSTHOG_READ_ONLY": "false"
+            }
+          },
+          "category": "analytics",
+          "vendor": "PostHog",
+          "official": true,
+          "optional": false,
+          "summary": "Product analytics, flags, experiments, heatmaps and replays"
+        }
+      },
+      {
+        "id": "ga4",
+        "name": "Google Analytics 4",
+        "description": "GA4 official MCP (googleanalytics). Read-only (analytics.readonly); write tools stay off.",
+        "market": {
+          "version": "1.1.0",
+          "transport": "stdio",
+          "command": {
+            "command": "uvx",
+            "args": [
+              "analytics-mcp@1.1.0"
+            ]
+          },
+          "env": {
+            "GOOGLE_APPLICATION_CREDENTIALS": {
+              "kind": "plain",
+              "required": true,
+              "description": "Path to a 0600 service-account JSON (GAPS G5)"
+            },
+            "GOOGLE_CLOUD_PROJECT": {
+              "kind": "plain",
+              "required": true,
+              "description": "Google Cloud project id"
+            },
+            "ANALYTICS_MCP_ALLOW_WRITE": {
+              "kind": "plain",
+              "required": true,
+              "description": "Write tools switch",
+              "enum": [
+                "false",
+                "true"
+              ],
+              "default": "false"
+            }
+          },
+          "tiers": [
+            "read"
+          ],
+          "enforcement": "server",
+          "clis": [
+            "claude",
+            "codex",
+            "gemini"
+          ],
+          "tier_env": {
+            "read": {
+              "ANALYTICS_MCP_ALLOW_WRITE": "false"
+            }
+          },
+          "tool_classes": {
+            "create_property_annotation": "write",
+            "create_custom_dimension": "write",
+            "create_key_event": "write"
+          },
+          "category": "analytics",
+          "vendor": "Google",
+          "official": true,
+          "optional": true,
+          "summary": "Google Analytics 4 reports (Google Ads projects only)"
+        }
+      },
+      {
+        "id": "gsc",
+        "name": "Google Search Console",
+        "description": "Community mcp-search-console (AminForou/mcp-gsc; no official server). Read tier forces GSC_ALLOW_DESTRUCTIVE=false (webmasters.readonly scope).",
+        "market": {
+          "version": "0.4.2",
+          "transport": "stdio",
+          "command": {
+            "command": "uvx",
+            "args": [
+              "mcp-search-console@0.4.2"
+            ]
+          },
+          "env": {
+            "GSC_CREDENTIALS_PATH": {
+              "kind": "plain",
+              "required": true,
+              "description": "Path to a 0600 service-account JSON (GAPS G5)"
+            },
+            "GSC_SKIP_OAUTH": {
+              "kind": "plain",
+              "required": true,
+              "description": "Use the service account, no browser OAuth",
+              "enum": [
+                "true"
+              ],
+              "default": "true"
+            },
+            "GSC_ALLOW_DESTRUCTIVE": {
+              "kind": "plain",
+              "required": true,
+              "description": "Destructive tools switch",
+              "enum": [
+                "false",
+                "true"
+              ],
+              "default": "false"
+            }
+          },
+          "tiers": [
+            "read",
+            "write"
+          ],
+          "enforcement": "server",
+          "clis": [
+            "claude",
+            "codex",
+            "gemini"
+          ],
+          "tier_env": {
+            "read": {
+              "GSC_ALLOW_DESTRUCTIVE": "false"
+            },
+            "write": {
+              "GSC_ALLOW_DESTRUCTIVE": "true"
+            }
+          },
+          "tool_classes": {
+            "add_site": "write",
+            "delete_site": "write",
+            "delete_sitemap": "write"
+          },
+          "category": "seo",
+          "vendor": "Community (AminForou)",
+          "official": false,
+          "optional": false,
+          "summary": "Search Console queries, pages and indexing"
+        }
+      },
+      {
+        "id": "keyword-planner",
+        "name": "Google Ads Keyword Planner",
+        "description": "Community keyword-planner-mcp (GroMarketing, MIT, 0.1.1 of 2026-10-05, low adoption): keyword ideas, search volumes and location lookup. Read-only tools. Google sunset developer tokens on 2026-09-09; the README still asks for one.",
+        "market": {
+          "version": "0.1.1",
+          "transport": "stdio",
+          "command": {
+            "command": "npx",
+            "args": [
+              "-y",
+              "keyword-planner-mcp@0.1.1",
+              "mcp"
+            ]
+          },
+          "env": {
+            "GOOGLE_ADS_CLIENT_ID": {
+              "kind": "plain",
+              "required": true,
+              "description": "OAuth client id"
+            },
+            "GOOGLE_ADS_CLIENT_SECRET": {
+              "kind": "secret",
+              "required": true,
+              "description": "OAuth client secret"
+            },
+            "GOOGLE_ADS_REFRESH_TOKEN": {
+              "kind": "secret",
+              "required": true,
+              "description": "OAuth refresh token with the adwords scope"
+            },
+            "GOOGLE_ADS_CUSTOMER_ID": {
+              "kind": "plain",
+              "required": true,
+              "pattern": "^[0-9]{3}-?[0-9]{3}-?[0-9]{4}$",
+              "description": "Google Ads customer id"
+            },
+            "GOOGLE_ADS_LOGIN_CUSTOMER_ID": {
+              "kind": "plain",
+              "required": false,
+              "pattern": "^[0-9]{3}-?[0-9]{3}-?[0-9]{4}$",
+              "description": "Manager (MCC) customer id, if any"
+            },
+            "GOOGLE_ADS_DEVELOPER_TOKEN": {
+              "kind": "secret",
+              "required": false,
+              "description": "Developer token (sunset by Google on 2026-09-09; set only if the server still asks for it)"
+            }
+          },
+          "tiers": [
+            "read"
+          ],
+          "enforcement": "server",
+          "clis": [
+            "claude",
+            "codex",
+            "gemini"
+          ],
+          "tool_classes": {
+            "keyword_metrics": "read",
+            "keyword_ideas": "read",
+            "find_location": "read"
+          },
+          "category": "seo",
+          "vendor": "Community (GroMarketing)",
+          "official": false,
+          "optional": false,
+          "summary": "Keyword ideas and search volumes from Google Ads"
+        }
+      },
+      {
+        "id": "google-ads",
+        "name": "Google Ads",
+        "description": "Google Ads official MCP. Read tier points GOOGLE_ADS_MCP_TOOLS_CONFIG at a config with labels/assets disabled (GAPS G5).",
+        "market": {
+          "version": "0.0.6",
+          "transport": "stdio",
+          "command": {
+            "command": "uvx",
+            "args": [
+              "google-ads-mcp@0.0.6"
+            ]
+          },
+          "env": {
+            "GOOGLE_APPLICATION_CREDENTIALS": {
+              "kind": "plain",
+              "required": true,
+              "description": "Path to a 0600 ADC/service-account JSON with the adwords scope (GAPS G5)"
+            },
+            "GOOGLE_PROJECT_ID": {
+              "kind": "plain",
+              "required": true,
+              "description": "Google Cloud project id"
+            },
+            "GOOGLE_ADS_DEVELOPER_TOKEN": {
+              "kind": "secret",
+              "required": true,
+              "description": "Google Ads developer token"
+            },
+            "GOOGLE_ADS_LOGIN_CUSTOMER_ID": {
+              "kind": "plain",
+              "required": false,
+              "description": "Manager (MCC) customer id, digits only"
+            },
+            "GOOGLE_ADS_MCP_TOOLS_CONFIG": {
+              "kind": "plain",
+              "required": true,
+              "description": "Tools config file",
+              "enum": [
+                "/root/.clauterm/studio/mcp/google-ads/tools.read.yaml",
+                "/root/.clauterm/studio/mcp/google-ads/tools.write.yaml"
+              ],
+              "default": "/root/.clauterm/studio/mcp/google-ads/tools.read.yaml"
+            }
+          },
+          "tiers": [
+            "read",
+            "write"
+          ],
+          "enforcement": "server",
+          "clis": [
+            "claude",
+            "codex",
+            "gemini"
+          ],
+          "tier_env": {
+            "read": {
+              "GOOGLE_ADS_MCP_TOOLS_CONFIG": "/root/.clauterm/studio/mcp/google-ads/tools.read.yaml"
+            },
+            "write": {
+              "GOOGLE_ADS_MCP_TOOLS_CONFIG": "/root/.clauterm/studio/mcp/google-ads/tools.write.yaml"
+            }
+          },
+          "tool_classes": {
+            "create_asset": "write",
+            "upload_video_asset": "write",
+            "manage_labels": "write",
+            "manage_label_associations": "write"
+          },
+          "category": "ads",
+          "vendor": "Google",
+          "official": true,
+          "optional": false,
+          "summary": "Google Ads reporting (GAQL) and assets"
+        }
+      },
+      {
+        "id": "meta-ads",
+        "name": "Meta Ads",
+        "description": "Meta official Ads MCP (open beta). Read tier = system-user token with ads_mcp_management + ads_read only (unverified that this hides write tools).",
+        "market": {
+          "version": "remote-2026-11-15",
+          "transport": "http",
+          "url": "https://mcp.facebook.com/ads",
+          "bridge": {
+            "command": "npx",
+            "args": [
+              "-y",
+              "mcp-remote@0.16.6",
+              "https://mcp.facebook.com/ads",
+              "--transport",
+              "http-only",
+              "--silent",
+              "--header",
+              "Authorization:Bearer ${META_ADS_ACCESS_TOKEN}"
+            ]
+          },
+          "env": {
+            "META_ADS_ACCESS_TOKEN": {
+              "kind": "secret",
+              "required": true,
+              "description": "Meta system-user access token (Employee role)"
+            }
+          },
+          "tiers": [
+            "read",
+            "write"
+          ],
+          "enforcement": "credential",
+          "clis": [
+            "claude",
+            "codex",
+            "gemini"
+          ],
+          "headers": {
+            "Authorization": "META_ADS_ACCESS_TOKEN"
+          },
+          "category": "ads",
+          "vendor": "Meta",
+          "official": true,
+          "optional": false,
+          "summary": "Meta (Facebook/Instagram) ads insights and management"
+        }
+      },
+      {
+        "id": "resend",
+        "name": "Resend",
+        "description": "Resend official MCP (send, broadcasts, contacts, domains). No server read switch: read tier = pinned proxy allowlist (G3). Attachments pinned to an empty dir.",
+        "market": {
+          "version": "2.28.1",
+          "transport": "stdio",
+          "command": {
+            "command": "npx",
+            "args": [
+              "-y",
+              "resend-mcp@2.28.1"
+            ]
+          },
+          "env": {
+            "RESEND_API_KEY": {
+              "kind": "secret",
+              "required": true,
+              "description": "Resend API key"
+            },
+            "SENDER_EMAIL_ADDRESS": {
+              "kind": "plain",
+              "required": false,
+              "description": "Default From address on a verified domain"
+            },
+            "REPLY_TO_EMAIL_ADDRESSES": {
+              "kind": "plain",
+              "required": false,
+              "description": "Comma-separated Reply-To addresses"
+            },
+            "MCP_ALLOWED_FILE_DIRS": {
+              "kind": "plain",
+              "required": true,
+              "description": "Directories attachments may be read from",
+              "default": "/root/.clauterm/studio/mcp/resend-attachments"
+            }
+          },
+          "tiers": [
+            "read",
+            "write"
+          ],
+          "enforcement": "proxy",
+          "clis": [
+            "claude",
+            "codex",
+            "gemini"
+          ],
+          "tool_classes": {
+            "send-email": "write"
+          },
+          "read_tools": [
+            "list-emails",
+            "get-email",
+            "list-received-emails",
+            "get-received-email",
+            "list-received-email-attachments",
+            "get-received-email-attachment",
+            "get-email-metrics",
+            "list-sent-email-attachments",
+            "get-sent-email-attachment",
+            "list-contacts",
+            "get-contact",
+            "list-contact-segments",
+            "list-contact-topics",
+            "list-broadcasts",
+            "get-broadcast",
+            "list-broadcast-clicked-links",
+            "list-broadcast-recipients",
+            "list-domains",
+            "get-domain",
+            "get-domain-claim",
+            "get-automation",
+            "get-automation-runs",
+            "list-templates",
+            "get-template",
+            "list-segments",
+            "get-segment",
+            "get-contact-import",
+            "list-contact-imports",
+            "list-contact-properties",
+            "get-contact-property",
+            "list-inboxes",
+            "get-inbox",
+            "list-inbox-threads",
+            "search-inbox-threads",
+            "get-inbox-thread",
+            "list-inbox-thread-emails",
+            "get-inbox-thread-email",
+            "list-inbox-labels",
+            "list-inbox-drafts",
+            "get-inbox-draft",
+            "list-logs",
+            "get-log",
+            "list-suppressions",
+            "get-suppression",
+            "list-topics",
+            "get-topic",
+            "list-webhooks",
+            "get-webhook",
+            "list-webhook-events",
+            "get-webhook-event",
+            "list-webhook-event-attempts",
+            "get-usage"
+          ],
+          "category": "email",
+          "vendor": "Resend",
+          "official": true,
+          "optional": false,
+          "summary": "Transactional and product email"
+        }
+      },
+      {
+        "id": "brevo",
+        "name": "Brevo",
+        "description": "Brevo official hosted MCP (campaigns, contacts, CRM, templates; all modules). No read-only switch: read tier = proxy allowlist.",
+        "market": {
+          "version": "remote-2026-11-15",
+          "transport": "http",
+          "url": "https://mcp.brevo.com/v1/brevo/mcp",
+          "bridge": {
+            "command": "npx",
+            "args": [
+              "-y",
+              "mcp-remote@0.16.6",
+              "https://mcp.brevo.com/v1/brevo/mcp",
+              "--transport",
+              "http-only",
+              "--silent",
+              "--header",
+              "Authorization:Bearer ${BREVO_API_KEY}"
+            ]
+          },
+          "env": {
+            "BREVO_API_KEY": {
+              "kind": "secret",
+              "required": true,
+              "description": "Brevo API key created with the MCP option"
+            }
+          },
+          "tiers": [
+            "read",
+            "write"
+          ],
+          "enforcement": "tools-only",
+          "clis": [
+            "claude",
+            "codex",
+            "gemini"
+          ],
+          "headers": {
+            "Authorization": "BREVO_API_KEY"
+          },
+          "category": "email",
+          "vendor": "Brevo",
+          "official": true,
+          "optional": false,
+          "summary": "Email campaigns, contacts and CRM"
+        }
+      },
+      {
+        "id": "airtable",
+        "name": "Airtable",
+        "description": "Airtable official hosted MCP. Read tier = PAT with data.records:read, schema.bases:read, data.recordComments:read, workspacesAndBases:read only, granted per base.",
+        "market": {
+          "version": "remote-2026-11-15",
+          "transport": "http",
+          "url": "https://mcp.airtable.com/mcp",
+          "bridge": {
+            "command": "npx",
+            "args": [
+              "-y",
+              "mcp-remote@0.16.6",
+              "https://mcp.airtable.com/mcp",
+              "--transport",
+              "http-only",
+              "--silent",
+              "--header",
+              "Authorization:Bearer ${AIRTABLE_PAT}"
+            ]
+          },
+          "env": {
+            "AIRTABLE_PAT": {
+              "kind": "secret",
+              "required": true,
+              "description": "Airtable personal access token (scoped to the project's bases)"
+            }
+          },
+          "tiers": [
+            "read",
+            "write"
+          ],
+          "enforcement": "credential",
+          "clis": [
+            "claude",
+            "codex",
+            "gemini"
+          ],
+          "headers": {
+            "Authorization": "AIRTABLE_PAT"
+          },
+          "category": "data",
+          "vendor": "Airtable",
+          "official": true,
+          "optional": false,
+          "summary": "Airtable bases, tables and records"
+        }
+      },
+      {
+        "id": "google-workspace",
+        "name": "Google Workspace",
+        "description": "Community google_workspace_mcp (Sheets, Drive, Docs; Gmail/Calendar opt-in). Read tier forces WORKSPACE_MCP_READ_ONLY=true. First OAuth consent needs a browser (GAPS G6).",
+        "market": {
+          "version": "2.5.0",
+          "transport": "stdio",
+          "command": {
+            "command": "uvx",
+            "args": [
+              "workspace-mcp@2.5.0"
+            ]
+          },
+          "env": {
+            "GOOGLE_OAUTH_CLIENT_ID": {
+              "kind": "plain",
+              "required": true,
+              "description": "OAuth client id (Desktop app client)"
+            },
+            "GOOGLE_OAUTH_CLIENT_SECRET": {
+              "kind": "secret",
+              "required": true,
+              "description": "OAuth client secret"
+            },
+            "USER_GOOGLE_EMAIL": {
+              "kind": "plain",
+              "required": true,
+              "description": "Google account the instance acts as"
+            },
+            "MCP_SINGLE_USER_MODE": {
+              "kind": "plain",
+              "required": true,
+              "description": "Single-user mode",
+              "enum": [
+                "true"
+              ],
+              "default": "true"
+            },
+            "WORKSPACE_MCP_TOOLS": {
+              "kind": "plain",
+              "required": true,
+              "description": "Enabled services",
+              "default": "sheets,drive,docs"
+            },
+            "WORKSPACE_MCP_TOOL_TIER": {
+              "kind": "plain",
+              "required": true,
+              "description": "Tool tier",
+              "enum": [
+                "core",
+                "extended",
+                "complete"
+              ],
+              "default": "core"
+            },
+            "WORKSPACE_MCP_READ_ONLY": {
+              "kind": "plain",
+              "required": true,
+              "description": "Read-only scopes and tools",
+              "enum": [
+                "true",
+                "false"
+              ],
+              "default": "true"
+            }
+          },
+          "tiers": [
+            "read",
+            "write"
+          ],
+          "enforcement": "server",
+          "clis": [
+            "claude",
+            "codex",
+            "gemini"
+          ],
+          "tier_env": {
+            "read": {
+              "WORKSPACE_MCP_READ_ONLY": "true"
+            },
+            "write": {
+              "WORKSPACE_MCP_READ_ONLY": "false"
+            }
+          },
+          "category": "data",
+          "vendor": "Community (taylorwilsdon)",
+          "official": false,
+          "optional": false,
+          "summary": "Sheets, Drive and Docs (Gmail/Calendar opt-in)"
+        }
+      },
+      {
+        "id": "exa",
+        "name": "Exa",
+        "description": "Exa official web search MCP. ENABLED_TOOLS forced to search/fetch/advanced search (agent_run excluded: up to $1 per run).",
+        "market": {
+          "version": "3.4.3",
+          "transport": "stdio",
+          "command": {
+            "command": "npx",
+            "args": [
+              "-y",
+              "exa-mcp-server@3.4.3"
+            ]
+          },
+          "env": {
+            "EXA_API_KEY": {
+              "kind": "secret",
+              "required": true,
+              "description": "Exa API key"
+            },
+            "ENABLED_TOOLS": {
+              "kind": "plain",
+              "required": true,
+              "description": "Enabled tools",
+              "enum": [
+                "web_search_exa,web_fetch_exa,web_search_advanced_exa"
+              ],
+              "default": "web_search_exa,web_fetch_exa,web_search_advanced_exa"
+            }
+          },
+          "tiers": [
+            "read"
+          ],
+          "enforcement": "server",
+          "clis": [
+            "claude",
+            "codex",
+            "gemini"
+          ],
+          "tier_env": {
+            "read": {
+              "ENABLED_TOOLS": "web_search_exa,web_fetch_exa,web_search_advanced_exa"
+            }
+          },
+          "tool_classes": {
+            "web_search_exa": "read",
+            "web_fetch_exa": "read",
+            "web_search_advanced_exa": "read"
+          },
+          "category": "research",
+          "vendor": "Exa",
+          "official": true,
+          "optional": false,
+          "summary": "Web search and page fetch for every CLI",
+          "billing": "metered"
+        }
+      },
+      {
+        "id": "brave-search",
+        "name": "Brave Search",
+        "description": "Brave official Search MCP: web, news, image, video, local and LLM-context search. Every call is a billed Brave API request; BRAVE_MCP_ENABLED_TOOLS narrows the tool set (space-separated).",
+        "market": {
+          "version": "2.1.4",
+          "transport": "stdio",
+          "command": {
+            "command": "npx",
+            "args": [
+              "-y",
+              "@brave/brave-search-mcp-server@2.1.4",
+              "--transport",
+              "stdio"
+            ]
+          },
+          "env": {
+            "BRAVE_API_KEY": {
+              "kind": "secret",
+              "required": true,
+              "description": "Brave Search API key"
+            },
+            "BRAVE_MCP_ENABLED_TOOLS": {
+              "kind": "plain",
+              "required": false,
+              "description": "Space-separated tool allowlist (empty = all)"
+            }
+          },
+          "tiers": [
+            "read"
+          ],
+          "enforcement": "server",
+          "clis": [
+            "claude",
+            "codex",
+            "gemini"
+          ],
+          "tool_classes": {
+            "brave_web_search": "read",
+            "brave_local_search": "read",
+            "brave_video_search": "read",
+            "brave_image_search": "read",
+            "brave_news_search": "read",
+            "brave_summarizer": "read",
+            "brave_llm_context": "read",
+            "brave_place_search": "read"
+          },
+          "category": "research",
+          "vendor": "Brave",
+          "official": true,
+          "optional": false,
+          "summary": "Web, news, image and local search",
+          "billing": "metered"
+        }
+      },
+      {
+        "id": "perplexity",
+        "name": "Perplexity",
+        "description": "Perplexity official remote MCP (recommended by Perplexity): search, ask, reason and deep research with citations. All tools are billed; perplexity_research is the costliest.",
+        "market": {
+          "version": "remote-2026-11-15",
+          "transport": "http",
+          "url": "https://api.perplexity.ai/mcp",
+          "bridge": {
+            "command": "npx",
+            "args": [
+              "-y",
+              "mcp-remote@0.16.6",
+              "https://api.perplexity.ai/mcp",
+              "--transport",
+              "http-only",
+              "--silent",
+              "--header",
+              "Authorization:Bearer ${PERPLEXITY_API_KEY}"
+            ]
+          },
+          "env": {
+            "PERPLEXITY_API_KEY": {
+              "kind": "secret",
+              "required": true,
+              "description": "Perplexity API key"
+            }
+          },
+          "headers": {
+            "Authorization": "PERPLEXITY_API_KEY"
+          },
+          "tiers": [
+            "read"
+          ],
+          "enforcement": "server",
+          "clis": [
+            "claude",
+            "codex",
+            "gemini"
+          ],
+          "tool_classes": {
+            "perplexity_search": "read",
+            "perplexity_ask": "read",
+            "perplexity_reason": "read",
+            "perplexity_research": "read"
+          },
+          "category": "research",
+          "vendor": "Perplexity",
+          "official": true,
+          "optional": false,
+          "summary": "Answers and deep research with citations",
+          "billing": "metered"
+        }
+      },
+      {
+        "id": "firecrawl",
+        "name": "Firecrawl",
+        "description": "Firecrawl official MCP: scrape, search, map, crawl. Read tier = pinned proxy allowlist (map, search, status, monitors read); scrape/crawl/interact count as write (browser actions).",
+        "market": {
+          "version": "3.40.0",
+          "transport": "stdio",
+          "command": {
+            "command": "npx",
+            "args": [
+              "-y",
+              "firecrawl-mcp@3.40.0"
+            ]
+          },
+          "env": {
+            "FIRECRAWL_API_KEY": {
+              "kind": "secret",
+              "required": true,
+              "description": "Firecrawl API key"
+            },
+            "FIRECRAWL_NO_SEARCH_FEEDBACK": {
+              "kind": "plain",
+              "required": true,
+              "description": "Disable search feedback tool",
+              "enum": [
+                "1"
+              ],
+              "default": "1"
+            },
+            "FIRECRAWL_NO_ENDPOINT_FEEDBACK": {
+              "kind": "plain",
+              "required": true,
+              "description": "Disable endpoint feedback tool",
+              "enum": [
+                "1"
+              ],
+              "default": "1"
+            }
+          },
+          "tiers": [
+            "read",
+            "write"
+          ],
+          "enforcement": "proxy",
+          "clis": [
+            "claude",
+            "codex",
+            "gemini"
+          ],
+          "tool_classes": {
+            "firecrawl_interact": "write",
+            "firecrawl_scrape": "write",
+            "firecrawl_crawl": "write",
+            "firecrawl_interact_stop": "write",
+            "firecrawl_monitor_create": "write",
+            "firecrawl_monitor_update": "write",
+            "firecrawl_monitor_delete": "write",
+            "firecrawl_monitor_run": "write"
+          },
+          "read_tools": [
+            "firecrawl_map",
+            "firecrawl_search",
+            "firecrawl_check_crawl_status",
+            "firecrawl_credit_usage",
+            "firecrawl_monitor_list",
+            "firecrawl_monitor_get",
+            "firecrawl_monitor_checks",
+            "firecrawl_monitor_check"
+          ],
+          "category": "research",
+          "vendor": "Firecrawl",
+          "official": true,
+          "optional": false,
+          "summary": "Scrape, crawl and map websites",
+          "billing": "metered"
+        }
+      },
+      {
+        "id": "reddit",
+        "name": "Reddit (read-only)",
+        "description": "reddit-mcp-buddy (community): read-only Reddit browsing/search, anonymous access. Optional.",
+        "market": {
+          "version": "1.3.0",
+          "transport": "stdio",
+          "command": {
+            "command": "npx",
+            "args": [
+              "-y",
+              "reddit-mcp-buddy@1.3.0"
+            ]
+          },
+          "env": {},
+          "tiers": [
+            "read"
+          ],
+          "enforcement": "server",
+          "clis": [
+            "claude",
+            "codex",
+            "gemini"
+          ],
+          "category": "research",
+          "vendor": "Community (karanb192)",
+          "official": false,
+          "optional": true,
+          "summary": "Read-only Reddit browsing and search"
+        }
+      },
+      {
+        "id": "minimax",
+        "name": "MiniMax media",
+        "description": "MiniMax official MCP: image, video, speech, music generation. Spends credits (cap by balance); no owned data changed.",
+        "market": {
+          "version": "0.0.20",
+          "transport": "stdio",
+          "command": {
+            "command": "uvx",
+            "args": [
+              "minimax-mcp@0.0.20"
+            ]
+          },
+          "env": {
+            "MINIMAX_API_KEY": {
+              "kind": "secret",
+              "required": true,
+              "description": "MiniMax API key"
+            },
+            "MINIMAX_API_HOST": {
+              "kind": "plain",
+              "required": true,
+              "description": "API host (global or mainland China)",
+              "enum": [
+                "https://api.minimax.io",
+                "https://api.minimaxi.com"
+              ],
+              "default": "https://api.minimax.io"
+            },
+            "MINIMAX_MCP_BASE_PATH": {
+              "kind": "plain",
+              "required": true,
+              "description": "Output directory for local files",
+              "default": "/root/.clauterm/studio/media"
+            },
+            "MINIMAX_API_RESOURCE_MODE": {
+              "kind": "plain",
+              "required": true,
+              "description": "Return URLs or local files",
+              "enum": [
+                "url",
+                "local"
+              ],
+              "default": "url"
+            }
+          },
+          "tiers": [
+            "read"
+          ],
+          "enforcement": "server",
+          "clis": [
+            "claude",
+            "codex",
+            "gemini"
+          ],
+          "category": "media",
+          "vendor": "MiniMax",
+          "official": true,
+          "optional": false,
+          "summary": "Image, video, speech and music generation",
+          "billing": "metered"
+        }
+      }
+    ]
+  },
+  "x-not-expressible": [
+    {
+      "id": "playwright",
+      "name": "Playwright",
+      "reason": "By policy the latest Playwright CLI, not an MCP (D50); R11 keeps it out of the market."
+    }
+  ]
+}

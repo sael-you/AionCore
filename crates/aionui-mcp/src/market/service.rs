@@ -14,6 +14,7 @@ use aionui_db::{IMcpMarketRepository, IMcpServerRepository, MarketInstanceParams
 use tracing::info;
 
 use super::error::{MarketError, invalid};
+use super::params::{substitute, substitute_command};
 use super::rules::{InstanceSpec, instance_problems, secret_ref_name};
 use super::stored::{StoredInstance, placeholder_transport_config, secret_keys};
 use super::template::{IMcpTemplateCatalog, find_template, load_templates};
@@ -143,6 +144,11 @@ impl McpMarketService {
         req: CreateMcpMarketInstanceRequest,
     ) -> Result<McpMarketInstanceResponse, MarketError> {
         let template = find_template(self.catalog.as_ref(), user_id, &req.template_id).await?;
+        let mut req = req;
+        // G3: a read instance without its own allowlist starts with the template's pinned one.
+        if req.tools_allow.is_none() && req.tier == "read" && !template.read_tools.is_empty() {
+            req.tools_allow = Some(template.read_tools.clone());
+        }
         let mut plain_env = req.plain_env;
         apply_defaults(&template, &req.tier, &mut plain_env);
         let status = req.status.unwrap_or_else(|| "dormant".to_owned());
@@ -539,13 +545,17 @@ impl McpMarketService {
         }
         let t = &inst.template;
         match (t.transport.as_str(), &t.command) {
-            ("stdio", Some(cmd)) => Ok(McpServerTransport::Stdio {
-                command: cmd.command.clone(),
-                args: cmd.args.clone(),
-                env,
-            }),
+            ("stdio", Some(cmd)) => {
+                let cmd = substitute_command(cmd, t, &inst.plain_env).map_err(invalid)?;
+                Ok(McpServerTransport::Stdio {
+                    command: cmd.command,
+                    args: cmd.args,
+                    env,
+                })
+            }
             ("http", _) => {
-                let url = t.url.clone().ok_or_else(|| invalid("template has no url"))?;
+                let url = t.url.as_deref().ok_or_else(|| invalid("template has no url"))?;
+                let url = substitute(url, t, &inst.plain_env).map_err(invalid)?;
                 let headers = t
                     .headers
                     .iter()

@@ -7,23 +7,29 @@ use std::collections::BTreeMap;
 
 use aionui_api_types::{McpMarketEnvKind, McpMarketTemplate};
 
+use super::params::{compile_pattern, is_param, referenced_params, value_matches};
 use crate::secret_mask::{is_secret_key, looks_like_secret_value};
 
 pub const CLIS: &[&str] = &["claude", "codex", "gemini"];
 pub const TIERS: &[&str] = &["read", "write"];
 pub const STATUSES: &[&str] = &["active", "dormant", "revoked"];
 pub const ENVIRONMENTS: &[&str] = &["production", "staging", "sandbox", "local"];
-pub const ENFORCEMENTS: &[&str] = &["server", "credential", "tools-only"];
+/// `proxy` (G3): the launcher's stdio proxy enforces the template's pinned
+/// read allowlist (`read_tools`); counts as read-only enforcement for R6.
+pub const ENFORCEMENTS: &[&str] = &["server", "credential", "proxy", "tools-only"];
+/// Enforcements that make a production read instance acceptable (R6).
+pub const READ_ENFORCEMENTS: &[&str] = &["server", "credential", "proxy"];
+/// Allowed `billing` values (G7).
+pub const BILLINGS: &[&str] = &["metered"];
 pub const TRANSPORTS: &[&str] = &["stdio", "http"];
 /// R2: the only instances that may be assigned globally.
 pub const GLOBAL_IDS: &[&str] = &["context7", "studio-memory"];
 pub const RESERVED: &[&str] = &["aionui-team", "aionui"];
-/// R11: not in the market, matched as prefixes.
+/// R11: not in the market, matched as prefixes. GitHub and Chrome DevTools
+/// were removed by the owner's picks (D49/D50, GAPS G2).
 pub const NOT_IN_MARKET: &[&str] = &[
     "playwright",
     "mcp-playwright",
-    "chrome-devtools",
-    "github",
     "codex-cli",
     "gemini-cli",
     "sequential-thinking",
@@ -135,7 +141,7 @@ pub fn template_problems(t: &McpMarketTemplate) -> Vec<String> {
         p.push(format!("{w}: transport must be stdio|http"));
     }
     if !ENFORCEMENTS.contains(&t.enforcement.as_str()) {
-        p.push(format!("{w}: enforcement must be server|credential|tools-only"));
+        p.push(format!("{w}: enforcement must be {}", ENFORCEMENTS.join("|")));
     }
     if t.tiers.is_empty() || t.tiers.iter().any(|x| !TIERS.contains(&x.as_str())) {
         p.push(format!("{w}: tiers must be a non-empty subset of read,write"));
@@ -153,6 +159,40 @@ pub fn template_problems(t: &McpMarketTemplate) -> Vec<String> {
         {
             p.push(format!("{w}: env.{key} default looks like a credential (R4)"));
         }
+        if let Some(pattern) = &field.pattern {
+            if field.kind != McpMarketEnvKind::Plain {
+                p.push(format!("{w}: env.{key} pattern is allowed on plain keys only (G1)"));
+            } else if let Err(e) = compile_pattern(pattern) {
+                p.push(format!("{w}: env.{key} {e} (G1)"));
+            } else {
+                let samples = field.default.iter().chain(field.allowed.iter());
+                for value in samples {
+                    if !value_matches(field, value) {
+                        p.push(format!("{w}: env.{key} default/enum value does not match its pattern (G1)"));
+                    }
+                }
+            }
+        }
+    }
+    for key in referenced_params(t) {
+        if !t.env[&key].required {
+            p.push(format!("{w}: launch parameter {key} must be required (G1)"));
+        }
+    }
+    if let Some(billing) = &t.billing
+        && !BILLINGS.contains(&billing.as_str())
+    {
+        p.push(format!("{w}: billing must be one of {}", BILLINGS.join("|")));
+    }
+    for tool in &t.read_tools {
+        if !is_valid_tool_name(tool) {
+            p.push(format!("{w}: read_tools has an invalid tool name"));
+        } else if t.tool_classes.get(tool).is_some_and(|c| c == "write") {
+            p.push(format!("{w}: read_tools.{tool} is classified write (G3)"));
+        }
+    }
+    if t.enforcement == "proxy" && t.tiers.iter().any(|x| x == "read") && t.read_tools.is_empty() {
+        p.push(format!("{w}: enforcement proxy needs a pinned read_tools allowlist (G3)"));
     }
     let check_command =
         |cmd: &aionui_api_types::McpMarketCommand, what: &str, allow_refs: bool, p: &mut Vec<String>| {
@@ -164,7 +204,10 @@ pub fn template_problems(t: &McpMarketTemplate) -> Vec<String> {
                     p.push(format!("{w}: {what} args[{i}] has control characters"));
                 }
                 if arg.contains("${") {
-                    let ok = allow_refs && refs_in(arg).iter().all(|r| t.env.contains_key(r));
+                    // Launch parameters (G1) anywhere; other declared keys only in a bridge.
+                    let ok = refs_in(arg)
+                        .iter()
+                        .all(|r| is_param(t, r) || (allow_refs && t.env.contains_key(r)));
                     if !ok {
                         p.push(format!("{w}: {what} args[{i}] contains a ${{...}} ref (R1 #13)"));
                     }
@@ -180,8 +223,10 @@ pub fn template_problems(t: &McpMarketTemplate) -> Vec<String> {
         },
         "http" => {
             match t.url.as_deref() {
-                Some(url) if url.contains("${") => p.push(format!("{w}: no ${{NAME}} in url (R1 #13)")),
-                Some(url) => match reqwest::Url::parse(url) {
+                Some(url) if refs_in(url).iter().any(|r| !is_param(t, r)) => {
+                    p.push(format!("{w}: no ${{NAME}} in url except launch parameters (R1 #13, G1)"))
+                }
+                Some(url) => match reqwest::Url::parse(&mask_params(url)) {
                     Ok(u) if matches!(u.scheme(), "http" | "https") => {
                         if looks_like_secret_value(url) {
                             p.push(format!("{w}: url holds a credential (R4)"));
@@ -219,6 +264,15 @@ pub fn template_problems(t: &McpMarketTemplate) -> Vec<String> {
         }
     }
     p
+}
+
+/// `url` with every `${…}` replaced by a neutral token, for URL parsing.
+fn mask_params(url: &str) -> String {
+    let mut out = url.to_owned();
+    for r in refs_in(url) {
+        out = out.replace(&format!("${{{r}}}"), "x");
+    }
+    out
 }
 
 /// `${NAME}` refs inside a string.
@@ -314,10 +368,22 @@ pub fn instance_problems(spec: &InstanceSpec<'_>, t: &McpMarketTemplate, secrets
         ("write", Some(_)) => p.push(format!("{w}: write instances use tools_block, not tools_allow (R6)")),
         _ => {}
     }
-    if spec.tier == "read" && spec.environment == "production" && t.enforcement == "tools-only" {
+    if spec.tier == "read" && spec.environment == "production" && !READ_ENFORCEMENTS.contains(&t.enforcement.as_str())
+    {
         p.push(format!(
-            "{w}: production read instances need enforcement server|credential (R6)"
+            "{w}: production read instances need enforcement {} (R6)",
+            READ_ENFORCEMENTS.join("|")
         ));
+    }
+    // G3: a proxy-enforced read instance allows only the template's pinned read tools.
+    if spec.tier == "read" && t.enforcement == "proxy" {
+        for tool in spec.tools_allow.unwrap_or_default() {
+            if !t.read_tools.contains(tool) {
+                p.push(format!(
+                    "{w}: tool \"{tool}\" is not in the template's read allowlist (G3)"
+                ));
+            }
+        }
     }
     for tool in spec.tools_allow.unwrap_or_default().iter().chain(spec.tools_block) {
         if !is_valid_tool_name(tool) {
@@ -347,6 +413,8 @@ pub fn instance_problems(spec: &InstanceSpec<'_>, t: &McpMarketTemplate, secrets
                     p.push(format!("{w}: env.{key} looks like a credential (R4)"));
                 } else if !field.allowed.is_empty() && !field.allowed.contains(value) {
                     p.push(format!("{w}: env.{key} must be one of {}", field.allowed.join("|")));
+                } else if !value_matches(field, value) {
+                    p.push(format!("{w}: env.{key} does not match the template pattern (G1)"));
                 }
             }
         }
@@ -395,7 +463,11 @@ mod tests {
         }
         assert!(name_problem("aionui-team").is_some());
         assert!(name_problem("playwright-cloud").is_some());
-        assert!(name_problem("github").is_some());
+        assert!(name_problem("sequential-thinking").is_some());
+        // G2: the owner picked GitHub and Chrome DevTools (D49/D50).
+        assert!(name_problem("github").is_none());
+        assert!(name_problem("chrome-devtools").is_none());
+        assert!(name_problem("tb-github-read").is_none());
     }
 
     #[test]

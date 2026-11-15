@@ -7,6 +7,7 @@
 use aionui_db::IMcpMarketRepository;
 
 use super::error::MarketError;
+use super::params::{substitute, substitute_command};
 use super::proxy::ToolPolicy;
 use super::rules::GLOBAL_IDS;
 use super::secrets::decrypt_declared;
@@ -137,6 +138,8 @@ pub async fn resolve_launch(
         _ => t.bridge.clone(),
     }
     .ok_or_else(|| refuse(format!("template {} has no stdio command for the launcher", t.id)))?;
+    // G1: per-instance launch parameters, validated against the template pattern again now.
+    let cmd = substitute_command(&cmd, t, &inst.plain_env).map_err(|e| refuse(format!("{}: {e}", req.instance)))?;
 
     let mut env: Vec<(String, String)> = Vec::new();
     for (key, value) in &inst.plain_env {
@@ -157,9 +160,10 @@ pub async fn resolve_launch(
     if t.transport == "http"
         && let Some(url) = &t.url
     {
-        env.push(("MCP_SERVER_URL".to_owned(), url.clone()));
+        let url = substitute(url, t, &inst.plain_env).map_err(|e| refuse(format!("{}: {e}", req.instance)))?;
+        env.push(("MCP_SERVER_URL".to_owned(), url));
     }
-    let policy = ToolPolicy::for_tier(&inst.tier, inst.tools_allow.as_deref(), &inst.tools_block);
+    let policy = launch_policy(&inst);
     Ok(LaunchPlan {
         instance_id: inst.row.id.clone(),
         instance_name: inst.row.name.clone(),
@@ -168,6 +172,25 @@ pub async fn resolve_launch(
         env,
         policy,
     })
+}
+
+/// The proxy policy of an instance. A read instance of a `proxy`-enforced
+/// template (G3) may never allow more than the template's pinned
+/// `read_tools`, even if its stored allowlist says otherwise.
+pub fn launch_policy(inst: &StoredInstance) -> ToolPolicy {
+    let t = &inst.template;
+    if inst.tier == "read" && t.enforcement == "proxy" {
+        let allow: Vec<String> = inst
+            .tools_allow
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .filter(|tool| t.read_tools.contains(tool))
+            .cloned()
+            .collect();
+        return ToolPolicy::for_tier("read", Some(&allow), &inst.tools_block);
+    }
+    ToolPolicy::for_tier(&inst.tier, inst.tools_allow.as_deref(), &inst.tools_block)
 }
 
 /// Re-check that the launch is still allowed (status, deletion, assignment).

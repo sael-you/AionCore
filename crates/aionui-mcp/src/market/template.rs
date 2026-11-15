@@ -40,6 +40,33 @@ impl IMcpTemplateCatalog for StaticTemplateCatalog {
     }
 }
 
+/// The built-in catalogue (D49/D50): the curated `studio-mcp-catalog`
+/// manifest shipped inside the binary, so the market is never empty on a
+/// fresh or an existing install. Source of truth for edits:
+/// `clauterm-studio/design/mcp-catalogue/templates.draft.json`.
+const BUILTIN_CATALOGUE: &str = include_str!("../../catalogue/studio-mcp-catalog.json");
+
+/// The `contributes.mcpServers[]` entries of the built-in catalogue.
+pub fn builtin_entries() -> Vec<serde_json::Value> {
+    serde_json::from_str::<serde_json::Value>(BUILTIN_CATALOGUE)
+        .ok()
+        .and_then(|v| v.pointer("/contributes/mcpServers").and_then(|e| e.as_array()).cloned())
+        .unwrap_or_default()
+}
+
+/// `installed` entries (an installed `studio-mcp-catalog` extension) followed
+/// by every built-in entry whose id the extension does not override.
+pub fn with_builtin(mut installed: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
+    let id = |e: &serde_json::Value| e.get("id").and_then(|v| v.as_str()).map(str::to_owned);
+    let taken: std::collections::HashSet<String> = installed.iter().filter_map(id).collect();
+    installed.extend(
+        builtin_entries()
+            .into_iter()
+            .filter(|e| id(e).is_none_or(|i| !taken.contains(&i))),
+    );
+    installed
+}
+
 /// Parse one catalogue entry. The entry's `id`/`name`/`description` win over
 /// the same keys inside `market`.
 pub fn parse_template(entry: &serde_json::Value) -> Result<McpMarketTemplate, String> {
