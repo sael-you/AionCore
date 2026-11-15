@@ -320,8 +320,9 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
 
     // MCP market: reads behind the ordinary auth middleware; every market write
     // behind a session-only auth state (never the agent runtime-token channel,
-    // never `--local`'s default user, R1 #1), plus CSRF in local mode (the
-    // global CSRF layer covers the other modes).
+    // never `--local`'s default user, R1 #1). No route-private CSRF layer:
+    // the strict Origin rule guards writes in local identity, the global C11
+    // CSRF layer applies in webui identity.
     let market_state = aionui_mcp::McpMarketRouterState {
         market: states.mcp.market.clone(),
     };
@@ -427,8 +428,9 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     let session_message_authenticated = session_message_user_routes(states.session_message)
         .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
     // Voice (card C9) carries its own guards: cookie session in every mode,
-    // credential precedence, Origin allowlist, CSRF when local. It sits inside
-    // the global CSRF layer like the other user routes.
+    // credential precedence and the shared Origin rule (same-origin in local
+    // identity, allow-list in webui); no route-private CSRF layer. It sits
+    // inside the global CSRF layer (webui identity) like the other user routes.
     // Agent → user voice (`say`/`ask`): runtime-token router, outside auth/CSRF.
     let voice_agent = aionui_voice::voice_agent_routes(aionui_voice::VoiceAgentRouterState {
         service: states.voice.service.clone(),
