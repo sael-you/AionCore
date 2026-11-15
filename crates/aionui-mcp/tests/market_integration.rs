@@ -181,7 +181,7 @@ async fn r1_names() {
         "paddle",
         "aionui-team",
         "playwright-x",
-        "github",
+        "serena",
         "a-name-longer-than-24-chars",
     ] {
         let err = f.market.create_instance(USER, paddle_read(bad)).await.unwrap_err();
