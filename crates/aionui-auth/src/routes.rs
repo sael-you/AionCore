@@ -848,7 +848,13 @@ async fn refresh_handler(
     let (raw_token, from_cookie) = match cookie_token {
         Some(cookie_token) => (cookie_token, true),
         None => {
-            let Json(req) = body.map_err(ApiError::from)?;
+            let Json(req) = body.map_err(|rejection| match rejection {
+                // No refresh cookie and no JSON body at all (TASK-85): the
+                // browser's silent refresh posts without a body, so with the
+                // cookie gone this is an unauthenticated request — 401, not 415.
+                JsonRejection::MissingJsonContentType(_) => ApiError::Unauthorized("No refresh token".into()),
+                other => ApiError::from(other),
+            })?;
             (req.token, false)
         }
     };

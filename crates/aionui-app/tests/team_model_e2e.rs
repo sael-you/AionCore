@@ -220,6 +220,8 @@ async fn update_agent_model_requires_csrf() {
         .method("PATCH")
         .uri(format!("/api/teams/{team_id}/agents/{slot_id}/model"))
         .header("authorization", format!("Bearer {token}"))
+        // A browser session (cookie) still needs CSRF; a cookieless Bearer client is exempt (C11-switch).
+        .header("cookie", format!("aionui-session={token}"))
         .header("content-type", "application/json")
         .body(axum::body::Body::from(r#"{"model_id":"gpt-5.6-sol"}"#))
         .unwrap();
@@ -318,6 +320,8 @@ async fn set_team_config_option_requires_csrf() {
             "/api/teams/{team_id}/conversations/{conversation_id}/config-options/model"
         ))
         .header("authorization", format!("Bearer {token}"))
+        // A browser session (cookie) still needs CSRF; a cookieless Bearer client is exempt (C11-switch).
+        .header("cookie", format!("aionui-session={token}"))
         .header("content-type", "application/json")
         .body(axum::body::Body::from(r#"{"value":"gpt-5.6-sol"}"#))
         .unwrap();

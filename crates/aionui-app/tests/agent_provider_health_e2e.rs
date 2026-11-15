@@ -40,6 +40,8 @@ async fn provider_health_check_requires_csrf_for_post() {
         .uri("/api/agents/provider-health-check")
         .header("content-type", "application/json")
         .header("authorization", format!("Bearer {token}"))
+        // A browser session (cookie) still needs CSRF; a cookieless Bearer client is exempt (C11-switch).
+        .header("cookie", format!("aionui-session={token}"))
         .body(Body::from(
             serde_json::to_vec(&json!({"provider_id": "p1", "model": "gpt-4o"})).unwrap(),
         ))
