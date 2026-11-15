@@ -32,7 +32,7 @@ use aionui_db::{
 use aionui_project::canonical;
 
 use crate::hierarchy::{Hierarchy, fold_hierarchy, subtree_ids};
-use crate::ports::{ArchiveTeardownPorts, ProjectBoardPorts, RemoveProjectPorts};
+use crate::ports::{ArchiveTeardownPorts, ConversationLivePorts, ProjectBoardPorts, RemoveProjectPorts};
 use crate::types::{
     Cursor, DEFAULT_ITEMS_LIMIT, DEFAULT_LIMIT, ScopeToken, SidebarError, canonical_to_dir_key, validate_limit,
 };
@@ -64,6 +64,10 @@ pub struct SidebarService {
     /// startup like the two above. Absent → projects behave as if they had
     /// no board.
     project_board_ports: Arc<OnceLock<Arc<dyn ProjectBoardPorts>>>,
+    /// Live runtime state (pending approvals) for the descendant roll-up
+    /// counts, injected once after startup like the ports above. Absent →
+    /// `waiting_descendant_count` stays 0.
+    live_ports: Arc<OnceLock<Arc<dyn ConversationLivePorts>>>,
 }
 
 impl SidebarService {
@@ -75,7 +79,18 @@ impl SidebarService {
             remove_project_ports: Arc::new(OnceLock::new()),
             archive_teardown_ports: Arc::new(OnceLock::new()),
             project_board_ports: Arc::new(OnceLock::new()),
+            live_ports: Arc::new(OnceLock::new()),
         }
+    }
+
+    /// Install the live-state ports the descendant roll-up counts read
+    /// (set-once, `Arc`-shared like the other ports).
+    pub fn set_conversation_live_ports(&self, ports: Arc<dyn ConversationLivePorts>) {
+        let _ = self.live_ports.set(ports);
+    }
+
+    fn live(&self) -> Option<&dyn ConversationLivePorts> {
+        self.live_ports.get().map(|ports| ports.as_ref())
     }
 
     /// Install the deletion ports `remove_project` drives. Called once, after the
@@ -844,6 +859,7 @@ impl SidebarService {
                 &snapshot.team_by_id,
                 &snapshot.hierarchy,
                 false,
+                self.live(),
             );
             let next_cursor = has_more
                 .then(|| {
@@ -945,7 +961,14 @@ impl SidebarService {
         let hydrated = self.hydrate(user_id, &conv_ids, scope).await?;
 
         let window: Vec<GroupItemRef> = after[..take].iter().map(|i| (*i).clone()).collect();
-        let items = assemble_items(&window, &hydrated, &group.team_by_id_ref(), hierarchy, false);
+        let items = assemble_items(
+            &window,
+            &hydrated,
+            &group.team_by_id_ref(),
+            hierarchy,
+            false,
+            self.live(),
+        );
         let next_cursor = has_more
             .then(|| window.last().map(|i| i.activity_cursor().encode(&group.token)))
             .flatten();
@@ -1005,7 +1028,7 @@ impl SidebarService {
                 if !hierarchy.is_descendant(&row.item_id)
                     && let Some(resp) = hydrated.get(&row.item_id)
                 {
-                    items.push(conversation_item(resp.clone(), true, hierarchy, &hydrated));
+                    items.push(conversation_item(resp.clone(), true, hierarchy, &hydrated, self.live()));
                 }
             } else if let Some(agg) = team_by_id.get(&row.item_id) {
                 items.push(team_item(agg, true));
@@ -1572,13 +1595,14 @@ fn assemble_items(
     team_by_id: &HashMap<String, TeamAgg>,
     hierarchy: &Hierarchy,
     pinned: bool,
+    live: Option<&dyn ConversationLivePorts>,
 ) -> Vec<SidebarItem> {
     let mut out = Vec::with_capacity(window.len());
     for item in window {
         match item {
             GroupItemRef::Conv { id, .. } => {
                 if let Some(resp) = hydrated.get(id) {
-                    out.push(conversation_item(resp.clone(), pinned, hierarchy, hydrated));
+                    out.push(conversation_item(resp.clone(), pinned, hierarchy, hydrated, live));
                 }
             }
             GroupItemRef::Team { team_id, .. } => {
@@ -1599,6 +1623,7 @@ fn conversation_item(
     pinned: bool,
     hierarchy: &Hierarchy,
     hydrated: &HashMap<String, ConversationResponse>,
+    live: Option<&dyn ConversationLivePorts>,
 ) -> SidebarItem {
     resp.pinned = pinned;
     resp.pinned_at = None;
@@ -1619,12 +1644,28 @@ fn conversation_item(
         .iter()
         .filter(|d| d.status == ConversationStatus::Running)
         .count() as u32;
+    let waiting_descendant_count = live.map_or(0, |live| {
+        descendants
+            .iter()
+            .filter(|d| live.pending_confirmations(&d.id) > 0)
+            .count() as u32
+    });
+    let failed_descendant_count = descendants.iter().filter(|d| last_turn_failed(d)).count() as u32;
     SidebarItem::Conversation {
         conversation: resp,
         descendants,
         descendant_count,
         running_descendant_count,
+        waiting_descendant_count,
+        failed_descendant_count,
     }
+}
+
+/// The conversation's last turn ended in an error (`extra.last_outcome`) and
+/// no new turn is running.
+fn last_turn_failed(conversation: &ConversationResponse) -> bool {
+    conversation.status != ConversationStatus::Running
+        && conversation.extra.get("last_outcome").and_then(|v| v.as_str()) == Some("error")
 }
 
 fn team_item(agg: &TeamAgg, pinned: bool) -> SidebarItem {

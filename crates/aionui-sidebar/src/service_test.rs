@@ -1790,6 +1790,7 @@ fn chat_items(resp: &aionui_api_types::SidebarResponse) -> Vec<(String, Vec<Stri
                 descendants,
                 descendant_count,
                 running_descendant_count,
+                ..
             } => Some((
                 conversation.id.clone(),
                 descendants.iter().map(|d| d.id.clone()).collect(),
@@ -1938,6 +1939,64 @@ async fn classification_follows_the_root_not_the_child() {
         chat_items(&resp),
         vec![("root".to_owned(), vec!["kid".to_owned()], 1, 0)]
     );
+}
+
+struct FakeLivePorts(Vec<&'static str>);
+
+impl crate::ports::ConversationLivePorts for FakeLivePorts {
+    fn pending_confirmations(&self, conversation_id: &str) -> usize {
+        usize::from(self.0.contains(&conversation_id))
+    }
+}
+
+/// C21: collapsed parents need "needs you" and "failed" without per-child
+/// subscriptions. Waiting comes from the live ports; failed from the persisted
+/// `extra.last_outcome`, and only while the descendant is not running again.
+#[tokio::test]
+async fn descendant_roll_up_counts_waiting_and_failed() {
+    let fx = fixture().await;
+    let pool = fx.pool();
+    insert_conv(pool, USER, "root", None, "{}", 100).await;
+    insert_conv(pool, USER, "waits", None, "{}", 110).await;
+    insert_conv(pool, USER, "failed", None, r#"{"last_outcome":"error"}"#, 120).await;
+    insert_conv(pool, USER, "retrying", None, r#"{"last_outcome":"error"}"#, 130).await;
+    insert_conv(pool, USER, "ok", None, r#"{"last_outcome":"finished"}"#, 140).await;
+    for kid in ["waits", "failed", "retrying", "ok"] {
+        set_parent(pool, kid, "root", 1).await;
+    }
+    set_status(pool, "retrying", "running").await;
+
+    let counts = |resp: &aionui_api_types::SidebarResponse| match &find_chats(resp).items[0] {
+        SidebarItem::Conversation {
+            waiting_descendant_count,
+            failed_descendant_count,
+            ..
+        } => (*waiting_descendant_count, *failed_descendant_count),
+        SidebarItem::Team(_) => panic!("root item expected"),
+    };
+
+    // Without live ports nothing is known to wait; failed is persisted data.
+    let resp = fx
+        .service
+        .first_screen(USER, Some(50), &[], ArchiveScope::Active)
+        .await
+        .unwrap();
+    assert_eq!(counts(&resp), (0, 1));
+    let json = serde_json::to_value(&find_chats(&resp).items[0]).unwrap();
+    assert!(
+        json.get("waiting_descendant_count").is_none(),
+        "zero is omitted: {json}"
+    );
+    assert_eq!(json["failed_descendant_count"], 1);
+
+    fx.service
+        .set_conversation_live_ports(Arc::new(FakeLivePorts(vec!["waits", "root"])));
+    let resp = fx
+        .service
+        .first_screen(USER, Some(50), &[], ArchiveScope::Active)
+        .await
+        .unwrap();
+    assert_eq!(counts(&resp), (1, 1), "the root itself is not its own descendant");
 }
 
 #[tokio::test]

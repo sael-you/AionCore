@@ -100,6 +100,13 @@ pub enum SidebarItem {
         descendant_count: u32,
         #[serde(default, skip_serializing_if = "is_zero_u32")]
         running_descendant_count: u32,
+        /// Descendants waiting on the user (a pending approval or question).
+        #[serde(default, skip_serializing_if = "is_zero_u32")]
+        waiting_descendant_count: u32,
+        /// Descendants whose last turn ended in an error and that are not
+        /// running again (`extra.last_outcome == "error"`).
+        #[serde(default, skip_serializing_if = "is_zero_u32")]
+        failed_descendant_count: u32,
     },
     /// An aggregated team row (server-side aggregate; the frontend does not
     /// reconstruct it from member conversations).

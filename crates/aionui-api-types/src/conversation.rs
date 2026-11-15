@@ -256,6 +256,16 @@ pub struct ConversationRuntimeSummary {
     /// `accepts_proactive_input` must never be exposed.
     #[serde(default)]
     pub supports_midturn_delivery: bool,
+    /// Background work (Task subagents, background shell commands, workflows)
+    /// still in flight for this conversation. Non-zero after a turn ended
+    /// means the conversation is still working, even though the turn is idle.
+    /// Omitted when zero.
+    #[serde(default, skip_serializing_if = "is_zero_usize")]
+    pub background_active: usize,
+}
+
+fn is_zero_usize(value: &usize) -> bool {
+    *value == 0
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]

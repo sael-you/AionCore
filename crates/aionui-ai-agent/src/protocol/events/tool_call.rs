@@ -30,6 +30,42 @@ pub struct ToolCallEventData {
     /// would DELETE the stored attribution).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_call_id: Option<String>,
+    /// Structured identity of the delegated work this call launched (a Task
+    /// subagent, a background bash, a workflow), so the frontend can show the
+    /// task by name, kind and duration instead of parsing the headline. Set
+    /// only on progress-card frames; skipped when `None` (merge-patch: a later
+    /// frame without it must not erase the stored value).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub task: Option<ToolTaskInfo>,
+}
+
+/// What kind of delegated work a progress card tracks.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolTaskKind {
+    /// A Task / Agent subagent (`local_agent`).
+    Subagent,
+    /// A background shell command (`local_bash`).
+    Background,
+    /// A multi-agent workflow (`local_workflow`).
+    Workflow,
+}
+
+/// Structured fields of a delegated-work card (see [`ToolCallEventData::task`]).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolTaskInfo {
+    pub kind: ToolTaskKind,
+    /// The CLI's task id (the id a later SendMessage addresses).
+    pub id: String,
+    /// The launching call's own description of the work; absent when it gave
+    /// none (e.g. a SendMessage that resumed a subagent).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub label: Option<String>,
+    /// Wall-clock start (epoch ms) of the card.
+    pub started_at: i64,
+    /// Wall-clock end (epoch ms), present once the task settled.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ended_at: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

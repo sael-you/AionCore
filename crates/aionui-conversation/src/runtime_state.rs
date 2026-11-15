@@ -554,6 +554,7 @@ impl ConversationRuntimeStateService {
             pending_confirmations,
             turn_id: active_turn_id,
             supports_midturn_delivery,
+            background_active: 0,
         }
     }
 

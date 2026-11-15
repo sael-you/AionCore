@@ -833,13 +833,17 @@ impl ConversationService {
             None => self.static_supports_midturn_delivery(conversation_id).await,
         };
 
-        self.runtime_state.summary_from_parts(
+        let mut summary = self.runtime_state.summary_from_parts(
             conversation_id,
             task_status,
             has_task,
             pending_confirmations,
             supports_midturn_delivery,
-        )
+        );
+        // Background work outlives its turn: report it so the UI keeps the
+        // conversation "running" until the last subagent / bg task settles.
+        summary.background_active = agent.as_ref().map(|agent| agent.live_background_tasks()).unwrap_or(0);
+        summary
     }
 
     /// Backend-static `supports_midturn_delivery` for a conversation with no

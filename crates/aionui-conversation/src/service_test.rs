@@ -6845,6 +6845,7 @@ async fn send_message_does_not_auto_replay_after_tool_side_effect() {
                 output: None,
                 description: None,
                 parent_call_id: None,
+                task: None,
             }),
             AgentStreamEvent::Error(ErrorEventData {
                 message: "temporary provider failure".into(),

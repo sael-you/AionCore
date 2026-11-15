@@ -359,6 +359,12 @@ pub async fn build_module_states(
         .set_project_board_ports(Arc::new(ProjectBoardAdapter {
             board: services.board_service.clone(),
         }));
+    states
+        .sidebar
+        .service
+        .set_conversation_live_ports(Arc::new(ConversationLiveAdapter {
+            tasks: services.worker_task_manager.clone(),
+        }));
     // Same late injection for the board's host port (assign, Board Keeper,
     // lazy project bind): it needs the team and assistant services.
     services
@@ -626,6 +632,20 @@ pub fn build_sidebar_state(services: &AppServices) -> SidebarRouterState {
 pub fn build_board_state(services: &AppServices) -> BoardRouterState {
     BoardRouterState {
         service: services.board_service.clone(),
+    }
+}
+
+/// Live agent state for the sidebar's roll-up counts (C21): reads the running
+/// task in memory, never the database.
+struct ConversationLiveAdapter {
+    tasks: Arc<dyn aionui_ai_agent::IWorkerTaskManager>,
+}
+
+impl aionui_sidebar::ConversationLivePorts for ConversationLiveAdapter {
+    fn pending_confirmations(&self, conversation_id: &str) -> usize {
+        self.tasks
+            .get_task(conversation_id)
+            .map_or(0, |task| task.get_confirmations().len())
     }
 }
 
