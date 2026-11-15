@@ -359,6 +359,54 @@ async fn market_gate_status_and_assignment_predicate() {
     assert!(gated.is_empty());
 }
 
+/// TASK-71: a conditional write refuses a row changed since it was read, and
+/// a same-millisecond write still moves `updated_at` forward.
+#[tokio::test]
+async fn update_instance_with_a_stale_updated_at_is_a_conflict() {
+    let (_db, market, _) = setup().await;
+    let row = market.create_instance(&instance("stale", "active")).await.unwrap();
+    let revoked = market
+        .update_instance(
+            USER,
+            &row.id,
+            &UpdateMarketInstanceParams {
+                status: Some("revoked"),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(revoked.updated_at > row.updated_at);
+    let stale = market
+        .update_instance(
+            USER,
+            &row.id,
+            &UpdateMarketInstanceParams {
+                tier: Some("write"),
+                expected_updated_at: Some(row.updated_at),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    assert!(matches!(stale, DbError::Conflict(_)), "{stale:?}");
+    let current = market.find_instance(USER, &row.id).await.unwrap().unwrap();
+    assert_eq!(current.market_status.as_deref(), Some("revoked"));
+    assert_eq!(current.market_tier.as_deref(), Some("read"));
+    market
+        .update_instance(
+            USER,
+            &row.id,
+            &UpdateMarketInstanceParams {
+                tier: Some("write"),
+                expected_updated_at: Some(current.updated_at),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+}
+
 #[tokio::test]
 async fn update_instance_keeps_and_clears_fields() {
     let (_db, market, _) = setup().await;

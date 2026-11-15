@@ -238,29 +238,35 @@ impl McpMarketService {
         req: UpdateMcpMarketInstanceRequest,
     ) -> Result<McpMarketInstanceResponse, MarketError> {
         let mut inst = self.load(user_id, id).await?;
-        if let Some(v) = req.environment {
+        // Only what the request changes is written (TASK-71); the checks below
+        // use the loaded row, so the write is also conditional on it being
+        // unchanged (409 otherwise).
+        let tier_changed = req.tier.as_ref().is_some_and(|t| *t != inst.tier);
+        let write_plain_env = req.plain_env.is_some() || tier_changed;
+        let write_tools_allow = req.tools_allow.is_some() || (tier_changed && req.tier.as_deref() == Some("write"));
+        if let Some(v) = req.environment.clone() {
             inst.environment = v;
         }
-        if let Some(v) = req.tier {
+        if let Some(v) = req.tier.clone() {
             inst.tier = v;
         }
-        if let Some(v) = req.status {
+        if let Some(v) = req.status.clone() {
             inst.status = v;
         }
-        if let Some(v) = req.clis {
+        if let Some(v) = req.clis.clone() {
             inst.clis = v;
         }
-        if let Some(v) = req.plain_env {
+        if let Some(v) = req.plain_env.clone() {
             inst.plain_env = v;
         }
         apply_defaults(&inst.template, &inst.tier.clone(), &mut inst.plain_env);
-        if let Some(v) = req.tools_allow {
+        if let Some(v) = req.tools_allow.clone() {
             inst.tools_allow = Some(v);
         } else if inst.tier == "write" {
             // A tier change to write drops the allowlist (write = blocklist, R6).
             inst.tools_allow = None;
         }
-        if let Some(v) = req.tools_block {
+        if let Some(v) = req.tools_block.clone() {
             inst.tools_block = v;
         }
         let secrets = self.set_secret_keys(user_id, &inst).await?;
@@ -285,13 +291,14 @@ impl McpMarketService {
                 id,
                 &UpdateMarketInstanceParams {
                     description: req.description.as_deref().map(Some),
-                    status: Some(&inst.status),
-                    environment: Some(&inst.environment),
-                    tier: Some(&inst.tier),
-                    clis_json: Some(&clis_json),
-                    plain_env_json: Some(&plain_env_json),
-                    tools_allow_json: Some(tools_allow_json.as_deref()),
-                    tools_block_json: Some(&tools_block_json),
+                    status: req.status.is_some().then_some(inst.status.as_str()),
+                    environment: req.environment.is_some().then_some(inst.environment.as_str()),
+                    tier: req.tier.is_some().then_some(inst.tier.as_str()),
+                    clis_json: req.clis.is_some().then_some(clis_json.as_str()),
+                    plain_env_json: write_plain_env.then_some(plain_env_json.as_str()),
+                    tools_allow_json: write_tools_allow.then_some(tools_allow_json.as_deref()),
+                    tools_block_json: req.tools_block.is_some().then_some(tools_block_json.as_str()),
+                    expected_updated_at: Some(inst.row.updated_at),
                     ..Default::default()
                 },
             )
@@ -350,15 +357,24 @@ impl McpMarketService {
     /// (running launchers stop at their next check). Assignments are kept so
     /// the owner can re-activate.
     pub async fn revoke_instance(&self, user_id: &str, id: &str) -> Result<McpMarketInstanceResponse, MarketError> {
-        self.update_instance(
-            user_id,
-            id,
-            UpdateMcpMarketInstanceRequest {
-                status: Some("revoked".to_owned()),
-                ..Default::default()
-            },
-        )
-        .await
+        // One column, unconditional: a revoke always wins and never rewrites
+        // anything else (TASK-71).
+        let row = self
+            .repo
+            .update_instance(
+                user_id,
+                id,
+                &UpdateMarketInstanceParams {
+                    status: Some("revoked"),
+                    ..Default::default()
+                },
+            )
+            .await?;
+        let inst = StoredInstance::from_row(row)?;
+        info!(instance = %inst.row.name, "mcp market: instance revoked");
+        let secrets = self.repo.list_instance_secrets(user_id, id).await?;
+        let current = self.current_template(user_id, &inst.template.id).await;
+        Ok(to_response(&inst, &secrets, current.as_ref()))
     }
 
     /// Soft-delete: assistant bindings are removed, then the row's assignments
@@ -403,6 +419,7 @@ impl McpMarketService {
                 &UpdateMarketInstanceParams {
                     approval_ref: Some(inst.approval_ref.as_deref()),
                     status: Some(&inst.status),
+                    expected_updated_at: Some(inst.row.updated_at),
                     ..Default::default()
                 },
             )
@@ -501,6 +518,7 @@ impl McpMarketService {
                     plain_env_json: Some(&plain_env_json),
                     secret_refs_json: Some(&secret_refs_json),
                     enforcement: Some(&current.enforcement),
+                    expected_updated_at: Some(inst.row.updated_at),
                     ..Default::default()
                 },
             )

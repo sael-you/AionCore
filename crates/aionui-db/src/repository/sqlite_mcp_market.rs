@@ -186,36 +186,54 @@ impl IMcpMarketRepository for SqliteMcpMarketRepository {
         id: &str,
         p: &UpdateMarketInstanceParams<'_>,
     ) -> Result<McpMarketRow, DbError> {
-        let current = self
-            .find_instance(user_id, id)
-            .await?
-            .ok_or_else(|| DbError::NotFound(format!("MCP market instance {id}")))?;
-        let pick = |new: Option<&str>, old: &Option<String>| new.map(str::to_owned).or_else(|| old.clone());
-        let pick_nullable =
-            |new: Option<Option<&str>>, old: &Option<String>| new.map(|v| v.map(str::to_owned)).unwrap_or(old.clone());
-        sqlx::query(
-            "UPDATE mcp_servers SET description = ?, updated_at = ?, market_template = ?, market_status = ?, market_environment = ?, \
-             market_tier = ?, market_enforcement = ?, market_clis = ?, market_plain_env = ?, \
-             market_secret_refs = ?, market_tools_allow = ?, market_tools_block = ?, market_approval_ref = ? \
-             WHERE user_id = ? AND id = ? AND deleted_at IS NULL",
-        )
-        .bind(pick_nullable(p.description, &current.description))
-        .bind(aionui_common::now_ms())
-        .bind(pick(p.template_json, &current.market_template))
-        .bind(pick(p.status, &current.market_status))
-        .bind(pick(p.environment, &current.market_environment))
-        .bind(pick(p.tier, &current.market_tier))
-        .bind(pick(p.enforcement, &current.market_enforcement))
-        .bind(pick(p.clis_json, &current.market_clis))
-        .bind(pick(p.plain_env_json, &current.market_plain_env))
-        .bind(pick(p.secret_refs_json, &current.market_secret_refs))
-        .bind(pick_nullable(p.tools_allow_json, &current.market_tools_allow))
-        .bind(pick(p.tools_block_json, &current.market_tools_block))
-        .bind(pick_nullable(p.approval_ref, &current.market_approval_ref))
-        .bind(user_id)
-        .bind(id)
-        .execute(&self.pool)
-        .await?;
+        // Column-level: only the given columns are written, so a concurrent
+        // change of another column (a revoke) is never overwritten with a
+        // stale value (TASK-71). `updated_at` always moves forward, also
+        // within the same millisecond, so `expected_updated_at` sees it.
+        let mut sets: Vec<&str> = vec!["updated_at = MAX(?, updated_at + 1)"];
+        let mut values: Vec<Option<String>> = Vec::new();
+        let mut set = |column: &'static str, value: Option<Option<&str>>| {
+            if let Some(value) = value {
+                sets.push(column);
+                values.push(value.map(str::to_owned));
+            }
+        };
+        set("description = ?", p.description);
+        set("market_template = ?", p.template_json.map(Some));
+        set("market_status = ?", p.status.map(Some));
+        set("market_environment = ?", p.environment.map(Some));
+        set("market_tier = ?", p.tier.map(Some));
+        set("market_enforcement = ?", p.enforcement.map(Some));
+        set("market_clis = ?", p.clis_json.map(Some));
+        set("market_plain_env = ?", p.plain_env_json.map(Some));
+        set("market_secret_refs = ?", p.secret_refs_json.map(Some));
+        set("market_tools_allow = ?", p.tools_allow_json);
+        set("market_tools_block = ?", p.tools_block_json.map(Some));
+        set("market_approval_ref = ?", p.approval_ref);
+        let mut sql = format!(
+            "UPDATE mcp_servers SET {} WHERE user_id = ? AND id = ? AND market_status IS NOT NULL AND deleted_at IS NULL",
+            sets.join(", ")
+        );
+        if p.expected_updated_at.is_some() {
+            sql.push_str(" AND updated_at = ?");
+        }
+        let mut query = sqlx::query(&sql).bind(aionui_common::now_ms());
+        for value in values {
+            query = query.bind(value);
+        }
+        query = query.bind(user_id).bind(id);
+        if let Some(expected) = p.expected_updated_at {
+            query = query.bind(expected);
+        }
+        let affected = query.execute(&self.pool).await?.rows_affected();
+        if affected == 0 {
+            return Err(match self.find_instance(user_id, id).await? {
+                Some(_) => DbError::Conflict(format!(
+                    "MCP market instance {id} changed since it was read; reload and retry"
+                )),
+                None => DbError::NotFound(format!("MCP market instance {id}")),
+            });
+        }
         self.fetch_instance_any(user_id, id)
             .await?
             .ok_or_else(|| DbError::NotFound(format!("MCP server {id}")))
