@@ -114,7 +114,7 @@ pub fn extract_cookie_values(headers: &HeaderMap, name: &str) -> Vec<String> {
 }
 
 /// Extract the bearer token from the `Authorization` header.
-fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {
+pub(crate) fn extract_bearer_token(headers: &HeaderMap) -> Option<String> {
     let auth = headers.get(header::AUTHORIZATION)?.to_str().ok()?;
     let token = auth.strip_prefix("Bearer ")?;
     if token.is_empty() { None } else { Some(token.to_owned()) }

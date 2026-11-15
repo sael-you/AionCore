@@ -900,19 +900,23 @@ fn csrf_app_with_policy(policy: aionui_auth::OriginPolicy) -> Router {
 #[tokio::test]
 async fn c11_3a_a_session_cookie_disables_the_runtime_token_exemption() {
     let app = csrf_app_with_policy(aionui_auth::OriginPolicy::default());
-    for (name, value) in [("cookie", "aionui-session=abc"), ("authorization", "Bearer abc")] {
-        let resp = app
-            .clone()
-            .oneshot(
-                Request::post("/api/thing")
-                    .header("x-aionui-runtime-token", "junk")
-                    .header(name, value)
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{name} + junk runtime header");
+    // A Bearer header alone (no session cookie) is exempt on its own since the
+    // C11 switch prerequisite (mobile app; auth validates the Bearer and never
+    // falls back to the runtime channel), so the Bearer case carries a cookie.
+    for headers in [
+        &[("cookie", "aionui-session=abc")][..],
+        &[("authorization", "Bearer abc"), ("cookie", "aionui-session=abc")][..],
+    ] {
+        let mut builder = Request::post("/api/thing").header("x-aionui-runtime-token", "junk");
+        for (name, value) in headers {
+            builder = builder.header(*name, *value);
+        }
+        let resp = app.clone().oneshot(builder.body(Body::empty()).unwrap()).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::FORBIDDEN,
+            "{headers:?} + junk runtime header"
+        );
         assert_eq!(json_body(resp).await["code"], "CSRF_INVALID");
     }
 }
@@ -1121,5 +1125,163 @@ async fn c11_b_l3_cross_site_api_reads_need_navigation_or_a_trusted_origin() {
     ] {
         let resp = app.clone().oneshot(get(site, mode, origin)).await.unwrap();
         assert_eq!(resp.status(), expected, "{site} {mode:?} {origin:?}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// C11 switch prerequisite — Bearer clients (mobile app) and the webui CSRF layer
+// ---------------------------------------------------------------------------
+
+fn bearer_post(path: &str, cookie: Option<&str>) -> Request<Body> {
+    let mut builder = Request::post(path).header("authorization", "Bearer some-jwt");
+    if let Some(cookie) = cookie {
+        builder = builder.header("cookie", cookie);
+    }
+    builder.body(Body::empty()).unwrap()
+}
+
+#[tokio::test]
+async fn c11_switch_bearer_without_a_session_cookie_is_csrf_exempt() {
+    for names in [aionui_auth::CookieNames::LEGACY, aionui_auth::CookieNames::PREFIXED] {
+        let app = csrf_app_with(names, Some(aionui_auth::OriginPolicy::default()));
+        let resp = app.clone().oneshot(bearer_post("/api/thing", None)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{names:?}");
+        // Other cookies (CSRF, refresh) are not session cookies.
+        let resp = app
+            .oneshot(bearer_post(
+                "/api/thing",
+                Some("aionui-csrf-token=x; __Secure-aionui-refresh=r"),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{names:?} + non-session cookies");
+    }
+}
+
+#[tokio::test]
+async fn c11_switch_bearer_with_a_session_cookie_still_needs_csrf() {
+    for names in [aionui_auth::CookieNames::LEGACY, aionui_auth::CookieNames::PREFIXED] {
+        let app = csrf_app_with(names, Some(aionui_auth::OriginPolicy::default()));
+        // Either session-cookie name removes the exemption, including the
+        // name this mode does not read (a tossed legacy cookie in prefixed mode).
+        for cookie in ["__Host-aionui-session=s", "aionui-session=s"] {
+            let resp = app
+                .clone()
+                .oneshot(bearer_post("/api/thing", Some(cookie)))
+                .await
+                .unwrap();
+            assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{names:?} {cookie}");
+            assert_eq!(json_body(resp).await["code"], "CSRF_INVALID");
+        }
+        // With the double-submit pair it passes as before.
+        let resp = app
+            .oneshot(
+                Request::post("/api/thing")
+                    .header("authorization", "Bearer some-jwt")
+                    .header("cookie", format!("aionui-session=s; {}=t", names.csrf))
+                    .header("x-csrf-token", "t")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK, "{names:?} with CSRF pair");
+    }
+}
+
+#[tokio::test]
+async fn c11_switch_non_bearer_authorization_is_not_exempt() {
+    let app = csrf_app_with(
+        aionui_auth::CookieNames::PREFIXED,
+        Some(aionui_auth::OriginPolicy::default()),
+    );
+    for value in ["Basic abc", "Bearer ", "bearer abc"] {
+        let resp = app
+            .clone()
+            .oneshot(
+                Request::post("/api/thing")
+                    .header("authorization", value)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{value}");
+    }
+}
+
+#[tokio::test]
+async fn c11_switch_bearer_exemption_still_follows_the_origin_rule() {
+    let app = csrf_app_with(
+        aionui_auth::CookieNames::PREFIXED,
+        Some(aionui_auth::OriginPolicy::new(Some("https://y.talkseeds.com"), &[])),
+    );
+    let resp = app
+        .oneshot(
+            Request::post("/api/thing")
+                .header("authorization", "Bearer some-jwt")
+                .header("sec-fetch-site", "cross-site")
+                .header("origin", "https://evil.example")
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(json_body(resp).await["code"], "ORIGIN_FORBIDDEN");
+}
+
+#[tokio::test]
+async fn c11_switch_aionpro_keeps_csrf_for_bearer_requests() {
+    let app = csrf_app_with(aionui_auth::CookieNames::LEGACY, None);
+    let resp = app.oneshot(bearer_post("/api/thing", None)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(json_body(resp).await["code"], "CSRF_INVALID");
+}
+
+#[tokio::test]
+async fn c11_switch_an_exempt_bearer_is_still_validated_by_auth() {
+    let db = init_database_memory().await.unwrap();
+    let user_repo = Arc::new(SqliteUserRepository::new(db.pool().clone())) as Arc<dyn IUserRepository>;
+    let jwt_service = Arc::new(JwtService::new("c11-bearer-secret".into()));
+    let access = jwt_service
+        .sign_with_session_generation("system_default_user", "admin", 0)
+        .unwrap();
+    let refresh = jwt_service.sign_refresh("system_default_user", "admin", 0).unwrap();
+    let auth = AuthState {
+        jwt_service,
+        user_repo,
+        identity_mode: AuthIdentityMode::UserSession,
+        runtime_token_verifier: None,
+        cookie_names: aionui_auth::CookieNames::PREFIXED,
+    };
+    let csrf = aionui_auth::CsrfState {
+        cookie_config: Arc::new(CookieConfig::for_identity(true, true)),
+        origin_policy: Some(Arc::new(aionui_auth::OriginPolicy::default())),
+    };
+    // Same order as the real router: CSRF outside, auth inside.
+    let app = Router::new()
+        .route("/api/thing", post(|| async { "ok" }))
+        .route_layer(middleware::from_fn_with_state(auth, auth_middleware))
+        .layer(middleware::from_fn_with_state(csrf, csrf_middleware));
+    let post_bearer = |token: &str, runtime: bool| {
+        let mut builder = Request::post("/api/thing").header("authorization", format!("Bearer {token}"));
+        if runtime {
+            builder = builder
+                .header("x-aionui-runtime-token", "tok")
+                .header("x-aionui-user-id", "system_default_user")
+                .header("x-aionui-conversation-id", "c");
+        }
+        builder.body(Body::empty()).unwrap()
+    };
+    let ok = app.clone().oneshot(post_bearer(&access, false)).await.unwrap();
+    assert_eq!(ok.status(), StatusCode::OK);
+    for (token, runtime) in [("junk", false), ("junk", true), (refresh.as_str(), false)] {
+        let resp = app.clone().oneshot(post_bearer(token, runtime)).await.unwrap();
+        assert_eq!(
+            resp.status(),
+            StatusCode::UNAUTHORIZED,
+            "bearer {token} runtime header {runtime}"
+        );
     }
 }
