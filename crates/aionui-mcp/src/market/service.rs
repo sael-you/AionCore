@@ -249,7 +249,7 @@ impl McpMarketService {
         // unchanged (409 otherwise).
         let tier_changed = req.tier.as_ref().is_some_and(|t| *t != inst.tier);
         let write_plain_env = req.plain_env.is_some() || tier_changed;
-        let write_tools_allow = req.tools_allow.is_some() || (tier_changed && req.tier.as_deref() == Some("write"));
+        let mut write_tools_allow = req.tools_allow.is_some() || (tier_changed && req.tier.as_deref() == Some("write"));
         if let Some(v) = req.environment.clone() {
             inst.environment = v;
         }
@@ -271,6 +271,10 @@ impl McpMarketService {
         } else if inst.tier == "write" {
             // A tier change to write drops the allowlist (write = blocklist, R6).
             inst.tools_allow = None;
+        } else if inst.tools_allow.is_none() && !inst.template.read_tools.is_empty() {
+            // G3: switching to read starts with the template's pinned allowlist.
+            inst.tools_allow = Some(inst.template.read_tools.clone());
+            write_tools_allow = true;
         }
         if let Some(v) = req.tools_block.clone() {
             inst.tools_block = v;

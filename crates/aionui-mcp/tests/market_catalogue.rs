@@ -331,6 +331,28 @@ async fn g3_proxy_enforcement_gives_a_production_read_tier_limited_to_the_pinned
         assert!(!plan.policy.permits(blocked), "{blocked}");
     }
 
+    // The read/write toggle: a full-tools (write) instance switched to read gets the pinned allowlist.
+    let full = market
+        .create_instance(
+            USER,
+            instance("lighthouse-full", "chrome-devtools", "local", "write", &["claude"]),
+        )
+        .await
+        .unwrap();
+    assert_eq!(full.tools_allow, None);
+    let toggled = market
+        .update_instance(
+            USER,
+            &full.id,
+            UpdateMcpMarketInstanceRequest {
+                tier: Some("read".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert!(toggled.tools_allow.unwrap().contains(&"lighthouse_audit".to_owned()));
+
     // A tools-only template without a pinned allowlist still has no production read tier.
     let brevo = CreateMcpMarketInstanceRequest {
         tools_allow: Some(vec!["get_contacts".into()]),
