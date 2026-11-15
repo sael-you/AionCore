@@ -233,6 +233,14 @@ pub enum VoiceServerFrame {
     /// its call only on this frame (`voice.state` is display-only).
     #[serde(rename = "voice.callEnded")]
     CallEnded(VoiceCallEnded),
+    #[serde(rename = "voice.draftUpdated")]
+    DraftUpdated(VoiceDraftUpdated),
+    #[serde(rename = "voice.readbackReady")]
+    ReadbackReady(VoiceReadbackReady),
+    #[serde(rename = "voice.followUp")]
+    FollowUp(VoiceFollowUp),
+    #[serde(rename = "voice.wake")]
+    Wake(VoiceWake),
 }
 
 impl VoiceServerFrame {
@@ -246,6 +254,10 @@ impl VoiceServerFrame {
             Self::Budget(_) => "voice.budget",
             Self::Error(_) => "voice.error",
             Self::CallEnded(_) => "voice.callEnded",
+            Self::DraftUpdated(_) => "voice.draftUpdated",
+            Self::ReadbackReady(_) => "voice.readbackReady",
+            Self::FollowUp(_) => "voice.followUp",
+            Self::Wake(_) => "voice.wake",
         }
     }
 }
@@ -306,6 +318,130 @@ pub struct VoiceCallEnded {
     pub reason: String,
 }
 
+/// Draft target as shown on the card.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VoiceDraftTarget {
+    pub id: String,
+    pub name: String,
+    /// `conversation` | `project`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<String>,
+}
+
+/// One transcript→draft diff op (`equal` | `insert` | `delete`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VoiceDiffOp {
+    pub op: String,
+    pub text: String,
+    /// `filler` | `reference` | `reorder`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub transform: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VoiceDraftUpdated {
+    pub voice_session_id: Option<String>,
+    pub draft_id: String,
+    pub version: i64,
+    /// Payload hash; a `voice.confirmTap` must carry it.
+    pub hash: String,
+    pub state: String,
+    pub target: Option<VoiceDraftTarget>,
+    /// Choices when `state` is `ambiguous`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub options: Vec<VoiceDraftTarget>,
+    pub text: String,
+    pub diff: Vec<VoiceDiffOp>,
+    /// `new_turn` | `steer` | `queue_busy` | `queue_approval` | `new_conversation`.
+    pub delivery: String,
+    /// Spoken "send" is accepted for this draft (read-back name check passed).
+    pub spoken_confirm: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hold_remaining_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub hold_frozen: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VoiceReadbackReady {
+    pub voice_session_id: Option<String>,
+    pub draft_id: String,
+    pub version: i64,
+    pub readback_id: String,
+    /// Same-origin path: `/api/voice/readbacks/{readbackId}`.
+    pub url: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VoiceFollowUp {
+    pub voice_session_id: Option<String>,
+    pub conversation_id: String,
+    /// `finished` | `failed` | `needs_approval` | `says` | `asks` | draft outcomes
+    /// (`queued`, `sent`, `failed`, `saved_not_started`, `expired`, `interrupted`).
+    pub status: String,
+    pub line: String,
+    /// Clip id for `/api/voice/readbacks/{clipId}`; absent → show `line` with the tone.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub clip_id: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VoiceWake {
+    pub voice_session_id: Option<String>,
+    /// `follow_up` | `say` | `ask`.
+    pub reason: String,
+    pub item_id: String,
+}
+
+// ---------------------------------------------------------------------------
+// Agent → user (runtime routes, `aioncore voice …`)
+// ---------------------------------------------------------------------------
+
+/// `POST /api/runtime/voice/say`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VoiceSayRequest {
+    pub text: String,
+    /// `low` (default, waits for idle) | `high`.
+    #[serde(default)]
+    pub priority: Option<String>,
+}
+
+/// `POST /api/runtime/voice/ask`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct VoiceAskRequest {
+    pub question: String,
+    /// Seconds to block (capped at `max_wait_s`).
+    #[serde(default)]
+    pub timeout_s: Option<u64>,
+}
+
+/// Answer of `say`, `ask` and `wait`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VoiceAgentReply {
+    /// `delivered` | `answered` | `timeout` | `pending` | `no_device` | `cancelled`.
+    pub status: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub answer: Option<String>,
+}
+
+/// `GET /api/runtime/voice/capabilities`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct VoiceAgentCapabilities {
+    pub max_wait_s: u64,
+    pub say_per_minute: u32,
+    pub note: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct VoiceErrorFrame {
@@ -363,6 +499,39 @@ mod tests {
         assert_eq!(value["name"], "voice.callEnded");
         assert_eq!(value["data"]["voiceSessionId"], "vs_1");
         assert_eq!(value["data"]["reason"], "idle");
+    }
+
+    #[test]
+    fn draft_frame_matches_the_ui_contract() {
+        let frame = VoiceServerFrame::DraftUpdated(VoiceDraftUpdated {
+            voice_session_id: Some("vs_1".into()),
+            draft_id: "d1".into(),
+            version: 2,
+            hash: "h".into(),
+            state: "committing".into(),
+            target: Some(VoiceDraftTarget {
+                id: "c1".into(),
+                name: "Kanban build".into(),
+                kind: Some("conversation".into()),
+            }),
+            options: vec![],
+            text: "Goal: rerun".into(),
+            diff: vec![VoiceDiffOp {
+                op: "delete".into(),
+                text: "um".into(),
+                transform: Some("filler".into()),
+            }],
+            delivery: "new_turn".into(),
+            spoken_confirm: true,
+            hold_remaining_ms: Some(4000),
+            hold_frozen: Some(false),
+        });
+        let v = serde_json::to_value(&frame).unwrap();
+        assert_eq!(v["name"], "voice.draftUpdated");
+        assert_eq!(v["data"]["target"]["name"], "Kanban build");
+        assert_eq!(v["data"]["diff"][0]["transform"], "filler");
+        assert_eq!(v["data"]["holdRemainingMs"], 4000);
+        assert!(v["data"].get("options").is_none());
     }
 
     #[test]

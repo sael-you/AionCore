@@ -244,9 +244,11 @@ pub use team_tools::{
 };
 pub use voice::{
     CreateVoiceSessionRequest, CreateVoiceSessionResponse, EndVoiceSessionRequest, UpdateVoiceSettingsRequest,
-    VoiceAssistantAudioFinished, VoiceBudget, VoiceCallEnded, VoiceCaption, VoiceClientFrame, VoiceDraftTap,
-    VoiceErrorFrame, VoiceHeartbeat, VoiceHello, VoicePlaybackFinished, VoiceReady, VoiceServerFrame, VoiceSessionRef,
-    VoiceSessionResponse, VoiceSettingsResponse, VoiceSpeechOnset, VoiceStateFrame, VoiceStatusResponse,
+    VoiceAgentCapabilities, VoiceAgentReply, VoiceAskRequest, VoiceAssistantAudioFinished, VoiceBudget, VoiceCallEnded,
+    VoiceCaption, VoiceClientFrame, VoiceDiffOp, VoiceDraftTap, VoiceDraftTarget, VoiceDraftUpdated, VoiceErrorFrame,
+    VoiceFollowUp, VoiceHeartbeat, VoiceHello, VoicePlaybackFinished, VoiceReadbackReady, VoiceReady, VoiceSayRequest,
+    VoiceServerFrame, VoiceSessionRef, VoiceSessionResponse, VoiceSettingsResponse, VoiceSpeechOnset, VoiceStateFrame,
+    VoiceStatusResponse, VoiceWake,
 };
 pub use websocket::WebSocketMessage;
 
