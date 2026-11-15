@@ -1052,56 +1052,129 @@ async fn update_extra_replaces_json() {
     assert_eq!(found.extra, r#"{"workspace":"/new","flag":true}"#);
 }
 
-/// C21 FIXES 1: `set_extra_keys` is one `json_set` on the CURRENT extra. A
-/// writer that removed or added a key after another reader loaded the row is
-/// kept (a read-modify-write would resurrect `current_model_id`, the key the
-/// ACP model-failure recovery deletes).
-#[tokio::test]
-async fn set_extra_keys_is_atomic_against_a_concurrent_extra_writer() {
-    let (repo, _db) = setup().await;
-    let mut conv = make_conversation("extra-atomic");
+/// Writer A removes `current_model_id` (what the ACP model-failure recovery
+/// does) inside a transaction that is still open while writer B runs; B is
+/// released only when A commits. Returns the extra B's write produced.
+async fn interleave_with_open_writer<F, Fut>(writer_b: F) -> serde_json::Value
+where
+    F: FnOnce(SqliteConversationRepository, String, String) -> Fut + Send + 'static,
+    Fut: std::future::Future<Output = ()> + Send + 'static,
+{
+    let dir = tempfile::tempdir().unwrap();
+    let db = aionui_db::init_database(&dir.path().join("interleave.db"))
+        .await
+        .unwrap();
+    let repo = SqliteConversationRepository::new(db.pool().clone());
+    let mut conv = make_conversation("interleave");
     conv.extra = r#"{"workspace":"/w","current_model_id":"bad-model"}"#.to_string();
-    conv.status = Some("running".to_string());
     repo.create(&conv).await.unwrap();
 
-    // Turn completion "read" the row earlier; now a concurrent writer removes
-    // current_model_id and adds a key of its own.
-    let stale = repo.get(&conv.user_id, &conv.id).await.unwrap().unwrap();
-    assert!(stale.extra.contains("current_model_id"));
-    repo.update(
-        &conv.user_id,
-        &conv.id,
-        &ConversationRowUpdate {
-            extra: Some(r#"{"workspace":"/w","acp_session_id":"s-2"}"#.to_string()),
-            ..Default::default()
-        },
-    )
-    .await
-    .unwrap();
+    let mut tx = db.pool().begin().await.unwrap();
+    sqlx::query("UPDATE conversations SET extra = json_remove(extra, '$.current_model_id') WHERE id = ?")
+        .bind(&conv.id)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    let b = tokio::spawn(writer_b(
+        SqliteConversationRepository::new(db.pool().clone()),
+        conv.user_id.clone(),
+        conv.id.clone(),
+    ));
+    // B has started (and, if it reads first, has read the stale extra) and is
+    // now blocked on A's write lock.
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(!b.is_finished(), "writer B must be waiting on writer A");
+    tx.commit().await.unwrap();
+    b.await.unwrap();
+    let found = repo.get(&conv.user_id, &conv.id).await.unwrap().unwrap();
+    serde_json::from_str(&found.extra).unwrap()
+}
 
-    let matched = repo
-        .set_extra_keys(
-            &conv.user_id,
-            &conv.id,
-            &[
-                ("last_outcome", serde_json::json!("error")),
-                ("last_outcome_at", serde_json::json!(1234)),
-            ],
-            Some("finished"),
-            Some(5678),
+/// TASK-84 / C21 FIXES 1: `set_extra_keys` computes the new extra from the
+/// row as it is when its UPDATE runs, so a key another writer removed after
+/// "our" turn started stays removed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn set_extra_keys_keeps_a_concurrent_writers_change() {
+    let extra = interleave_with_open_writer(|repo, user_id, id| async move {
+        let matched = repo
+            .set_extra_keys(
+                &user_id,
+                &id,
+                &[
+                    ("last_outcome", serde_json::json!("error")),
+                    ("last_outcome_at", serde_json::json!(1234)),
+                ],
+                Some("finished"),
+                Some(5678),
+            )
+            .await
+            .unwrap();
+        assert!(matched);
+    })
+    .await;
+    assert_eq!(extra["last_outcome"], "error");
+    assert_eq!(extra["last_outcome_at"], 1234);
+    assert!(
+        extra.get("current_model_id").is_none(),
+        "the removed key stays removed: {extra}"
+    );
+}
+
+/// Control for the test above: the same interleaving with the old
+/// read-modify-write (read extra, merge, write the whole value) resurrects the
+/// removed key, so the harness really catches the bug.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn read_modify_write_of_extra_loses_a_concurrent_writers_change() {
+    let extra = interleave_with_open_writer(|repo, user_id, id| async move {
+        let row = repo.get(&user_id, &id).await.unwrap().unwrap();
+        let mut extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap();
+        extra["last_outcome"] = serde_json::json!("error");
+        repo.update(
+            &user_id,
+            &id,
+            &ConversationRowUpdate {
+                extra: Some(extra.to_string()),
+                ..Default::default()
+            },
         )
         .await
         .unwrap();
-    assert!(matched);
+    })
+    .await;
+    assert_eq!(extra["current_model_id"], "bad-model", "a stale copy is written back");
+}
 
+/// TASK-84: the extra writers that also remove keys (ACP model-failure
+/// recovery, PATCH stripping `user_id`) set and remove in one statement;
+/// camelCase keys are addressable.
+#[tokio::test]
+async fn patch_extra_keys_sets_and_removes_in_one_statement() {
+    let (repo, _db) = setup().await;
+    let mut conv = make_conversation("extra-patch");
+    conv.extra = r#"{"workspace":"/w","current_model_id":"m","user_id":"x"}"#.to_string();
+    repo.create(&conv).await.unwrap();
+    assert!(
+        repo.patch_extra_keys(
+            &conv.user_id,
+            &conv.id,
+            &[
+                ("contextFileName", serde_json::json!("ctx.md")),
+                ("flag", serde_json::Value::Null)
+            ],
+            &["current_model_id", "user_id"],
+            None,
+            Some(42),
+        )
+        .await
+        .unwrap()
+    );
     let found = repo.get(&conv.user_id, &conv.id).await.unwrap().unwrap();
     let extra: serde_json::Value = serde_json::from_str(&found.extra).unwrap();
-    assert_eq!(extra["last_outcome"], "error");
-    assert_eq!(extra["last_outcome_at"], 1234);
-    assert_eq!(extra["acp_session_id"], "s-2", "the concurrent write survives");
-    assert!(extra.get("current_model_id").is_none(), "the removed key stays removed");
-    assert_eq!(found.status.as_deref(), Some("finished"));
-    assert_eq!(found.updated_at, 5678);
+    assert_eq!(
+        extra,
+        serde_json::json!({"workspace": "/w", "contextFileName": "ctx.md", "flag": null})
+    );
+    assert_eq!(found.updated_at, 42);
 }
 
 #[tokio::test]

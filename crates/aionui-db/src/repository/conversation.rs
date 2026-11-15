@@ -33,11 +33,8 @@ pub trait IConversationRepository: Send + Sync {
     /// Set top-level keys of `extra` (JSON values), and optionally `status` /
     /// `updated_at`, in ONE statement, so a concurrent `extra` write is never
     /// overwritten with a stale copy (C21: `last_outcome`, `last_outcome_seen_at`).
-    /// A non-object `extra` is replaced by an object. Keys must be plain
-    /// identifiers (`[a-z_][a-z0-9_]*`). Returns `false` when no row matched.
-    ///
-    /// The default is a read-modify-write for in-memory test doubles; the
-    /// SQLite repository overrides it with an atomic `json_set`.
+    /// A non-object `extra` is replaced by an object. Returns `false` when no
+    /// row matched. See [`Self::patch_extra_keys`] for the key rules.
     async fn set_extra_keys(
         &self,
         user_id: &str,
@@ -46,7 +43,27 @@ pub trait IConversationRepository: Send + Sync {
         status: Option<&str>,
         updated_at: Option<TimestampMs>,
     ) -> Result<bool, DbError> {
-        validate_extra_keys(entries)?;
+        self.patch_extra_keys(user_id, id, entries, &[], status, updated_at)
+            .await
+    }
+
+    /// Set and remove top-level keys of `extra` (plus optional `status` /
+    /// `updated_at`) in ONE statement: `json_remove(json_set(<current extra>,
+    /// ...), ...)`, never a read-modify-write of the whole object. Keys must
+    /// match [`is_valid_extra_key`] (they are spliced into a JSON path).
+    ///
+    /// The default is a read-modify-write for in-memory test doubles; the
+    /// SQLite repository overrides it with the atomic statement.
+    async fn patch_extra_keys(
+        &self,
+        user_id: &str,
+        id: &str,
+        set: &[(&str, serde_json::Value)],
+        remove: &[&str],
+        status: Option<&str>,
+        updated_at: Option<TimestampMs>,
+    ) -> Result<bool, DbError> {
+        validate_extra_keys(set.iter().map(|(key, _)| *key).chain(remove.iter().copied()))?;
         let Some(row) = self.get(user_id, id).await? else {
             return Ok(false);
         };
@@ -55,8 +72,11 @@ pub trait IConversationRepository: Send + Sync {
             extra = serde_json::json!({});
         }
         if let Some(object) = extra.as_object_mut() {
-            for (key, value) in entries {
+            for (key, value) in set {
                 object.insert((*key).to_owned(), value.clone());
+            }
+            for key in remove {
+                object.remove(*key);
             }
         }
         let updates = ConversationRowUpdate {
@@ -641,14 +661,17 @@ pub struct MessageSearchRow {
     pub conversation_updated_at: TimestampMs,
 }
 
-/// Reject `extra` keys that are not plain identifiers: they are spliced into a
-/// JSON path (`$.key`), so anything else could address a different location.
-pub fn validate_extra_keys(entries: &[(&str, serde_json::Value)]) -> Result<(), DbError> {
-    for (key, _) in entries {
-        let mut chars = key.chars();
-        let valid = chars.next().is_some_and(|c| c == '_' || c.is_ascii_lowercase())
-            && chars.all(|c| c == '_' || c.is_ascii_lowercase() || c.is_ascii_digit());
-        if !valid {
+/// Whether `key` can be addressed as `$."key"` in a SQLite JSON path:
+/// non-empty, at most 128 chars of ASCII letters, digits, `_` and `-`.
+pub fn is_valid_extra_key(key: &str) -> bool {
+    !key.is_empty() && key.len() <= 128 && key.chars().all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+}
+
+/// Reject `extra` keys [`is_valid_extra_key`] refuses: they are spliced into a
+/// JSON path, so anything else could address a different location.
+pub fn validate_extra_keys<'a>(keys: impl IntoIterator<Item = &'a str>) -> Result<(), DbError> {
+    for key in keys {
+        if !is_valid_extra_key(key) {
             return Err(DbError::Init(format!("invalid extra key: {key:?}")));
         }
     }

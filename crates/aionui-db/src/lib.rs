@@ -39,7 +39,7 @@ pub use repository::channel::UpdatePluginStatusParams;
 pub use repository::conversation::{
     ConversationFilters, ConversationRowUpdate, IdempotentInsert, MentionableCandidatesParams, MessagePageCursor,
     MessagePageDirection, MessagePageParams, MessagePageResult, MessageRowUpdate, MessageSearchRow, NewIdempotentSend,
-    StaleRuntimeMessageRow,
+    StaleRuntimeMessageRow, is_valid_extra_key,
 };
 pub use repository::cron::{
     ClaimCronRunParams, CronRunClaimResult, FinishCronRunParams, RecoverableCronRun, UpdateCronJobParams,
