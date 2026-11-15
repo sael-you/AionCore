@@ -7,6 +7,7 @@
 //! - DB: opened read-only (no create, no migrator), migrations 904/905 required.
 //! - Decision from the DB now: market row, not deleted, `active`, CLI allowed,
 //!   exact assignment; the template's pinned command (never caller-supplied).
+//! - Command: `<data_dir>/toolchain/bin/<cmd>` first (G4, e.g. uvx), else PATH.
 //! - Child env: `env_clear()` + allowlist + plain env + this instance's
 //!   declared secrets; never `AIONUI_*` (incl. the runtime token).
 //! - stdio proxy filtering `tools/list` / `tools/call`; re-checks the launch
@@ -26,7 +27,8 @@ use aionui_app::derive_encryption_key;
 use aionui_auth::resolve_encryption_secret;
 use aionui_db::{IUserRepository, SqliteMcpMarketRepository, SqliteUserRepository, open_database_read_only};
 use aionui_mcp::market::{
-    LaunchRequest, LaunchScope, MarketError, ProxyExit, child_env, resolve_launch, run_stdio_proxy, still_allowed,
+    LaunchRequest, LaunchScope, MarketError, ProxyExit, child_env, resolve_launch, resolve_toolchain_command, run_stdio_proxy,
+    still_allowed,
 };
 
 use crate::cli::{McpArgs, McpCommand, McpExecArgs};
@@ -149,15 +151,24 @@ async fn run_exec(args: McpExecArgs) -> ExitCode {
         Err(e) => return fail(EXIT_INTERNAL, &e.to_string()),
     };
 
-    let resolved = match aionui_runtime::ensure_runtime_command(&plan.command).await {
+    // G4: a pinned runtime in `<data_dir>/toolchain/bin` (e.g. uvx) wins over PATH.
+    let toolchain = resolve_toolchain_command(&plan.command, &data_dir, std::env::var_os("PATH").as_deref());
+    let program = toolchain
+        .as_ref()
+        .map(|t| t.program.to_string_lossy().into_owned())
+        .unwrap_or_else(|| plan.command.clone());
+    let resolved = match aionui_runtime::ensure_runtime_command(&program).await {
         Ok(r) => r,
         Err(e) => return fail(EXIT_INTERNAL, &format!("cannot resolve the server command: {e}")),
     };
-    let runtime_env: Vec<(String, String)> = resolved
+    let mut runtime_env: Vec<(String, String)> = resolved
         .env
         .iter()
         .map(|(k, v)| (k.to_string_lossy().into_owned(), v.to_string_lossy().into_owned()))
         .collect();
+    if let Some(t) = toolchain {
+        runtime_env.extend(t.env);
+    }
     let mut builder = aionui_runtime::Builder::from_resolved(&resolved);
     builder
         .env_clear()

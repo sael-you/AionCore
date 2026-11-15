@@ -764,9 +764,10 @@ impl ArchiveTeardownPorts for ArchiveTeardownAdapter {
 }
 
 /// Build the default `McpRouterState` from application services. The MCP
-/// market reads templates from the catalogue extension (`registry`) and
+/// market reads templates from the catalogue extension (`registry`) over the
+/// built-in catalogue, and
 /// updates assistant bindings through `assistant`; either may be absent
-/// (empty catalogue / no binding updates).
+/// (built-in catalogue only / no binding updates).
 pub fn build_mcp_state(
     services: &AppServices,
     registry: Option<ExtensionRegistry>,
@@ -779,7 +780,7 @@ pub fn build_mcp_state(
         Arc::new(aionui_db::SqliteMcpMarketRepository::new(pool));
     let catalog: Arc<dyn aionui_mcp::IMcpTemplateCatalog> = match registry {
         Some(registry) => Arc::new(super::mcp_market::ExtensionTemplateCatalog { registry }),
-        None => Arc::new(aionui_mcp::StaticTemplateCatalog::new(Vec::new())),
+        None => Arc::new(aionui_mcp::StaticTemplateCatalog::new(aionui_mcp::market::builtin_entries())),
     };
     // Same storage-encryption key as provider API keys (owner decision 1).
     let mut market = aionui_mcp::McpMarketService::new(
