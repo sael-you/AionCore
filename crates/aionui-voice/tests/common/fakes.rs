@@ -247,3 +247,32 @@ impl SpeechFactory for FakeSpeech {
         }
     }
 }
+
+/// Settings repository over the real one; `slow_next_read` makes the next
+/// `get` return its (already read) row only after a delay, to force the
+/// stale-read interleaving of concurrent settings updates.
+pub struct GatedSettings {
+    pub inner: Arc<aionui_db::SqliteVoiceRepository>,
+    pub slow_next: std::sync::atomic::AtomicBool,
+}
+
+impl GatedSettings {
+    pub fn slow_next_read(&self) {
+        self.slow_next.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+#[async_trait::async_trait]
+impl aionui_db::IVoiceSettingsRepository for GatedSettings {
+    async fn get(&self, user_id: &str) -> Result<Option<aionui_db::VoiceSettingsRow>, aionui_db::DbError> {
+        let row = self.inner.get(user_id).await;
+        if self.slow_next.swap(false, std::sync::atomic::Ordering::SeqCst) {
+            tokio::time::sleep(std::time::Duration::from_millis(400)).await;
+        }
+        row
+    }
+
+    async fn upsert(&self, row: &aionui_db::VoiceSettingsRow) -> Result<(), aionui_db::DbError> {
+        self.inner.upsert(row).await
+    }
+}

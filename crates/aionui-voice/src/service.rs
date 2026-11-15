@@ -231,6 +231,11 @@ impl VoiceService {
         user_id: &str,
         req: &UpdateVoiceSettingsRequest,
     ) -> Result<VoiceSettings, VoiceError> {
+        // Read-apply-write under the user's admission lock: a concurrent update
+        // that read `enabled: true` can never land after the kill switch, and
+        // an admission never sees a half-applied change.
+        let lock = self.inner.user_lock(user_id);
+        let _guard = lock.lock().await;
         let current = self.settings(user_id).await?;
         let next = current.apply(req)?;
         self.inner.settings.upsert(&next.to_row(user_id)).await?;
@@ -251,12 +256,10 @@ impl VoiceService {
         Ok(next)
     }
 
-    /// Kill switch for one user: hang up, notify, close sockets. Holds the
-    /// user's admission lock so an admission in flight finishes first (and
-    /// then sees voice off and hangs up its call itself).
+    /// Kill switch for one user: hang up, notify, close sockets. The caller
+    /// holds the user's admission lock, so an admission in flight finishes
+    /// first (and then sees voice off and hangs up its call itself).
     async fn kill_user(&self, user_id: &str, audit: bool) {
-        let lock = self.inner.user_lock(user_id);
-        let _guard = lock.lock().await;
         let ended = self.end_user_calls(user_id, EndReason::Disabled).await;
         let cancelled_drafts = self.inner.drafts.cancel_all_for_user(user_id).await;
         self.inner.asks.cancel_user(user_id);
