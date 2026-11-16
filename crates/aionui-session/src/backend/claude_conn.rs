@@ -277,6 +277,30 @@ pub(crate) fn build_claude_init_args(config: &SessionConfig, mcp_config_arg: Opt
     args
 }
 
+/// The full claude argv tail: init flags, then caller `extra_args`, then (TASK-97)
+/// a `permissions.ask` rule per MCP server that needs the user's OK on every call,
+/// merged into the caller's `--settings` if it passed one. A relative settings
+/// path is read against the session cwd, where claude itself would resolve it.
+fn claude_spawn_args(config: &SessionConfig, init_args: &[String]) -> Vec<String> {
+    let mut args = prepend_args(init_args, &config.extra_args);
+    let ask = super::claude_ask_settings::claude_ask_rules(&config.init.mcp_servers);
+    if !ask.is_empty() {
+        tracing::info!(
+            servers = ask.len(),
+            "claude: MCP servers that need approval on every call get permissions.ask rules"
+        );
+    }
+    super::claude_ask_settings::merge_ask_into_settings_args(&mut args, &ask, |path| {
+        let path = std::path::Path::new(path);
+        let path = match (&config.cwd, path.is_relative()) {
+            (Some(cwd), true) => std::path::Path::new(cwd).join(path),
+            _ => path.to_path_buf(),
+        };
+        std::fs::read_to_string(path).ok()
+    });
+    args
+}
+
 /// What [`prepare_claude_mcp_config`] resolved: the `--mcp-config` value and,
 /// when it is a file path, the guard that owns (and finally deletes) that file.
 pub(crate) type PreparedMcpConfig = (Option<String>, Option<super::claude_mcp_file::McpConfigFile>);
@@ -833,7 +857,7 @@ impl ClaudeWakeRecipe {
             spawner,
             claude_session_id: Arc::new(std::sync::Mutex::new(claude_session_id)),
             cwd: config.cwd.clone(),
-            extra_args: prepend_args(&init_args, &config.extra_args),
+            extra_args: claude_spawn_args(config, &init_args),
             env: config.spawn_env.clone(),
             cli_program: config.cli_program.clone(),
             mcp_config_file,
@@ -3875,6 +3899,56 @@ mod tests {
              (the Ask card renders multi-question payloads)"
         );
         assert_eq!(build_claude_mcp_config(&[]), None, "no servers → no --mcp-config");
+    }
+
+    /// TASK-97: a production write MCP server (require_approval) makes the spawn
+    /// carry `--settings {"permissions":{"ask":["mcp__<name>__*"]}}` even in
+    /// bypassPermissions (claude never auto-approves an explicit ask rule), merged
+    /// into a caller `--settings`; without such a server the spawn is unchanged.
+    #[test]
+    fn production_write_mcp_server_adds_an_ask_rule_to_the_spawn() {
+        let stdio = |name: &str, require_approval: bool| McpServerSpec {
+            name: name.into(),
+            transport: McpTransport::Stdio {
+                command: "/opt/aioncore".into(),
+                args: vec!["mcp".into(), "exec".into(), name.into()],
+                env: vec![],
+            },
+            tool_filter: super::super::McpToolFilter {
+                require_approval,
+                ..Default::default()
+            },
+        };
+        let mut config = SessionConfig {
+            mode: Some("bypassPermissions".into()),
+            extra_args: vec![
+                "--settings".into(),
+                r#"{"permissions":{"allow":["Read"]}}"#.into(),
+                "--add-dir".into(),
+                "/src/skill".into(),
+            ],
+            ..Default::default()
+        };
+        config.init.mcp_servers = vec![stdio("paddle-live", true), stdio("context7", false)];
+        let init = build_claude_init_args(&config, Some("/run/mcp.json"));
+        let args = claude_spawn_args(&config, &init);
+        assert_eq!(args.iter().filter(|a| *a == "--settings").count(), 1, "{args:?}");
+        let at = args.iter().position(|a| a == "--settings").unwrap();
+        let settings: serde_json::Value = serde_json::from_str(&args[at + 1]).unwrap();
+        assert_eq!(
+            settings,
+            serde_json::json!({"permissions": {"allow": ["Read"], "ask": ["mcp__paddle-live__*"]}})
+        );
+        assert!(args.windows(2).any(|w| w == ["--permission-mode", "bypassPermissions"]));
+        assert!(args.windows(2).any(|w| w == ["--add-dir", "/src/skill"]));
+
+        // No flagged server: argv is exactly init + caller args (pre-TASK-97 shape).
+        config.init.mcp_servers = vec![stdio("context7", false)];
+        let init = build_claude_init_args(&config, Some("/run/mcp.json"));
+        assert_eq!(
+            claude_spawn_args(&config, &init),
+            prepend_args(&init, &config.extra_args)
+        );
     }
 
     /// One stdio server carrying a secret env value, for the MCP argv tests.

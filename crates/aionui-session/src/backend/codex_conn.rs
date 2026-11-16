@@ -556,7 +556,7 @@ fn thread_start_params(config: &SessionConfig) -> HandshakeParams {
     // approvalPolicy is data-driven (sibling of sandbox): None ⇒ "on-request"
     // (byte-identical to the pre-data-driven handshake); a yolo / full-access agent
     // resolves to "never" at the orchestration boundary (app registry).
-    let approval = config.approval_policy.as_deref().unwrap_or("on-request");
+    let approval = codex_effective_approval_policy(config);
     let mut params = json!({
         "approvalPolicy": approval,
         "sandbox": sandbox,
@@ -573,6 +573,27 @@ fn thread_start_params(config: &SessionConfig) -> HandshakeParams {
         params["developerInstructions"] = json!(preset);
     }
     HandshakeParams(params)
+}
+
+/// The thread's `approvalPolicy`: the configured one (None ⇒ "on-request"), except
+/// that "never" becomes "on-request" when an MCP server needs approval on every
+/// call (TASK-97). codex 0.169 AUTO-APPROVES an MCP prompt under "never" when the
+/// sandbox has full disk write (codex-mcp/src/mcp/mod.rs
+/// `mcp_permission_prompt_is_auto_approved`) and DENIES it otherwise
+/// (core/src/mcp_tool_call.rs `request_mcp_tool_user_approval`), so the owner
+/// would never be asked. The sandbox is untouched, and an in-band mode switch
+/// only sends `permissions` (see `Command::SetMode`), so the clamp holds for the
+/// whole thread, including resume and fork (they reuse these params).
+fn codex_effective_approval_policy(config: &SessionConfig) -> &str {
+    let approval = config.approval_policy.as_deref().unwrap_or("on-request");
+    if approval == "never" && config.init.mcp_servers.iter().any(|s| s.tool_filter.require_approval) {
+        tracing::info!(
+            backend = "codex",
+            "approvalPolicy never -> on-request: an MCP server needs approval on every call"
+        );
+        return "on-request";
+    }
+    approval
 }
 
 /// `thread/resume` params = the full `thread/start` override surface + the
@@ -665,6 +686,21 @@ fn build_codex_mcp_servers(servers: &[crate::backend::McpServerSpec]) -> Value {
         }
         if !s.tool_filter.disabled_tools.is_empty() {
             entry["disabled_tools"] = json!(s.tool_filter.disabled_tools);
+        }
+        // TASK-97: every call to a production write server needs the user's OK.
+        // `mcp_servers.<id>.default_tools_approval_mode` takes
+        // `auto | prompt | writes | approve` (learn.chatgpt.com/docs/config-file/
+        // config-reference; codex 0.169 source config/src/mcp_types.rs
+        // `AppToolApproval`), and `Prompt => true` in
+        // core/src/mcp_tool_call.rs `requires_mcp_tool_approval_for_mode` asks on
+        // every call; "approve for session" is downgraded to a one-off approval in
+        // that mode (`normalize_approval_decision_for_mode`). thread/start `config`
+        // lands in codex's session-flags layer, which is where it reads the mode
+        // (app-server/src/config_manager.rs `load_with_validation` chains request
+        // overrides into the CLI overrides; mcp_tool_call.rs
+        // `custom_mcp_tool_approval_mode` reads `effective_config()`).
+        if s.tool_filter.require_approval {
+            entry["default_tools_approval_mode"] = json!("prompt");
         }
         map.insert(s.name.clone(), entry);
     }
@@ -8113,6 +8149,7 @@ mod tests {
                 McpToolFilter {
                     enabled_tools: Some(vec!["list_products".into()]),
                     disabled_tools: vec!["create_refund".into()],
+                    ..Default::default()
                 },
             ),
             stdio(
@@ -8120,6 +8157,7 @@ mod tests {
                 McpToolFilter {
                     enabled_tools: None,
                     disabled_tools: vec!["delete_product".into()],
+                    ..Default::default()
                 },
             ),
             stdio("plain", McpToolFilter::default()),
@@ -8174,6 +8212,64 @@ mod tests {
         let bare = thread_start_params(&SessionConfig::default()).into_frame(4, "thread/start");
         assert!(bare["params"].get("developerInstructions").is_none());
         assert!(bare["params"].get("baseInstructions").is_none());
+    }
+
+    /// TASK-97: a production write MCP server (require_approval) is configured with
+    /// `default_tools_approval_mode = "prompt"`, and a yolo thread ("never") is
+    /// started/resumed/forked "on-request" so codex asks the user instead of
+    /// auto-approving; the full-access sandbox stays. Unflagged servers and their
+    /// threads keep the previous wire.
+    #[test]
+    fn production_write_mcp_server_prompts_on_every_call() {
+        use crate::backend::{McpServerSpec, McpToolFilter, McpTransport, SessionInit};
+        let stdio = |name: &str, require_approval: bool| McpServerSpec {
+            name: name.into(),
+            transport: McpTransport::Stdio {
+                command: "/opt/aioncore".into(),
+                args: vec!["mcp".into(), "exec".into(), name.into()],
+                env: vec![],
+            },
+            tool_filter: McpToolFilter {
+                require_approval,
+                ..Default::default()
+            },
+        };
+        let yolo = |servers: Vec<McpServerSpec>| SessionConfig {
+            approval_policy: Some("never".into()),
+            sandbox_mode: Some("danger-full-access".into()),
+            init: SessionInit {
+                mcp_servers: servers,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let config = yolo(vec![stdio("paddle-live", true), stdio("context7", false)]);
+        let frames = [
+            thread_start_params(&config).into_frame(1, "thread/start"),
+            thread_resume_params(&config, "th-1").into_frame(2, "thread/resume"),
+            thread_fork_params(&config, "th-1", None).into_frame(3, "thread/fork"),
+        ];
+        for frame in &frames {
+            let mcp = &frame["params"]["config"]["mcp_servers"];
+            assert_eq!(mcp["paddle-live"]["default_tools_approval_mode"], "prompt", "{frame}");
+            assert!(mcp["context7"].get("default_tools_approval_mode").is_none());
+            assert_eq!(frame["params"]["approvalPolicy"], "on-request", "{frame}");
+            assert_eq!(frame["params"]["sandbox"], "danger-full-access");
+        }
+
+        // Without a flagged server a yolo thread stays "never".
+        let plain = thread_start_params(&yolo(vec![stdio("context7", false)])).into_frame(4, "thread/start");
+        assert_eq!(plain["params"]["approvalPolicy"], "never");
+        assert!(
+            plain["params"]["config"]["mcp_servers"]["context7"]
+                .get("default_tools_approval_mode")
+                .is_none()
+        );
+        // A non-yolo policy is never loosened or changed.
+        let mut gated = config.clone();
+        gated.approval_policy = Some("untrusted".into());
+        let frame = thread_start_params(&gated).into_frame(5, "thread/start");
+        assert_eq!(frame["params"]["approvalPolicy"], "untrusted");
     }
 
     /// thread/resume re-sends the FULL thread/start override surface + threadId.

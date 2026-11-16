@@ -2341,6 +2341,7 @@ fn session_server_to_spec(server: &aionui_api_types::SessionMcpServer) -> aionui
         tool_filter: aionui_session::McpToolFilter {
             enabled_tools: server.tool_filter.enabled_tools.clone(),
             disabled_tools: server.tool_filter.disabled_tools.clone(),
+            require_approval: server.tool_filter.require_approval,
         },
     }
 }
