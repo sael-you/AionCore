@@ -113,11 +113,13 @@ async fn websocket_origin_except_extension(
     state: axum::extract::State<Arc<aionui_auth::OriginPolicy>>,
     request: axum::extract::Request,
     next: axum::middleware::Next,
-) -> Result<axum::response::Response, aionui_common::ApiError> {
+) -> axum::response::Response {
     if request.uri().path() == "/api/browser/extension" {
-        return Ok(next.run(request).await);
+        return next.run(request).await;
     }
-    websocket_origin_middleware(state, request, next).await
+    websocket_origin_middleware(state, request, next)
+        .await
+        .unwrap_or_else(axum::response::IntoResponse::into_response)
 }
 
 /// Create the application router and return runtime handles needed by
