@@ -2,4 +2,5 @@
 //! layout). A new test file goes in this directory with a `mod` line below.
 //! Files that mutate the process environment stay separate binaries in `tests/`.
 
+mod extension_relay;
 mod live_chrome;
