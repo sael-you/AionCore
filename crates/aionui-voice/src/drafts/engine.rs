@@ -97,7 +97,7 @@ pub struct DraftEngine {
     pub(crate) speech: Arc<dyn SpeechFactory>,
     pub(crate) clips: ClipStore,
     name_check: NameCheck,
-    sockets: VoiceSockets,
+    pub(crate) sockets: VoiceSockets,
     extras: DashMap<(String, i64), DraftExtras>,
     /// Conversations sent to by voice → user (follow-up watcher).
     pub(crate) watched: DashMap<String, String>,

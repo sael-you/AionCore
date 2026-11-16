@@ -353,3 +353,33 @@ async fn turn_latency_with_s0_provider_timings() {
     assert!(p50(modelled) < 1500, "backend adds well under 0.5 s");
     assert!(p50(overhead) < 300);
 }
+
+#[tokio::test]
+async fn the_answer_ends_only_after_its_last_sentence_was_delivered() {
+    let mut c = cascade_call().await;
+    // The last sentence takes a while to synthesize.
+    *c.h.speech.slow.lock().unwrap() = Some(("clauterm".into(), Duration::from_millis(800)));
+    c.h.fake.set_chat_script(vec![
+        json!({"text": "You have two projects. They are aionui and clauterm."}),
+    ]);
+    c.say("What projects do I have?");
+    let mut order = Vec::new();
+    loop {
+        let frame = ws_next(&mut c.ws, Duration::from_secs(10))
+            .await
+            .expect("socket closed or timed out");
+        if frame["name"] == "voice.followUp" && frame["data"]["status"] == "reply" {
+            order.push("reply");
+        }
+        if frame["name"] == "voice.assistantAudioFinished" {
+            assert_eq!(frame["data"]["voiceSessionId"], c.session.as_str());
+            order.push("finished");
+            break;
+        }
+    }
+    assert_eq!(
+        order,
+        vec!["reply", "reply", "finished"],
+        "the end comes after the last clip"
+    );
+}

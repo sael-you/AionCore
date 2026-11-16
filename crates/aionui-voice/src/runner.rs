@@ -337,11 +337,17 @@ impl CallRunner {
             }
             EngineEvent::AssistantAudioFinished { response_id } => {
                 self.speaking = false;
-                self.send(VoiceServerFrame::AssistantAudioFinished(VoiceAssistantAudioFinished {
-                    voice_session_id: self.call.session_id.clone(),
-                    response_id,
-                }));
-                self.send(state_frame(Some(self.session_id()), "listening", None));
+                // Cascade: the answer is clips still being synthesized; the
+                // mouth announces the end after its last sentence went out.
+                if let Some(mouth) = &self.mouth {
+                    mouth.finish(response_id);
+                } else {
+                    self.send(VoiceServerFrame::AssistantAudioFinished(VoiceAssistantAudioFinished {
+                        voice_session_id: self.call.session_id.clone(),
+                        response_id,
+                    }));
+                    self.send(state_frame(Some(self.session_id()), "listening", None));
+                }
             }
             EngineEvent::ToolCall {
                 call_id,

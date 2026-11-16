@@ -90,7 +90,7 @@ refused with `voice.error SESSION_MISMATCH` (frame dropped).
 | `voice.callEnded` | `{voiceSessionId, reason}` — **sent exactly once when a call ends, for any reason. The client ends its call only on this frame.** | S1a |
 | `voice.state` | `{voiceSessionId, state, reason?}` — **display only** (see below) | S1a |
 | `voice.caption` | `{voiceSessionId, role: user\|assistant, text, final}` | S1a |
-| `voice.assistantAudioFinished` | `{voiceSessionId, responseId}` — provider finished sending audio (play "your turn" after the measured output latency) | S1a |
+| `voice.assistantAudioFinished` | `{voiceSessionId, responseId}` — provider finished sending audio (play "your turn" after the measured output latency). `minimax-cascade`: sent only after the answer's last `reply` clip frame was delivered (never before a `voice.followUp` `reply` of the same answer; none after a barge-in), so the client needs no end-of-answer heuristic | S1a, TASK-37 |
 | `voice.budget` | `{voiceSessionId, usedUsd, limitUsd, warning?: "80"\|"100"}` | S1a |
 | `voice.error` | `{voiceSessionId, code, message}`; codes containing `DISABLED` (e.g. `VOICE_DISABLED`) mean voice was turned off → disarm | S1a |
 | `voice.draftUpdated` | `{voiceSessionId, draftId, version, hash, state, target: {id, name, kind?}, options?, spokenConfirm, text, diff: [{op: equal\|insert\|delete, text, transform?: filler\|reference\|reorder}], delivery: new_turn\|steer\|queue_busy\|queue_approval\|new_conversation, holdRemainingMs?, holdFrozen?}` — `holdRemainingMs` = ms left in the 4 s hold (§3.3.5), `holdFrozen` = true while speech froze the deadline; the UI falls back to a local 4 s countdown when absent | S1b |

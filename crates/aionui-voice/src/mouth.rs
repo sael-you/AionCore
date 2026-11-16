@@ -3,10 +3,13 @@
 //! the OpenAI realtime-mini fallback after it; D51), synthesized one at a time
 //! in the order spoken and delivered as `voice.followUp` with status `reply`
 //! (no conversation). A barge-in drops every sentence not delivered yet.
+//! The answer's `voice.assistantAudioFinished` goes out only after its last
+//! sentence was delivered (TASK-37: the UI no longer guesses the end).
 
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+use aionui_api_types::{VoiceAssistantAudioFinished, VoiceServerFrame};
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
@@ -17,21 +20,43 @@ use crate::readback::ClipVoice;
 /// `voice.followUp` status of a cascade answer clip.
 pub(crate) const REPLY_STATUS: &str = "reply";
 
+enum Item {
+    Sentence(String),
+    /// Every sentence of this response was queued: announce its end.
+    Finished(String),
+}
+
 pub(crate) struct Mouth {
-    tx: mpsc::UnboundedSender<(u64, String)>,
+    tx: mpsc::UnboundedSender<(u64, Item)>,
     epoch: Arc<AtomicU64>,
 }
 
 impl Mouth {
     pub(crate) fn spawn(drafts: Arc<DraftEngine>, user_id: String, session_id: String) -> Self {
-        let (tx, mut rx) = mpsc::unbounded_channel::<(u64, String)>();
+        let (tx, mut rx) = mpsc::unbounded_channel::<(u64, Item)>();
         let epoch = Arc::new(AtomicU64::new(0));
         let current = epoch.clone();
         tokio::spawn(async move {
-            while let Some((said_in, line)) = rx.recv().await {
+            while let Some((said_in, item)) = rx.recv().await {
                 let wanted = || current.load(Ordering::SeqCst) == said_in;
-                if wanted() {
-                    speak_reply(&drafts, &user_id, &session_id, &line, &wanted).await;
+                if !wanted() {
+                    continue;
+                }
+                match item {
+                    Item::Sentence(line) => speak_reply(&drafts, &user_id, &session_id, &line, &wanted).await,
+                    Item::Finished(response_id) => {
+                        drafts.sockets.send_user(
+                            &user_id,
+                            &VoiceServerFrame::AssistantAudioFinished(VoiceAssistantAudioFinished {
+                                voice_session_id: session_id.clone(),
+                                response_id,
+                            }),
+                        );
+                        drafts.sockets.send_user(
+                            &user_id,
+                            &crate::frames::state_frame(Some(&session_id), "listening", None),
+                        );
+                    }
                 }
             }
         });
@@ -40,7 +65,15 @@ impl Mouth {
 
     /// Queue a sentence of the current answer.
     pub(crate) fn say(&self, line: String) {
-        let _ = self.tx.send((self.epoch.load(Ordering::SeqCst), line));
+        let _ = self.tx.send((self.epoch.load(Ordering::SeqCst), Item::Sentence(line)));
+    }
+
+    /// The answer's text is complete: once every sentence queued before this
+    /// is delivered, send `voice.assistantAudioFinished` (dropped on a barge-in).
+    pub(crate) fn finish(&self, response_id: String) {
+        let _ = self
+            .tx
+            .send((self.epoch.load(Ordering::SeqCst), Item::Finished(response_id)));
     }
 
     /// Barge-in / call end: nothing queued or in synthesis is delivered.
