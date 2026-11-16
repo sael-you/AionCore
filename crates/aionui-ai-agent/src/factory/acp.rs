@@ -236,7 +236,7 @@ pub(super) async fn build(
                     cli,
                 )
             });
-            load_user_mcp_servers(
+            load_user_mcp_servers_with_approval(
                 repo.as_ref(),
                 config.mcp_server_ids.as_deref(),
                 &ctx.user_id,
@@ -246,8 +246,9 @@ pub(super) async fn build(
             )
             .await
         }
-        None => Vec::new(),
+        None => (Vec::new(), Vec::new()),
     };
+    let (user_mcp_servers, mut approval_servers) = user_mcp_servers;
     let mut session_mcp_servers = user_mcp_servers;
     for server in &config.session_mcp_servers {
         // Reserved name defense: the team coordination MCP must win.
@@ -269,7 +270,12 @@ pub(super) async fn build(
             continue;
         }
         match session_server_to_sdk_mcp_server(server).await {
-            Ok(server) => session_mcp_servers.push(server),
+            Ok(sdk) => {
+                if server.tool_filter.require_approval {
+                    approval_servers.push(server.name.clone());
+                }
+                session_mcp_servers.push(sdk)
+            }
             Err(err) => {
                 warn!(
                     ctx.conversation_id,
@@ -279,6 +285,39 @@ pub(super) async fn build(
                     "session_mcp: failed to convert session snapshot; skipping"
                 );
             }
+        }
+    }
+
+    // TASK-97: servers whose every call needs the user's OK make the CLI ask
+    // (gemini: an admin-tier ask_user policy); if that cannot be guaranteed the
+    // servers are not delivered at all (fail closed).
+    match crate::factory::acp_mcp_approval::approval_launch_args(
+        config.backend.as_deref(),
+        &ctx.conversation_id,
+        &deps.data_dir,
+        &approval_servers,
+    ) {
+        Ok(args) => {
+            if !args.is_empty() {
+                info!(
+                    ctx.conversation_id,
+                    servers = approval_servers.len(),
+                    "acp: MCP servers that need approval on every call get an ask policy"
+                );
+            }
+            command_spec.args.extend(args);
+        }
+        Err(reason) => {
+            warn!(
+                ctx.conversation_id,
+                servers = ?approval_servers,
+                %reason,
+                "acp: cannot make the CLI ask before calling these MCP servers; not delivering them"
+            );
+            session_mcp_servers.retain(|server| {
+                crate::factory::acp_mcp_approval::sdk_server_name(server)
+                    .is_none_or(|name| !approval_servers.iter().any(|n| n == name))
+            });
         }
     }
 
@@ -429,6 +468,7 @@ async fn resolve_agent_command_spec(
 /// are injected regardless of the current global `enabled` flag. Legacy
 /// conversations without a snapshot still fall back to "all enabled rows".
 /// Builtins are wired through other paths (e.g. team/guide MCP).
+#[cfg(test)]
 async fn load_user_mcp_servers(
     repo: &dyn IMcpServerRepository,
     selected_ids: Option<&[String]>,
@@ -437,6 +477,21 @@ async fn load_user_mcp_servers(
     market: Option<&crate::mcp_resolve::McpMarketLaunch>,
     capabilities: &AcpMcpCapabilities,
 ) -> Vec<McpServer> {
+    load_user_mcp_servers_with_approval(repo, selected_ids, user_id, conversation_id, market, capabilities)
+        .await
+        .0
+}
+
+/// [`load_user_mcp_servers`] plus the names of the delivered servers whose
+/// every call needs the user's OK (TASK-97, a production write market instance).
+async fn load_user_mcp_servers_with_approval(
+    repo: &dyn IMcpServerRepository,
+    selected_ids: Option<&[String]>,
+    user_id: &str,
+    conversation_id: &str,
+    market: Option<&crate::mcp_resolve::McpMarketLaunch>,
+    capabilities: &AcpMcpCapabilities,
+) -> (Vec<McpServer>, Vec<String>) {
     // The ONE market gate (R1 #5): inactive/unassigned market rows never pass,
     // assigned ones are rewritten to the launcher below.
     let rows_result = crate::mcp_resolve::load_gated_rows(repo, user_id, selected_ids, conversation_id, market).await;
@@ -448,11 +503,12 @@ async fn load_user_mcp_servers(
                 error = %err,
                 "user_mcp: list() failed; skipping injection"
             );
-            return Vec::new();
+            return (Vec::new(), Vec::new());
         }
     };
 
     let mut servers = Vec::with_capacity(rows.len());
+    let mut approval = Vec::new();
     for aionui_db::GatedMcpRow { row, market: delivery } in rows {
         let selected = selected_ids
             .map(|ids| ids.iter().any(|id| id == &row.id))
@@ -468,7 +524,12 @@ async fn load_user_mcp_servers(
             match launched {
                 Some(server) if session_server_supported_by_capabilities(&server, capabilities) => {
                     match session_server_to_sdk_mcp_server(&server).await {
-                        Ok(server) => servers.push(server),
+                        Ok(sdk) => {
+                            if server.tool_filter.require_approval {
+                                approval.push(server.name.clone());
+                            }
+                            servers.push(sdk)
+                        }
                         Err(err) => {
                             warn!(conversation_id, server_name = %row.name, error = %err, "user_mcp: market launcher entry failed; skipping")
                         }
@@ -511,7 +572,7 @@ async fn load_user_mcp_servers(
             "user_mcp: injected into session/new"
         );
     }
-    servers
+    (servers, approval)
 }
 
 /// Convert an `McpServerRow` into the SDK `McpServer` shape used by
@@ -1206,6 +1267,34 @@ mod tests {
         }
         let none = load_user_mcp_servers(&fx.servers, Some(&selected), USER, CONV, None, &caps).await;
         assert!(none.is_empty(), "no market context = no market rows");
+    }
+
+    /// TASK-97 on the ACP lane: a production write market instance assigned to
+    /// gemini is reported for an ask policy; a production read one is not.
+    #[tokio::test]
+    async fn load_user_mcp_servers_reports_production_write_rows_for_approval() {
+        use crate::mcp_resolve::market_test_support::{CONV, USER, market_fx};
+        let fx = market_fx().await;
+        let write = fx.instance_with("gem-live", "active", "production", "write").await;
+        let read = fx.instance_with("gem-read", "active", "production", "read").await;
+        fx.assign(&write, Some("asst-1"), "gemini").await;
+        fx.assign(&read, Some("asst-1"), "gemini").await;
+        let caps = AcpMcpCapabilities {
+            stdio: true,
+            http: true,
+            sse: true,
+        };
+        let launch = crate::mcp_resolve::McpMarketLaunch::new(
+            std::path::Path::new("/bin/true"),
+            std::path::Path::new("/data/aionui"),
+            Some("asst-1"),
+            "gemini",
+        );
+        let (servers, approval) =
+            load_user_mcp_servers_with_approval(&fx.servers, Some(&[write, read]), USER, CONV, Some(&launch), &caps)
+                .await;
+        assert_eq!(servers.len(), 2);
+        assert_eq!(approval, vec!["gem-live".to_string()]);
     }
 
     #[tokio::test]

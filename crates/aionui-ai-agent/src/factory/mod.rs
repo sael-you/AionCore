@@ -2,6 +2,7 @@ pub mod acp_assembler;
 
 mod acp;
 mod acp_launch_policy;
+mod acp_mcp_approval;
 pub(crate) mod aionrs;
 mod antigravity;
 mod context;
