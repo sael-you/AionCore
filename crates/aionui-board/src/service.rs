@@ -358,11 +358,24 @@ impl BoardService {
     ) -> BoardResult<Vec<aionui_api_types::BoardCardSummaryDto>> {
         let open = open_dependencies(cards, deps, columns, self, user_id).await?;
         let decisions = self.needs_decision(user_id, cards, columns).await?;
+        let creators = crate::convert::card_creators(
+            self.store()
+                .card_creators(user_id, &crate::convert::agent_card_ids(cards))
+                .await?,
+        );
         Ok(cards
             .iter()
             .map(|card| {
                 let open = open.get(&card.id).copied().unwrap_or(0);
-                crate::convert::card_summary(card, card.blocked || open > 0, open, decisions.contains(&card.id))
+                let mut summary =
+                    crate::convert::card_summary(card, card.blocked || open > 0, open, decisions.contains(&card.id));
+                crate::convert::set_creator(
+                    &card.id,
+                    &mut summary.creator_conversation_id,
+                    &mut summary.creator_name,
+                    &creators,
+                );
+                summary
             })
             .collect())
     }

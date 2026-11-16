@@ -31,6 +31,15 @@ pub struct BoardProjectRow {
     pub kind: String,
 }
 
+/// The conversation that created an agent card (its `card_created` event)
+/// and that conversation's current name (`None` once it is deleted).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoardCardCreator {
+    pub card_id: String,
+    pub conversation_id: String,
+    pub conversation_name: Option<String>,
+}
+
 /// A conversation as assign sees it (parent eligibility, link scope).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BoardConversationInfo {
@@ -196,6 +205,10 @@ pub trait IBoardStore: Send + Sync {
 
     async fn cards_by_ids(&self, user_id: &str, ids: &[String]) -> Result<Vec<BoardCardRow>, DbError>;
 
+    /// Creator conversation of each card in `card_ids` that an agent created
+    /// (cards without a conversation on their `card_created` event are absent).
+    async fn card_creators(&self, user_id: &str, card_ids: &[String]) -> Result<Vec<BoardCardCreator>, DbError>;
+
     async fn reviews(&self, user_id: &str, card_id: &str) -> Result<Vec<BoardReviewRow>, DbError>;
 
     async fn questions(&self, user_id: &str, card_id: &str) -> Result<Vec<BoardQuestionRow>, DbError>;
@@ -285,6 +298,9 @@ pub trait IBoardTx: Send {
     async fn card(&mut self, user_id: &str, card_id: &str) -> Result<Option<BoardCardRow>, DbError>;
 
     async fn cards_by_ids(&mut self, user_id: &str, ids: &[String]) -> Result<Vec<BoardCardRow>, DbError>;
+
+    /// [`IBoardStore::card_creators`] inside the transaction.
+    async fn card_creators(&mut self, user_id: &str, card_ids: &[String]) -> Result<Vec<BoardCardCreator>, DbError>;
 
     async fn count_cards(&mut self, user_id: &str, project_id: &str, include_archived: bool) -> Result<i64, DbError>;
 

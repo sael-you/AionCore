@@ -11,8 +11,8 @@ use crate::models::{
     BoardReviewRow, BoardSettingsRow, BoardSupervisorCursorRow,
 };
 use crate::repository::board::{
-    BoardCallerRow, BoardCardCursor, BoardCardFilter, BoardConversationInfo, BoardEventQuery, BoardEventScope,
-    BoardProjectRow, IBoardStore, IBoardTx,
+    BoardCallerRow, BoardCardCreator, BoardCardCursor, BoardCardFilter, BoardConversationInfo, BoardEventQuery,
+    BoardEventScope, BoardProjectRow, IBoardStore, IBoardTx,
 };
 use crate::repository::sqlite_board_tx::SqliteBoardTx;
 
@@ -148,6 +148,38 @@ pub(crate) async fn fetch_cards_by_ids<'e, E: Executor<'e, Database = Sqlite>>(
     }
     builder.push(") ORDER BY number ASC");
     Ok(builder.build_query_as::<BoardCardRow>().fetch_all(executor).await?)
+}
+
+/// [`IBoardStore::card_creators`]: the conversation of each card's
+/// `card_created` event, joined to the conversation's current name.
+pub(crate) async fn fetch_card_creators<'e, E: Executor<'e, Database = Sqlite>>(
+    executor: E,
+    user_id: &str,
+    card_ids: &[String],
+) -> Result<Vec<BoardCardCreator>, DbError> {
+    if card_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut builder = QueryBuilder::<Sqlite>::new(
+        "SELECT e.card_id, e.conversation_id, c.name FROM board_events e \
+         LEFT JOIN conversations c ON c.id = e.conversation_id AND c.user_id = e.user_id \
+         WHERE e.kind = 'card_created' AND e.conversation_id IS NOT NULL AND e.user_id = ",
+    );
+    builder.push_bind(user_id.to_owned()).push(" AND e.card_id IN (");
+    let mut separated = builder.separated(", ");
+    for id in card_ids {
+        separated.push_bind(id.clone());
+    }
+    builder.push(") ORDER BY e.seq ASC");
+    let rows: Vec<(String, String, Option<String>)> = builder.build_query_as().fetch_all(executor).await?;
+    Ok(rows
+        .into_iter()
+        .map(|(card_id, conversation_id, conversation_name)| BoardCardCreator {
+            card_id,
+            conversation_id,
+            conversation_name,
+        })
+        .collect())
 }
 
 pub(crate) async fn fetch_count_cards<'e, E: Executor<'e, Database = Sqlite>>(
@@ -385,6 +417,10 @@ impl IBoardStore for SqliteBoardStore {
 
     async fn cards_by_ids(&self, user_id: &str, ids: &[String]) -> Result<Vec<BoardCardRow>, DbError> {
         fetch_cards_by_ids(&self.pool, user_id, ids).await
+    }
+
+    async fn card_creators(&self, user_id: &str, card_ids: &[String]) -> Result<Vec<BoardCardCreator>, DbError> {
+        fetch_card_creators(&self.pool, user_id, card_ids).await
     }
 
     async fn reviews(&self, user_id: &str, card_id: &str) -> Result<Vec<BoardReviewRow>, DbError> {

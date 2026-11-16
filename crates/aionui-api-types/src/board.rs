@@ -167,6 +167,12 @@ pub struct BoardCardDto {
     pub routing: Vec<String>,
     pub creator_kind: BoardActorKind,
     pub creator_ref: String,
+    /// Agent cards: the conversation that created the card.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub creator_conversation_id: Option<String>,
+    /// Agent cards: that conversation's current name (absent once deleted).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub creator_name: Option<String>,
     pub assignee_kind: Option<AssigneeKind>,
     pub assignee_ref: Option<String>,
     pub blocked: bool,
@@ -204,6 +210,12 @@ pub struct BoardCardSummaryDto {
     pub skills: Vec<String>,
     pub creator_kind: BoardActorKind,
     pub creator_ref: String,
+    /// Agent cards: the conversation that created the card.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub creator_conversation_id: Option<String>,
+    /// Agent cards: that conversation's current name (absent once deleted).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub creator_name: Option<String>,
     pub assignee_kind: Option<AssigneeKind>,
     pub assignee_ref: Option<String>,
     /// Display name of the assignee when known.

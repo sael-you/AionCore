@@ -17,7 +17,7 @@ use serde_json::{Value, json};
 use tracing::Instrument;
 
 use crate::actor::BoardActor;
-use crate::convert::{card_dto, dependency_dto, reference};
+use crate::convert::{agent_card_ids, card_creators, card_dto, dependency_dto, reference, set_creator};
 use crate::error::{BoardError, BoardErrorCode, BoardResult};
 use crate::events::{
     CARD_ARCHIVED, CARD_BLOCKED, CARD_CREATED, CARD_MOVED, CARD_RESTORED, CARD_UNBLOCKED, CARD_UPDATED, DEPLOY_FORCED,
@@ -242,10 +242,15 @@ impl BoardService {
             .map(|dep| dep.depends_on_card_id)
             .collect();
         let targets = tx.cards_by_ids(&card.user_id, &ids).await?;
-        Ok(card_dto(
-            card,
-            targets.iter().map(|t| dependency_dto(t, &columns)).collect(),
-        ))
+        let mut dto = card_dto(card, targets.iter().map(|t| dependency_dto(t, &columns)).collect());
+        let creators = card_creators(tx.card_creators(&card.user_id, &agent_card_ids([card])).await?);
+        set_creator(
+            &card.id,
+            &mut dto.creator_conversation_id,
+            &mut dto.creator_name,
+            &creators,
+        );
+        Ok(dto)
     }
 
     /// The full card as read outside a transaction.
@@ -259,10 +264,15 @@ impl BoardService {
             .map(|dep| dep.depends_on_card_id)
             .collect();
         let targets = store.cards_by_ids(&card.user_id, &ids).await?;
-        Ok(card_dto(
-            card,
-            targets.iter().map(|t| dependency_dto(t, &columns)).collect(),
-        ))
+        let mut dto = card_dto(card, targets.iter().map(|t| dependency_dto(t, &columns)).collect());
+        let creators = card_creators(store.card_creators(&card.user_id, &agent_card_ids([card])).await?);
+        set_creator(
+            &card.id,
+            &mut dto.creator_conversation_id,
+            &mut dto.creator_name,
+            &creators,
+        );
+        Ok(dto)
     }
 
     /// Write a changed card, append its single event, commit, broadcast.
@@ -413,11 +423,20 @@ impl BoardService {
                 updated_at: now,
             };
             tx.insert_card(&card).await?;
-            let dto = card_dto(&card, Vec::new());
+            let mut dto = card_dto(&card, Vec::new());
             let mut payload = json!({ "card": dto, "version": card.version });
             add_reordered(&mut payload, tx.as_mut());
             let event =
                 Self::append_event(tx.as_mut(), actor, project_id, Some(&card.id), CARD_CREATED, payload).await?;
+            // The creator conversation is read back from the event just
+            // appended (the payload keeps the card as stored).
+            let creators = card_creators(tx.card_creators(user_id, &agent_card_ids([&card])).await?);
+            set_creator(
+                &card.id,
+                &mut dto.creator_conversation_id,
+                &mut dto.creator_name,
+                &creators,
+            );
             self.commit(tx, user_id, &Committed::card(event, dto.clone())).await?;
             Ok(dto)
         }

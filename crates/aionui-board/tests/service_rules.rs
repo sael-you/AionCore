@@ -1100,3 +1100,60 @@ async fn the_board_get_pages_large_boards_and_the_card_list_continues_it() {
             .is_none()
     );
 }
+
+/// TASK-38: a card an agent created names its conversation (plain
+/// conversations have no assistant id, so `creator_ref` alone reads
+/// `assistant:unknown@<backend>`).
+#[tokio::test]
+async fn agent_cards_name_the_creating_conversation() {
+    let env = env().await;
+    enable(&env.service, PROJECT).await;
+    exec(
+        env.pool(),
+        "UPDATE conversations SET name = 'Fix login bug' WHERE id = 'conv-1'",
+    )
+    .await;
+    let agent = agent(&env).await;
+    let created = env.service.create_card(&agent, PROJECT, create("a")).await.unwrap();
+    assert_eq!(created.creator_ref, "assistant:unknown@claude");
+    assert_eq!(created.creator_conversation_id.as_deref(), Some(CONV));
+    assert_eq!(
+        created.creator_name.as_deref(),
+        Some("Fix login bug"),
+        "create response"
+    );
+    let detail = env.service.card_detail(&owner(), &created.id).await.unwrap();
+    assert_eq!(
+        detail.card.creator_name.as_deref(),
+        Some("Fix login bug"),
+        "card detail"
+    );
+    let mine = env.service.create_card(&owner(), PROJECT, create("b")).await.unwrap();
+    assert!(mine.creator_conversation_id.is_none() && mine.creator_name.is_none());
+    let view = env.service.board_view(&owner(), PROJECT, false).await.unwrap();
+    let summary = |id: &str| view.cards.iter().find(|card| card.id == id).unwrap().clone();
+    assert_eq!(
+        summary(&created.id).creator_name.as_deref(),
+        Some("Fix login bug"),
+        "board view"
+    );
+    assert_eq!(summary(&created.id).creator_conversation_id.as_deref(), Some(CONV));
+    assert!(
+        summary(&mine.id).creator_name.is_none(),
+        "owner cards carry no conversation"
+    );
+
+    // Renaming follows; a deleted conversation keeps only its id.
+    exec(
+        env.pool(),
+        "UPDATE conversations SET name = 'Login fix, round 2' WHERE id = 'conv-1'",
+    )
+    .await;
+    let detail = env.service.card_detail(&owner(), &created.id).await.unwrap();
+    assert_eq!(detail.card.creator_name.as_deref(), Some("Login fix, round 2"));
+    exec(env.pool(), "PRAGMA foreign_keys = OFF").await;
+    exec(env.pool(), "DELETE FROM conversations WHERE id = 'conv-1'").await;
+    let detail = env.service.card_detail(&owner(), &created.id).await.unwrap();
+    assert_eq!(detail.card.creator_conversation_id.as_deref(), Some(CONV));
+    assert!(detail.card.creator_name.is_none());
+}
