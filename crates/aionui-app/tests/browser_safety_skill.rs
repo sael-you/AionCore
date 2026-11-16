@@ -70,3 +70,13 @@ fn instances_and_tabs_follow_the_owner_limits() {
     assert!(prose.contains("Do not close the owner's own tabs"), "{prose}");
     assert!(prose.contains("BROWSER_AGENTS_DISABLED"), "{prose}");
 }
+
+#[test]
+fn agents_pick_a_profile_by_name_and_never_substitute_another() {
+    let prose = skill_prose();
+    assert!(prose.contains("$AIONUI_CDP_INSTANCES"), "{prose}");
+    assert!(prose.contains("select((.name | ascii_downcase)"), "{prose}");
+    assert!(prose.contains("never use another profile instead"), "{prose}");
+    assert!(prose.contains("BROWSER_INSTANCE_NOT_FOUND"), "{prose}");
+}
+
