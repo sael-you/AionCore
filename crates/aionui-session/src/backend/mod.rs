@@ -10,6 +10,7 @@
 
 mod acp_conn;
 mod antigravity;
+mod claude_ask_settings;
 mod claude_conn;
 mod claude_mcp_file;
 #[cfg(test)]
@@ -190,6 +191,10 @@ pub struct McpToolFilter {
     /// Allowlist; `None` = every tool not in `disabled_tools`.
     pub enabled_tools: Option<Vec<String>>,
     pub disabled_tools: Vec<String>,
+    /// Every call to this server must be confirmed by the user, in every
+    /// permission mode (TASK-97). claude: a `permissions.ask` rule in
+    /// `--settings`; codex: `default_tools_approval_mode = "prompt"`.
+    pub require_approval: bool,
 }
 
 /// MCP transport variants (SDK-free mirror of the neutral session-snapshot shape).

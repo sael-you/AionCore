@@ -2341,6 +2341,7 @@ fn session_server_to_spec(server: &aionui_api_types::SessionMcpServer) -> aionui
         tool_filter: aionui_session::McpToolFilter {
             enabled_tools: server.tool_filter.enabled_tools.clone(),
             disabled_tools: server.tool_filter.disabled_tools.clone(),
+            require_approval: server.tool_filter.require_approval,
         },
     }
 }
@@ -5019,6 +5020,101 @@ mod build_mapping_tests {
             created_at: 0,
             updated_at: 0,
         }
+    }
+
+    /// TASK-97 end to end: a production WRITE market instance assigned to this
+    /// (project, assistant, claude) goes through the real SQLite market gate and the
+    /// session build into the spawned claude argv as a `permissions.ask` rule, also
+    /// in bypassPermissions; a sandbox write instance adds nothing.
+    #[tokio::test]
+    async fn production_write_market_instance_reaches_the_claude_spawn_as_an_ask_rule() {
+        use crate::mcp_resolve::market_test_support::{CONV, USER, market_fx};
+        let fx = market_fx().await;
+        let prod = fx.instance_with("paddle-live", "active", "production", "write").await;
+        let sandbox = fx.instance_with("paddle-sb", "active", "sandbox", "write").await;
+        fx.assign(&prod, Some("asst-1"), "claude").await;
+        fx.assign(&sandbox, Some("asst-1"), "claude").await;
+        let repo: Arc<dyn IMcpServerRepository> =
+            Arc::new(aionui_db::SqliteMcpServerRepository::new(fx.db.pool().clone()));
+        let metadata = test_metadata(Some("claude"), None);
+        let runtime_dir = tempfile::tempdir().expect("runtime dir");
+
+        let spawn = |ids: Vec<String>| {
+            let repo = repo.clone();
+            let metadata = metadata.clone();
+            let runtime_dir = runtime_dir.path().to_path_buf();
+            async move {
+                let config = AcpBuildExtra {
+                    backend: Some("claude".into()),
+                    preset_assistant_id: Some("asst-1".into()),
+                    session_mode: Some("bypassPermissions".into()),
+                    mcp_server_ids: Some(ids),
+                    ..Default::default()
+                };
+                let spawner = Arc::new(RecordingFailSpawner::default());
+                let result = build_session_instance(
+                    "claude",
+                    SessionBuildInputs {
+                        conversation_id: CONV.into(),
+                        user_id: USER.into(),
+                        workspace: std::env::current_dir().unwrap().to_string_lossy().into_owned(),
+                        config: &config,
+                        metadata: &metadata,
+                        skill_delivery: crate::factory::ResolvedSkillDelivery {
+                            runtime_dir: Some(runtime_dir),
+                            ..Default::default()
+                        },
+                        session_snapshot: None,
+                        backend_session_id: None,
+                        mcp_server_repo: Some(&repo),
+                        mcp_market: Some(crate::mcp_resolve::McpMarketLaunch::new(
+                            std::path::Path::new("/opt/aionui/aioncore"),
+                            std::path::Path::new("/data/aionui"),
+                            Some("asst-1"),
+                            "claude",
+                        )),
+                        runtime_env: &[],
+                        broadcaster: Arc::new(aionui_realtime::BroadcastEventBus::new(16)),
+                        catalog_writeback: None,
+                        acp_session_repo: None,
+                        prompt_dump_dir: None,
+                        permission_hook_body: None,
+                    },
+                    spawner.clone(),
+                )
+                .await;
+                assert!(result.is_err(), "the recording spawner stops after assembly");
+                (
+                    spawner.last_command().expect("claude must reach spawn").args,
+                    spawner.mcp_config_body().unwrap_or_default(),
+                )
+            }
+        };
+
+        let (args, mcp_body) = spawn(vec![prod.clone(), sandbox.clone()]).await;
+        assert!(
+            mcp_body.contains("paddle-live") && mcp_body.contains("paddle-sb"),
+            "{mcp_body}"
+        );
+        assert!(
+            args.windows(2).any(|w| w == ["--permission-mode", "bypassPermissions"]),
+            "{args:?}"
+        );
+        let at = args
+            .iter()
+            .position(|a| a == "--settings")
+            .expect("--settings on the spawn");
+        let settings: serde_json::Value = serde_json::from_str(&args[at + 1]).unwrap();
+        assert_eq!(
+            settings["permissions"]["ask"],
+            serde_json::json!(["mcp__paddle-live__*"])
+        );
+
+        let (args, _) = spawn(vec![sandbox]).await;
+        assert!(
+            !args.iter().any(|a| a == "--settings"),
+            "non-production writes stay as before: {args:?}"
+        );
     }
 
     #[tokio::test]

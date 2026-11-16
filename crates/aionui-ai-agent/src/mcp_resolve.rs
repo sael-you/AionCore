@@ -207,6 +207,9 @@ pub fn market_session_server(
         tool_filter: SessionMcpToolFilter {
             enabled_tools,
             disabled_tools: json_list(delivery.tools_block.as_deref()).unwrap_or_default(),
+            // TASK-97: production writes need the owner's OK per call (D50 keeps
+            // full tools, so the CLI must ask instead of the server refusing).
+            require_approval: delivery.requires_owner_approval(),
         },
     })
 }
@@ -487,6 +490,11 @@ pub(crate) mod market_test_support {
     impl MarketFx {
         /// A market instance (read tier, allowlist `["echo"]`, block `["drop"]`).
         pub async fn instance(&self, name: &str, status: &str) -> String {
+            self.instance_with(name, status, "local", "read").await
+        }
+
+        /// A market instance in `environment` at `tier` (write = no allowlist).
+        pub async fn instance_with(&self, name: &str, status: &str, environment: &str, tier: &str) -> String {
             let config = format!(r#"{{"command":"aioncore","args":["mcp","exec","{name}"],"env":{{}}}}"#);
             self.market
                 .create_instance(&MarketInstanceParams {
@@ -498,13 +506,13 @@ pub(crate) mod market_test_support {
                     status,
                     template_id: "fake",
                     template_json: r#"{"id":"fake","name":"Fake","transport":"stdio","command":{"command":"/bin/true","args":[]},"tiers":["read"],"enforcement":"server","clis":["claude","codex","gemini"]}"#,
-                    environment: "local",
-                    tier: "read",
+                    environment,
+                    tier,
                     enforcement: "server",
                     clis_json: r#"["claude","codex","gemini"]"#,
                     plain_env_json: "{}",
                     secret_refs_json: "{}",
-                    tools_allow_json: Some(r#"["echo"]"#),
+                    tools_allow_json: (tier == "read").then_some(r#"["echo"]"#),
                     tools_block_json: r#"["drop"]"#,
                     approval_ref: None,
                 })
@@ -635,6 +643,88 @@ mod market_gate_tests {
             assert_eq!(names, vec!["plain"]);
         }
         let _ = active;
+    }
+
+    /// TASK-97: only a production WRITE instance asks before every call; a
+    /// production read or a non-production write instance keeps the old shape.
+    #[tokio::test]
+    async fn production_write_instance_requires_approval() {
+        let fx = market_fx().await;
+        let cases = [
+            ("tb-prod-write", "production", "write", true),
+            ("tb-prod-read", "production", "read", false),
+            ("tb-stage-write", "staging", "write", false),
+        ];
+        let mut selected = Vec::new();
+        for (name, environment, tier, _) in cases {
+            let id = fx.instance_with(name, "active", environment, tier).await;
+            fx.assign(&id, Some("asst-1"), "codex").await;
+            selected.push(id);
+        }
+        let servers = resolve_session_mcp_servers(
+            &fx.servers,
+            USER,
+            Some(&selected),
+            CONV,
+            Some(&launch(Some("asst-1"), "codex")),
+            bus(),
+        )
+        .await;
+        assert_eq!(servers.len(), cases.len());
+        for (name, _, _, approval) in cases {
+            let server = servers.iter().find(|s| s.name == name).unwrap();
+            assert_eq!(server.tool_filter.require_approval, approval, "{name}");
+        }
+        // The flag survives the snapshot round trip and is omitted when false.
+        let prod = servers.iter().find(|s| s.name == "tb-prod-write").unwrap();
+        let json = serde_json::to_value(prod).unwrap();
+        assert_eq!(json["tool_filter"]["require_approval"], true);
+        let back: SessionMcpServer = serde_json::from_value(json).unwrap();
+        assert!(back.tool_filter.require_approval);
+        let read = servers.iter().find(|s| s.name == "tb-prod-read").unwrap();
+        assert!(
+            serde_json::to_value(read).unwrap()["tool_filter"]
+                .get("require_approval")
+                .is_none()
+        );
+    }
+
+    /// TASK-97 x C27: a production write instance granted by a conversation-level
+    /// kit (no assignment) becomes a `--conversation` launcher entry that still
+    /// requires approval, so every CLI asks before each call.
+    #[tokio::test]
+    async fn kit_granted_production_write_instance_requires_approval() {
+        let fx = market_fx().await;
+        let id = fx.instance_with("tb-kit-live", "active", "production", "write").await;
+        sqlx::query(
+            "INSERT INTO kit_attachments (id, user_id, level, target_id, item_kind, item_ref, op, created_at, updated_at) \
+             VALUES ('att-1', ?, 'conversation', ?, 'mcp', ?, 'add', 1, 1)",
+        )
+        .bind(USER)
+        .bind(CONV)
+        .bind(&id)
+        .execute(fx.db.pool())
+        .await
+        .unwrap();
+        let servers = resolve_session_mcp_servers(
+            &fx.servers,
+            USER,
+            Some(&[]),
+            CONV,
+            Some(&launch(Some("asst-1"), "codex")),
+            bus(),
+        )
+        .await;
+        assert_eq!(servers.len(), 1, "the kit grant delivers the instance");
+        let server = &servers[0];
+        assert_eq!(server.name, "tb-kit-live");
+        match &server.transport {
+            SessionMcpTransport::Stdio { args, .. } => {
+                assert!(args.windows(2).any(|w| w == ["--conversation", CONV]), "{args:?}")
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(server.tool_filter.require_approval);
     }
 
     #[tokio::test]

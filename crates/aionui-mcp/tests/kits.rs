@@ -575,6 +575,69 @@ async fn market_gate_delivers_kit_grants_and_honours_kit_removes() {
     let _ = &f.db;
 }
 
+/// TASK-97 x C27: a production WRITE instance delivered through a kit grant
+/// carries its environment, so every CLI is made to ask before each call; a
+/// kit remove still drops it.
+#[tokio::test]
+async fn kit_granted_production_write_instance_requires_owner_approval() {
+    let f = fx().await;
+    let m = &f.market;
+    let inst = m.create_instance(USER, paddle("tb-pdl-live", "write")).await.unwrap();
+    m.set_secret(USER, &inst.id, "PADDLE_API_KEY", FIXTURE_SECRET)
+        .await
+        .unwrap();
+    m.update_instance(
+        USER,
+        &inst.id,
+        UpdateMcpMarketInstanceRequest {
+            status: Some("active".into()),
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let k = kit(&f, "Payments live", &[], &[&inst.id]).await;
+    m.attach_kit_item(
+        USER,
+        attach(KitLevel::Project, "proj-a", KitItemKind::Kit, &k, KitOp::Add),
+    )
+    .await
+    .unwrap();
+    let rows = f
+        .servers
+        .list_by_ids_any(USER, std::slice::from_ref(&inst.id))
+        .await
+        .unwrap();
+    for cli in ["claude", "codex"] {
+        let gated = f.servers.market_gate(USER, &scope(cli), rows.clone()).await.unwrap();
+        assert_eq!(gated.len(), 1, "{cli}: kit grant delivers the instance");
+        let delivery = gated[0].market.as_ref().unwrap();
+        assert_eq!(
+            delivery.conversation_id.as_deref(),
+            Some("conv-a"),
+            "{cli}: via the kit"
+        );
+        assert_eq!(delivery.environment, "production");
+        assert_eq!(delivery.tier, "write");
+        assert!(delivery.requires_owner_approval(), "{cli}: ask before every call");
+    }
+
+    m.attach_kit_item(
+        USER,
+        attach(KitLevel::Conversation, "conv-a", KitItemKind::Kit, &k, KitOp::Remove),
+    )
+    .await
+    .unwrap();
+    assert!(
+        f.servers
+            .market_gate(USER, &scope("claude"), rows)
+            .await
+            .unwrap()
+            .is_empty(),
+        "a kit remove still drops the row"
+    );
+}
+
 #[tokio::test]
 async fn launcher_conversation_scope_follows_attachments() {
     let f = fx().await;

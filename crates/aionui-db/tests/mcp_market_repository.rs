@@ -237,6 +237,57 @@ async fn assignment_partial_unique_indexes() {
     );
 }
 
+/// TASK-97: the gate carries the instance's environment so the spawn path can
+/// tell a production write instance (owner must confirm every call) from the rest.
+#[tokio::test]
+async fn market_gate_delivery_carries_environment_for_owner_approval() {
+    let (db, market, servers) = setup().await;
+    seed_project_conversation(&db).await;
+    let cases = [
+        ("prod-write", "production", "write", true),
+        ("prod-read", "production", "read", false),
+        ("sandbox-write", "sandbox", "write", false),
+    ];
+    let mut ids = Vec::new();
+    for (name, environment, tier, _) in cases {
+        let created = market
+            .create_instance(&MarketInstanceParams {
+                environment,
+                tier,
+                tools_allow_json: (tier == "read").then_some(r#"["list_products"]"#),
+                ..instance(name, "active")
+            })
+            .await
+            .unwrap();
+        market
+            .create_assignment(&CreateAssignmentParams {
+                user_id: USER,
+                instance_id: &created.id,
+                project_id: Some("proj-a"),
+                assistant_id: Some("asst-1"),
+                cli: "codex",
+            })
+            .await
+            .unwrap();
+        ids.push(created.id);
+    }
+    let rows = servers.list_by_ids_any(USER, &ids).await.unwrap();
+    let scope = McpMarketScope {
+        conversation_id: Some("conv-a"),
+        assistant_id: Some("asst-1"),
+        cli: Some("codex"),
+    };
+    let gated = servers.market_gate(USER, &scope, rows).await.unwrap();
+    assert_eq!(gated.len(), cases.len());
+    for (name, environment, tier, approval) in cases {
+        let row = gated.iter().find(|g| g.row.name == name).unwrap();
+        let delivery = row.market.as_ref().unwrap();
+        assert_eq!(delivery.environment, environment, "{name}");
+        assert_eq!(delivery.tier, tier, "{name}");
+        assert_eq!(delivery.requires_owner_approval(), approval, "{name}");
+    }
+}
+
 #[tokio::test]
 async fn market_gate_status_and_assignment_predicate() {
     let (db, market, servers) = setup().await;

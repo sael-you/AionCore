@@ -52,11 +52,16 @@ pub struct SessionMcpToolFilter {
     pub enabled_tools: Option<Vec<String>>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub disabled_tools: Vec<String>,
+    /// Every call to this server needs the user's confirmation, whatever the
+    /// session's permission mode (TASK-97: a production write market instance).
+    /// Each backend maps it to its CLI's own ask mechanism.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub require_approval: bool,
 }
 
 impl SessionMcpToolFilter {
     pub fn is_empty(&self) -> bool {
-        self.enabled_tools.is_none() && self.disabled_tools.is_empty()
+        self.enabled_tools.is_none() && self.disabled_tools.is_empty() && !self.require_approval
     }
 }
 

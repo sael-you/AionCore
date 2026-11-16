@@ -310,8 +310,8 @@ impl IMcpServerRepository for SqliteMcpServerRepository {
             return Ok(Vec::new());
         }
         let mut query = QueryBuilder::new(
-            "SELECT id, market_status, market_tier, market_tools_allow, market_tools_block, market_clis \
-             FROM mcp_servers WHERE market_status IS NOT NULL AND user_id = ",
+            "SELECT id, market_status, market_tier, market_environment, market_tools_allow, market_tools_block, \
+             market_clis FROM mcp_servers WHERE market_status IS NOT NULL AND user_id = ",
         );
         query.push_bind(user_id);
         query.push(" AND id IN (");
@@ -363,6 +363,7 @@ impl IMcpServerRepository for SqliteMcpServerRepository {
                     assistant_id: assistant_id.map(str::to_owned),
                     conversation_id: conversation_id.map(str::to_owned),
                     tier: tier.clone(),
+                    environment: m.market_environment.clone().unwrap_or_default(),
                     tools_allow: m.market_tools_allow.clone(),
                     tools_block: m.market_tools_block.clone(),
                 };
@@ -452,6 +453,7 @@ struct MarketColumns {
     id: String,
     market_status: Option<String>,
     market_tier: Option<String>,
+    market_environment: Option<String>,
     market_tools_allow: Option<String>,
     market_tools_block: Option<String>,
     market_clis: Option<String>,
