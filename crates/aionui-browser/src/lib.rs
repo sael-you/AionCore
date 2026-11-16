@@ -16,6 +16,7 @@ pub mod layout;
 pub mod mux;
 pub mod panel;
 pub mod proxy;
+pub mod relay;
 pub mod routes;
 pub mod service;
 pub mod settings;
