@@ -310,13 +310,70 @@ async fn the_browser_realtime_request_is_accepted_but_other_engines_are_not() {
     assert!(body["data"]["sdp_answer"].as_str().unwrap().starts_with("v=0"));
 }
 
+/// Owner decision (TASK-37): a restart no longer ends cascade calls; the
+/// recovered call resumes and its brain still knows the earlier dialogue.
 #[tokio::test]
-async fn a_restart_ends_cascade_calls_instead_of_resuming_them() {
-    let c = cascade_call().await;
+async fn a_restart_mid_call_resumes_the_cascade_with_its_prior_context() {
+    let mut c = cascade_call().await;
+    c.h.fake.set_chat_script(vec![json!({"text": "Your build is green."})]);
+    c.turn("How is my build doing?", 1).await;
+    let (repo, session) = (c.h.voice_repo.clone(), c.session.clone());
+    wait_for(Duration::from_secs(5), || async {
+        let turns = aionui_db::IVoiceDraftRepository::recent_transcripts(repo.as_ref(), &session, 10)
+            .await
+            .unwrap();
+        (turns.len() == 2).then_some(())
+    })
+    .await
+    .expect("the dialogue is persisted with the session");
+
+    // "Restart": the old process dies, a fresh service runs over the same DB.
+    c.h.service.simulate_crash();
     let restarted = Harness::with_db(c.h.db.clone(), c.h.fake.clone(), Options::default()).await;
-    assert_eq!(restarted.service.recover_open_sessions().await, 0);
-    let row = restarted.wait_ended(&c.user, &c.session).await;
-    assert_eq!(row.end_reason.as_deref(), Some("restart"));
+    assert_eq!(restarted.service.recover_open_sessions().await, 1, "resumed, not ended");
+    let row = restarted.session_row(&c.user, &c.session).await;
+    assert_eq!((row.state.as_str(), row.engine.as_str()), ("live", "minimax-cascade"));
+    let fake = c.h.fake.clone();
+    let call_id = c.call_id.clone();
+    wait_for(Duration::from_secs(5), || async {
+        (fake.open_sidebands(&call_id) >= 1).then_some(())
+    })
+    .await
+    .expect("the ear re-attached");
+
+    // The next utterance reaches the brain with the earlier turns in its history.
+    let before = c.h.fake.chat_requests().len();
+    c.h.fake.set_chat_script(vec![json!({"text": "It still is."})]);
+    c.say("And is it still green?");
+    let request = wait_for(Duration::from_secs(10), || async {
+        let requests = fake.chat_requests();
+        (requests.len() > before).then(|| requests.last().cloned().unwrap())
+    })
+    .await
+    .expect("the recovered call answers");
+    let messages: Vec<(String, String)> = request["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|m| {
+            (
+                m["role"].as_str().unwrap().to_owned(),
+                m["content"].as_str().unwrap_or("").to_owned(),
+            )
+        })
+        .collect();
+    let pos = |role: &str, text: &str| {
+        messages
+            .iter()
+            .position(|(r, t)| r == role && t == text)
+            .unwrap_or_else(|| panic!("{role}: {text} missing in {messages:?}"))
+    };
+    let (asked, answered, now) = (
+        pos("user", "How is my build doing?"),
+        pos("assistant", "Your build is green."),
+        pos("user", "And is it still green?"),
+    );
+    assert!(asked < answered && answered < now, "{messages:?}");
 }
 
 /// Latency per turn with the S0-B provider timings on the fake: brain first

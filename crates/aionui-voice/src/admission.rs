@@ -132,7 +132,7 @@ impl VoiceService {
             profile.model = MODEL_MINI.to_owned();
         }
         let engine = if cascade {
-            self.inner.cascade.clone()
+            self.inner.cascade.clone() as Arc<dyn crate::engine::VoiceEngine>
         } else {
             self.inner.engine.clone()
         };
@@ -537,12 +537,6 @@ impl VoiceService {
         if row.instructions_hash.as_deref() == Some(conversation_instructions_hash().as_str()) {
             return Err(EndReason::Restart);
         }
-        // The cascade brain's context lived in the dead process: end it like a
-        // conversation-mode call; the client drops its WebRTC ear on
-        // `voice.callEnded` and re-dials on the next wake.
-        if row.engine == ENGINE_MINIMAX_CASCADE {
-            return Err(EndReason::Restart);
-        }
         let lock = self.inner.user_lock(&row.user_id);
         let _guard = lock.lock().await;
         let settings = self.settings(&row.user_id).await.map_err(|_| EndReason::Restart)?;
@@ -553,7 +547,29 @@ impl VoiceService {
         let tools: Vec<Value> = crate::tools::definitions();
         let instructions = self.inner.jarvis_instructions(&row.user_id).await;
         let config = session_config(&settings.call_profile(), &row.model, &instructions, tools.clone());
-        let mut engine_call = self.inner.engine.resume(credential, call_id, config);
+        let cascade = row.engine == ENGINE_MINIMAX_CASCADE;
+        let mut engine_call = if cascade {
+            // The brain's context is rebuilt from the session's persisted
+            // dialogue (TASK-37); without a MiniMax key the call cannot answer.
+            let brain = self
+                .resolve_minimax(&row.user_id)
+                .await
+                .map_err(|_| EndReason::Restart)?;
+            let turns = self
+                .inner
+                .drafts
+                .repo
+                .recent_transcripts(&row.id, crate::engine::minimax_cascade::MAX_HISTORY as u32)
+                .await
+                .unwrap_or_default();
+            let history = crate::engine::minimax_cascade::history_from_transcripts(&turns);
+            tracing::info!(session_id = %row.id, messages = history.len(), "voice recovery: cascade resumes with its context");
+            self.inner
+                .cascade
+                .resume_with_brain(credential, call_id, config, brain, history)
+        } else {
+            self.inner.engine.resume(credential, call_id, config)
+        };
         if !settings.enabled {
             let _ = engine_call.close(EndReason::Disabled.as_str()).await;
             return Err(EndReason::Disabled);
@@ -584,7 +600,11 @@ impl VoiceService {
             carry: None,
             session_mode: SessionMode::Jarvis,
             car: settings.car_mode,
-            engine: self.inner.engine.kind(),
+            engine: if cascade {
+                crate::engine::VoiceEngine::kind(self.inner.cascade.as_ref())
+            } else {
+                self.inner.engine.kind()
+            },
         });
         Ok(())
     }

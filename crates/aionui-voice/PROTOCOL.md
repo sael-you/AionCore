@@ -164,7 +164,10 @@ silence) · `hard_cap` (55 min) · `rotation` (≥ 30 min at an idle point) ·
 `session.updated` in 5 s) · `attach_failed` · `control_lost` (re-attach failed
 within 20 s) · `provider_ended` · `restart` (could not recover after a backend
 restart). Setup/transport failures are stored with state `failed`, the rest
-`ended`.
+`ended`. A live `minimax-cascade` call is recovered like a realtime one (its ear
+re-attached); its brain gets the session's persisted dialogue back (the last 40
+user/Jarvis turns from `voice_transcripts`; tool calls of the dead process are
+not kept). Without a MiniMax key at recovery it ends with `restart`.
 
 ## Database (migrations) and manual rollback
 

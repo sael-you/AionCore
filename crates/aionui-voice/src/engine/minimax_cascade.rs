@@ -30,7 +30,7 @@ pub const ENGINE_KIND: &str = "minimax-cascade";
 /// The ear only transcribes (no responses), so it runs on the cheapest realtime model.
 const EAR_MODEL: &str = crate::settings::MODEL_MINI;
 /// Brain history kept per call (messages, oldest dropped first).
-const MAX_HISTORY: usize = 40;
+pub(crate) const MAX_HISTORY: usize = 40;
 /// No first byte / no next chunk from the brain for this long = failed turn.
 const BRAIN_IDLE_TIMEOUT: Duration = Duration::from_secs(20);
 /// Spoken when the brain fails, so the user is never left in silence.
@@ -100,8 +100,8 @@ impl VoiceEngine for MiniMaxCascadeEngine {
         Ok((answer, Box::new(CascadeCall::new(ear, Some(Arc::new(brain)), &config))))
     }
 
-    /// Never used by the service (cascade calls are not recovered); returns the
-    /// ear alone so a stray resume can still hang the provider call up.
+    /// Without a brain: the ear alone, so a stray resume can still hang the
+    /// provider call up. Restart recovery uses [`Self::resume_with_brain`].
     fn resume(
         &self,
         credential: ResolvedCredential,
@@ -111,6 +111,49 @@ impl VoiceEngine for MiniMaxCascadeEngine {
         let ear = self.ear.resume(credential, call_id, ear_config(&config));
         Box::new(CascadeCall::new(ear, None, &config))
     }
+}
+
+impl MiniMaxCascadeEngine {
+    /// Restart recovery (TASK-37): re-attach the ear like a realtime call and
+    /// give the brain its credential and the call's dialogue back, so the
+    /// next answer still knows what was said before the restart.
+    pub(crate) fn resume_with_brain(
+        &self,
+        credential: ResolvedCredential,
+        call_id: String,
+        config: EngineSessionConfig,
+        brain: ResolvedCredential,
+        history: Vec<Value>,
+    ) -> Box<dyn EngineCall> {
+        let ear = self.ear.resume(credential, call_id, ear_config(&config));
+        let brain = Brain {
+            http: self.http.clone(),
+            credential: brain,
+            model: config.model.clone(),
+            instructions: config.instructions.clone(),
+            tools: chat_tools(&config.tools),
+            max_output_tokens: config.max_output_tokens,
+        };
+        let mut call = CascadeCall::new(ear, Some(Arc::new(brain)), &config);
+        for message in history {
+            call.push_history(message);
+        }
+        Box::new(call)
+    }
+}
+
+/// The brain's history rebuilt from a session's persisted transcript turns
+/// (`voice_transcripts`, oldest first): the user's words and Jarvis's
+/// answers; tool calls and results of the dead process are not kept.
+pub(crate) fn history_from_transcripts(turns: &[(String, String)]) -> Vec<Value> {
+    turns
+        .iter()
+        .filter(|(_, text)| !text.trim().is_empty())
+        .filter_map(|(role, text)| match role.as_str() {
+            "user" | "assistant" => Some(json!({"role": role, "content": text})),
+            _ => None,
+        })
+        .collect()
 }
 
 /// One streamed MiniMax completion.
