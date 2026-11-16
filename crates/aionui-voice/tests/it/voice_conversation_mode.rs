@@ -1152,10 +1152,19 @@ async fn quotes_are_refused_when_too_large_or_without_a_conversation_call() {
         (ack["data"]["consumed"].clone(), ack["data"]["reason"].clone()),
         (json!(false), json!("too_large"))
     );
-    // A session that is not this user's live call.
-    ws_send(&mut c.ws, attach("vs_someone_else", "> hi")).await;
+    // A frame that names no call.
+    ws_send(
+        &mut c.ws,
+        json!({"name": "voice.attachQuotes", "data": {"text": "> hi"}}),
+    )
+    .await;
     let ack = ws_expect(&mut c.ws, "voice.quotesAttached").await;
     assert_eq!(ack["data"]["reason"], "no_call", "{ack}");
+    // Another user's session never gets that far: the socket's ownership
+    // check (§3.5) refuses the frame itself.
+    ws_send(&mut c.ws, attach("vs_someone_else", "> hi")).await;
+    let refused = ws_expect(&mut c.ws, "voice.error").await;
+    assert_eq!(refused["data"]["code"], "SESSION_MISMATCH", "{refused}");
 
     // A Jarvis-mode call takes no quotes (its words never become a message).
     let h = Harness::new(Options::default()).await;
