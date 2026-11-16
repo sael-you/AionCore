@@ -7,7 +7,7 @@ pub mod state;
 pub mod text;
 pub mod worker;
 
-pub use engine::{Delivered, DraftEngine, DraftRequest, SpeechFactory, SpeechKit};
+pub use engine::{Delivered, DraftEngine, DraftRequest, SpeechFactory, SpeechKit, TtsBudget};
 pub use evidence::{ConfirmTracker, HoldClock, HoldEvent, OnsetVerdict, TranscriptVerdict};
 pub use state::{Delivery, DraftAction, DraftState};
 pub use worker::{DraftWorker, LiveSessions};

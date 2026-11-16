@@ -173,12 +173,14 @@ impl FollowUpWatcher {
                 user_id,
                 conversation_id,
             } => {
-                let queued = self
+                let mut queued = self
                     .drafts
                     .repo
                     .user_drafts_in_states(&user_id, &["queued"])
                     .await
                     .unwrap_or_default();
+                // Oldest first: queued messages keep the order they were said in.
+                queued.sort_by_key(|r| (r.created_at, r.id.clone()));
                 for row in queued
                     .into_iter()
                     .filter(|r| r.target_id.as_deref() == Some(&conversation_id))

@@ -248,6 +248,11 @@ impl CallRunner {
             })
             .await;
 
+        // Conversation mode classifies first: a spoken control is never
+        // swallowed as an `ask` answer (it handles the bound conversation's asks).
+        if self.call.mode.is_conversation() {
+            return self.on_conversation_final(text).await;
+        }
         // An `ask` answer is never a command or an approval, and while a draft
         // awaits its confirmation or holds, the utterance belongs to the draft
         // ("yes, send it" must never be swallowed as an answer).
@@ -258,9 +263,6 @@ impl CallRunner {
             tracing::info!(session_id = %self.call.session_id, ask_id = %ask_id, "voice ask answered");
             self.set_manual(false).await;
             return None;
-        }
-        if self.call.mode.is_conversation() {
-            return self.on_conversation_final(text).await;
         }
         self.on_jarvis_final(text).await;
         None

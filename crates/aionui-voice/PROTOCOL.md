@@ -222,9 +222,22 @@ still applies (`VOICE_BUSY`).
 - Agent `say`/`ask` from the bound conversation: no "<name> says:" prefix,
   ≤ 1200 characters split into ≤ 300-character clips (`status` `says` /
   `asks`), no confirm-word ban, not counted against the 6/h wake limit; the
-  6/min say limit stays. Allowed while the call is live and 30 min after an
-  idle/rotation/network hangup (the device is still armed); ended by the
-  user (`user`, `sleep`), the kill switch, a revoked session or the budget.
+  6/min say limit stays. The lines of one conversation are synthesized
+  through one serial queue, so clips arrive in the order they were said.
+  Allowed while the call is live, while an armed device of the user has a
+  voice socket connected after an idle/rotation/network hangup, and 30 min
+  after that socket is gone; ended by the user (`user`, `sleep`), the kill
+  switch, a revoked session or the budget. A `say`/`ask` whose clips do not
+  fit today's budget answers `VOICE_BUDGET_REACHED`.
+- An open `voice ask` of the bound conversation never takes a spoken
+  control: "stop", "stop the task", "stop voice" cancel the ask and act;
+  any other utterance answers it (not posted). Another conversation's ask
+  never takes an utterance in conversation mode.
+- Queued voice messages keep their order: a new utterance waits behind an
+  earlier queued one of the same conversation; retries go oldest first and
+  keep the original 30 min expiry.
+- "stop the task" when the cancel itself fails: `failed`, "I could not stop
+  it. Use Stop task on the screen."
 - Turn end of the bound conversation: `finished` as text when the agent
   spoke in that turn, spoken "<name> finished." when it did not; a
   cancelled turn is text only; a failed TURN is the spoken status
@@ -246,5 +259,7 @@ still applies (`VOICE_BUSY`).
   `focus`).
 - Speech: MiniMax `speech-2.8-turbo` (4 s) → OpenAI `gpt-realtime-2.1-mini`
   → text. Every clip is charged 60 µUSD per character to the daily budget
-  (the live session, else the user's latest).
+  (the live session, else the user's latest), is refused (text only) when it
+  does not fit what is left today, and is fed into a live call's meter: the
+  80 % `voice.budget` warning and the hangup at 100 % (`budget`) count clips.
 

@@ -454,28 +454,32 @@ impl VoiceService {
     }
 
     /// A conversation-mode call died with the process: when its last voice
-    /// message has no turn end after it and the conversation is not running
-    /// now, the restart interrupted that turn — say so on the next hello.
+    /// message has no turn end of that conversation after it (in any of the
+    /// user's sessions: a rotation changes the session id) and the
+    /// conversation is not running now, the restart interrupted that turn —
+    /// say so on the next hello.
     async fn note_interrupted_turn(&self, row: &VoiceSessionRow) {
         use crate::conversation_mode::{AUDIT_TURN_END, AUDIT_VOICE_MESSAGE};
         let Ok(events) = self.inner.audit.list(&row.user_id, 500).await else {
             return;
         };
-        let mine = events
+        let conversation_of = |detail: &str| {
+            serde_json::from_str::<Value>(detail)
+                .ok()
+                .and_then(|d| d["conversationId"].as_str().map(str::to_owned))
+        };
+        // Newest first: this session's last voice message names the conversation.
+        let Some(conversation_id) = events
             .iter()
-            .filter(|e| e.session_id.as_deref() == Some(row.id.as_str()));
-        let focus = mine
-            .clone()
-            .find(|e| e.event == "session_created")
-            .and_then(|e| serde_json::from_str::<Value>(&e.detail).ok())
-            .and_then(|d| d["focus"].as_str().map(str::to_owned));
-        let Some(conversation_id) = focus else {
+            .find(|e| e.session_id.as_deref() == Some(row.id.as_str()) && e.event == AUDIT_VOICE_MESSAGE)
+            .and_then(|e| conversation_of(&e.detail))
+        else {
             return;
         };
-        // Newest first: the latest message-or-turn-end decides.
-        let last = mine
-            .clone()
-            .find(|e| e.event == AUDIT_VOICE_MESSAGE || e.event == AUDIT_TURN_END);
+        let last = events.iter().find(|e| {
+            (e.event == AUDIT_VOICE_MESSAGE || e.event == AUDIT_TURN_END)
+                && conversation_of(&e.detail).as_deref() == Some(conversation_id.as_str())
+        });
         if last.is_none_or(|e| e.event != AUDIT_VOICE_MESSAGE) {
             return;
         }

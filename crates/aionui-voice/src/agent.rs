@@ -115,6 +115,32 @@ impl AskRegistry {
         None
     }
 
+    /// Answer the oldest pending ask of ONE conversation (conversation mode:
+    /// another conversation's ask never takes an utterance meant for the bound one).
+    pub fn answer_next_for(&self, user_id: &str, conversation_id: &str, transcript: &str) -> Option<String> {
+        let mut queue = self.queue.get_mut(user_id)?;
+        let position = queue.iter().position(|id| {
+            self.items
+                .get(id)
+                .is_some_and(|i| i.status == AskStatus::Pending && i.conversation_id == conversation_id)
+        })?;
+        let id = queue.remove(position)?;
+        let mut item = self.items.get_mut(&id)?;
+        item.status = AskStatus::Answered(transcript.to_owned());
+        item.notify.notify_waiters();
+        Some(id)
+    }
+
+    /// Cancel the pending asks of one conversation (a spoken control won).
+    pub fn cancel_conversation(&self, user_id: &str, conversation_id: &str) {
+        for mut item in self.items.iter_mut() {
+            if item.user_id == user_id && item.conversation_id == conversation_id && item.status == AskStatus::Pending {
+                item.status = AskStatus::Cancelled;
+                item.notify.notify_waiters();
+            }
+        }
+    }
+
     pub fn cancel_user(&self, user_id: &str) {
         for mut item in self.items.iter_mut() {
             if item.user_id == user_id && item.status == AskStatus::Pending {

@@ -102,6 +102,9 @@ pub struct VoiceTimings {
     pub reattach_retry_delay: Duration,
     /// First socket frame must be `voice.hello` within this time.
     pub hello_timeout: Duration,
+    /// Conversation voice mode: how long the binding outlives its call when
+    /// no voice socket of the user is connected any more (C26).
+    pub binding_grace: Duration,
 }
 
 impl Default for VoiceTimings {
@@ -118,6 +121,7 @@ impl Default for VoiceTimings {
             reattach_deadline: Duration::from_secs(20),
             reattach_retry_delay: Duration::from_millis(500),
             hello_timeout: Duration::from_secs(5),
+            binding_grace: Duration::from_secs(30 * 60),
         }
     }
 }

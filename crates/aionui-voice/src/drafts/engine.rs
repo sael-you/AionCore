@@ -37,6 +37,14 @@ const DICTIONARY_VERSION: u32 = 1;
 /// agent turn is normal; the C9 10 min is for Jarvis drafts).
 pub const VOICE_QUEUE_TTL_MS: i64 = 30 * 60_000;
 
+/// The daily budget seen by spoken clips (C26 §3.5): what is left today, and
+/// a charge notice so a live call's meter warns and hangs up at 100 %.
+#[async_trait::async_trait]
+pub trait TtsBudget: Send + Sync {
+    async fn remaining_micros(&self, user_id: &str) -> i64;
+    fn charged(&self, user_id: &str, session_id: &str, micros: i64);
+}
+
 /// Whether a draft row is a queued conversation-mode message (C26).
 pub(crate) fn is_voice_mode(row: &VoiceDraftRow) -> bool {
     row.delivery.as_deref() == Some(VOICE_MODE_DELIVERY)
@@ -96,6 +104,8 @@ pub struct DraftEngine {
     pub(crate) spoke: DashMap<String, ()>,
     /// Session usage rows: clip characters are charged to the daily budget.
     sessions: Arc<dyn IVoiceSessionRepository>,
+    /// Set by the service once it exists (it owns the settings and live calls).
+    pub(crate) budget: std::sync::OnceLock<Arc<dyn TtsBudget>>,
 }
 
 fn now_ms() -> i64 {
@@ -122,6 +132,7 @@ impl DraftEngine {
             watched: DashMap::new(),
             spoke: DashMap::new(),
             sessions,
+            budget: std::sync::OnceLock::new(),
         }
     }
 
@@ -307,8 +318,14 @@ impl DraftEngine {
         text: &str,
         voice: ClipVoice,
     ) -> Result<crate::readback::Clip, String> {
-        let clip = synth.synthesize(text, voice).await?;
         let cost = crate::pricing::tts_cost_micros(text.chars().count());
+        if let Some(budget) = self.budget.get()
+            && budget.remaining_micros(user_id).await < cost
+        {
+            tracing::info!(user_id, cost_micros = cost, "voice clip refused: daily budget reached");
+            return Err("daily voice budget reached".to_owned());
+        }
+        let clip = synth.synthesize(text, voice).await?;
         let session = match session_id {
             Some(id) => Some(id.to_owned()),
             None => self
@@ -325,6 +342,8 @@ impl DraftEngine {
             };
             if let Err(err) = self.sessions.add_usage(user_id, &session, &delta, now_ms()).await {
                 tracing::warn!(error = %err, "voice clip usage not recorded");
+            } else if let Some(budget) = self.budget.get() {
+                budget.charged(user_id, &session, cost);
             }
         }
         Ok(clip)
@@ -865,7 +884,8 @@ impl DraftEngine {
                 DraftState::Queued,
                 DraftPatch {
                     queued_reason: Some(Some(reason)),
-                    expires_at: Some(Some(now_ms() + QUEUE_TTL_MS)),
+                    // A voice message keeps its own 30 min from when you said it.
+                    expires_at: (!is_voice_mode(row)).then_some(Some(now_ms() + QUEUE_TTL_MS)),
                     ..Default::default()
                 },
             )
@@ -961,6 +981,13 @@ impl DraftEngine {
 
     /// Retry a queued draft (target turn ended / approval removed / tick).
     pub async fn retry_queued(&self, row: &VoiceDraftRow) -> Option<Delivered> {
+        if is_voice_mode(row)
+            && let Some(target) = row.target_id.as_deref()
+            && let Some(earlier) = self.oldest_queued_voice(&row.user_id, target, Some(&row.id)).await
+            && (earlier.created_at, earlier.id.as_str()) < (row.created_at, row.id.as_str())
+        {
+            return None;
+        }
         if row.expires_at.is_some_and(|t| t <= now_ms()) {
             self.transition_and_emit(row, DraftState::Expired, DraftPatch::default())
                 .await?;
@@ -1125,6 +1152,13 @@ impl DraftEngine {
                 .queue_voice_message(user_id, session_id, conversation_id, &id, &text, "awaiting_approval")
                 .await;
         }
+        // Your words keep their order: never overtake an earlier queued one.
+        if let Some(earlier) = self.oldest_queued_voice(user_id, conversation_id, None).await {
+            let reason = earlier.queued_reason.as_deref().unwrap_or("busy").to_owned();
+            return self
+                .queue_voice_message(user_id, session_id, conversation_id, &id, &text, &reason)
+                .await;
+        }
         match self
             .conversations
             .send_message(user_id, conversation_id, &text, &key)
@@ -1228,6 +1262,28 @@ impl DraftEngine {
         };
         self.voice_line(user_id, Some(session_id), conversation_id, STATUS_QUEUED, line);
         Delivered::Queued
+    }
+
+    /// The oldest queued conversation-mode message for a conversation (other
+    /// than `except`): later ones wait behind it (FIFO by creation).
+    pub(crate) async fn oldest_queued_voice(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        except: Option<&str>,
+    ) -> Option<VoiceDraftRow> {
+        self.repo
+            .user_drafts_in_states(user_id, &["queued", "sending"])
+            .await
+            .ok()?
+            .into_iter()
+            .filter(|r| {
+                is_voice_mode(r)
+                    && r.target_id.as_deref() == Some(conversation_id)
+                    && except.is_none_or(|id| r.id != id)
+                    && (r.state == "queued" || r.outcome_msg_id.is_none())
+            })
+            .min_by_key(|r| (r.created_at, r.id.clone()))
     }
 
     /// "Cancel that": drop the user's queued conversation-mode messages for

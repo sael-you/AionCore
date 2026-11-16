@@ -490,3 +490,176 @@ async fn saw_follow_up(ws: &mut Client) -> bool {
     }
     false
 }
+
+// ------------------------------------------------------------- review fixes
+
+async fn set_budget(h: &Harness, user: &TestUser, usd: f64) {
+    h.service
+        .update_settings(
+            &user.id,
+            &aionui_api_types::UpdateVoiceSettingsRequest {
+                daily_budget_usd: Some(usd),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn speech_past_the_daily_cap_is_refused() {
+    let c = call().await;
+    set_budget(&c.h, &c.user, 0.001).await;
+    let refused = c.h.service.agent_say(&c.user.id, "c-build", &"word ".repeat(40)).await;
+    assert!(
+        matches!(refused, Err(aionui_voice::VoiceError::BudgetReached)),
+        "{refused:?}"
+    );
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    assert!(c.h.speech.lines().is_empty(), "nothing synthesized past the cap");
+}
+
+#[tokio::test]
+async fn spoken_clips_feed_the_live_meter_and_the_call_hangs_up_at_the_cap() {
+    let h = Harness::new(Options::default()).await;
+    h.conversations.add("c-build", "Kanban build", None);
+    let user = h.enabled_user("alice").await;
+    // Three 299-char clips = 897 chars × 60 µUSD = exactly the cap.
+    set_budget(&h, &user, 0.05382).await;
+    let (status, body) = create_conversation_session(&h, &user, Some("c-build")).await;
+    assert_eq!(status, 201, "{body}");
+    let session = body["data"]["voice_session_id"].as_str().unwrap().to_owned();
+    let addr = h.serve().await;
+    let mut ws = ws_connect(&addr, &user, Some(ORIGIN)).await.unwrap();
+    ws_send(&mut ws, hello(Some(&session))).await;
+    let word = "a".repeat(299);
+    let text = format!("{word} {word} {word}");
+    h.service.agent_say(&user.id, "c-build", &text).await.unwrap();
+    let budget = ws_expect(&mut ws, "voice.budget").await;
+    assert_eq!(budget["data"]["warning"], "100", "{budget}");
+    let row = h.wait_ended(&user, &session).await;
+    assert_eq!(row.end_reason.as_deref(), Some("budget"));
+    // The budget ends voice mode: nothing more is spoken today.
+    assert!(!h.service.is_bound(&user.id, "c-build"));
+    assert!(h.service.agent_say(&user.id, "c-build", "more").await.is_err());
+}
+
+#[tokio::test]
+async fn a_later_utterance_never_overtakes_a_queued_one() {
+    let mut c = call().await;
+    c.set_status(running(true, 1));
+    c.say("use the staging database");
+    assert_eq!(c.follow_up().await["status"], "queued");
+    // The approval was granted, the turn ended: the next words still wait behind.
+    c.set_status(ConversationStatus::default());
+    c.say("and skip the migration");
+    assert_eq!(c.follow_up().await["status"], "queued");
+    assert!(c.h.conversations.sends().is_empty());
+    c.h.service.run_draft_sweep(false, 0).await;
+    c.h.service.run_draft_sweep(false, 0).await;
+    let texts: Vec<String> = c.h.conversations.sends().into_iter().map(|s| s.text).collect();
+    assert_eq!(texts.len(), 2, "{texts:?}");
+    assert!(texts[0].starts_with("use the staging database"));
+    assert!(texts[1].starts_with("and skip the migration"));
+}
+
+#[tokio::test]
+async fn the_bound_agents_lines_arrive_in_the_order_they_were_said() {
+    let mut c = call().await;
+    *c.h.speech.slow.lock().unwrap() = Some(("FIRST".into(), Duration::from_millis(400)));
+    c.h.service
+        .agent_say(&c.user.id, "c-build", "FIRST line.")
+        .await
+        .unwrap();
+    c.h.service
+        .agent_say(&c.user.id, "c-build", "Second line.")
+        .await
+        .unwrap();
+    assert_eq!(c.follow_up().await["line"], "FIRST line.");
+    assert_eq!(c.follow_up().await["line"], "Second line.");
+}
+
+#[tokio::test]
+async fn a_spoken_control_beats_a_pending_ask_and_only_the_bound_ask_takes_answers() {
+    let mut c = call().await;
+    c.set_status(running(true, 0));
+    let ask = {
+        let service = c.h.service.clone();
+        let uid = c.user.id.clone();
+        tokio::spawn(async move {
+            service
+                .agent_ask(&uid, "c-build", "Which port?", Duration::from_secs(5))
+                .await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    c.say("stop the task");
+    let outcome = loop {
+        let frame = c.follow_up().await;
+        if frame["status"] != "asks" {
+            break frame;
+        }
+    };
+    assert_eq!(outcome["status"], "stopped", "{outcome}");
+    assert_eq!(
+        c.h.conversations.state.lock().unwrap().cancelled,
+        vec!["c-build".to_owned()]
+    );
+    assert_eq!(ask.await.unwrap().unwrap().status, "cancelled");
+
+    // A message answers the bound conversation's ask and is not posted.
+    let ask = {
+        let service = c.h.service.clone();
+        let uid = c.user.id.clone();
+        tokio::spawn(async move {
+            service
+                .agent_ask(&uid, "c-build", "Which port?", Duration::from_secs(5))
+                .await
+        })
+    };
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    c.say("port eight thousand");
+    let answered = ask.await.unwrap().unwrap();
+    assert_eq!(answered.status, "answered");
+    assert_eq!(answered.answer.as_deref(), Some("port eight thousand"));
+    assert!(c.h.conversations.sends().is_empty(), "an answer is never posted");
+}
+
+#[tokio::test]
+async fn a_failed_cancel_never_claims_nothing_runs() {
+    let mut c = call().await;
+    c.set_status(running(true, 0));
+    c.h.conversations.state.lock().unwrap().cancel_fails = true;
+    c.say("cancel that");
+    let outcome = c.follow_up().await;
+    assert_eq!(outcome["status"], "failed", "{outcome}");
+    assert!(outcome["line"].as_str().unwrap().contains("could not stop"));
+}
+
+#[tokio::test]
+async fn the_binding_holds_while_the_armed_device_is_connected() {
+    let timings = aionui_voice::VoiceTimings {
+        idle_hangup: Duration::from_millis(400),
+        heartbeat_stale: Duration::from_secs(60),
+        binding_grace: Duration::from_millis(300),
+        ..fast_timings()
+    };
+    let (h, user, session) = conversation_harness_with(Options { timings }).await;
+    let addr = h.serve().await;
+    let ws = ws_connect(&addr, &user, Some(ORIGIN)).await.unwrap();
+    let mut ws = ws;
+    ws_send(&mut ws, hello(None)).await;
+    let row = h.wait_ended(&user, &session).await;
+    assert_eq!(row.end_reason.as_deref(), Some("idle"));
+    tokio::time::sleep(Duration::from_millis(900)).await;
+    assert!(
+        h.service.is_bound(&user.id, "c-build"),
+        "armed device connected: still bound"
+    );
+    drop(ws);
+    let unbound = wait_for(Duration::from_secs(5), || async {
+        (!h.service.is_bound(&user.id, "c-build")).then_some(())
+    })
+    .await;
+    assert!(unbound.is_some(), "device gone: the grace runs out");
+}

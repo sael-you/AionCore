@@ -34,6 +34,8 @@ pub(crate) enum CallCommand {
     },
     /// A client frame for this call (evidence, taps) or a pending `ask`.
     Client(ClientEvent),
+    /// A clip was charged to the user's daily budget (already persisted).
+    ExternalCharge { session_id: String, micros: i64 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -410,6 +412,11 @@ impl CallRunner {
                 self.on_client(event).await;
                 None
             }
+            CallCommand::ExternalCharge { session_id, micros } => {
+                let this_session = session_id == self.call.session_id;
+                self.meter.on_external_charge(micros, this_session);
+                self.check_budget()
+            }
             CallCommand::CreateResponse { done } => {
                 if self.meter.reserve_own().is_err() {
                     let _ = done.send(Err(VoiceError::BudgetReached));
@@ -550,6 +557,6 @@ fn reject_not_ready(command: CallCommand) {
         CallCommand::SetCreateResponse { done, .. } | CallCommand::CreateResponse { done } => {
             let _ = done.send(Err(err()));
         }
-        CallCommand::Client(_) => {}
+        CallCommand::Client(_) | CallCommand::ExternalCharge { .. } => {}
     }
 }
