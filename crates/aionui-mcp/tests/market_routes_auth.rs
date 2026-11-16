@@ -32,6 +32,11 @@ impl IRuntimeTokenVerifier for AlwaysValid {
     fn verify_conversation_helper(&self, _: &str, _: &str, _: &str) -> bool {
         true
     }
+    /// Unscoped on purpose: these tests prove the market write router
+    /// refuses the runtime-token channel by itself, not via the C13 scope.
+    fn allows_route(&self, _: &axum::http::Method, _: &str) -> bool {
+        true
+    }
 }
 
 struct Fx {

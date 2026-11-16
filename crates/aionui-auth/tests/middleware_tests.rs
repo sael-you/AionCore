@@ -640,6 +640,11 @@ impl IRuntimeTokenVerifier for MatchVerifier {
     fn verify_conversation_helper(&self, token: &str, user_id: &str, conversation_id: &str) -> bool {
         token == self.token && user_id == self.user_id && conversation_id == self.conversation_id
     }
+
+    /// Test scope: only `GET /whoami` (the identity echo route).
+    fn allows_route(&self, method: &axum::http::Method, path: &str) -> bool {
+        method == axum::http::Method::GET && path == "/whoami"
+    }
 }
 
 fn helper_request(token: Option<&str>, user_id: &str, conversation_id: &str) -> Request<Body> {
@@ -1308,4 +1313,103 @@ async fn c11_switch_an_exempt_bearer_is_still_validated_by_auth() {
             "bearer {token} runtime header {runtime}"
         );
     }
+}
+
+// ============================================================
+// Runtime-token route scope (card C13)
+// ============================================================
+
+/// `GET /whoami` is inside the test verifier's scope; `GET /owner-only` and
+/// `POST /whoami` are not.
+fn scoped_app(user_repo: Arc<dyn IUserRepository>, jwt_service: Arc<JwtService>) -> Router {
+    let state = AuthState {
+        jwt_service,
+        user_repo,
+        identity_mode: AuthIdentityMode::UserSession,
+        runtime_token_verifier: Some(Arc::new(MatchVerifier {
+            token: "tok-1",
+            user_id: "system_default_user",
+            conversation_id: "conv-1",
+        })),
+        cookie_names: aionui_auth::CookieNames::LEGACY,
+    };
+    let whoami = |user: axum::Extension<CurrentUser>| async move { user.id.clone() };
+    Router::new()
+        .route("/whoami", get(whoami).post(whoami))
+        .route("/owner-only", get(whoami))
+        .route_layer(middleware::from_fn_with_state(state, auth_middleware))
+}
+
+fn scoped_request(method: &str, path: &str, token: &str) -> Request<Body> {
+    Request::builder()
+        .method(method)
+        .uri(path)
+        .header("x-aionui-user-id", "system_default_user")
+        .header("x-aionui-conversation-id", "conv-1")
+        .header("x-aionui-runtime-token", token)
+        .body(Body::empty())
+        .unwrap()
+}
+
+#[tokio::test]
+async fn runtime_token_outside_route_scope_is_refused_with_runtime_scope() {
+    let jwt_service = Arc::new(JwtService::new("middleware_test_secret".into()));
+    let db = init_database_memory().await.unwrap();
+    let repo = Arc::new(SqliteUserRepository::new(db.pool().clone())) as Arc<dyn IUserRepository>;
+    let app = scoped_app(repo, jwt_service);
+
+    let allowed = app
+        .clone()
+        .oneshot(scoped_request("GET", "/whoami?x=1", "tok-1"))
+        .await
+        .unwrap();
+    assert_eq!(allowed.status(), StatusCode::OK);
+
+    for (method, path) in [("GET", "/owner-only"), ("POST", "/whoami")] {
+        let resp = app
+            .clone()
+            .oneshot(scoped_request(method, path, "tok-1"))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN, "{method} {path}");
+        let json = json_body(resp).await;
+        assert_eq!(json["code"], aionui_auth::RUNTIME_SCOPE_ERROR_CODE, "{method} {path}");
+        assert_eq!(json["code"], "RUNTIME_SCOPE");
+    }
+}
+
+#[tokio::test]
+async fn invalid_runtime_token_outside_scope_is_still_401() {
+    let jwt_service = Arc::new(JwtService::new("middleware_test_secret".into()));
+    let db = init_database_memory().await.unwrap();
+    let repo = Arc::new(SqliteUserRepository::new(db.pool().clone())) as Arc<dyn IUserRepository>;
+    let app = scoped_app(repo, jwt_service);
+
+    let resp = app
+        .oneshot(scoped_request("GET", "/owner-only", "wrong-token"))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::UNAUTHORIZED);
+    let json = json_body(resp).await;
+    assert_eq!(json["error"], "Invalid runtime token");
+}
+
+#[tokio::test]
+async fn session_jwt_is_not_limited_by_the_runtime_route_scope() {
+    let jwt_service = Arc::new(JwtService::new("middleware_test_secret".into()));
+    let db = init_database_memory().await.unwrap();
+    let repo = Arc::new(SqliteUserRepository::new(db.pool().clone())) as Arc<dyn IUserRepository>;
+    let token = jwt_service.sign("system_default_user", "system_default_user").unwrap();
+    let app = scoped_app(repo, jwt_service);
+
+    let resp = app
+        .oneshot(
+            Request::get("/owner-only")
+                .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
 }
