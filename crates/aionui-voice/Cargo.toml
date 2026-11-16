@@ -70,3 +70,7 @@ required-features = ["voice-test"]
 [[test]]
 name = "voice_conversation_mode"
 required-features = ["voice-test"]
+
+[[test]]
+name = "voice_minimax_cascade"
+required-features = ["voice-test"]

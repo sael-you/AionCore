@@ -60,6 +60,11 @@ struct Knobs {
     audio_stopped_after_done: Duration,
     hangup_close_after: Duration,
     create_delay: Duration,
+    /// MiniMax chat completions: scripted answers, one per request, in order.
+    chat_script: std::collections::VecDeque<Value>,
+    /// Delay before the first streamed chunk and between chunks.
+    chat_first_token: Duration,
+    chat_chunk_gap: Duration,
 }
 
 struct FakeState {
@@ -68,6 +73,7 @@ struct FakeState {
     created_sdps: Mutex<Vec<String>>,
     bearer_seen: Mutex<Vec<String>>,
     knobs: Mutex<Knobs>,
+    chat_requests: Mutex<Vec<Value>>,
     next_id: AtomicU64,
     attach_attempts: AtomicU32,
 }
@@ -103,7 +109,11 @@ impl FakeOpenAi {
                 audio_stopped_after_done: Duration::from_millis(2_900),
                 hangup_close_after: Duration::from_secs(2),
                 create_delay: Duration::ZERO,
+                chat_script: Default::default(),
+                chat_first_token: Duration::ZERO,
+                chat_chunk_gap: Duration::ZERO,
             }),
+            chat_requests: Mutex::new(Vec::new()),
             next_id: AtomicU64::new(1),
             attach_attempts: AtomicU32::new(0),
         });
@@ -114,6 +124,7 @@ impl FakeOpenAi {
             .route("/v1/responses", post(responses))
             .route("/v1/audio/transcriptions", post(transcriptions))
             .route("/ws/v1/t2a_v2", get(minimax_tts))
+            .route("/v1/chat/completions", post(chat_completions))
             .with_state(state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -127,6 +138,25 @@ impl FakeOpenAi {
             state,
             task,
         }
+    }
+
+    /// Script the MiniMax brain: each entry answers one chat request, in order:
+    /// `{"text": "...", "tool_calls": [{"name", "arguments"}], "status": 500}`
+    /// (all optional). Unscripted requests answer `{"text": "OK."}`.
+    pub fn set_chat_script(&self, answers: Vec<Value>) {
+        self.state.knobs.lock().unwrap().chat_script = answers.into();
+    }
+
+    /// Streaming pace of the brain: time to first chunk, then between chunks.
+    pub fn set_chat_timing(&self, first_token: Duration, chunk_gap: Duration) {
+        let mut knobs = self.state.knobs.lock().unwrap();
+        knobs.chat_first_token = first_token;
+        knobs.chat_chunk_gap = chunk_gap;
+    }
+
+    /// Chat request bodies received, in order (with the bearer under `_bearer`).
+    pub fn chat_requests(&self) -> Vec<Value> {
+        self.state.chat_requests.lock().unwrap().clone()
     }
 
     /// Base URL to use as the provider origin (no `/v1`).
@@ -472,6 +502,66 @@ fn replies(state: &FakeState, event: &Value, event_no: &mut u64) -> Vec<Value> {
         }
         _ => Vec::new(),
     }
+}
+
+/// MiniMax chat completions (OpenAI-compatible SSE, S0-B #2): the scripted
+/// answer streamed in small content pieces, tool calls in two fragments each,
+/// a usage chunk, then `[DONE]`.
+async fn chat_completions(State(state): State<Arc<FakeState>>, headers: HeaderMap, body: String) -> Response {
+    let Some(token) = bearer(&headers) else {
+        return StatusCode::UNAUTHORIZED.into_response();
+    };
+    let mut request: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+    request["_bearer"] = Value::String(token);
+    state.chat_requests.lock().unwrap().push(request);
+    let (answer, first_token, gap) = {
+        let mut knobs = state.knobs.lock().unwrap();
+        let answer = knobs.chat_script.pop_front().unwrap_or_else(|| json!({"text": "OK."}));
+        (answer, knobs.chat_first_token, knobs.chat_chunk_gap)
+    };
+    if let Some(status) = answer["status"].as_u64() {
+        return StatusCode::from_u16(status as u16)
+            .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
+            .into_response();
+    }
+    let mut chunks: Vec<Value> = Vec::new();
+    let text = answer["text"].as_str().unwrap_or_default();
+    let chars: Vec<char> = text.chars().collect();
+    for piece in chars.chunks(6) {
+        let piece: String = piece.iter().collect();
+        chunks.push(json!({"choices": [{"index": 0, "delta": {"content": piece}}]}));
+    }
+    for (index, call) in answer["tool_calls"].as_array().into_iter().flatten().enumerate() {
+        let args = call["arguments"]
+            .as_str()
+            .map(str::to_owned)
+            .unwrap_or_else(|| call["arguments"].to_string());
+        let (a, b) = args.split_at(args.len() / 2);
+        chunks.push(
+            json!({"choices": [{"index": 0, "delta": {"tool_calls": [{"index": index,
+            "id": format!("call_fake_{index}"), "type": "function",
+            "function": {"name": call["name"], "arguments": a}}]}}]}),
+        );
+        chunks.push(
+            json!({"choices": [{"index": 0, "delta": {"tool_calls": [{"index": index,
+            "function": {"arguments": b}}]}}]}),
+        );
+    }
+    chunks.push(
+        json!({"choices": [], "usage": {"prompt_tokens": 1000, "completion_tokens": 40,
+        "total_tokens": 1040, "prompt_tokens_details": {"cached_tokens": 800}}}),
+    );
+    let mut lines: Vec<String> = chunks.iter().map(|c| format!("data: {c}\n\n")).collect();
+    lines.push("data: [DONE]\n\n".to_owned());
+    let stream = futures_util::stream::unfold((lines.into_iter(), true), move |(mut it, first)| async move {
+        let line = it.next()?;
+        tokio::time::sleep(if first { first_token } else { gap }).await;
+        Some((Ok::<_, std::convert::Infallible>(line), (it, false)))
+    });
+    Response::builder()
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .body(axum::body::Body::from_stream(stream))
+        .unwrap()
 }
 
 /// Responses API (refiner): the configured structured output as `output_text`.
