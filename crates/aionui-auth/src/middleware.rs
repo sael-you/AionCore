@@ -237,7 +237,7 @@ async fn runtime_token_channel(state: &AuthState, mut request: Request, next: Ne
         return Err(ApiError::coded(
             StatusCode::FORBIDDEN,
             RUNTIME_SCOPE_ERROR_CODE,
-            "Runtime token is not allowed on this route.",
+            "Runtime token is not allowed on this route; agent CLIs use the /api/runtime/* routers.",
             None,
         ));
     }

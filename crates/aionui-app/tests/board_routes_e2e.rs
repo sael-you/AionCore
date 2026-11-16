@@ -352,8 +352,10 @@ async fn user_session_mode_enforces_auth_channels_csrf_and_isolation() {
         (StatusCode::FORBIDDEN, Some("board_system_forbidden"))
     );
 
-    // An agent riding the auth middleware's runtime-token channel is sent to
-    // the agent router.
+    // An agent riding the auth middleware's runtime-token channel is refused
+    // by the runtime-token route scope (C13) before the board handler; the
+    // handler's own `board_use_agent_router` refusal stays as a second layer
+    // (aionui-board routes.rs unit test).
     let token = token(&services, LOCAL_USER, CONV);
     let channel = Auth {
         runtime: Some((LOCAL_USER.into(), CONV.into(), token.clone())),
@@ -366,7 +368,7 @@ async fn user_session_mode_enforces_auth_channels_csrf_and_isolation() {
     .await;
     assert_eq!(
         (status, body["code"].as_str()),
-        (StatusCode::FORBIDDEN, Some("board_use_agent_router"))
+        (StatusCode::FORBIDDEN, Some("RUNTIME_SCOPE"))
     );
     let (status, body) = send(&app, request("GET", "/api/runtime/board/status", None, &channel)).await;
     assert_eq!(
