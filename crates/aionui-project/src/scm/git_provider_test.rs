@@ -881,16 +881,14 @@ fn staged_anchor_is_refused_without_the_staging_capability() {
     check_anchor(caps, ContentRef::Committed).expect("committed is universal");
 }
 
-/// The stale-index fallback: with a read-only `.git` and a stale index, index
-/// writeback fails and the whole `statuses()` call errors out. The provider must
-/// retry without writeback and still return the full list, degraded but usable.
+/// The stale-index fallback: with a stale index that cannot be written back,
+/// the whole `statuses()` call errors out. The provider must retry without
+/// writeback and still return the full list, degraded but usable.
 ///
-/// Unix-only: the test needs POSIX mode bits to make `.git` unwritable.
-#[cfg(unix)]
+/// Writeback is blocked by a held `.git/index.lock` (a concurrent git), which
+/// fails for every user; a read-only `.git` does not stop root.
 #[tokio::test]
 async fn status_falls_back_when_index_writeback_is_impossible() {
-    use std::os::unix::fs::PermissionsExt;
-
     let tmp = TempDir::new().expect("tempdir");
     let repo = init_repo(tmp.path());
     for i in 0..40 {
@@ -912,16 +910,12 @@ async fn status_falls_back_when_index_writeback_is_impossible() {
 
     let (provider, repo_ref) = discovered(tmp.path()).await;
 
-    let git_dir = tmp.path().join(".git");
-    let original = std::fs::metadata(&git_dir).expect("stat .git").permissions();
-    let mut readonly = original.clone();
-    readonly.set_mode(0o500); // r-x: traversable, not writable
-    std::fs::set_permissions(&git_dir, readonly).expect("make .git read-only");
+    let index_lock = tmp.path().join(".git").join("index.lock");
+    std::fs::write(&index_lock, b"").expect("hold index.lock like a concurrent git");
 
     let status = provider.status(&repo_ref).await;
 
-    // Restore before asserting so a failure cannot leave an unwritable tempdir.
-    std::fs::set_permissions(&git_dir, original).expect("restore .git permissions");
+    std::fs::remove_file(&index_lock).expect("release index.lock");
 
     let status = status.expect("status must succeed via fallback, never surface as an SCM error");
     assert!(

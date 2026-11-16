@@ -2285,16 +2285,14 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn register_failure_kills_spawned_process() {
-        use std::os::unix::fs::PermissionsExt;
         use std::path::PathBuf;
 
         let dir = tempfile::tempdir().unwrap();
-        let runtime_dir = dir.path().join("runtime");
-        std::fs::create_dir_all(&runtime_dir).unwrap();
-        // Read-only runtime/ makes the registry temp-file creation fail with
-        // a genuine I/O error (corruption now degrades, so only real I/O
-        // errors still abort registration).
-        std::fs::set_permissions(&runtime_dir, std::fs::Permissions::from_mode(0o555)).unwrap();
+        // A regular file where the runtime/ directory belongs makes every
+        // registry path under it fail with a genuine I/O error (ENOTDIR;
+        // corruption now degrades, so only real I/O errors still abort
+        // registration). Unlike a read-only directory, this also fails for root.
+        std::fs::write(dir.path().join("runtime"), b"not a directory").unwrap();
 
         let process = Arc::new(
             CliAgentProcess::spawn_for_sdk(aionui_common::CommandSpec {
@@ -2315,13 +2313,10 @@ mod tests {
             None,
             None,
         );
-        assert!(result.is_err(), "read-only runtime dir must fail registration");
+        assert!(result.is_err(), "an unusable runtime dir must fail registration");
 
         tokio::time::timeout(Duration::from_secs(5), process.wait_for_exit())
             .await
             .expect("spawned process must be killed after registration failure");
-
-        // Restore permissions so tempdir cleanup can remove the directory.
-        std::fs::set_permissions(&runtime_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
     }
 }
