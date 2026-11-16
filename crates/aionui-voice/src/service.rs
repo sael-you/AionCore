@@ -176,7 +176,9 @@ impl ServiceInner {
         let Some(until) = binding.until else {
             return Some(binding.conversation_id.clone());
         };
-        if self.sockets.count_for_user(user_id) > 0 {
+        // Only a device still armed in conversation mode (or an older client
+        // that does not say) renews it: a Jarvis-mode socket never does.
+        if self.sockets.conversation_capable_count(user_id) > 0 {
             binding.until = Some(Instant::now() + self.timings.binding_grace);
             return Some(binding.conversation_id.clone());
         }
@@ -204,7 +206,11 @@ impl ServiceInner {
             reason,
             EndReason::User | EndReason::Sleep | EndReason::Disabled | EndReason::AuthRevoked | EndReason::Budget
         );
-        if ends_mode {
+        // Every connected device is armed in Jarvis mode (the call ran on a
+        // device that switched or left): nothing keeps conversation mode armed.
+        let only_jarvis =
+            self.sockets.count_for_user(user_id) > 0 && self.sockets.conversation_capable_count(user_id) == 0;
+        if ends_mode || only_jarvis {
             self.bindings
                 .remove_if(user_id, |_, binding| binding.session_id == session_id);
         } else if let Some(mut binding) = self.bindings.get_mut(user_id)
@@ -625,9 +631,11 @@ impl VoiceService {
     /// A device said hello armed in `mode`: Jarvis mode ends a conversation
     /// binding whose call is gone (C26 mode switch). Unknown or absent
     /// modes change nothing.
-    pub fn note_hello_mode(&self, user_id: &str, mode: Option<&str>) {
+    pub fn note_hello_mode(&self, user_id: &str, conn_id: aionui_realtime::ConnectionId, mode: Option<&str>) {
         let mode = mode.map(str::trim).filter(|m| !m.is_empty());
-        if matches!(mode.map(|m| SessionMode::parse(Some(m))), Some(Ok(SessionMode::Jarvis))) {
+        let jarvis = matches!(mode.map(|m| SessionMode::parse(Some(m))), Some(Ok(SessionMode::Jarvis)));
+        self.inner.sockets.set_jarvis(conn_id, user_id, jarvis);
+        if jarvis {
             self.inner.leave_conversation_mode(user_id);
         }
     }

@@ -5,6 +5,7 @@ use std::sync::Arc;
 
 use aionui_api_types::{VoiceCallEnded, VoiceErrorFrame, VoiceServerFrame, VoiceStateFrame, WebSocketMessage};
 use aionui_realtime::{ConnectionId, WebSocketManager};
+use dashmap::DashMap;
 use serde_json::Value;
 
 /// Serialize a frame into the standard `{name, data}` envelope.
@@ -47,11 +48,38 @@ pub(crate) fn state_frame(session_id: Option<&str>, state: &str, reason: Option<
 #[derive(Clone)]
 pub struct VoiceSockets {
     manager: Arc<WebSocketManager>,
+    /// Sockets whose hello said the device is armed in Jarvis mode (C26):
+    /// connection → user. They never keep a conversation binding alive.
+    jarvis: Arc<DashMap<ConnectionId, String>>,
 }
 
 impl VoiceSockets {
     pub fn new(manager: Arc<WebSocketManager>) -> Self {
-        Self { manager }
+        Self {
+            manager,
+            jarvis: Arc::new(DashMap::new()),
+        }
+    }
+
+    /// Record the mode a socket's hello announced (`None`: unknown, an older client).
+    pub(crate) fn set_jarvis(&self, conn_id: ConnectionId, user_id: &str, jarvis: bool) {
+        if jarvis {
+            self.jarvis.insert(conn_id, user_id.to_owned());
+        } else {
+            self.jarvis.remove(&conn_id);
+        }
+    }
+
+    /// The socket closed.
+    pub(crate) fn forget(&self, conn_id: ConnectionId) {
+        self.jarvis.remove(&conn_id);
+    }
+
+    /// Connected sockets of the user not known to be in Jarvis mode: only
+    /// these keep a conversation binding alive.
+    pub fn conversation_capable_count(&self, user_id: &str) -> usize {
+        let jarvis = self.jarvis.iter().filter(|e| e.value() == user_id).count();
+        self.count_for_user(user_id).saturating_sub(jarvis)
     }
 
     pub fn manager(&self) -> &Arc<WebSocketManager> {

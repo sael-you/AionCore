@@ -162,7 +162,8 @@ impl Socket {
                 self.hello_done = true;
                 tracing::debug!(user_id = %self.user_id, device = %log_safe(&hello.device), "voice socket hello");
                 self.service.note_heartbeat(&self.user_id, session.as_deref());
-                self.service.note_hello_mode(&self.user_id, hello.mode.as_deref());
+                self.service
+                    .note_hello_mode(&self.user_id, self.conn_id, hello.mode.as_deref());
                 if let (Some(id), Some(token)) = (session.as_deref(), self.token.as_deref()) {
                     self.service.adopt_token(&self.user_id, id, token);
                 }
@@ -346,6 +347,7 @@ pub async fn handle_voice_socket(socket: WebSocket, user_id: String, token: Opti
     }
 
     service.sockets().manager().remove_client(conn_id);
+    service.sockets().forget(conn_id);
     // Let the writer flush a pending close frame, then stop it.
     drop(state);
     let _ = tokio::time::timeout(Duration::from_secs(1), writer).await;

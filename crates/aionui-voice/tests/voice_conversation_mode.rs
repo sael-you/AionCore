@@ -720,3 +720,33 @@ async fn a_jarvis_hello_never_unbinds_a_live_conversation_call() {
     }
     assert_eq!(c.h.session_row(&c.user, &c.session).await.state, "live");
 }
+
+#[tokio::test]
+async fn a_call_on_another_device_leaves_no_binding_once_it_ends() {
+    let timings = aionui_voice::VoiceTimings {
+        idle_hangup: Duration::from_millis(400),
+        heartbeat_stale: Duration::from_secs(60),
+        // Long grace: only the fix can end the binding inside this test.
+        binding_grace: Duration::from_secs(600),
+        ..fast_timings()
+    };
+    let (h, user, session) = conversation_harness_with(Options { timings }).await;
+    let addr = h.serve().await;
+    // Device A runs the conversation call; device B is armed in Jarvis mode.
+    let mut phone = ws_connect(&addr, &user, Some(ORIGIN)).await.unwrap();
+    ws_send(&mut phone, hello_in("conversation")).await;
+    ws_expect(&mut phone, "voice.state").await;
+    let mut desk = ws_connect(&addr, &user, Some(ORIGIN)).await.unwrap();
+    ws_send(&mut desk, hello_in("jarvis")).await;
+    ws_expect(&mut desk, "voice.state").await;
+    assert!(h.service.is_bound(&user.id, "c-build"), "A's live call keeps it");
+
+    // A goes away; its call then ends. B's Jarvis socket must not keep it alive.
+    drop(phone);
+    let row = h.wait_ended(&user, &session).await;
+    assert_eq!(row.end_reason.as_deref(), Some("idle"));
+    assert!(
+        !h.service.is_bound(&user.id, "c-build"),
+        "only a Jarvis-mode device is left: the binding ends with the call"
+    );
+}
