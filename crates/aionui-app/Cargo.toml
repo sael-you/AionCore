@@ -29,6 +29,7 @@ aionui-auth.workspace = true
 aionui-system.workspace = true
 aionui-file.workspace = true
 aionui-office.workspace = true
+aionui-browser.workspace = true
 aionui-shell.workspace = true
 aionui-ai-agent.workspace = true
 aionui-session.workspace = true

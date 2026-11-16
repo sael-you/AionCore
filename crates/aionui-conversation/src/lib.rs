@@ -4,6 +4,7 @@
 mod acp_error_recovery;
 mod agent_health_policy;
 mod background_stream;
+pub mod browser_port;
 mod child_report;
 mod convert;
 pub mod error;
@@ -52,3 +53,4 @@ pub use state::ConversationRouterState;
 #[cfg(test)]
 #[path = "service_test.rs"]
 mod service_test;
+pub use browser_port::{BROWSER_SAFETY_SKILL, ConversationBrowserPort};

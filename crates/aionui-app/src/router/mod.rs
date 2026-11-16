@@ -2,6 +2,7 @@
 
 mod antigravity_hook;
 mod board_host;
+pub(crate) mod browser;
 mod clipboard_writer;
 mod fs_monitor;
 mod health;

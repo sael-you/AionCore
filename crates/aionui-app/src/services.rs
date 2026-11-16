@@ -65,6 +65,8 @@ pub struct AppServices {
     /// Built-in project board (Kanban). Shared by the board routers, the
     /// sidebar project ports and the helper CLI recover path. Cheap to clone.
     pub board_service: BoardService,
+    /// Server-side in-app browser (C30): Chrome instances, panel and agent bridge.
+    pub browser_service: Arc<aionui_browser::BrowserService>,
     /// Same instance as `worker_task_manager`, exposed through the
     /// `OnConversationDelete` trait so `ConversationService::with_delete_hook`
     /// can wire it up. Optional because tests construct `AppServices` with a
@@ -490,6 +492,14 @@ impl AppServices {
             user_order_store: user_order_store.clone(),
         });
 
+        // Server browser (C30): nothing starts here (no Chrome, no install);
+        // only the idle reaper and the daily update timer.
+        let browser_service = crate::router::browser::build_browser_service(&data_dir, &origin_policy)?;
+        browser_service.spawn_background();
+        conversation_service.with_browser_port(Arc::new(crate::router::browser::BrowserConversationPort {
+            service: browser_service.clone(),
+        }));
+
         let session_message_queue = Arc::new(DeliveryQueue::new(Arc::new(SystemClock)));
         let session_message_notify = Arc::new(Notify::new());
         let session_message_service = Arc::new(SessionMessageService::new(SessionMessageDeps {
@@ -538,6 +548,7 @@ impl AppServices {
             project_service,
             user_order_store,
             board_service,
+            browser_service,
             task_manager_delete_hook: Some(task_manager_delete_hook),
             agent_registry,
             conversation_repo,
