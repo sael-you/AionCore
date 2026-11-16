@@ -305,3 +305,58 @@ impl aionui_db::IVoiceSettingsRepository for GatedSettings {
         self.inner.upsert(row).await
     }
 }
+
+/// The owner's messaging channel: off until a test configures it.
+#[derive(Default)]
+pub struct FakeChannels {
+    pub configured: std::sync::atomic::AtomicBool,
+    pub sent: Mutex<Vec<(String, String)>>,
+}
+
+impl FakeChannels {
+    pub fn configure(&self) {
+        self.configured.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    pub fn sent(&self) -> Vec<(String, String)> {
+        self.sent.lock().unwrap().clone()
+    }
+}
+
+#[async_trait::async_trait]
+impl aionui_voice::ChannelPort for FakeChannels {
+    async fn send_text(&self, user_id: &str, text: &str) -> Result<bool, String> {
+        if !self.configured.load(std::sync::atomic::Ordering::SeqCst) {
+            return Ok(false);
+        }
+        self.sent.lock().unwrap().push((user_id.to_owned(), text.to_owned()));
+        Ok(true)
+    }
+}
+
+/// The user's skill library: `(user, skill) → SKILL.md`.
+#[derive(Default)]
+pub struct FakeSkills {
+    pub skills: Mutex<Vec<(String, String, String)>>,
+}
+
+impl FakeSkills {
+    pub fn add(&self, user_id: &str, name: &str, markdown: &str) {
+        self.skills
+            .lock()
+            .unwrap()
+            .push((user_id.to_owned(), name.to_owned(), markdown.to_owned()));
+    }
+}
+
+#[async_trait::async_trait]
+impl aionui_voice::SkillPort for FakeSkills {
+    async fn skill_markdown(&self, user_id: &str, name: &str) -> Option<String> {
+        self.skills
+            .lock()
+            .unwrap()
+            .iter()
+            .find(|(u, n, _)| u == user_id && n == name)
+            .map(|(_, _, md)| md.clone())
+    }
+}

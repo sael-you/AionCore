@@ -48,9 +48,9 @@ pub(crate) fn capabilities_data() -> Value {
         "contract": "agent-facing-voice-cli",
         "commands": {
             "say": {"stdin": {"text": "string (≤ 500 chars, no confirmation words; in conversation voice mode ≤ 1200 chars, spoken in ≤ 300-char clips)"},
-                    "returns": {"status": "delivered | no_device"}},
+                    "returns": {"status": "delivered | channel | no_device"}},
             "ask": {"stdin": {"question": "string", "timeout_s": "integer, optional (≤ 50)"},
-                    "returns": {"status": "answered | pending | timeout | no_device | cancelled", "id": "string",
+                    "returns": {"status": "answered | pending | timeout | channel | no_device | cancelled", "id": "string",
                                 "answer": "string"}},
             "wait": {"args": "<id>", "returns": "same as ask"},
             "status": {"returns": {"live_calls": "integer (all users)"}},

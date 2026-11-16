@@ -776,3 +776,55 @@ async fn a_call_on_another_device_leaves_no_binding_once_it_ends() {
         "only a Jarvis-mode device is left: the binding ends with the call"
     );
 }
+
+#[tokio::test]
+async fn with_no_device_say_and_ask_go_to_the_messaging_channel_when_one_is_configured() {
+    let timings = aionui_voice::VoiceTimings {
+        idle_hangup: Duration::from_millis(400),
+        heartbeat_stale: Duration::from_secs(60),
+        binding_grace: Duration::from_secs(600),
+        ..fast_timings()
+    };
+    let (h, user, session) = conversation_harness_with(Options { timings }).await;
+    h.wait_ended(&user, &session).await;
+    assert!(h.service.is_bound(&user.id, "c-build"));
+
+    // No device and no channel: unchanged.
+    let said = h
+        .service
+        .agent_say(&user.id, "c-build", "Done, all green.")
+        .await
+        .unwrap();
+    assert_eq!(said.status, "no_device");
+    assert!(h.channels.sent().is_empty());
+
+    // A channel is configured: the line goes there as text.
+    h.channels.configure();
+    let said = h
+        .service
+        .agent_say(&user.id, "c-build", "Done, all green.")
+        .await
+        .unwrap();
+    assert_eq!(said.status, "channel");
+    let asked = h
+        .service
+        .agent_ask(&user.id, "c-build", "Which port should I use?", Duration::from_secs(1))
+        .await
+        .unwrap();
+    assert_eq!(asked.status, "channel");
+    assert!(asked.id.is_none(), "no voice answer can come back: nothing to wait on");
+    assert_eq!(
+        h.channels.sent(),
+        vec![
+            (user.id.clone(), "Kanban build says: Done, all green.".to_owned()),
+            (
+                user.id.clone(),
+                "Kanban build asks: Which port should I use?".to_owned()
+            ),
+        ]
+    );
+    assert!(
+        h.speech.lines().is_empty(),
+        "nothing was synthesized for an absent device"
+    );
+}

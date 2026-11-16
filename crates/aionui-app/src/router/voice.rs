@@ -65,7 +65,15 @@ fn voice_auth_state(services: &AppServices) -> AuthState {
     }
 }
 
-pub fn build_voice_state(services: &AppServices) -> VoiceRouterState {
+/// `channel`: the channel manager and repository (`build_channel_state`) for
+/// the no-device text fallback of `say` / `ask`.
+pub fn build_voice_state(
+    services: &AppServices,
+    channel: (
+        Arc<aionui_channel::manager::ChannelManager>,
+        Arc<dyn aionui_db::IChannelRepository>,
+    ),
+) -> VoiceRouterState {
     let pool = services.database.pool().clone();
     let voice_repo = Arc::new(SqliteVoiceRepository::new(pool.clone()));
     let providers = ProviderService::new(
@@ -97,6 +105,14 @@ pub fn build_voice_state(services: &AppServices) -> VoiceRouterState {
             credentials,
             policy,
             http: reqwest::Client::new(),
+        }),
+        channels: Arc::new(super::voice_fallbacks::VoiceChannelAdapter {
+            manager: channel.0,
+            repo: channel.1,
+        }),
+        skills: Arc::new(super::voice_fallbacks::VoiceSkillAdapter {
+            paths: services.skill_paths.clone(),
+            repo: services.skill_repo.clone(),
         }),
     });
     VoiceRouterState {

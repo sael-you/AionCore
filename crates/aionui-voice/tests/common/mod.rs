@@ -19,7 +19,7 @@ pub mod fakes;
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, Response};
-pub use fakes::{FakeConversations, FakeSpeech, GatedSettings};
+pub use fakes::{FakeChannels, FakeConversations, FakeSkills, FakeSpeech, GatedSettings};
 use http_body_util::BodyExt;
 use serde_json::Value;
 use tokio::net::TcpListener;
@@ -106,6 +106,8 @@ pub struct Harness {
     pub auth_state: AuthState,
     pub voice_repo: Arc<SqliteVoiceRepository>,
     pub settings_gate: Arc<GatedSettings>,
+    pub channels: Arc<FakeChannels>,
+    pub skills: Arc<FakeSkills>,
 }
 
 impl Harness {
@@ -129,6 +131,8 @@ impl Harness {
         let voice_repo = Arc::new(SqliteVoiceRepository::new(db.pool().clone()));
         let conversations = Arc::new(FakeConversations::default());
         let speech = Arc::new(FakeSpeech::default());
+        let channels = Arc::new(FakeChannels::default());
+        let skills = Arc::new(FakeSkills::default());
         let settings_gate = Arc::new(GatedSettings {
             inner: voice_repo.clone(),
             slow_next: Default::default(),
@@ -146,6 +150,8 @@ impl Harness {
             verifier: Arc::new(SessionTokenVerifier::new(auth_state.clone())),
             sockets: VoiceSockets::new(Arc::new(WebSocketManager::new())),
             timings: options.timings,
+            channels: channels.clone(),
+            skills: skills.clone(),
         });
         let guards = VoiceHttpGuards {
             auth_state: auth_state.clone(),
@@ -173,6 +179,8 @@ impl Harness {
             auth_state,
             voice_repo,
             settings_gate,
+            channels,
+            skills,
         }
     }
 

@@ -60,6 +60,9 @@ JSON
 
 ## Results to report
 
-`voice say` prints `delivered` (queued for his device) or `no_device` (voice
-is not open on any device: keep writing, do not retry). `RATE_LIMITED` means
+`voice say` prints `delivered` (queued for his device), `channel` (no voice
+device: the line went to his messaging channel as text) or `no_device` (voice
+is not open on any device and no channel is set up: keep writing, do not
+retry). `voice ask` answering `channel` means no spoken answer will come:
+continue in writing. `RATE_LIMITED` means
 you spoke too often: stop speaking for this turn.

@@ -55,7 +55,10 @@ pub use error::VoiceError;
 pub use frames::VoiceSockets;
 pub use guard::{SessionTokenVerifier, VoiceHttpGuards};
 pub use lifecycle::{EndReason, VoiceTimings};
-pub use ports::{ApiKey, AuthRejected, AuthVerifier, CredentialPort, ProviderCredential, VerifiedUser};
+pub use ports::{
+    ApiKey, AuthRejected, AuthVerifier, ChannelPort, CredentialPort, NoChannels, NoSkills, ProviderCredential,
+    SkillPort, VerifiedUser,
+};
 pub use readback::{Clip, ClipVoice, SynthPort, TranscribePort};
 pub use refiner::{RawRefinement, RefineInput, RefinerPort};
 pub use routes::voice_routes;

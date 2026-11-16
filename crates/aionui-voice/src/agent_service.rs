@@ -16,6 +16,8 @@ use crate::runner_drafts::ClientEvent;
 use crate::service::VoiceService;
 
 const MAX_AGENT_TEXT: usize = 500;
+/// `say` / `ask` reply: no device, the line went to the messaging channel as text.
+pub const STATUS_CHANNEL: &str = "channel";
 
 fn reply(status: &str, id: Option<String>, answer: Option<String>) -> VoiceAgentReply {
     VoiceAgentReply {
@@ -72,16 +74,39 @@ impl VoiceService {
                 "this conversation may not speak by voice (no voice request was sent to it)".into(),
             ));
         }
-        let name = self
-            .inner
+        let name = self.conversation_name(user_id, conversation_id).await;
+        Ok(AgentAccess { name, bound: false })
+    }
+
+    async fn conversation_name(&self, user_id: &str, conversation_id: &str) -> String {
+        self.inner
             .drafts
             .conversations
             .list_conversations(user_id)
             .await
             .ok()
             .and_then(|list| list.into_iter().find(|c| c.id == conversation_id).map(|c| c.name))
-            .unwrap_or_else(|| "A conversation".to_owned());
-        Ok(AgentAccess { name, bound: false })
+            .unwrap_or_else(|| "A conversation".to_owned())
+    }
+
+    /// No voice device: the line goes to the owner's messaging channel as
+    /// text when one is configured (§3.4); `false` keeps `no_device`.
+    async fn channel_fallback(&self, user_id: &str, conversation_id: &str, line: &str) -> bool {
+        match self.inner.channels.send_text(user_id, line).await {
+            Ok(true) => {
+                tracing::info!(
+                    user_id,
+                    conversation_id,
+                    "voice line sent to the messaging channel (no device)"
+                );
+                true
+            }
+            Ok(false) => false,
+            Err(err) => {
+                tracing::warn!(user_id, conversation_id, error = %err, "voice channel fallback failed");
+                false
+            }
+        }
     }
 
     /// Text of a bound `say`/`ask`: 1–1 200 characters, no control characters.
@@ -272,17 +297,22 @@ impl VoiceService {
         tracing::info!(user_id, conversation_id, bound = access.bound, "voice agent say");
         if access.bound {
             if self.inner.sockets.count_for_user(user_id) == 0 {
-                return Ok(reply("no_device", None, None));
+                let name = self.conversation_name(user_id, conversation_id).await;
+                let sent = self
+                    .channel_fallback(user_id, conversation_id, &format!("{name} says: {text}"))
+                    .await;
+                return Ok(reply(if sent { STATUS_CHANNEL } else { "no_device" }, None, None));
             }
             self.bound_budget_check(user_id, &text).await?;
             self.bound_speak(user_id, conversation_id, "says", &text);
             return Ok(reply("delivered", None, None));
         }
-        let name = access.name;
-        let delivered = self
-            .agent_speak(user_id, conversation_id, "says", &format!("{name} says: {text}"))
-            .await;
-        Ok(reply(if delivered { "delivered" } else { "no_device" }, None, None))
+        let line = format!("{} says: {text}", access.name);
+        if self.agent_speak(user_id, conversation_id, "says", &line).await {
+            return Ok(reply("delivered", None, None));
+        }
+        let sent = self.channel_fallback(user_id, conversation_id, &line).await;
+        Ok(reply(if sent { STATUS_CHANNEL } else { "no_device" }, None, None))
     }
 
     pub async fn agent_ask(
@@ -302,7 +332,15 @@ impl VoiceService {
             self.bound_budget_check(user_id, &question).await?;
         }
         if self.inner.sockets.count_for_user(user_id) == 0 {
-            return Ok(reply("no_device", None, None));
+            // No voice answer can come back: the question goes to the channel
+            // as text and the agent gets `channel` (no ask id to wait on).
+            let name = match access.bound {
+                true => self.conversation_name(user_id, conversation_id).await,
+                false => access.name,
+            };
+            let line = format!("{name} asks: {question}");
+            let sent = self.channel_fallback(user_id, conversation_id, &line).await;
+            return Ok(reply(if sent { STATUS_CHANNEL } else { "no_device" }, None, None));
         }
         // Same budget as `say` (each ask is spoken), one open ask per conversation.
         if self.inner.say_limiter.check_and_increment(conversation_id).is_err() {

@@ -27,7 +27,7 @@ use crate::engine::VoiceEngine;
 use crate::error::VoiceError;
 use crate::frames::{VoiceSockets, call_ended_frame, error_frame};
 use crate::lifecycle::{EndReason, VoiceTimings};
-use crate::ports::{AuthRejected, AuthVerifier, CredentialPort, VerifiedUser};
+use crate::ports::{AuthRejected, AuthVerifier, ChannelPort, CredentialPort, SkillPort, VerifiedUser};
 use crate::readback::{Clip, ClipStore, ClipVoice};
 use crate::runner::CallCommand;
 use crate::runner_drafts::ClientEvent;
@@ -51,6 +51,10 @@ pub struct VoiceServiceDeps {
     pub conversations: Arc<dyn ConversationPort>,
     pub drafts: Arc<dyn IVoiceDraftRepository>,
     pub speech: Arc<dyn SpeechFactory>,
+    /// Text fallback for `say` / `ask` with no device (TASK-37).
+    pub channels: Arc<dyn ChannelPort>,
+    /// Source of the `cs-voice-concierge` skill (TASK-37, §3.7).
+    pub skills: Arc<dyn SkillPort>,
 }
 
 /// Liveness the WebSocket reports for the device that owns a call (§3.8).
@@ -142,6 +146,8 @@ pub(crate) struct ServiceInner {
     /// synthesized and delivered in the order they were said.
     pub speech_queues: DashMap<String, mpsc::UnboundedSender<crate::agent_service::BoundLine>>,
     pub tasks: DashMap<String, tokio::task::AbortHandle>,
+    pub channels: Arc<dyn ChannelPort>,
+    pub skills: Arc<dyn SkillPort>,
     /// Per-user admission lock: an admission, a resume and the kill switch of
     /// one user never interleave; other users are not blocked.
     admission: DashMap<String, Arc<Mutex<()>>>,
@@ -236,6 +242,29 @@ impl ServiceInner {
         removed
     }
 
+    /// Jarvis's session instructions: the user's `cs-voice-concierge` skill
+    /// compiled (§3.7), else the built-in ones.
+    pub(crate) async fn jarvis_instructions(&self, user_id: &str) -> String {
+        use crate::instructions::{BASE_INSTRUCTIONS, CONCIERGE_SKILL, compile_concierge_skill};
+        let Some(markdown) = self.skills.skill_markdown(user_id, CONCIERGE_SKILL).await else {
+            return BASE_INSTRUCTIONS.to_owned();
+        };
+        match compile_concierge_skill(&markdown) {
+            Ok(compiled) => {
+                tracing::info!(
+                    user_id,
+                    chars = compiled.chars().count(),
+                    "voice instructions compiled from the concierge skill"
+                );
+                compiled
+            }
+            Err(err) => {
+                tracing::warn!(user_id, error = ?err, "voice concierge skill not usable; built-in instructions");
+                BASE_INSTRUCTIONS.to_owned()
+            }
+        }
+    }
+
     pub(crate) fn mark_listening(&self) {
         if let Ok(mut since) = self.listening_since.lock()
             && since.is_none()
@@ -316,6 +345,8 @@ impl VoiceService {
                 interrupted: DashMap::new(),
                 speech_queues: DashMap::new(),
                 tasks: DashMap::new(),
+                channels: deps.channels,
+                skills: deps.skills,
                 admission: DashMap::new(),
                 settings_locks: DashMap::new(),
                 listening_since: std::sync::Mutex::new(None),

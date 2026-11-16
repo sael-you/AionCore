@@ -23,7 +23,7 @@ use crate::credentials::ResolvedCredential;
 use crate::engine::{EngineCall, EngineSessionConfig, OpenCallRequest};
 use crate::error::VoiceError;
 use crate::frames::call_ended_frame;
-use crate::instructions::{BASE_INSTRUCTIONS, estimate_prefix_tokens, instructions_hash};
+use crate::instructions::{estimate_prefix_tokens, instructions_hash};
 use crate::lifecycle::EndReason;
 use crate::pricing::pricing_for;
 use crate::runner::{CallRunner, RunMode};
@@ -142,9 +142,9 @@ impl VoiceService {
             crate::tools::definitions()
         };
         let instructions = if mode.is_conversation() {
-            TRANSCRIBE_ONLY_INSTRUCTIONS
+            TRANSCRIBE_ONLY_INSTRUCTIONS.to_owned()
         } else {
-            BASE_INSTRUCTIONS
+            self.inner.jarvis_instructions(user_id).await
         };
         let used = self
             .inner
@@ -155,7 +155,7 @@ impl VoiceService {
             pricing_for(&profile.model),
             settings.daily_budget_micros,
             used,
-            estimate_prefix_tokens(instructions, &tools),
+            estimate_prefix_tokens(&instructions, &tools),
         );
         if !meter.can_afford_response() {
             self.inner
@@ -173,7 +173,7 @@ impl VoiceService {
         let config = if mode.is_conversation() {
             conversation_session_config(&profile, &profile.model, self.transcription_keywords(user_id).await)
         } else {
-            session_config(&profile, &profile.model, tools.clone())
+            session_config(&profile, &profile.model, &instructions, tools.clone())
         };
         let hash = instructions_hash(&config.instructions, &tools);
         let session_id = aionui_common::generate_prefixed_id("vs");
@@ -551,7 +551,8 @@ impl VoiceService {
             .await
             .map_err(|_| EndReason::Restart)?;
         let tools: Vec<Value> = crate::tools::definitions();
-        let config = session_config(&settings.call_profile(), &row.model, tools.clone());
+        let instructions = self.inner.jarvis_instructions(&row.user_id).await;
+        let config = session_config(&settings.call_profile(), &row.model, &instructions, tools.clone());
         let mut engine_call = self.inner.engine.resume(credential, call_id, config);
         if !settings.enabled {
             let _ = engine_call.close(EndReason::Disabled.as_str()).await;
@@ -568,7 +569,7 @@ impl VoiceService {
             pricing_for(&row.model),
             settings.daily_budget_micros,
             used,
-            estimate_prefix_tokens(BASE_INSTRUCTIONS, &tools),
+            estimate_prefix_tokens(&instructions, &tools),
         );
         self.spawn_runner(RunnerStart {
             user_id: row.user_id.clone(),
@@ -625,10 +626,10 @@ fn started_from_created_at(created_at_ms: i64) -> Instant {
     now.checked_sub(Duration::from_millis(age_ms as u64)).unwrap_or(now)
 }
 
-fn session_config(profile: &CallProfile, model: &str, tools: Vec<Value>) -> EngineSessionConfig {
+fn session_config(profile: &CallProfile, model: &str, instructions: &str, tools: Vec<Value>) -> EngineSessionConfig {
     EngineSessionConfig {
         model: model.to_owned(),
-        instructions: BASE_INSTRUCTIONS.to_owned(),
+        instructions: instructions.to_owned(),
         voice: profile.voice.clone(),
         eagerness: profile.eagerness.clone(),
         noise_reduction: profile.noise_reduction.clone(),

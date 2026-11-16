@@ -300,6 +300,7 @@ pub async fn build_module_states(
         elapsed_ms = boot.elapsed().as_millis(),
         "startup: module states bundle started"
     );
+    let voice_channel = (channel_state.manager.clone(), channel_state.repo.clone());
     let states = ModuleStates {
         system: build_module_state_phase(&boot, "system", || build_system_state(services)),
         conversation: build_module_state_phase(&boot, "conversation", || {
@@ -344,7 +345,9 @@ pub async fn build_module_states(
         office: build_module_state_phase(&boot, "office", || build_office_state(services)),
         shell: build_module_state_phase(&boot, "shell", || build_shell_state(services)),
         assistant,
-        voice: build_module_state_phase(&boot, "voice", || super::voice::build_voice_state(services)),
+        voice: build_module_state_phase(&boot, "voice", || {
+            super::voice::build_voice_state(services, voice_channel)
+        }),
     };
     // Re-attach sidebands to calls persisted as live by the previous process
     // (or hang them up); runs in the background so startup never waits on it.

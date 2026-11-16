@@ -714,3 +714,59 @@ async fn a_recovered_call_without_a_device_goes_stale() {
     let row = second.wait_ended(&user, &session).await;
     assert_eq!(row.end_reason.as_deref(), Some("device_stale"));
 }
+
+#[tokio::test]
+async fn jarvis_instructions_come_from_the_concierge_skill_when_present() {
+    let h = Harness::new(Options::default()).await;
+    let alice = h.enabled_user("alice").await;
+    let bob = h.enabled_user("bob").await;
+    h.skills.add(
+        &alice.id,
+        "cs-voice-concierge",
+        "---\nname: cs-voice-concierge\ndescription: Jarvis\n---\n\nYou are Jarvis. Speak in short sentences.\n",
+    );
+    let (status, body) = create_session(&h, &alice).await;
+    assert_eq!(status, 201, "{body}");
+    let session = h.fake.created_sessions().last().cloned().unwrap();
+    assert_eq!(
+        session["instructions"], "You are Jarvis. Speak in short sentences.",
+        "the skill body, without its frontmatter"
+    );
+    let hash = h
+        .session_row(&alice, body["data"]["voice_session_id"].as_str().unwrap())
+        .await;
+    assert!(hash.instructions_hash.is_some(), "the hash of what was sent is stored");
+
+    // Another user without the skill keeps the built-in instructions.
+    let (status, body) = create_session(&h, &bob).await;
+    assert_eq!(status, 201, "{body}");
+    let session = h.fake.created_sessions().last().cloned().unwrap();
+    assert!(
+        session["instructions"]
+            .as_str()
+            .unwrap()
+            .starts_with("You are Jarvis, a concise voice concierge"),
+        "{session}"
+    );
+}
+
+#[tokio::test]
+async fn an_unusable_concierge_skill_falls_back_to_the_built_in_instructions() {
+    let h = Harness::new(Options::default()).await;
+    let alice = h.enabled_user("alice").await;
+    h.skills.add(
+        &alice.id,
+        "cs-voice-concierge",
+        "---\nname: cs-voice-concierge\n---\n   \n",
+    );
+    let (status, body) = create_session(&h, &alice).await;
+    assert_eq!(status, 201, "{body}");
+    let session = h.fake.created_sessions().last().cloned().unwrap();
+    assert!(
+        session["instructions"]
+            .as_str()
+            .unwrap()
+            .starts_with("You are Jarvis, a concise voice concierge"),
+        "{session}"
+    );
+}

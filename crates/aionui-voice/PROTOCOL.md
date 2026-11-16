@@ -128,8 +128,8 @@ refused with `voice.error SESSION_MISMATCH` (frame dropped).
 
 | Route | Body | Reply `data` |
 |---|---|---|
-| `POST /api/runtime/voice/say` | `{text, priority?}` | `{status: delivered \| no_device}` |
-| `POST /api/runtime/voice/ask` | `{question, timeout_s?}` | `{status: answered \| pending \| timeout \| no_device \| cancelled, id, answer?}` (blocks ≤ 50 s) |
+| `POST /api/runtime/voice/say` | `{text, priority?}` | `{status: delivered \| channel \| no_device}` (`channel`: no voice device, sent to the owner's messaging channel as text) |
+| `POST /api/runtime/voice/ask` | `{question, timeout_s?}` | `{status: answered \| pending \| timeout \| channel \| no_device \| cancelled, id, answer?}` (blocks ≤ 50 s; `channel`: the question went to the messaging channel as text, no `id`, no spoken answer) |
 | `GET /api/runtime/voice/ask/{id}` | — | same as `ask` (continues waiting ≤ 50 s) |
 | `GET /api/runtime/voice/capabilities` | — | `{max_wait_s, say_per_minute, note}` |
 

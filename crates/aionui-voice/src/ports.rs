@@ -85,3 +85,41 @@ mod tests {
         assert!(!format!("{cred:?}").contains("sk-live"));
     }
 }
+
+/// The owner's messaging channel (Telegram, Lark, … from `aionui-channel`):
+/// an agent's `say` / `ask` goes there as text when no voice device is
+/// connected (§3.4 "No armed device → Channels message if configured").
+#[async_trait::async_trait]
+pub trait ChannelPort: Send + Sync {
+    /// Send `text` to the user's paired chat. `Ok(false)` when no channel is
+    /// configured and running for this user.
+    async fn send_text(&self, user_id: &str, text: &str) -> Result<bool, String>;
+}
+
+/// No messaging channel: `say` / `ask` keep returning `no_device`.
+pub struct NoChannels;
+
+#[async_trait::async_trait]
+impl ChannelPort for NoChannels {
+    async fn send_text(&self, _user_id: &str, _text: &str) -> Result<bool, String> {
+        Ok(false)
+    }
+}
+
+/// The user's skill library (D47): the concierge instructions are compiled
+/// from the skill `cs-voice-concierge` when it exists (§3.7).
+#[async_trait::async_trait]
+pub trait SkillPort: Send + Sync {
+    /// Full `SKILL.md` text of the user's skill `name`, if it exists.
+    async fn skill_markdown(&self, user_id: &str, name: &str) -> Option<String>;
+}
+
+/// No skill library: Jarvis keeps the built-in instructions.
+pub struct NoSkills;
+
+#[async_trait::async_trait]
+impl SkillPort for NoSkills {
+    async fn skill_markdown(&self, _user_id: &str, _name: &str) -> Option<String> {
+        None
+    }
+}

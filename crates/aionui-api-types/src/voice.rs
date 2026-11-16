@@ -440,7 +440,8 @@ pub struct VoiceAskRequest {
 /// Answer of `say`, `ask` and `wait`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct VoiceAgentReply {
-    /// `delivered` | `answered` | `timeout` | `pending` | `no_device` | `cancelled`.
+    /// `delivered` | `answered` | `timeout` | `pending` | `channel` (no device:
+    /// sent to the messaging channel as text) | `no_device` | `cancelled`.
     pub status: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub id: Option<String>,
