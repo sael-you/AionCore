@@ -2,8 +2,10 @@
 //! instance, streamed into the WebUI panel, drivable by agents through a
 //! token-gated CDP bridge.
 
+pub mod approvals;
 pub mod bridge;
 pub mod cdp;
+pub mod devices;
 pub mod error;
 pub mod filter;
 pub mod guard;

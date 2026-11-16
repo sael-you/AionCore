@@ -170,7 +170,7 @@ impl SettingsStore {
     }
 }
 
-fn write_private_json<T: Serialize>(path: &Path, value: &T) -> Result<(), BrowserError> {
+pub(crate) fn write_private_json<T: Serialize>(path: &Path, value: &T) -> Result<(), BrowserError> {
     let dir = path
         .parent()
         .ok_or_else(|| BrowserError::Internal("settings path has no parent".into()))?;
