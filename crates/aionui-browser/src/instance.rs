@@ -1,0 +1,605 @@
+//! One running Chrome instance (C30): Xvfb + headful Chrome as the browser
+//! account, AionCore's own browser-level CDP session, the tab model and the
+//! navigation guard.
+//!
+//! Guard before the first request: AionCore's session sets
+//! `Target.setAutoAttach {waitForDebuggerOnStart: true, flatten: true}` at
+//! browser level, so every new target (panel tab, agent `createTarget`,
+//! popup) is paused until AionCore has run `Fetch.enable` with the guard's
+//! patterns on it and only then `Runtime.runIfWaitingForDebugger`. Paused
+//! requests are decided by [`NavigationGuard::decide`]. Navigations that
+//! never touch the network (`file:`, `chrome:`) are caught on
+//! `targetInfoChanged` and sent back to `about:blank`.
+//!
+//! Stop: root here lacks CAP_KILL and cannot signal the browser account's
+//! processes, so the stop is `Browser.close` over our own session, with a
+//! `kill` helper spawned AS the browser account as fallback.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicI64, AtomicU8, Ordering};
+use std::time::Duration;
+
+use aionui_api_types::BrowserErrorCode;
+use serde_json::{Value, json};
+use tokio::process::Child;
+use tokio::sync::{Mutex, broadcast, watch};
+
+use crate::cdp::{CdpClient, CdpEvent};
+use crate::error::BrowserError;
+use crate::guard::{GuardDecision, NavigationGuard};
+
+/// Everything needed to launch one instance.
+#[derive(Debug, Clone)]
+pub struct LaunchSpec {
+    pub user_id: String,
+    pub instance: u8,
+    pub chrome: PathBuf,
+    pub profile: PathBuf,
+    pub home: PathBuf,
+    pub uid: u32,
+    pub gid: u32,
+    pub hide_automation: bool,
+    pub max_tabs: Arc<AtomicU8>,
+    pub guard: Arc<NavigationGuard>,
+}
+
+/// One page target as the panel and status see it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TabRecord {
+    pub id: String,
+    pub url: String,
+    pub title: String,
+}
+
+/// Notices the panel shows (blocked navigation, tab limit).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct InstanceNotice {
+    pub code: BrowserErrorCode,
+    pub message: String,
+}
+
+pub struct ChromeInstance {
+    pub user_id: String,
+    pub instance: u8,
+    pub hide_automation: bool,
+    pub version: String,
+    cdp: CdpClient,
+    /// Chrome's private endpoint pieces (never logged or sent out).
+    port: u16,
+    browser_path: String,
+    uid: u32,
+    gid: u32,
+    chrome_child: Mutex<Option<Child>>,
+    xvfb_child: Mutex<Option<Child>>,
+    chrome_pid: Option<u32>,
+    xvfb_pid: Option<u32>,
+    display: u16,
+    tabs: watch::Sender<Vec<TabRecord>>,
+    notices: broadcast::Sender<InstanceNotice>,
+    max_tabs: Arc<AtomicU8>,
+    last_activity_ms: AtomicI64,
+    agent_last_ms: AtomicI64,
+    agent_tab: std::sync::Mutex<Option<String>>,
+    exited: watch::Receiver<bool>,
+}
+
+impl std::fmt::Debug for ChromeInstance {
+    // Hand-written: never print Chrome's private port or endpoint path.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChromeInstance")
+            .field("user_id", &self.user_id)
+            .field("instance", &self.instance)
+            .field("version", &self.version)
+            .finish_non_exhaustive()
+    }
+}
+
+const START_TIMEOUT: Duration = Duration::from_secs(25);
+/// "agent is driving" lasts this long after the last agent command.
+const AGENT_ACTIVE_MS: i64 = 5_000;
+
+fn now_ms() -> i64 {
+    aionui_common::now_ms()
+}
+
+/// Displays in use by this process (X server numbers).
+static DISPLAYS: std::sync::Mutex<Vec<u16>> = std::sync::Mutex::new(Vec::new());
+
+fn allocate_display() -> Option<u16> {
+    let mut used = DISPLAYS.lock().unwrap_or_else(|e| e.into_inner());
+    let n = (110..400).find(|n| {
+        !used.contains(n)
+            && !Path::new(&format!("/tmp/.X11-unix/X{n}")).exists()
+            && !Path::new(&format!("/tmp/.X{n}-lock")).exists()
+    })?;
+    used.push(n);
+    Some(n)
+}
+
+fn release_display(n: u16) {
+    DISPLAYS.lock().unwrap_or_else(|e| e.into_inner()).retain(|d| *d != n);
+}
+
+/// Chrome's launch arguments. No port, no token: the port is chosen by
+/// Chrome (`--remote-debugging-port=0`) and read from `DevToolsActivePort`.
+pub fn chrome_args(profile: &Path, hide_automation: bool) -> Vec<String> {
+    let mut args = vec![
+        // The container forbids every Chrome sandbox (NoNewPrivs, seccomp, no
+        // user namespaces); isolation = the separate account (decision d).
+        "--no-sandbox".to_owned(),
+        format!("--user-data-dir={}", profile.display()),
+        "--remote-debugging-address=127.0.0.1".to_owned(),
+        "--remote-debugging-port=0".to_owned(),
+        // /dev/shm is 64 MB here: without this Chrome crashes or renders blank.
+        "--disable-dev-shm-usage".to_owned(),
+        "--no-first-run".to_owned(),
+        "--password-store=basic".to_owned(),
+        "--disable-breakpad".to_owned(),
+        "--window-position=0,0".to_owned(),
+        "--window-size=1280,800".to_owned(),
+    ];
+    if hide_automation {
+        args.push("--disable-blink-features=AutomationControlled".to_owned());
+    }
+    args.push("about:blank".to_owned());
+    args
+}
+
+/// `DevToolsActivePort`: line 1 = port, line 2 = browser ws path.
+pub fn parse_devtools_active_port(text: &str) -> Option<(u16, String)> {
+    let mut lines = text.lines();
+    let port = lines.next()?.trim().parse::<u16>().ok().filter(|p| *p > 0)?;
+    let path = lines.next()?.trim().to_owned();
+    path.starts_with("/devtools/browser/").then_some((port, path))
+}
+
+async fn wait_for(path: &Path, timeout: Duration) -> bool {
+    let deadline = tokio::time::Instant::now() + timeout;
+    while tokio::time::Instant::now() < deadline {
+        if path.exists() {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    false
+}
+
+/// `kill -<sig> -- -<pgid>` run AS the browser account (same uid may signal).
+async fn kill_as(uid: u32, gid: u32, pgid: u32, signal: &str) {
+    let mut cmd = aionui_runtime::Builder::clean_cli("kill");
+    cmd.uid(uid)
+        .gid(gid)
+        .arg(format!("-{signal}"))
+        .arg("--")
+        .arg(format!("-{pgid}"));
+    let _ = cmd.output().await;
+}
+
+impl ChromeInstance {
+    pub async fn launch(spec: LaunchSpec) -> Result<Arc<Self>, BrowserError> {
+        let display = allocate_display()
+            .ok_or_else(|| BrowserError::coded(BrowserErrorCode::BrowserStartFailed, "no free X display"))?;
+        match Self::launch_on(spec, display).await {
+            Ok(i) => Ok(i),
+            Err(e) => {
+                release_display(display);
+                Err(e)
+            }
+        }
+    }
+
+    async fn launch_on(spec: LaunchSpec, display: u16) -> Result<Arc<Self>, BrowserError> {
+        let failed = |what: &str| BrowserError::coded(BrowserErrorCode::BrowserStartFailed, what.to_owned());
+        let base_env = |cmd: &mut aionui_runtime::Builder| {
+            cmd.env_clear()
+                .env("HOME", &spec.home)
+                .env("PATH", "/usr/local/bin:/usr/bin:/bin")
+                .env("LANG", "en_US.UTF-8")
+                .env("DISPLAY", format!(":{display}"));
+        };
+
+        let mut xvfb = aionui_runtime::Builder::new("Xvfb");
+        base_env(&mut xvfb);
+        xvfb.args([
+            format!(":{display}"),
+            "-screen".into(),
+            "0".into(),
+            "1920x1080x24".into(),
+            "-nolisten".into(),
+            "tcp".into(),
+        ])
+        .uid(spec.uid)
+        .gid(spec.gid)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+        let mut xvfb_child = xvfb.spawn().map_err(|_| failed("Xvfb did not start"))?;
+        let xvfb_pid = xvfb_child.id();
+        if !wait_for(Path::new(&format!("/tmp/.X11-unix/X{display}")), Duration::from_secs(8)).await {
+            if let Some(pid) = xvfb_pid {
+                kill_as(spec.uid, spec.gid, pid, "KILL").await;
+            }
+            let _ = xvfb_child.wait().await;
+            return Err(failed("Xvfb display did not appear"));
+        }
+
+        let port_file = spec.profile.join("DevToolsActivePort");
+        let _ = std::fs::remove_file(&port_file);
+        let mut chrome = aionui_runtime::Builder::new(&spec.chrome);
+        base_env(&mut chrome);
+        chrome
+            .args(chrome_args(&spec.profile, spec.hide_automation))
+            .current_dir(&spec.home)
+            .uid(spec.uid)
+            .gid(spec.gid)
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        let chrome_child = match chrome.spawn() {
+            Ok(c) => c,
+            Err(_) => {
+                if let Some(pid) = xvfb_pid {
+                    kill_as(spec.uid, spec.gid, pid, "TERM").await;
+                }
+                return Err(failed("Chrome did not start"));
+            }
+        };
+        let chrome_pid = chrome_child.id();
+
+        let deadline = tokio::time::Instant::now() + START_TIMEOUT;
+        let (port, browser_path) = loop {
+            if let Some(parsed) = std::fs::read_to_string(&port_file)
+                .ok()
+                .and_then(|t| parse_devtools_active_port(&t))
+            {
+                break parsed;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                for pid in [chrome_pid, xvfb_pid].into_iter().flatten() {
+                    kill_as(spec.uid, spec.gid, pid, "KILL").await;
+                }
+                return Err(failed("Chrome did not open its debugging port"));
+            }
+            tokio::time::sleep(Duration::from_millis(150)).await;
+        };
+        let cdp = CdpClient::connect(&format!("ws://127.0.0.1:{port}{browser_path}")).await?;
+        let version = cdp
+            .call("Browser.getVersion", json!({}), None)
+            .await
+            .ok()
+            .and_then(|v| v.get("product").and_then(Value::as_str).map(str::to_owned))
+            .unwrap_or_default();
+
+        let (exited_tx, exited_rx) = watch::channel(false);
+        let (tabs_tx, _) = watch::channel(Vec::new());
+        let (notices, _) = broadcast::channel(64);
+        let inst = Arc::new(Self {
+            user_id: spec.user_id.clone(),
+            instance: spec.instance,
+            hide_automation: spec.hide_automation,
+            version: version.trim_start_matches("Chrome/").to_owned(),
+            cdp,
+            port,
+            browser_path,
+            uid: spec.uid,
+            gid: spec.gid,
+            chrome_child: Mutex::new(Some(chrome_child)),
+            xvfb_child: Mutex::new(Some(xvfb_child)),
+            chrome_pid,
+            xvfb_pid,
+            display,
+            tabs: tabs_tx,
+            notices,
+            max_tabs: spec.max_tabs.clone(),
+            last_activity_ms: AtomicI64::new(now_ms()),
+            agent_last_ms: AtomicI64::new(0),
+            agent_tab: std::sync::Mutex::new(None),
+            exited: exited_rx,
+        });
+
+        inst.clone().spawn_event_loop(spec.guard.clone());
+        inst.clone().spawn_exit_watch(exited_tx);
+        // Order matters: auto-attach (paused) before anything can navigate.
+        inst.cdp
+            .call(
+                "Target.setAutoAttach",
+                json!({"autoAttach": true, "waitForDebuggerOnStart": true, "flatten": true}),
+                None,
+            )
+            .await?;
+        inst.cdp
+            .call("Target.setDiscoverTargets", json!({"discover": true}), None)
+            .await?;
+        tracing::info!(
+            user_id = %inst.user_id,
+            instance = inst.instance,
+            chrome = %inst.version,
+            hide_automation = inst.hide_automation,
+            "server browser instance started"
+        );
+        Ok(inst)
+    }
+
+    fn spawn_exit_watch(self: Arc<Self>, exited: watch::Sender<bool>) {
+        tokio::spawn(async move {
+            let child = self.chrome_child.lock().await.take();
+            if let Some(mut child) = child {
+                let _ = child.wait().await;
+            }
+            let _ = exited.send(true);
+            if let Some(pid) = self.xvfb_pid {
+                kill_as(self.uid, self.gid, pid, "TERM").await;
+            }
+            if let Some(mut x) = self.xvfb_child.lock().await.take() {
+                let _ = tokio::time::timeout(Duration::from_secs(5), x.wait()).await;
+            }
+            release_display(self.display);
+            tracing::info!(user_id = %self.user_id, instance = self.instance, "server browser instance exited");
+        });
+    }
+
+    fn spawn_event_loop(self: Arc<Self>, guard: Arc<NavigationGuard>) {
+        let mut events = self.cdp.subscribe();
+        let weak = Arc::downgrade(&self);
+        drop(self);
+        tokio::spawn(async move {
+            // targetId → our auto-attach session (for guard redirects).
+            let mut sessions: HashMap<String, String> = HashMap::new();
+            let mut pages: Vec<TabRecord> = Vec::new();
+            loop {
+                let ev = match events.recv().await {
+                    Ok(ev) => ev,
+                    Err(broadcast::error::RecvError::Lagged(n)) => {
+                        tracing::warn!(skipped = n, "server browser event loop lagged");
+                        continue;
+                    }
+                    Err(broadcast::error::RecvError::Closed) => break,
+                };
+                let Some(inst) = weak.upgrade() else { break };
+                inst.handle_event(&ev, &guard, &mut sessions, &mut pages).await;
+            }
+        });
+    }
+
+    async fn handle_event(
+        &self,
+        ev: &CdpEvent,
+        guard: &NavigationGuard,
+        sessions: &mut HashMap<String, String>,
+        pages: &mut Vec<TabRecord>,
+    ) {
+        match ev.method.as_str() {
+            "Target.attachedToTarget" => {
+                let Some(session) = ev.params["sessionId"].as_str().map(str::to_owned) else {
+                    return;
+                };
+                let target_id = ev.params["targetInfo"]["targetId"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned();
+                let kind = ev.params["targetInfo"]["type"].as_str().unwrap_or_default().to_owned();
+                if kind == "page" {
+                    sessions.insert(target_id, session.clone());
+                }
+                let cdp = self.cdp.clone();
+                let patterns: Vec<Value> = guard
+                    .fetch_patterns()
+                    .into_iter()
+                    .map(|p| json!({"urlPattern": p, "requestStage": "Request"}))
+                    .collect();
+                tokio::spawn(async move {
+                    // Not every target type has Fetch / auto-attach; ignore those errors.
+                    let _ = cdp
+                        .call("Fetch.enable", json!({"patterns": patterns}), Some(&session))
+                        .await;
+                    let _ = cdp
+                        .call(
+                            "Target.setAutoAttach",
+                            json!({"autoAttach": true, "waitForDebuggerOnStart": true, "flatten": true}),
+                            Some(&session),
+                        )
+                        .await;
+                    let _ = cdp
+                        .call("Runtime.runIfWaitingForDebugger", json!({}), Some(&session))
+                        .await;
+                });
+            }
+            "Target.detachedFromTarget" => {
+                if let Some(sid) = ev.params["sessionId"].as_str() {
+                    sessions.retain(|_, s| s != sid);
+                }
+            }
+            "Fetch.requestPaused" => {
+                let Some(session) = ev.session_id.clone() else { return };
+                let request_id = ev.params["requestId"].as_str().unwrap_or_default().to_owned();
+                let url = ev.params["request"]["url"].as_str().unwrap_or_default();
+                let decision = guard.decide(url);
+                if decision == GuardDecision::Block {
+                    let host = url::Url::parse(url)
+                        .ok()
+                        .and_then(|u| u.host_str().map(str::to_owned))
+                        .unwrap_or_else(|| url.split(':').next().unwrap_or("").to_owned());
+                    tracing::info!(user_id = %self.user_id, instance = self.instance, %host, "server browser: blocked a request");
+                    let _ = self.notices.send(InstanceNotice {
+                        code: BrowserErrorCode::BrowserUrlBlocked,
+                        message: host,
+                    });
+                    self.cdp.notify(
+                        "Fetch.failRequest",
+                        json!({"requestId": request_id, "errorReason": "BlockedByClient"}),
+                        Some(&session),
+                    );
+                } else {
+                    self.cdp.notify(
+                        "Fetch.continueRequest",
+                        json!({"requestId": request_id}),
+                        Some(&session),
+                    );
+                }
+            }
+            "Target.targetCreated" | "Target.targetInfoChanged" => {
+                let info = &ev.params["targetInfo"];
+                if info["type"].as_str() != Some("page") {
+                    return;
+                }
+                let record = TabRecord {
+                    id: info["targetId"].as_str().unwrap_or_default().to_owned(),
+                    url: info["url"].as_str().unwrap_or_default().to_owned(),
+                    title: info["title"].as_str().unwrap_or_default().to_owned(),
+                };
+                // Local schemes never reach Fetch: send the tab back.
+                if !record.url.is_empty()
+                    && guard.decide(&record.url) == GuardDecision::Block
+                    && let Some(session) = sessions.get(&record.id)
+                {
+                    let _ = self.notices.send(InstanceNotice {
+                        code: BrowserErrorCode::BrowserUrlBlocked,
+                        message: record.url.split(':').next().unwrap_or("").to_owned(),
+                    });
+                    self.cdp
+                        .notify("Page.navigate", json!({"url": "about:blank"}), Some(session));
+                }
+                match pages.iter_mut().find(|p| p.id == record.id) {
+                    Some(existing) => *existing = record,
+                    None => {
+                        let limit = usize::from(self.max_tabs.load(Ordering::Relaxed).max(1));
+                        if pages.len() >= limit {
+                            // A popup beyond the limit (explicit creates are refused earlier).
+                            let _ = self.notices.send(InstanceNotice {
+                                code: BrowserErrorCode::BrowserTabLimit,
+                                message: format!("max {limit} tabs"),
+                            });
+                            self.cdp
+                                .notify("Target.closeTarget", json!({"targetId": record.id}), None);
+                            return;
+                        }
+                        pages.push(record);
+                    }
+                }
+                self.tabs.send_replace(pages.clone());
+            }
+            "Target.targetDestroyed" => {
+                if let Some(id) = ev.params["targetId"].as_str() {
+                    pages.retain(|p| p.id != id);
+                    sessions.remove(id);
+                    self.tabs.send_replace(pages.clone());
+                }
+            }
+            _ => {}
+        }
+    }
+
+    pub fn cdp(&self) -> &CdpClient {
+        &self.cdp
+    }
+
+    /// `ws://127.0.0.1:<port><path>` for the bridge's upstream (private).
+    pub(crate) fn upstream_url(&self, path: &str) -> String {
+        format!("ws://127.0.0.1:{}{}", self.port, path)
+    }
+
+    pub(crate) fn browser_path(&self) -> &str {
+        &self.browser_path
+    }
+
+    pub fn tabs(&self) -> watch::Receiver<Vec<TabRecord>> {
+        self.tabs.subscribe()
+    }
+
+    pub fn tab_count(&self) -> usize {
+        self.tabs.borrow().len()
+    }
+
+    pub fn max_tabs(&self) -> u8 {
+        self.max_tabs.load(Ordering::Relaxed)
+    }
+
+    pub fn notices(&self) -> broadcast::Receiver<InstanceNotice> {
+        self.notices.subscribe()
+    }
+
+    pub fn is_running(&self) -> bool {
+        !*self.exited.borrow() && !self.cdp.is_closed()
+    }
+
+    pub fn touch(&self) {
+        self.last_activity_ms.store(now_ms(), Ordering::Relaxed);
+    }
+
+    pub fn idle_ms(&self) -> i64 {
+        now_ms() - self.last_activity_ms.load(Ordering::Relaxed)
+    }
+
+    /// An agent command reached this instance (optionally for a tab).
+    pub fn mark_agent(&self, tab: Option<&str>) {
+        self.agent_last_ms.store(now_ms(), Ordering::Relaxed);
+        self.touch();
+        if let Some(tab) = tab {
+            *self.agent_tab.lock().unwrap_or_else(|e| e.into_inner()) = Some(tab.to_owned());
+        }
+    }
+
+    pub fn agent_active(&self) -> bool {
+        now_ms() - self.agent_last_ms.load(Ordering::Relaxed) < AGENT_ACTIVE_MS
+    }
+
+    pub fn agent_tab(&self) -> Option<String> {
+        self.agent_tab.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
+    /// Resolves once Chrome has exited.
+    pub async fn exited(&self) {
+        let mut rx = self.exited.clone();
+        while !*rx.borrow() {
+            if rx.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+
+    /// Close Chrome over CDP; fall back to a kill run as the browser account.
+    pub async fn stop(&self) {
+        let _ = tokio::time::timeout(Duration::from_secs(5), self.cdp.call("Browser.close", json!({}), None)).await;
+        if tokio::time::timeout(Duration::from_secs(8), self.exited())
+            .await
+            .is_err()
+            && let Some(pid) = self.chrome_pid
+        {
+            tracing::warn!(user_id = %self.user_id, instance = self.instance, "Browser.close did not stop Chrome; killing it");
+            kill_as(self.uid, self.gid, pid, "KILL").await;
+            let _ = tokio::time::timeout(Duration::from_secs(5), self.exited()).await;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn launch_args_carry_no_port_or_token_and_honour_hide_automation() {
+        let args = chrome_args(Path::new("/b/u/1"), false);
+        assert!(args.contains(&"--remote-debugging-port=0".to_owned()));
+        assert!(args.contains(&"--remote-debugging-address=127.0.0.1".to_owned()));
+        assert!(args.contains(&"--user-data-dir=/b/u/1".to_owned()));
+        assert!(args.contains(&"--disable-dev-shm-usage".to_owned()));
+        assert!(!args.iter().any(|a| a.contains("AutomationControlled")));
+        assert!(!args.iter().any(|a| a.contains("token")));
+        let hidden = chrome_args(Path::new("/b/u/1"), true);
+        assert!(hidden.contains(&"--disable-blink-features=AutomationControlled".to_owned()));
+        assert_eq!(hidden.len(), args.len() + 1, "no other flag changes");
+    }
+
+    #[test]
+    fn devtools_active_port_file() {
+        assert_eq!(
+            parse_devtools_active_port("41234\n/devtools/browser/abc-def\n"),
+            Some((41234, "/devtools/browser/abc-def".to_owned()))
+        );
+        assert_eq!(parse_devtools_active_port("0\n/devtools/browser/x"), None);
+        assert_eq!(parse_devtools_active_port("41234\n"), None);
+        assert_eq!(parse_devtools_active_port("41234\n/evil"), None);
+    }
+}

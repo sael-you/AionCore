@@ -405,6 +405,7 @@ dependencies = [
  "aionui-assistant",
  "aionui-auth",
  "aionui-board",
+ "aionui-browser",
  "aionui-channel",
  "aionui-common",
  "aionui-conversation",
@@ -551,6 +552,34 @@ dependencies = [
  "tower",
  "tracing",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "aionui-browser"
+version = "0.2.2"
+dependencies = [
+ "aionui-api-types",
+ "aionui-auth",
+ "aionui-common",
+ "aionui-runtime",
+ "async-trait",
+ "axum",
+ "base64",
+ "dashmap",
+ "futures-util",
+ "hex",
+ "libc",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-tungstenite 0.26.2",
+ "tracing",
+ "url",
+ "uuid",
 ]
 
 [[package]]
