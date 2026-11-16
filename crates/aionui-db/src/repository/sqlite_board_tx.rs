@@ -333,10 +333,10 @@ impl IBoardTx for SqliteBoardTx {
         sqlx::query(
             "INSERT INTO board_cards \
              (id, project_id, user_id, number, title, description, type, priority, size, tier, column_key, position, \
-              labels, skills, routing, creator_kind, creator_ref, assignee_kind, assignee_ref, blocked, blocked_reason, \
-              blocked_by, \
+              labels, skills, routing, creator_kind, creator_ref, assignee_kind, assignee_ref, assignee_conversation_id, \
+              blocked, blocked_reason, blocked_by, \
               change_id, metadata, version, archived_at, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         )
         .bind(&row.id)
         .bind(&row.project_id)
@@ -357,6 +357,7 @@ impl IBoardTx for SqliteBoardTx {
         .bind(&row.creator_ref)
         .bind(&row.assignee_kind)
         .bind(&row.assignee_ref)
+        .bind(&row.assignee_conversation_id)
         .bind(row.blocked)
         .bind(&row.blocked_reason)
         .bind(&row.blocked_by)
@@ -375,7 +376,7 @@ impl IBoardTx for SqliteBoardTx {
         let result = sqlx::query(
             "UPDATE board_cards SET title = ?, description = ?, type = ?, priority = ?, size = ?, tier = ?, \
              column_key = ?, position = ?, labels = ?, skills = ?, routing = ?, assignee_kind = ?, assignee_ref = ?, \
-             blocked = ?, blocked_reason = ?, blocked_by = ?, change_id = ?, metadata = ?, version = ?, archived_at = ?, \
+             assignee_conversation_id = ?, blocked = ?, blocked_reason = ?, blocked_by = ?, change_id = ?, metadata = ?, version = ?, archived_at = ?, \
              updated_at = ? \
              WHERE user_id = ? AND id = ? AND version = ?",
         )
@@ -392,6 +393,7 @@ impl IBoardTx for SqliteBoardTx {
         .bind(&row.routing)
         .bind(&row.assignee_kind)
         .bind(&row.assignee_ref)
+        .bind(&row.assignee_conversation_id)
         .bind(row.blocked)
         .bind(&row.blocked_reason)
         .bind(&row.blocked_by)

@@ -557,6 +557,7 @@ mod tests {
             creator_ref: "u".into(),
             assignee_kind: None,
             assignee_ref: None,
+            assignee_conversation_id: None,
             blocked: false,
             blocked_reason: None,
             blocked_by: None,

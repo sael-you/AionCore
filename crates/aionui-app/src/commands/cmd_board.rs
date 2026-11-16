@@ -69,7 +69,15 @@ async fn run_board_inner(cli: &Cli, args: &BoardArgs) -> Result<(), ExitCode> {
             ))
         }
         command => {
-            let stdin = read_stdin_if_needed(command)?;
+            let mut stdin = read_stdin_if_needed(command)?;
+            // `update N --assignee-conversation X` alone: read the version first.
+            if let BoardCommand::Update(update) = command
+                && update.assignee_conversation.is_some()
+                && stdin.get("version").is_none()
+                && let Value::Object(object) = &mut stdin
+            {
+                object.insert("version".into(), json!(card_version(&update.card).await?));
+            }
             let request = build_request(command, stdin)?;
             send(request).await
         }
@@ -232,14 +240,19 @@ pub(crate) fn build_request(command: &BoardCommand, stdin: Value) -> Result<Boar
             "/cards".into(),
             Value::Object(payload.unwrap_or_default()),
         ),
-        BoardCommand::Update(args) => write(
-            reqwest::Method::PATCH,
-            card_path(&args.card, ""),
-            Value::Object(payload.unwrap_or_default()),
-        ),
+        BoardCommand::Update(args) => {
+            let mut body = payload.unwrap_or_default();
+            if let Some(conversation) = &args.assignee_conversation {
+                body.insert("assignee_conversation".into(), json!(conversation));
+            }
+            write(reqwest::Method::PATCH, card_path(&args.card, ""), Value::Object(body))
+        }
         BoardCommand::Move(args) => {
             let mut body = payload.unwrap_or_default();
             body.insert("to_column".into(), json!(args.column));
+            if let Some(note) = &args.approval_note {
+                body.insert("approval_note".into(), json!(note));
+            }
             write(
                 reqwest::Method::POST,
                 card_path(&args.card, "/move"),
@@ -360,6 +373,36 @@ impl RuntimeEnv {
         }
         Ok(headers)
     }
+}
+
+/// The card's current version (`board show`), for an update given only flags.
+async fn card_version(card: &str) -> Result<i64, ExitCode> {
+    const COMMAND: &str = "board update";
+    let env = RuntimeEnv::from_env(COMMAND)?;
+    let url = format!(
+        "{}/api/runtime/board/cards/{}",
+        env.base_url.trim_end_matches('/'),
+        encode_segment(card.trim())
+    );
+    let failure = |message: String| {
+        print_failure(
+            COMMAND,
+            "BOARD_CLI_HTTP_BRIDGE_FAILED",
+            TRANSPORT_UNAVAILABLE,
+            message,
+            None,
+        )
+    };
+    let response = reqwest::Client::new()
+        .get(url)
+        .headers(env.headers(COMMAND)?)
+        .send()
+        .await
+        .map_err(|error| failure(error.to_string()))?;
+    let body: Value = response.json().await.map_err(|error| failure(error.to_string()))?;
+    body["data"]["card"]["version"]
+        .as_i64()
+        .ok_or_else(|| failure(format!("could not read the card version: {}", body["error"])))
 }
 
 async fn send(request: BoardRequest) -> Result<(), ExitCode> {
@@ -505,6 +548,45 @@ mod tests {
         let request = build_request(&parse(&["move", "4", "done"]), json!({ "after": 2 })).unwrap();
         assert_eq!(request.path, "/cards/4/move");
         assert_eq!(request.body, Some(json!({ "after": 2, "to_column": "done" })));
+
+        // TASK-116: the gate approval note and the conversation assignee.
+        let request = build_request(
+            &parse(&["move", "4", "planned", "--approval-note", "owner said go in chat"]),
+            json!({}),
+        )
+        .unwrap();
+        assert_eq!(
+            request.body,
+            Some(json!({ "to_column": "planned", "approval_note": "owner said go in chat" }))
+        );
+        let request = build_request(
+            &parse(&["update", "TASK-4", "--assignee-conversation", "conv-9"]),
+            json!({ "version": 3 }),
+        )
+        .unwrap();
+        assert_eq!(request.path, "/cards/4");
+        assert_eq!(
+            request.body,
+            Some(json!({ "version": 3, "assignee_conversation": "conv-9" }))
+        );
+        // Both are also accepted on stdin (the descriptors list them).
+        assert!(validate_stdin("board move", "move", json!({ "approval_note": "x" })).is_ok());
+        assert!(
+            validate_stdin(
+                "board update",
+                "update",
+                json!({ "version": 1, "assignee_conversation": "c" })
+            )
+            .is_ok()
+        );
+        assert!(
+            validate_stdin(
+                "board create",
+                "create",
+                json!({ "title": "t", "assignee_conversation": "c" })
+            )
+            .is_err()
+        );
 
         let request = build_request(
             &parse(&["comment", "4", "--to", "qa", "--answers", "q1"]),

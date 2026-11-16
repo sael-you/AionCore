@@ -21,8 +21,9 @@ pub(crate) const SETTINGS_COLS: &str = "project_id, user_id, enabled, template, 
 pub(crate) const COLUMN_COLS: &str = "id, project_id, user_id, key, name, category, kind, resolution, agent_move, \
      wip_limit, exit_rule, gate, position, archived";
 pub(crate) const CARD_COLS: &str = "id, project_id, user_id, number, title, description, type, priority, size, tier, \
-     column_key, position, labels, skills, routing, creator_kind, creator_ref, assignee_kind, assignee_ref, blocked, \
-     blocked_reason, blocked_by, change_id, metadata, version, archived_at, created_at, updated_at";
+     column_key, position, labels, skills, routing, creator_kind, creator_ref, assignee_kind, assignee_ref, \
+     assignee_conversation_id, blocked, blocked_reason, blocked_by, change_id, metadata, version, archived_at, created_at, \
+     updated_at";
 pub(crate) const EVENT_COLS: &str = "seq, id, card_id, project_id, user_id, actor_kind, actor_ref, conversation_id, kind, payload, prev_seq, created_at";
 pub(crate) const REVIEW_COLS: &str = "id, card_id, project_id, user_id, department, reviewer_ref, conversation_id, \
      verdict, summary, findings, recommendation, assumptions, confidence, tokens_used, version, created_at, updated_at";

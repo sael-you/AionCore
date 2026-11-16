@@ -456,6 +456,8 @@ async fn move_card(
                 expected_column: Some(request.expected_column),
                 force: request.force,
                 reason: request.reason,
+                // The owner needs no approval note.
+                approval_note: None,
             },
         )
         .await

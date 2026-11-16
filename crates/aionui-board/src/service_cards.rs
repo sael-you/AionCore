@@ -9,7 +9,7 @@
 use std::collections::HashMap;
 
 use aionui_api_types::{
-    AgentMove, BoardCardDto, ColumnKind, ColumnResolution, CreateBoardCardRequest, UpdateBoardCardRequest,
+    AgentAccess, AgentMove, BoardCardDto, ColumnKind, ColumnResolution, CreateBoardCardRequest, UpdateBoardCardRequest,
 };
 use aionui_common::{generate_id, now_ms};
 use aionui_db::{BoardCardRow, BoardColumnRow, BoardPlacement, BoardPlacementOutcome, IBoardTx};
@@ -21,7 +21,7 @@ use crate::convert::{agent_card_ids, card_creators, card_dto, dependency_dto, re
 use crate::error::{BoardError, BoardErrorCode, BoardResult};
 use crate::events::{
     CARD_ARCHIVED, CARD_BLOCKED, CARD_CREATED, CARD_MOVED, CARD_RESTORED, CARD_UNBLOCKED, CARD_UPDATED, DEPLOY_FORCED,
-    GATE_FORCED,
+    GATE_CROSSED, GATE_FORCED,
 };
 use crate::rate_limit::WriteBudget;
 use crate::rules::{exit_rule_missing, owner_must_decide};
@@ -43,6 +43,9 @@ pub struct MoveCard {
     pub force: bool,
     /// Required when forcing a card out of a gate or `deploying`.
     pub reason: Option<String>,
+    /// Agent moves across a gate under `agent_access: approval` (TASK-116):
+    /// how the owner approved it, recorded as `{by: "owner", via, at}`.
+    pub approval_note: Option<String>,
 }
 
 pub(crate) fn card_archived() -> BoardError {
@@ -188,6 +191,15 @@ impl CardPatch {
         );
         set_opt("change_id", &mut card.change_id, self.change_id);
         set_opt("blocked_reason", &mut card.blocked_reason, self.blocked_reason);
+        // One assignee at a time: a conversation replaces an assistant/team.
+        if let Some(conversation) = self.request.assignee_conversation.clone()
+            && card.assignee_conversation_id.as_deref() != Some(conversation.as_str())
+        {
+            card.assignee_conversation_id = Some(conversation);
+            card.assignee_kind = None;
+            card.assignee_ref = None;
+            changed.push("assignee");
+        }
         if let Some(blocked) = self.request.blocked
             && card.blocked != blocked
         {
@@ -369,7 +381,7 @@ impl BoardService {
                     if column.key == DEPLOYING || (is_gate(column) && !actor.is_user()) {
                         return Err(gate_use_decision(&column.key));
                     }
-                    check_barrier(actor, &columns, None, column)?;
+                    check_barrier(actor, &columns, None, column, false)?;
                     column
                 }
             };
@@ -418,6 +430,7 @@ impl BoardService {
                 creator_ref: actor.actor_ref().to_owned(),
                 assignee_kind: None,
                 assignee_ref: None,
+                assignee_conversation_id: None,
                 blocked: false,
                 blocked_reason: None,
                 blocked_by: None,
@@ -460,6 +473,9 @@ impl BoardService {
     ) -> BoardResult<BoardCardDto> {
         self.charge(actor, WriteBudget::Write)?;
         let version = request.version;
+        if let Some(conversation) = request.assignee_conversation.as_deref() {
+            self.check_assignee_conversation(actor.user_id(), conversation).await?;
+        }
         let patch = CardPatch::validate(request)?;
         let card = self.scoped_card(actor, card_id).await?;
         self.refresh_archive(actor, &card.project_id).await?;
@@ -501,6 +517,22 @@ impl BoardService {
         .await
     }
 
+    /// A conversation assignee must be one of the user's live conversations.
+    async fn check_assignee_conversation(&self, user_id: &str, conversation_id: &str) -> BoardResult<()> {
+        let conversation_id = required_text("assignee_conversation", conversation_id, 200)?;
+        match self.store().conversation_info(user_id, &conversation_id).await? {
+            Some(info) if !info.archived => Ok(()),
+            Some(_) => Err(BoardError::invalid(
+                "assignee_conversation",
+                "the conversation is archived",
+            )),
+            None => Err(BoardError::invalid(
+                "assignee_conversation",
+                format!("no conversation `{conversation_id}`"),
+            )),
+        }
+    }
+
     /// `POST /api/board/cards/{id}/move` and the agent `move`.
     pub async fn move_card(&self, actor: &BoardActor, card_id: &str, request: MoveCard) -> BoardResult<BoardCardDto> {
         if request.before_id.is_some() && request.after_id.is_some() {
@@ -529,9 +561,19 @@ impl BoardService {
             ));
         }
         let reason = optional_text("reason", request.reason.as_deref(), BLOCK_REASON_MAX)?;
+        let approval_note = optional_text(
+            "approval_note",
+            request.approval_note.as_deref(),
+            crate::access::APPROVAL_NOTE_MAX,
+        )?;
         self.charge(actor, WriteBudget::Write)?;
         let card = self.scoped_card(actor, card_id).await?;
         self.refresh_archive(actor, &card.project_id).await?;
+        // TASK-116: how far this agent may move across gates.
+        let access = match actor.as_agent() {
+            Some(_) => Some(self.agent_access(actor.user_id(), &card.project_id).await?),
+            None => None,
+        };
         async {
             let user_id = actor.user_id();
             let mut tx = self.store().begin().await?;
@@ -553,7 +595,27 @@ impl BoardService {
                 .ok_or_else(|| BoardError::invalid("to_column", format!("unknown column `{}`", request.to_column)))?;
             let from = by_key.get(card.column_key.as_str()).copied();
             let changes_column = to.key != card.column_key;
-            check_agent_move(actor, from, to)?;
+            // An agent touching a gate (leaving, entering or passing it) with
+            // the board's access: the gate refusals below are lifted and the
+            // move is recorded as `gate_crossed`. Without it the old rules
+            // stand; under `approval` their refusal says a note is needed.
+            let touched = access
+                .filter(|_| changes_column)
+                .and_then(|access| touched_gate(&columns, from, to).map(|gate| (access, gate.key.clone())));
+            let crossing = touched
+                .as_ref()
+                .filter(|(access, _)| crate::access::permits(*access, approval_note.as_deref()))
+                .map(|(access, gate)| (*access, gate.clone()));
+            let gates_open = crossing.is_some();
+            let refused = |error: BoardError| match &touched {
+                Some((AgentAccess::Approval, gate)) if !gates_open => agent_move_denied(gate).with_details(json!({
+                    "column": to.key,
+                    "gate": gate,
+                    "approval_required": true,
+                })),
+                _ => error,
+            };
+            check_agent_move(actor, from, to, gates_open).map_err(refused)?;
             let mut kind = CARD_MOVED;
             let mut overrides: Vec<&str> = Vec::new();
             if changes_column {
@@ -577,15 +639,18 @@ impl BoardService {
                 } else if let Some(from) = from.filter(|from| is_gate(from)) {
                     let reviews = tx.reviews(user_id, &card.id).await?;
                     let questions = tx.questions(user_id, &card.id).await?;
-                    if owner_must_decide(&gate_rule(from), &card, &reviews, &questions) {
-                        require_forced_reason(actor, &request, &reason, &from.key)?;
+                    if owner_must_decide(&gate_rule(from), &card, &reviews, &questions) && !gates_open {
+                        require_forced_reason(actor, &request, &reason, &from.key).map_err(refused)?;
                         kind = GATE_FORCED;
                         overrides.push("gate");
                     }
                 }
             }
             if card.column_key != DEPLOYING {
-                check_barrier(actor, &columns, from, to)?;
+                check_barrier(actor, &columns, from, to, gates_open).map_err(refused)?;
+            }
+            if gates_open {
+                kind = GATE_CROSSED;
             }
             let forward = changes_column && from.is_some_and(|from| to.position > from.position);
             if forward {
@@ -691,6 +756,16 @@ impl BoardService {
                 // R5: dependents keep their block; the drop is recorded on
                 // this move's single event.
                 extra["blocker_dropped"] = json!(dropped_dependents);
+            }
+            if let Some((access, gate)) = &crossing {
+                extra["gate"] = json!(gate);
+                extra["agent_access"] = json!(access.as_str());
+                extra["approval"] = match &approval_note {
+                    Some(note) => json!({ "by": "owner", "via": note, "at": now_ms() }),
+                    None => Value::Null,
+                };
+                tracing::info!(card_id = %card.id, gate = %gate, agent_access = access.as_str(),
+                    approved = approval_note.is_some(), "board: agent moved a card across a gate");
             }
             self.write_card(tx, actor, card, expected, kind, extra).await
         }
@@ -844,13 +919,22 @@ pub(crate) fn add_reordered(payload: &mut Value, tx: &mut dyn IBoardTx) {
 
 /// Agents move only through columns open to them; the Board Keeper may move
 /// between any two non-gate columns (D40). `deploying` stays closed to both.
-fn check_agent_move(actor: &BoardActor, from: Option<&BoardColumnRow>, to: &BoardColumnRow) -> BoardResult<()> {
+/// `gates_open`: the board's `agent_access` lets this agent through gates
+/// (TASK-116); `deploying` stays closed regardless.
+fn check_agent_move(
+    actor: &BoardActor,
+    from: Option<&BoardColumnRow>,
+    to: &BoardColumnRow,
+    gates_open: bool,
+) -> BoardResult<()> {
     let Some(agent) = actor.as_agent() else {
         return Ok(());
     };
     let columns = std::iter::once(to).chain(from);
     for column in columns {
-        let open = if agent.keeper {
+        let open = if gates_open && is_gate(column) {
+            true
+        } else if agent.keeper {
             !is_gate(column) && column.key != DEPLOYING
         } else {
             column.agent_move == AgentMove::Allow.as_str()
@@ -871,6 +955,7 @@ fn check_barrier(
     columns: &[BoardColumnRow],
     from: Option<&BoardColumnRow>,
     to: &BoardColumnRow,
+    gates_open: bool,
 ) -> BoardResult<()> {
     if actor.is_user() {
         return Ok(());
@@ -881,7 +966,7 @@ fn check_barrier(
     }
     let barrier = columns
         .iter()
-        .filter(|c| !c.archived && c.position > from_position && (is_gate(c) || c.key == DEPLOYING))
+        .filter(|c| !c.archived && c.position > from_position && ((is_gate(c) && !gates_open) || c.key == DEPLOYING))
         .min_by_key(|c| c.position);
     let blocked_by_barrier = barrier.is_some_and(|barrier| to.position > barrier.position);
     let keeper_terminal = actor.as_agent().is_some_and(|agent| agent.keeper)
@@ -898,6 +983,29 @@ fn check_barrier(
         BoardActor::Agent(_) => agent_move_denied(&to.key).with_details(json!({ "column": to.key, "gate": gate })),
         _ => gate_use_decision(gate),
     })
+}
+
+/// The gate an agent's move touches (TASK-116): the gate it leaves, else the
+/// gate it enters, else the first gate it passes moving forward.
+fn touched_gate<'a>(
+    columns: &'a [BoardColumnRow],
+    from: Option<&'a BoardColumnRow>,
+    to: &'a BoardColumnRow,
+) -> Option<&'a BoardColumnRow> {
+    if let Some(from) = from.filter(|c| is_gate(c)) {
+        return Some(from);
+    }
+    if is_gate(to) {
+        return Some(to);
+    }
+    let from_position = from.map(|c| c.position).unwrap_or(i64::MIN);
+    if to.position <= from_position {
+        return None;
+    }
+    columns
+        .iter()
+        .filter(|c| !c.archived && is_gate(c) && c.position > from_position && c.position < to.position)
+        .min_by_key(|c| c.position)
 }
 
 /// Leaving a decided gate or `deploying` needs the owner's force with a

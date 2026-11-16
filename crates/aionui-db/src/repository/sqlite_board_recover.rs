@@ -448,14 +448,27 @@ async fn copy_columns(tx: &mut Transaction<'_, Sqlite>, project_id: &str) -> Res
 /// Card columns that a kept snapshot overwrites (identity, owner, number and
 /// creation stay as they are here).
 const CARD_MUTABLE_COLS: &str = "title, description, type, priority, size, tier, column_key, position, labels, \
-     skills, routing, assignee_kind, assignee_ref, blocked, blocked_reason, blocked_by, change_id, metadata, version, \
-     archived_at, updated_at";
+     skills, routing, assignee_kind, assignee_ref, assignee_conversation_id, blocked, blocked_reason, blocked_by, \
+     change_id, metadata, version, archived_at, updated_at";
 
 async fn recover_cards(
     tx: &mut Transaction<'_, Sqlite>,
     touched: &TouchedSet,
     report: &mut BoardRecoverReport,
 ) -> Result<(), DbError> {
+    // A kept file written before 909 has no `assignee_conversation_id`: read NULL for it.
+    let kept_has_conversation: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM pragma_table_info('board_cards', 'kept') WHERE name = 'assignee_conversation_id'",
+    )
+    .fetch_one(&mut **tx)
+    .await?;
+    let from_kept = |cols: &str| {
+        if kept_has_conversation > 0 {
+            cols.to_owned()
+        } else {
+            cols.replacen("assignee_conversation_id", "NULL", 1)
+        }
+    };
     let kept: Vec<(String, String, String, i64, i64)> = sqlx::query_as(&format!(
         "SELECT id, project_id, user_id, number, version FROM kept.board_cards k WHERE {KNOWN_PROJECT} \
              ORDER BY project_id, number"
@@ -481,7 +494,7 @@ async fn recover_cards(
                 } else {
                     number
                 };
-                let select_cols = CARD_COLS.replacen("number", "? AS number", 1);
+                let select_cols = from_kept(&CARD_COLS.replacen("number", "? AS number", 1));
                 sqlx::query(&format!(
                     "INSERT INTO main.board_cards ({CARD_COLS}) SELECT {select_cols} FROM kept.board_cards WHERE id = ?"
                 ))
@@ -505,9 +518,10 @@ async fn recover_cards(
                     ));
                     continue;
                 }
+                let kept_cols = from_kept(CARD_MUTABLE_COLS);
                 sqlx::query(&format!(
                     "UPDATE main.board_cards SET ({CARD_MUTABLE_COLS}) = \
-                     (SELECT {CARD_MUTABLE_COLS} FROM kept.board_cards WHERE id = ?) WHERE id = ?"
+                     (SELECT {kept_cols} FROM kept.board_cards WHERE id = ?) WHERE id = ?"
                 ))
                 .bind(&card_id)
                 .bind(&card_id)

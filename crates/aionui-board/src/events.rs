@@ -34,6 +34,9 @@ pub const LINK_REMOVED: &str = "link_removed";
 pub const GATE_APPROVED: &str = "gate_approved";
 pub const GATE_REJECTED: &str = "gate_rejected";
 pub const GATE_FORCED: &str = "gate_forced";
+/// An agent moved a card into, out of or past a gate under `agent_access`
+/// (TASK-116); payload adds `gate`, `agent_access` and `approval`.
+pub const GATE_CROSSED: &str = "gate_crossed";
 pub const DEPLOY_FORCED: &str = "deploy_forced";
 pub const REVIEW_UPDATED: &str = "review_updated";
 pub const CARD_ASSIGNED: &str = "card_assigned";

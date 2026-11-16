@@ -327,6 +327,7 @@ async fn move_card(
         expected_column: request.expected_column,
         force: false,
         reason: None,
+        approval_note: request.approval_note,
     };
     match state.service.move_card(&actor, &id, request).await {
         Ok(card) => success(StatusCode::OK, card, COMMAND),

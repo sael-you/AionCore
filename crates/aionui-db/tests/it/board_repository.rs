@@ -79,6 +79,7 @@ fn card(user: &str, project: &str, id: &str, number: i64, column: &str, position
         creator_ref: user.into(),
         assignee_kind: None,
         assignee_ref: None,
+        assignee_conversation_id: None,
         blocked: false,
         blocked_reason: None,
         blocked_by: None,

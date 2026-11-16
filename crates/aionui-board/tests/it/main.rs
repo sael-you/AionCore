@@ -9,6 +9,7 @@
 #[path = "../common/mod.rs"]
 mod common;
 
+mod agent_access;
 mod service_rules;
 mod service_s4;
 mod service_summary;

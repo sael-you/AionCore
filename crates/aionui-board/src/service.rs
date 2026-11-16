@@ -15,7 +15,7 @@ use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, OnceLock};
 
 use aionui_api_types::{
-    AgentMove, BoardCardDto, BoardColumnInput, BoardColumnsResponse, BoardEventDto, BoardKeeperResponse,
+    AgentAccess, AgentMove, BoardCardDto, BoardColumnInput, BoardColumnsResponse, BoardEventDto, BoardKeeperResponse,
     BoardReviewDto, BoardSettingsDto, BoardTemplate, BoardView, ColumnKind, ColumnResolution,
     UpdateBoardColumnsRequest, UpdateBoardSettingsRequest,
 };
@@ -224,6 +224,29 @@ impl BoardService {
         }
     }
 
+    /// The project's name (decides the default `agent_access`, TASK-116);
+    /// empty for a project the user does not have.
+    pub(crate) async fn project_name(&self, user_id: &str, project_id: &str) -> BoardResult<String> {
+        Ok(self
+            .store()
+            .project(user_id, project_id)
+            .await?
+            .map(|p| p.name)
+            .unwrap_or_default())
+    }
+
+    /// The agent access a project's board grants (TASK-116).
+    pub(crate) async fn agent_access(&self, user_id: &str, project_id: &str) -> BoardResult<AgentAccess> {
+        let name = self.project_name(user_id, project_id).await?;
+        let settings = self
+            .store()
+            .settings(user_id, project_id)
+            .await?
+            .map(|row| serde_json::from_str(&row.settings).unwrap_or(Value::Null))
+            .unwrap_or(Value::Null);
+        Ok(crate::access::effective(&settings, &name))
+    }
+
     /// Refuse writes on an archived board (409 owner / 403 agent) and agent
     /// access to a disabled board (R1).
     pub(crate) fn check_writable(settings: &BoardSettingsRow, actor: &BoardActor) -> BoardResult<()> {
@@ -273,6 +296,7 @@ impl BoardService {
         reason: &str,
     ) -> BoardResult<()> {
         let kind = if archived { BOARD_ARCHIVED } else { BOARD_UNARCHIVED };
+        let project_name = self.project_name(actor.user_id(), project_id).await?;
         async {
             let user_id = actor.user_id();
             let mut tx = self.store().begin().await?;
@@ -289,7 +313,7 @@ impl BoardService {
             if !tx.update_settings(&settings, expected).await? {
                 return Err(version_conflict(expected));
             }
-            let dto = settings_dto(project_id, Some(&settings));
+            let dto = settings_dto(project_id, Some(&settings), &project_name);
             let event = Self::append_event(
                 tx.as_mut(),
                 actor,
@@ -317,7 +341,7 @@ impl BoardService {
         include_archived: bool,
     ) -> BoardResult<BoardView> {
         let user_id = actor.user_id();
-        self.user_project(user_id, project_id).await?;
+        let project = self.user_project(user_id, project_id).await?;
         let store = self.store();
         // Read the chain head first: the snapshot below is at least that
         // new, so replaying hints after `last_seq` never skips a change.
@@ -336,7 +360,7 @@ impl BoardService {
             *counts.entry(card.column_key.as_str()).or_default() += 1;
         }
         Ok(BoardView {
-            settings: settings_dto(project_id, settings.as_ref()),
+            settings: settings_dto(project_id, settings.as_ref(), &project.name),
             columns: columns
                 .iter()
                 .map(|column| column_dto(column, counts.get(column.key.as_str()).copied().unwrap_or(0)))
@@ -430,6 +454,9 @@ impl BoardService {
         require_owner(actor)?;
         let user_id = actor.user_id();
         let project = self.user_project(user_id, project_id).await?;
+        if let Some(value) = &request.settings {
+            crate::access::validate(value)?;
+        }
         let settings_json = match &request.settings {
             Some(value) => Some(json_object("settings", value, METADATA_MAX_BYTES)?),
             None => None,
@@ -488,7 +515,7 @@ impl BoardService {
                     let columns = template_rows(user_id, project_id, &template_columns(template));
                     tx.upsert_columns(&columns).await?;
                     let payload = json!({
-                        "settings": settings_dto(project_id, Some(&row)),
+                        "settings": settings_dto(project_id, Some(&row), &project.name),
                         "columns": columns.iter().map(|c| column_dto(c, 0)).collect::<Vec<_>>(),
                         "version": row.version,
                     });
@@ -514,13 +541,14 @@ impl BoardService {
                     if !tx.update_settings(&row, expected).await? {
                         return Err(version_conflict(expected));
                     }
-                    let payload = json!({ "settings": settings_dto(project_id, Some(&row)), "version": row.version });
+                    let payload =
+                        json!({ "settings": settings_dto(project_id, Some(&row), &project.name), "version": row.version });
                     (row, payload)
                 }
             };
             let event = Self::append_event(tx.as_mut(), actor, project_id, None, kind, payload).await?;
             self.commit(tx, user_id, &Committed::event(event)).await?;
-            Ok(settings_dto(project_id, Some(&settings)))
+            Ok(settings_dto(project_id, Some(&settings), &project.name))
         }
         .instrument(write_span(kind, actor, None))
         .await;
@@ -628,13 +656,13 @@ impl BoardService {
     pub async fn reactivate(&self, actor: &BoardActor, project_id: &str) -> BoardResult<BoardSettingsDto> {
         require_owner(actor)?;
         let user_id = actor.user_id();
-        self.user_project(user_id, project_id).await?;
+        let project = self.user_project(user_id, project_id).await?;
         if self.store().settings(user_id, project_id).await?.is_none() {
             return Err(not_turned_on());
         }
         self.set_archived_state(actor, project_id, false, "reactivated").await?;
         let settings = self.store().settings(user_id, project_id).await?;
-        Ok(settings_dto(project_id, settings.as_ref()))
+        Ok(settings_dto(project_id, settings.as_ref(), &project.name))
     }
 
     // -- Board Keeper (D40) --------------------------------------------------
@@ -724,7 +752,10 @@ impl BoardService {
             if !tx.update_settings(&settings, expected).await? {
                 return Err(version_conflict(expected));
             }
-            let payload = json!({ "settings": settings_dto(project_id, Some(&settings)), "version": settings.version });
+            let payload = json!({
+                "settings": settings_dto(project_id, Some(&settings), &project.name),
+                "version": settings.version,
+            });
             let event = Self::append_event(tx.as_mut(), actor, project_id, None, SETTINGS_CHANGED, payload).await?;
             self.commit(tx, user_id, &Committed::event(event)).await?;
             Ok(None)
