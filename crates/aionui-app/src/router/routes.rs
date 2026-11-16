@@ -373,6 +373,25 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
             require_trusted_origin_middleware,
         ));
 
+    // Server browser (C30): settings, status, clear/stop and the panel socket.
+    // Same protection as the market writes: a verified browser session in
+    // every identity (never the runtime-token channel or `--local`'s default
+    // user) and a trusted Origin on writes and the upgrade.
+    let browser_routes = aionui_browser::browser_routes(aionui_browser::BrowserRouterState {
+        service: services.browser_service.clone(),
+    })
+    .route_layer(from_fn_with_state(
+        super::mcp_market::market_write_auth_state(services),
+        auth_middleware,
+    ))
+    .route_layer(from_fn_with_state(
+        OriginGuard {
+            policy: services.origin_policy.clone(),
+            same_origin_via_web_host: services.identity_mode.is_local(),
+        },
+        require_trusted_origin_middleware,
+    ));
+
     // MCP routes protected by auth middleware
     let mcp_authenticated =
         mcp_routes(states.mcp).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
@@ -494,6 +513,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         .merge(mcp_authenticated)
         .merge(mcp_market_read)
         .merge(mcp_market_write)
+        .merge(browser_routes)
         .merge(extension_authenticated)
         .merge(hub_authenticated)
         .merge(skill_authenticated)

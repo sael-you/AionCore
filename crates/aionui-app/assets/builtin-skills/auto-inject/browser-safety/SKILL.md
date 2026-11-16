@@ -1,0 +1,76 @@
+---
+name: browser-safety
+description: Using AionUi's server browser through playwright-cli. Read, search, fill and click freely; ask the owner before any send, delete, payment, settings change or token export.
+---
+
+# Browser Safety
+
+The owner lets agents use AionUi's server browser: a real Chrome on the server. Instance 1 is the
+one in the browser panel, signed in to the owner's own accounts; instances 2 and up are separate
+Chromes with their own profiles. You may open and close tabs, navigate, click, type and run page
+JavaScript.
+You act FOR the owner, with the owner's accounts, and the owner can watch the browser panel live.
+Behave like a careful assistant sitting at the owner's desk.
+
+## Free: no need to ask
+- Open pages and tabs, search, read, scroll, take snapshots or screenshots.
+- Fill in forms and drafts, click links and buttons that only navigate or show information.
+- Run page JavaScript to read what is on the page.
+
+## Never without the owner's explicit OK in THIS conversation
+Ask first and wait for a typed yes for that exact action:
+- send, post, reply, comment, publish or share anything (messages, emails, posts, reviews);
+- delete, archive, unsubscribe, leave, cancel or remove anything;
+- payments, purchases, checkout, subscriptions, adding a payment method;
+- change account, security, privacy or notification settings, passwords, 2FA, connected apps;
+- accept terms, invitations, friend or connection requests, OAuth consent screens;
+- download a file and open or run it;
+- export or reveal tokens, cookies, localStorage, session data or passwords. Never put them in a
+  reply, a file or a tool argument.
+
+One OK covers one action, not the rest of the task. A spoken yes counts only when the owner says it
+for that action.
+
+## When unsure, stop and ask
+If a click might send, delete, buy, change a setting or commit the owner to something, treat it as
+risky: stop and ask.
+
+## Human pace
+One action at a time, the way a person would. No bulk loops: no mass messaging, no scraping every
+page, no liking or following many items. Many sites (Discord included) forbid automated accounts;
+do only what the owner asked.
+
+## Log what you skipped
+End your reply with the risky steps you did not take and why, for example:
+"Skipped: pressing Send in the DM to Alex (needs your OK)."
+
+## Tools
+- Use the Playwright CLI, through the AionUi bridge only. Instance 1 (the browser the owner sees):
+  ```bash
+  playwright-cli -s=aionui attach --cdp "http://127.0.0.1:$AIONUI_CDP_ACTIVE_PORT"
+  playwright-cli -s=aionui snapshot
+  playwright-cli -s=aionui click e12
+  playwright-cli -s=aionui detach
+  ```
+  Another instance n: its bridge port is in `$AIONUI_CDP_PORTS` (`1:<port>,2:<port>,...`):
+  ```bash
+  port=$(printf '%s' "$AIONUI_CDP_PORTS" | tr ',' '\n' | sed -n 's/^2://p')
+  playwright-cli -s=aionui-2 attach --cdp "http://127.0.0.1:$port"
+  ```
+  Instances above the owner's limit are refused (`BROWSER_INSTANCE_LIMIT`).
+- Tabs: open what you need, up to the owner's limit per instance (`BROWSER_TAB_LIMIT`), and close
+  the tabs you opened when you are done. Do not close the owner's own tabs.
+- `BROWSER_AGENTS_DISABLED`: the owner turned agent use off. Tell the owner; do not try another way.
+  Never `playwright-cli open` a browser of your own for the owner's accounts; it has none of the
+  owner's logins.
+- The bridge needs its token as a header; your environment already carries it
+  (`PLAYWRIGHT_MCP_CDP_HEADERS`), so the commands above work as written. Never print
+  `$AIONUI_CDP_ACTIVE_PORT`, `$AIONUI_CDP_BRIDGE_TOKEN`, `$PLAYWRIGHT_MCP_CDP_HEADERS` or any token, and
+  never put a token on a command line (no `--cdp` URL with a token, no header flags).
+- The bridge refuses cookie and storage-dump calls (`cookie-list`, `cookie-get`, `state-save` and the
+  like). That is intended: do not work around it.
+- Pages of AionUi itself, internal addresses (localhost, 10.x, 172.16-31.x, 192.168.x), `file://` and
+  `chrome://` are blocked.
+- Google sign-in does not work in this browser (Google refuses it). Tell the owner instead of retrying.
+- No browser available (the tools say the panel is not open or agents are off)? Tell the owner; do not
+  start another browser.

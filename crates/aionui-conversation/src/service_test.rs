@@ -4385,6 +4385,36 @@ async fn send_message_injects_configured_runtime_helper_context() {
     );
 }
 
+/// C30: the agent env carries the server browser bridge only while agents
+/// may use the browser.
+#[tokio::test]
+async fn send_message_injects_the_browser_bridge_env_only_when_enabled() {
+    for enabled in [true, false] {
+        let (svc, _broadcaster, _repo, _default_task_mgr) = make_service();
+        svc.with_browser_port(Arc::new(StaticBrowserPort { enabled }));
+        let conv = svc.create("user_1", make_create_req()).await.unwrap();
+        let task_mgr = Arc::new(RebuildingScriptedTaskManager::new(vec![AgentInstance::Mock(Arc::new(
+            MockAgent::new(&conv.id),
+        ))]));
+        let task_mgr_dyn: Arc<dyn IWorkerTaskManager> = task_mgr.clone();
+        svc.send_message("user_1", &conv.id, make_send_req(), &task_mgr_dyn)
+            .await
+            .unwrap();
+        wait_for_turn_released(&svc, &conv.id).await;
+        let options = task_mgr.captured_options();
+        let env = &options[0].context.runtime_env;
+        let has_bridge = env.contains(&("AIONUI_CDP_ACTIVE_PORT".to_owned(), "4001".to_owned()));
+        assert_eq!(has_bridge, enabled, "agents_enabled = {enabled}");
+        if !enabled {
+            assert!(
+                !env.iter()
+                    .any(|(k, _)| crate::browser_port::BROWSER_ENV_KEYS.contains(&k.as_str())),
+                "no browser key at all when disabled"
+            );
+        }
+    }
+}
+
 #[tokio::test]
 async fn run_agent_turn_injects_conversation_runtime_context() {
     let task_mgr = Arc::new(RebuildingScriptedTaskManager::new(vec![AgentInstance::Mock(Arc::new(
@@ -7749,6 +7779,45 @@ async fn create_writes_extra_skills_from_auto_inject_and_preset() {
     assert_eq!(resp.extra["skills"], json!(["cron", "pdf"]));
     assert!(resp.extra.get("preset_enabled_skills").is_none());
     assert!(resp.extra.get("exclude_auto_inject_skills").is_none());
+}
+
+struct StaticBrowserPort {
+    enabled: bool,
+}
+
+#[async_trait::async_trait]
+impl crate::browser_port::ConversationBrowserPort for StaticBrowserPort {
+    async fn agent_env(&self, _user_id: &str) -> Vec<(String, String)> {
+        if self.enabled {
+            vec![("AIONUI_CDP_ACTIVE_PORT".into(), "4001".into())]
+        } else {
+            Vec::new()
+        }
+    }
+    fn agents_enabled(&self, _user_id: &str) -> bool {
+        self.enabled
+    }
+}
+
+/// C30: the browser-safety skill is auto-injected only while agents may use
+/// the server browser.
+#[tokio::test]
+async fn create_delivers_browser_safety_only_when_agents_may_use_the_browser() {
+    for (enabled, expected) in [(true, json!(["browser-safety", "cron"])), (false, json!(["cron"]))] {
+        let resolver = Arc::new(FixedSkillResolver {
+            names: vec!["browser-safety".into(), "cron".into()],
+        });
+        let (svc, _broadcaster, _repo, _task_mgr) = make_service_with_resolver(resolver);
+        svc.with_browser_port(Arc::new(StaticBrowserPort { enabled }));
+        let req: CreateConversationRequest = serde_json::from_value(json!({
+            "type": "acp",
+            "name": "t",
+            "extra": { "workspace": ensure_test_workspace_path(), "backend": "claude" },
+        }))
+        .unwrap();
+        let resp = svc.create("user-1", req).await.unwrap();
+        assert_eq!(resp.extra["skills"], expected, "agents_enabled = {enabled}");
+    }
 }
 
 #[tokio::test]

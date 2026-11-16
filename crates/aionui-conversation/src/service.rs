@@ -321,6 +321,8 @@ pub struct ConversationService {
     /// per-conversation state. Wrapped in `Arc<RwLock<…>>` so registration
     /// can happen post-construction without breaking the `Clone` impl.
     delete_hooks: Arc<RwLock<Vec<Arc<dyn OnConversationDelete>>>>,
+    /// Server browser (C30): agent bridge env + `browser-safety` skill gate.
+    browser_port: Arc<RwLock<Option<Arc<dyn crate::browser_port::ConversationBrowserPort>>>>,
     /// Hooks invoked when `cancel()` actually cancelled a turn, so upper-layer
     /// services can drop work aimed at this conversation. See
     /// `OnConversationTurnCancelled` for why only some branches fire.
@@ -415,6 +417,7 @@ impl ConversationService {
             skill_resolver,
             task_manager,
             delete_hooks: Arc::new(RwLock::new(Vec::new())),
+            browser_port: Arc::new(RwLock::new(None)),
             turn_cancelled_hooks: Arc::new(RwLock::new(Vec::new())),
             mcp_server_repo: Arc::new(RwLock::new(None)),
             assistant_definition_repo: Arc::new(RwLock::new(None)),
@@ -654,6 +657,18 @@ impl ConversationService {
         if let Ok(mut guard) = self.delete_hooks.write() {
             guard.push(hook);
         }
+    }
+
+    /// Wire the server browser (C30): agents get the CDP bridge env, and the
+    /// `browser-safety` skill is delivered only while agents may use it.
+    pub fn with_browser_port(&self, port: Arc<dyn crate::browser_port::ConversationBrowserPort>) {
+        if let Ok(mut guard) = self.browser_port.write() {
+            *guard = Some(port);
+        }
+    }
+
+    fn browser_port(&self) -> Option<Arc<dyn crate::browser_port::ConversationBrowserPort>> {
+        self.browser_port.read().ok().and_then(|g| g.clone())
     }
 
     /// Register a hook notified when `cancel()` cancelled a turn.
@@ -1374,6 +1389,15 @@ impl ConversationService {
         };
 
         let auto_inject_names = self.skill_resolver.auto_inject_names().await;
+        let mut exclude_auto_inject = exclude_auto_inject;
+        // C30: the browser-safety skill only while agents may use the browser.
+        if self.browser_port().is_some_and(|port| !port.agents_enabled(user_id))
+            && !exclude_auto_inject
+                .iter()
+                .any(|s| s == crate::browser_port::BROWSER_SAFETY_SKILL)
+        {
+            exclude_auto_inject.push(crate::browser_port::BROWSER_SAFETY_SKILL.to_owned());
+        }
         let initial_skills = compute_initial_skills(&auto_inject_names, &preset_enabled, &exclude_auto_inject);
 
         // Build the per-conversation skill VIEW under AionUi's own data dir.
@@ -4386,7 +4410,8 @@ impl ConversationService {
                 return Ok(self.send_message_response(conversation_id, user_msg_id, turn_id).await);
             }
         };
-        self.apply_conversation_runtime_context(&mut build_opts, user_id, conversation_id);
+        self.apply_conversation_runtime_context(&mut build_opts, user_id, conversation_id)
+            .await;
         self.ensure_session_skill_view(&build_opts.context).await;
         let stored_workspace = build_opts.context.workspace.stored_path.clone();
 
@@ -4508,7 +4533,8 @@ impl ConversationService {
             }
         };
 
-        self.apply_conversation_runtime_context(&mut build_opts, &request.user_id, &request.conversation_id);
+        self.apply_conversation_runtime_context(&mut build_opts, &request.user_id, &request.conversation_id)
+            .await;
         self.ensure_session_skill_view(&build_opts.context).await;
         let stored_workspace = build_opts.context.workspace.stored_path.clone();
         let conversation_id = request.conversation_id.clone();
@@ -5028,7 +5054,8 @@ impl ConversationService {
         }
 
         let mut build_opts = self.build_task_options(&row).await?;
-        self.apply_conversation_runtime_context(&mut build_opts, user_id, conversation_id);
+        self.apply_conversation_runtime_context(&mut build_opts, user_id, conversation_id)
+            .await;
         self.ensure_session_skill_view(&build_opts.context).await;
         let stored_workspace = build_opts.context.workspace.stored_path.clone();
         let backend = build_options_backend(&build_opts).map(str::to_owned);
@@ -5202,7 +5229,7 @@ impl ConversationService {
         }
     }
 
-    fn apply_conversation_runtime_context(
+    async fn apply_conversation_runtime_context(
         &self,
         build_opts: &mut BuildTaskOptions,
         user_id: &str,
@@ -5216,6 +5243,15 @@ impl ConversationService {
             self.runtime_base_url.as_deref(),
             runtime_token.as_deref(),
         );
+        // Server browser bridge (C30): re-applied on every build so a switch
+        // turned off since the last build leaves no stale bridge behind.
+        build_opts
+            .context
+            .runtime_env
+            .retain(|(key, _)| !crate::browser_port::BROWSER_ENV_KEYS.contains(&key.as_str()));
+        if let Some(port) = self.browser_port() {
+            build_opts.context.runtime_env.extend(port.agent_env(user_id).await);
+        }
     }
 
     fn runtime_token_for_build(

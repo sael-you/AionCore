@@ -1,0 +1,31 @@
+[package]
+name = "aionui-browser"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+aionui-api-types.workspace = true
+aionui-common.workspace = true
+aionui-auth.workspace = true
+aionui-runtime.workspace = true
+axum.workspace = true
+tokio.workspace = true
+tokio-tungstenite.workspace = true
+futures-util.workspace = true
+reqwest.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+hex.workspace = true
+base64.workspace = true
+libc.workspace = true
+url.workspace = true
+uuid = { workspace = true, features = ["v4"] }
+dashmap.workspace = true
+tracing.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+tokio = { workspace = true, features = ["test-util", "macros", "rt-multi-thread"] }

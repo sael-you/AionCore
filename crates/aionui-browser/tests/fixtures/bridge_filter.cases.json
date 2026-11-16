@@ -1,0 +1,417 @@
+{
+  "description": "Server CDP bridge filter (TASK-111, owner change 2026-11-16; train-7 review): agents get full page and tab control; cookie/storage APIs, browser lifecycle/contexts, side channels (sendMessageToTarget, non-flat sessions) and all of Fetch.* (owned by the navigation guard) are refused; createTarget needs a free tab slot. expect = forward | tab_slot | <error code>. `sanitize`: Chrome -> agent frames with cookies and cookie headers removed.",
+  "version": 2,
+  "cases": [
+    {
+      "method": "Page.navigate",
+      "expect": "forward"
+    },
+    {
+      "method": "Runtime.evaluate",
+      "expect": "forward"
+    },
+    {
+      "method": "Runtime.callFunctionOn",
+      "expect": "forward"
+    },
+    {
+      "method": "Input.dispatchMouseEvent",
+      "expect": "forward"
+    },
+    {
+      "method": "Input.insertText",
+      "expect": "forward"
+    },
+    {
+      "method": "Page.captureScreenshot",
+      "expect": "forward"
+    },
+    {
+      "method": "DOM.getDocument",
+      "expect": "forward"
+    },
+    {
+      "method": "Target.getTargets",
+      "expect": "forward"
+    },
+    {
+      "method": "Target.closeTarget",
+      "expect": "forward"
+    },
+    {
+      "method": "Target.activateTarget",
+      "expect": "forward"
+    },
+    {
+      "method": "Browser.getVersion",
+      "expect": "forward"
+    },
+    {
+      "method": "Network.enable",
+      "expect": "forward"
+    },
+    {
+      "method": "Target.createTarget",
+      "expect": "tab_slot"
+    },
+    {
+      "method": "Network.getCookies",
+      "expect": "BROWSER_METHOD_BLOCKED"
+    },
+    {
+      "method": "Network.getAllCookies",
+      "expect": "BROWSER_METHOD_BLOCKED"
+    },
+    {
+      "method": "Network.setCookies",
+      "expect": "BROWSER_METHOD_BLOCKED"
+    },
+    {
+      "method": "Network.clearBrowserCookies",
+      "expect": "BROWSER_METHOD_BLOCKED"
+    },
+    {
+      "method": "Storage.getCookies",
+      "expect": "BROWSER_METHOD_BLOCKED"
+    },
+    {
+      "method": "Storage.clearDataForOrigin",
+      "expect": "BROWSER_METHOD_BLOCKED"
+    },
+    {
+      "method": "DOMStorage.getDOMStorageItems",
+      "expect": "BROWSER_METHOD_BLOCKED"
+    },
+    {
+      "method": "IndexedDB.requestData",
+      "expect": "BROWSER_METHOD_BLOCKED"
+    },
+    {
+      "method": "CacheStorage.requestCachedResponse",
+      "expect": "BROWSER_METHOD_BLOCKED"
+    },
+    {
+      "method": "Browser.setDownloadBehavior",
+      "expect": "BROWSER_METHOD_BLOCKED"
+    },
+    {
+      "method": "Browser.close",
+      "expect": "BROWSER_METHOD_BLOCKED"
+    },
+    {
+      "method": "Target.createBrowserContext",
+      "expect": "BROWSER_METHOD_BLOCKED"
+    },
+    {
+      "method": "Target.disposeBrowserContext",
+      "expect": "BROWSER_METHOD_BLOCKED"
+    },
+    {
+      "method": "Target.exposeDevToolsProtocol",
+      "expect": "BROWSER_METHOD_BLOCKED"
+    },
+    {
+      "method": "Tethering.bind",
+      "expect": "BROWSER_METHOD_BLOCKED"
+    },
+    {
+      "method": "Target.attachToTarget",
+      "params": {
+        "targetId": "T",
+        "flatten": true
+      },
+      "expect": "forward"
+    },
+    {
+      "method": "Target.attachToTarget",
+      "params": {
+        "targetId": "T"
+      },
+      "expect": "BROWSER_METHOD_BLOCKED"
+    },
+    {
+      "method": "Target.attachToTarget",
+      "params": {
+        "targetId": "T",
+        "flatten": false
+      },
+      "expect": "BROWSER_METHOD_BLOCKED"
+    },
+    {
+      "method": "Target.setAutoAttach",
+      "params": {
+        "autoAttach": true,
+        "waitForDebuggerOnStart": false,
+        "flatten": true
+      },
+      "expect": "forward"
+    },
+    {
+      "method": "Target.setAutoAttach",
+      "params": {
+        "autoAttach": true,
+        "waitForDebuggerOnStart": false
+      },
+      "expect": "BROWSER_METHOD_BLOCKED"
+    },
+    {
+      "method": "Target.sendMessageToTarget",
+      "params": {
+        "message": "{\"id\":1,\"method\":\"Network.getAllCookies\"}",
+        "targetId": "T"
+      },
+      "expect": "BROWSER_METHOD_BLOCKED"
+    },
+    {
+      "method": "Fetch.enable",
+      "expect": "BROWSER_METHOD_BLOCKED"
+    },
+    {
+      "method": "Fetch.disable",
+      "expect": "BROWSER_METHOD_BLOCKED"
+    },
+    {
+      "method": "Fetch.continueRequest",
+      "expect": "BROWSER_METHOD_BLOCKED"
+    },
+    {
+      "method": "Fetch.fulfillRequest",
+      "expect": "BROWSER_METHOD_BLOCKED"
+    },
+    {
+      "method": "Fetch.failRequest",
+      "expect": "BROWSER_METHOD_BLOCKED"
+    }
+  ],
+  "sanitize": [
+    {
+      "name": "requestWillBeSentExtraInfo associatedCookies and Cookie header",
+      "frame": {
+        "method": "Network.requestWillBeSentExtraInfo",
+        "sessionId": "S",
+        "params": {
+          "requestId": "1",
+          "associatedCookies": [
+            {
+              "cookie": {
+                "name": "sid",
+                "value": "secret-session",
+                "httpOnly": true
+              },
+              "blockedReasons": []
+            }
+          ],
+          "headers": {
+            ":path": "/",
+            "Cookie": "sid=secret-session",
+            "Accept": "*/*"
+          }
+        }
+      },
+      "expect": {
+        "method": "Network.requestWillBeSentExtraInfo",
+        "sessionId": "S",
+        "params": {
+          "requestId": "1",
+          "headers": {
+            ":path": "/",
+            "Accept": "*/*"
+          }
+        }
+      }
+    },
+    {
+      "name": "responseReceivedExtraInfo Set-Cookie, blockedCookies, headersText",
+      "frame": {
+        "method": "Network.responseReceivedExtraInfo",
+        "params": {
+          "requestId": "1",
+          "blockedCookies": [
+            {
+              "cookieLine": "sid=secret-session"
+            }
+          ],
+          "exemptedCookies": [],
+          "headers": {
+            "set-cookie": "sid=secret-session; HttpOnly",
+            "Content-Type": "text/html"
+          },
+          "headersText": "HTTP/1.1 200\r\nSet-Cookie: sid=secret-session\r\n",
+          "statusCode": 200
+        }
+      },
+      "expect": {
+        "method": "Network.responseReceivedExtraInfo",
+        "params": {
+          "requestId": "1",
+          "headers": {
+            "Content-Type": "text/html"
+          },
+          "statusCode": 200
+        }
+      }
+    },
+    {
+      "name": "requestWillBeSent request headers",
+      "frame": {
+        "method": "Network.requestWillBeSent",
+        "params": {
+          "requestId": "1",
+          "request": {
+            "url": "https://a.b/",
+            "method": "GET",
+            "headers": {
+              "COOKIE": "sid=secret-session",
+              "User-Agent": "x"
+            }
+          }
+        }
+      },
+      "expect": {
+        "method": "Network.requestWillBeSent",
+        "params": {
+          "requestId": "1",
+          "request": {
+            "url": "https://a.b/",
+            "method": "GET",
+            "headers": {
+              "User-Agent": "x"
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "responseReceived response headers and requestHeaders",
+      "frame": {
+        "method": "Network.responseReceived",
+        "params": {
+          "requestId": "1",
+          "response": {
+            "url": "https://a.b/",
+            "status": 200,
+            "headers": {
+              "Set-Cookie": "sid=secret-session"
+            },
+            "requestHeaders": {
+              "Cookie": "sid=secret-session",
+              "Accept": "*/*"
+            },
+            "requestHeadersText": "GET / HTTP/1.1\r\nCookie: sid=secret-session\r\n"
+          }
+        }
+      },
+      "expect": {
+        "method": "Network.responseReceived",
+        "params": {
+          "requestId": "1",
+          "response": {
+            "url": "https://a.b/",
+            "status": 200,
+            "headers": {},
+            "requestHeaders": {
+              "Accept": "*/*"
+            }
+          }
+        }
+      }
+    },
+    {
+      "name": "Fetch.requestPaused headers in map and list form",
+      "frame": {
+        "method": "Fetch.requestPaused",
+        "params": {
+          "requestId": "r",
+          "request": {
+            "url": "https://a.b/",
+            "headers": {
+              "Cookie": "sid=secret-session"
+            }
+          },
+          "responseHeaders": [
+            {
+              "name": "Set-Cookie",
+              "value": "sid=secret-session"
+            },
+            {
+              "name": "Content-Type",
+              "value": "text/html"
+            }
+          ]
+        }
+      },
+      "expect": {
+        "method": "Fetch.requestPaused",
+        "params": {
+          "requestId": "r",
+          "request": {
+            "url": "https://a.b/",
+            "headers": {}
+          },
+          "responseHeaders": [
+            {
+              "name": "Content-Type",
+              "value": "text/html"
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "a command result carrying cookies",
+      "frame": {
+        "id": 7,
+        "result": {
+          "cookies": [
+            {
+              "name": "sid",
+              "value": "secret-session"
+            }
+          ]
+        }
+      },
+      "expect": {
+        "id": 7,
+        "result": {}
+      }
+    },
+    {
+      "name": "Audits cookie issue raw Set-Cookie line",
+      "frame": {
+        "method": "Audits.issueAdded",
+        "sessionId": "S",
+        "params": {
+          "issue": {
+            "code": "CookieIssue",
+            "details": {
+              "cookieIssueDetails": {
+                "rawCookieLine": "sid=secret-session; SameSite=None",
+                "cookieWarningReasons": [
+                  "WarnSameSiteNoneInsecure"
+                ],
+                "operation": "SetCookie"
+              }
+            }
+          }
+        }
+      },
+      "expect": {
+        "method": "Audits.issueAdded",
+        "sessionId": "S",
+        "params": {
+          "issue": {
+            "code": "CookieIssue",
+            "details": {
+              "cookieIssueDetails": {
+                "cookieWarningReasons": [
+                  "WarnSameSiteNoneInsecure"
+                ],
+                "operation": "SetCookie"
+              }
+            }
+          }
+        }
+      }
+    }
+  ]
+}

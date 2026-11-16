@@ -209,6 +209,43 @@ impl Builder {
         self
     }
 
+    /// Run the child as this user id (unix). The caller must hold the right to
+    /// switch to it (CAP_SETUID); the child cannot gain privileges back.
+    #[cfg(unix)]
+    pub fn uid(&mut self, id: u32) -> &mut Self {
+        self.inner.uid(id);
+        self
+    }
+
+    /// Run the child with this group id (unix), see [`Builder::uid`].
+    #[cfg(unix)]
+    pub fn gid(&mut self, id: u32) -> &mut Self {
+        self.inner.gid(id);
+        self
+    }
+
+    /// Give the child extra file descriptors: each `(src, dst)` is `dup2`ed
+    /// in the child right before `exec`, so `dst` is open (and not
+    /// close-on-exec) in the new program. Used for Chrome's
+    /// `--remote-debugging-pipe` (fds 3 and 4). Every `src` must be distinct
+    /// from every `dst` (callers pass descriptors >= 10).
+    #[cfg(unix)]
+    pub fn map_fds(&mut self, map: Vec<(std::os::fd::RawFd, std::os::fd::RawFd)>) -> &mut Self {
+        // SAFETY: the closure runs between fork and exec; it only calls
+        // `dup2`, which is async-signal-safe, and does not allocate.
+        unsafe {
+            self.inner.pre_exec(move || {
+                for &(src, dst) in &map {
+                    if libc::dup2(src, dst) < 0 {
+                        return Err(io::Error::last_os_error());
+                    }
+                }
+                Ok(())
+            });
+        }
+        self
+    }
+
     /// Spawn the process and return the standard `tokio::process::Child`.
     pub fn spawn(mut self) -> io::Result<Child> {
         self.inner.spawn()
@@ -367,6 +404,41 @@ mod tests {
     use super::*;
     use crate::ResolvedCommand;
     use std::time::{Duration, Instant};
+
+    /// A mapped descriptor is open in the child under its new number.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn mapped_fds_reach_the_child() {
+        use std::io::Read;
+        use std::os::fd::{AsRawFd, FromRawFd};
+        let mut fds = [0i32; 2];
+        assert_eq!(unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }, 0);
+        let high = unsafe { libc::fcntl(fds[1], libc::F_DUPFD_CLOEXEC, 10) };
+        unsafe { libc::close(fds[1]) };
+        let mut read_end = unsafe { std::fs::File::from_raw_fd(fds[0]) };
+        let mut builder = Builder::clean_cli("sh");
+        builder.args(["-c", "echo mapped >&4"]).map_fds(vec![(high, 4)]);
+        let out = builder.output().await.expect("sh runs");
+        unsafe { libc::close(high) };
+        assert!(out.status.success());
+        let mut got = String::new();
+        read_end.read_to_string(&mut got).unwrap();
+        assert_eq!(got.trim(), "mapped");
+        let _ = read_end.as_raw_fd();
+    }
+
+    /// The child runs with the uid/gid the builder was given (here the caller's
+    /// own ids, which needs no privilege).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn uid_and_gid_are_applied_to_the_child() {
+        let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+        let mut builder = Builder::clean_cli("id");
+        builder.arg("-u").uid(uid).gid(gid);
+        let out = builder.output().await.expect("id runs");
+        assert!(out.status.success());
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), uid.to_string());
+    }
 
     #[tokio::test]
     async fn clean_cli_captures_stdout_and_strips_env_pollution() {
