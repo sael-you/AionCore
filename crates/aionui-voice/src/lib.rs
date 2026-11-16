@@ -37,6 +37,7 @@ mod speech;
 mod state;
 mod summary;
 pub mod tools;
+mod utterance;
 mod ws;
 
 #[cfg(feature = "voice-test")]
@@ -46,6 +47,7 @@ pub use agent_routes::{VoiceAgentRouterState, voice_agent_routes};
 pub use budget::{BudgetMeter, BudgetThreshold, VOICE_MAX_OUTPUT_TOKENS};
 pub use conversation_port::{
     ConversationInfo, ConversationPort, ConversationStatus, MessageHit, ProjectInfo, SendOutcome, SendProbe,
+    UserMessage,
 };
 pub use credentials::{CredentialPolicy, FAKE_PROVIDER_URL_ENV, OPENAI_OFFICIAL_BASE_URL, ResolvedCredential};
 pub use engine::{

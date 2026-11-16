@@ -550,6 +550,50 @@ fn write_executable(dir: &std::path::Path, name: &str, contents: &str) -> String
     path.to_string_lossy().to_string()
 }
 
+/// `ProbePolicy::without_version_probe()` keeps the PATH lookup but never
+/// launches the CLI: the agent stays installed, nothing is queued for the
+/// background recheck, and the script's marker file is never written.
+#[cfg(unix)]
+#[tokio::test]
+async fn without_version_probe_keeps_installed_agents_and_never_launches_them() {
+    let db = init_database_memory().await.unwrap();
+    let repo: Arc<dyn IAgentMetadataRepository> = Arc::new(SqliteAgentMetadataRepository::new(db.pool().clone()));
+    let temp = tempfile::tempdir().unwrap();
+    let marker = temp.path().join("launched");
+    let command = write_executable(
+        temp.path(),
+        "recording-cli",
+        &format!("#!/bin/sh\ntouch '{}'\nexit 1\n", marker.display()),
+    );
+    let source_info = serde_json::json!({ "binary_name": command }).to_string();
+    repo.upsert(&upsert_script_agent_params(
+        "agent-recording-cli",
+        "Recording CLI",
+        &command,
+        &source_info,
+    ))
+    .await
+    .unwrap();
+
+    let registry = AgentRegistry::new_with_probe_policy(repo, ProbePolicy::without_version_probe());
+    registry.hydrate().await.unwrap();
+
+    let row = registry
+        .list_management_rows()
+        .await
+        .into_iter()
+        .find(|item| item.id == "agent-recording-cli")
+        .unwrap();
+    assert!(row.installed, "the PATH lookup still decides installed");
+    assert_ne!(
+        row.status,
+        AgentManagementStatus::Offline,
+        "no --version ran, so no failure was recorded"
+    );
+    assert!(registry.pending_slow_probe_rechecks().await.is_empty());
+    assert!(!marker.exists(), "the CLI must not be launched");
+}
+
 /// A builtin whose `--version` exceeds the inline budget must NOT be
 /// condemned to Missing: it stays installed, surfaces as Unchecked, and is
 /// queued for the background recheck (#675).
@@ -576,6 +620,7 @@ async fn slow_version_probe_lands_unchecked_and_pending_not_missing() {
             inline_budget: std::time::Duration::from_millis(50),
             recheck_budget: std::time::Duration::from_millis(100),
             slow_threshold_ms: 2000,
+            version_probe: true,
         },
     );
     registry.hydrate().await.unwrap();
@@ -648,6 +693,7 @@ async fn slow_probe_history_skips_inline_version_check() {
             inline_budget: std::time::Duration::from_secs(30),
             recheck_budget: std::time::Duration::from_millis(100),
             slow_threshold_ms: 2000,
+            version_probe: true,
         },
     );
     registry.hydrate().await.unwrap();
@@ -704,6 +750,7 @@ async fn background_recheck_settles_pending_agent_online() {
             inline_budget: std::time::Duration::from_millis(50),
             recheck_budget: std::time::Duration::from_secs(10),
             slow_threshold_ms: 2000,
+            version_probe: true,
         },
     );
     registry.hydrate().await.unwrap();
@@ -768,6 +815,7 @@ async fn background_recheck_marks_corrupted_install_offline() {
             inline_budget: std::time::Duration::from_millis(50),
             recheck_budget: std::time::Duration::from_secs(10),
             slow_threshold_ms: 2000,
+            version_probe: true,
         },
     );
     registry.hydrate().await.unwrap();

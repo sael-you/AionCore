@@ -156,7 +156,7 @@ Supports the same arguments as `git push` (e.g. `just push -u origin feat/branch
 2. Handler function → `crates/aionui-{domain}/src/routes.rs`
 3. Business logic → `crates/aionui-{domain}/src/service.rs`
 4. Register route in `domain_routes()` function
-5. Add test → `crates/aionui-{domain}/tests/` or `crates/aionui-app/tests/`
+5. Add test → `crates/aionui-{domain}/tests/it/` or `crates/aionui-app/tests/it/` (see Test Organization)
 
 ### Add Migration
 
@@ -174,7 +174,16 @@ Supports the same arguments as `git push` (e.g. `just push -u origin feat/branch
 | Location                                 | What goes there                        |
 | ---------------------------------------- | -------------------------------------- |
 | Inline `#[cfg(test)]` in each `.rs` file | Unit tests for that module's internals |
-| `crates/<crate>/tests/`                  | Integration / E2E tests for that crate |
+| `crates/<crate>/tests/it/<name>.rs`      | Integration / E2E tests for that crate |
+
+Integration tests are one test binary per crate (each binary links the whole crate graph, so 231 of
+them dominated gate time). A new file goes in `crates/<crate>/tests/it/` with a `mod <name>;` line in
+`tests/it/main.rs` (`#[cfg(feature = "...")]` on it if it needs a feature); shared helpers stay in
+`tests/common/` and are reached as `use crate::common;`. Only a file that mutates the process
+environment (`std::env::set_var` / `remove_var`) stays a separate `tests/<name>.rs` binary, because
+`cargo test` runs a binary's tests as threads of one process. Select tests by module path:
+`cargo nextest run -p <crate> -E 'test(/^<name>::/)'` or `cargo test -p <crate> --test it <name>::`.
+`just test` runs nextest (one process per test, `.config/nextest.toml`) plus doctests.
 
 ### Testing Rules
 

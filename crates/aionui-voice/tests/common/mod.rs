@@ -90,6 +90,9 @@ pub fn fast_timings() -> VoiceTimings {
         reattach_deadline: Duration::from_millis(2000),
         reattach_retry_delay: Duration::from_millis(50),
         hello_timeout: Duration::from_millis(800),
+        // TASK-112 holds: short here; their own tests set the real lengths.
+        utterance_window: Duration::from_millis(300),
+        cascade_answer_silence: Duration::ZERO,
         ..VoiceTimings::default()
     }
 }

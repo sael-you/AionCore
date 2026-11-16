@@ -64,6 +64,14 @@ pub struct MessageHit {
     pub snippet: String,
 }
 
+/// The latest user-side message of a conversation: what started its last turn
+/// (or was added to it). Hidden messages are system prompts (cron).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct UserMessage {
+    pub text: String,
+    pub hidden: bool,
+}
+
 #[async_trait::async_trait]
 pub trait ConversationPort: Send + Sync {
     async fn list_conversations(&self, user_id: &str) -> Result<Vec<ConversationInfo>, String>;
@@ -75,6 +83,9 @@ pub trait ConversationPort: Send + Sync {
 
     /// Text of the latest assistant reply, if any.
     async fn last_reply(&self, user_id: &str, conversation_id: &str) -> Result<Option<String>, String>;
+
+    /// The latest user-side text message, if any (TASK-112: who started the turn).
+    async fn last_user_message(&self, user_id: &str, conversation_id: &str) -> Result<Option<UserMessage>, String>;
 
     async fn search_messages(&self, user_id: &str, keyword: &str, limit: usize) -> Result<Vec<MessageHit>, String>;
 

@@ -9,12 +9,12 @@ use std::sync::Arc;
 use aionui_api_types::{
     AttachKitItemRequest, CreateKitRequest, KitAttachmentResponse, KitEffectiveItem, KitEffectiveMcp,
     KitEffectiveQuery, KitEffectiveSetResponse, KitErrorCode, KitItemKind, KitLevel, KitMcpMember, KitMissingTemplate,
-    KitOp, KitProvenance, KitResponse, ListKitAttachmentsQuery, UpdateKitRequest,
+    KitOp, KitProvenance, KitResponse, ListKitAttachmentsQuery, ListKitsQuery, UpdateKitRequest,
 };
 use aionui_db::models::{KitAttachmentRow, KitItemRow, KitRow, McpMarketRow};
 use aionui_db::{
-    AttachParams, CreateKitParams, DbError, IKitRepository, KIT_NAME_TAKEN_MSG, KIT_STALE_MSG, KitDecision, KitMembers,
-    KitScope, UpdateKitParams, kit_resolve,
+    AttachParams, CreateKitParams, DbError, IKitRepository, KIT_NAME_TAKEN_MSG, KIT_PROJECT_HAS_KIT_MSG, KIT_STALE_MSG,
+    KitDecision, KitMembers, KitScope, UpdateKitParams, kit_resolve,
 };
 use tracing::{info, warn};
 
@@ -36,9 +36,46 @@ pub trait IKitConversationApplier: Send + Sync {
     async fn reapply_kit_skills(&self, user_id: &str, conversation_id: &str) -> Result<(), String>;
 }
 
+/// C28 one-time data step marker (`client_preferences`, per user).
+const GLOBAL_KIT_STEP_MARKER: &str = "aionui.kits.c28_global_kit_step";
+/// Builtin kits that no longer stay at the global level (owner, C28).
+const OFF_GLOBAL_KEYS: &[&str] = &[
+    "K1", "K2", "K3", "K4", "K5", "K6", "K7", "K8", "K9", "K10", "K11", "K12",
+];
+/// Re-attached at the project level of [`PLATFORM_PROJECTS`] by that step.
+const PLATFORM_KIT_KEYS: &[&str] = &["K1", "K2"];
+const PLATFORM_PROJECTS: &[&str] = &["aionui", "clauterm-studio"];
+/// Largest workspace `.mcp.json` read for the shadow check (names only).
+const MAX_PROJECT_MCP_FILE: u64 = 1024 * 1024;
+
+/// Server names defined by `<workspace>/.mcp.json` (`mcpServers` keys). Only
+/// the names leave this function: the file holds keys and is never returned
+/// or logged. Missing, oversized or malformed → empty.
+async fn project_file_server_names(workspace: &str) -> BTreeSet<String> {
+    let path = std::path::Path::new(workspace).join(".mcp.json");
+    let Ok(meta) = tokio::fs::metadata(&path).await else {
+        return BTreeSet::new();
+    };
+    if !meta.is_file() || meta.len() > MAX_PROJECT_MCP_FILE {
+        return BTreeSet::new();
+    }
+    let Ok(bytes) = tokio::fs::read(&path).await else {
+        return BTreeSet::new();
+    };
+    serde_json::from_slice::<serde_json::Value>(&bytes)
+        .ok()
+        .and_then(|v| {
+            v.get("mcpServers")
+                .and_then(|m| m.as_object())
+                .map(|m| m.keys().cloned().collect())
+        })
+        .unwrap_or_default()
+}
+
 /// The repository's conflicts as kit codes (name taken vs stale write).
 fn kit_conflict(err: DbError) -> MarketError {
     match err {
+        DbError::Conflict(msg) if msg == KIT_PROJECT_HAS_KIT_MSG => kit_error(KitErrorCode::ProjectHasKit, msg),
         DbError::Conflict(msg) if msg == KIT_STALE_MSG => kit_error(KitErrorCode::Stale, msg),
         DbError::Conflict(msg) if msg == KIT_NAME_TAKEN_MSG => kit_error(KitErrorCode::NameTaken, msg),
         DbError::NotFound(msg) => kit_error(KitErrorCode::NotFound, msg),
@@ -82,7 +119,7 @@ fn globally_allowed(row: &McpMarketRow) -> bool {
 }
 
 impl McpMarketService {
-    fn kits(&self) -> Result<&Arc<dyn IKitRepository>, MarketError> {
+    pub(crate) fn kits(&self) -> Result<&Arc<dyn IKitRepository>, MarketError> {
         self.kits
             .as_ref()
             .ok_or_else(|| MarketError::Unavailable("kits are not configured".to_owned()))
@@ -100,17 +137,64 @@ impl McpMarketService {
 
     // -- kits ---------------------------------------------------------------
 
-    /// Live kits, seeding the KITS.md defaults first (idempotent).
-    pub async fn list_kits(&self, user_id: &str) -> Result<Vec<KitResponse>, MarketError> {
+    /// Seed K0–K12 (K0 attached globally on its first seed) and run the C28
+    /// one-time step (builtin kits off the global level, K1/K2 onto the
+    /// platform projects). Both are idempotent.
+    async fn ensure_seeded(&self, user_id: &str) -> Result<(), MarketError> {
         let kits = self.kits()?;
         let seeded = kits.seed_kits(user_id, DEFAULT_KITS).await?;
         if seeded > 0 {
             info!(count = seeded, "kits: default kits seeded");
         }
-        let rows = kits.list_kits(user_id).await?;
+        if let Some(step) = kits
+            .run_global_kit_step_once(
+                user_id,
+                GLOBAL_KIT_STEP_MARKER,
+                OFF_GLOBAL_KEYS,
+                PLATFORM_KIT_KEYS,
+                PLATFORM_PROJECTS,
+            )
+            .await?
+        {
+            info!(
+                removed_global = step.removed_global,
+                attached_project = step.attached_project,
+                "kits: C28 global kit step applied (builtin kits moved off the global level)"
+            );
+        }
+        Ok(())
+    }
+
+    /// Live kits (only `project_id`'s project kit when given), seeding the
+    /// defaults first.
+    pub async fn list_kits(&self, user_id: &str, query: ListKitsQuery) -> Result<Vec<KitResponse>, MarketError> {
+        self.ensure_seeded(user_id).await?;
+        let kits = self.kits()?;
+        let project = query.project_id.as_deref().map(str::trim).filter(|p| !p.is_empty());
+        let rows: Vec<KitRow> = kits
+            .list_kits(user_id)
+            .await?
+            .into_iter()
+            .filter(|k| project.is_none_or(|p| k.project_id.as_deref() == Some(p)))
+            .collect();
         let items = kits.list_kit_items(user_id, None).await?;
         let instances = self.instances_by_id(user_id).await?;
         Ok(rows.iter().map(|k| kit_response(k, &items, &instances)).collect())
+    }
+
+    /// The project kit of a project (`GET /api/projects/{project_id}/kit`).
+    pub async fn get_project_kit(&self, user_id: &str, project_id: &str) -> Result<KitResponse, MarketError> {
+        let row = self
+            .kits()?
+            .find_project_kit(user_id, project_id)
+            .await?
+            .ok_or_else(|| {
+                kit_error(
+                    KitErrorCode::NotFound,
+                    format!("project {project_id} has no project kit"),
+                )
+            })?;
+        self.get_kit(user_id, &row.id).await
     }
 
     pub async fn get_kit(&self, user_id: &str, id: &str) -> Result<KitResponse, MarketError> {
@@ -217,11 +301,24 @@ impl McpMarketService {
             mcps.unwrap_or_default(),
             templates.unwrap_or_default(),
         );
+        let project = req.project_id.as_deref().map(str::trim).filter(|p| !p.is_empty());
+        if let Some(p) = project {
+            if !self.repo.project_exists(p).await? {
+                return Err(kit_error(KitErrorCode::UnknownTarget, format!("project {p} not found")));
+            }
+            if kits.find_project_kit(user_id, p).await?.is_some() {
+                return Err(kit_error(
+                    KitErrorCode::ProjectHasKit,
+                    format!("project {p} already has a project kit"),
+                ));
+            }
+        }
         let row = kits
             .create_kit(&CreateKitParams {
                 user_id,
                 name: &name,
                 description: &description,
+                project_id: project,
                 members: KitMembers {
                     skills: &skills,
                     mcp_instance_ids: &mcps,
@@ -401,9 +498,34 @@ impl McpMarketService {
         let global_add = req.level == KitLevel::Global && req.op == KitOp::Add;
         match req.item_kind {
             KitItemKind::Kit => {
-                kits.find_kit(user_id, &item_ref)
+                let kit = kits
+                    .find_kit(user_id, &item_ref)
                     .await?
                     .ok_or_else(|| kit_error(KitErrorCode::NotFound, format!("kit {item_ref} not found")))?;
+                // C28: a project kit lives at its own project; it may only be
+                // removed (or re-added) below it, inside that project.
+                if let Some(own) = kit.project_id.as_deref() {
+                    let elsewhere = match req.level {
+                        KitLevel::Global => true,
+                        KitLevel::Project => target != own,
+                        KitLevel::Conversation => kits
+                            .conversation_scope(user_id, &target)
+                            .await?
+                            .and_then(|s| s.project_id)
+                            .is_none_or(|p| p != own),
+                        KitLevel::Assistant => false,
+                    };
+                    if elsewhere {
+                        return Err(kit_error(
+                            KitErrorCode::InvalidTarget,
+                            format!(
+                                "\"{}\" is the project kit of project {own}; it cannot be attached at the {} level elsewhere",
+                                kit.name,
+                                req.level.as_str()
+                            ),
+                        ));
+                    }
+                }
                 if global_add {
                     let items = kits
                         .list_kit_items(user_id, Some(std::slice::from_ref(&item_ref)))
@@ -504,6 +626,7 @@ impl McpMarketService {
         let kits = self.kits()?;
         let non_empty = |v: Option<String>| v.map(|s| s.trim().to_owned()).filter(|s| !s.is_empty());
         let conversation_id = non_empty(query.conversation_id);
+        let mut shadow_names = BTreeSet::new();
         let (scope, conversation_skills) = match &conversation_id {
             Some(cid) => {
                 let scope = kits
@@ -511,6 +634,9 @@ impl McpMarketService {
                     .await?
                     .ok_or_else(|| kit_error(KitErrorCode::UnknownTarget, format!("conversation {cid} not found")))?;
                 let skills = kits.conversation_skills(user_id, cid).await?.map(|s| s.skills);
+                if let Some(workspace) = kits.conversation_workspace(user_id, cid).await? {
+                    shadow_names = project_file_server_names(&workspace).await;
+                }
                 (scope, skills)
             }
             None => (
@@ -551,7 +677,7 @@ impl McpMarketService {
                 item_ref: id.clone(),
                 included: d.included,
                 provenance: provenance(d),
-                mcp: Some(effective_mcp(instances.get(id), d)),
+                mcp: Some(effective_mcp(instances.get(id), d, &shadow_names)),
             })
             .collect();
         // A wanted template is missing when no included instance of that template is in the set.
@@ -584,7 +710,7 @@ impl McpMarketService {
     }
 }
 
-fn effective_mcp(row: Option<&McpMarketRow>, d: &KitDecision) -> KitEffectiveMcp {
+fn effective_mcp(row: Option<&McpMarketRow>, d: &KitDecision, shadow_names: &BTreeSet<String>) -> KitEffectiveMcp {
     let Some(row) = row else {
         return KitEffectiveMcp {
             instance_name: String::new(),
@@ -596,6 +722,7 @@ fn effective_mcp(row: Option<&McpMarketRow>, d: &KitDecision) -> KitEffectiveMcp
             clis: Vec::new(),
             delivered: false,
             reason: Some("instance no longer exists".to_owned()),
+            shadowed_by_project_file: false,
         };
     };
     let status = row.market_status.clone().unwrap_or_default();
@@ -622,6 +749,7 @@ fn effective_mcp(row: Option<&McpMarketRow>, d: &KitDecision) -> KitEffectiveMcp
             .unwrap_or_default(),
         delivered: reason.is_none(),
         reason,
+        shadowed_by_project_file: shadow_names.contains(&row.name),
     }
 }
 
@@ -654,6 +782,7 @@ fn kit_response(row: &KitRow, items: &[KitItemRow], instances: &HashMap<String, 
         name: row.name.clone(),
         description: row.description.clone(),
         builtin_key: row.builtin_key.clone(),
+        project_id: row.project_id.clone(),
         skills,
         mcps,
         mcp_templates,

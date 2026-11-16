@@ -86,6 +86,7 @@ aionui-realtime.workspace = true
 # through the trait-object escape hatch without spawning real CLI processes.
 aionui-ai-agent = { workspace = true, features = ["test-support"] }
 base64.workspace = true
+bcrypt.workspace = true
 git2.workspace = true
 http-body-util.workspace = true
 rust_xlsxwriter.workspace = true

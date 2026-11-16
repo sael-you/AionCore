@@ -47,8 +47,8 @@ pub use repository::cron::{
     ClaimCronRunParams, CronRunClaimResult, FinishCronRunParams, RecoverableCronRun, UpdateCronJobParams,
 };
 pub use repository::kit::{
-    AttachParams, ConversationSkills, CreateKitParams, KIT_NAME_TAKEN_MSG, KIT_STALE_MSG, KitMembers, SeedKit,
-    UpdateKitParams,
+    AttachParams, ConversationSkills, CreateKitParams, GlobalKitStep, KIT_NAME_TAKEN_MSG, KIT_PROJECT_HAS_KIT_MSG,
+    KIT_STALE_MSG, KitMembers, KitProjectInfo, SeedKit, UpdateKitParams,
 };
 pub use repository::mcp_market::{CreateAssignmentParams, MarketInstanceParams, UpdateMarketInstanceParams};
 pub use repository::mcp_server::{

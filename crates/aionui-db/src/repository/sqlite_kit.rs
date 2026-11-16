@@ -6,8 +6,8 @@ use crate::error::DbError;
 use crate::kit_resolve::{KIT_LEVELS, KitLayers, KitScope};
 use crate::models::{KitAttachmentRow, KitItemRow, KitRow};
 use crate::repository::kit::{
-    AttachParams, ConversationSkills, CreateKitParams, IKitRepository, KIT_NAME_TAKEN_MSG, KIT_STALE_MSG, SeedKit,
-    UpdateKitParams,
+    AttachParams, ConversationSkills, CreateKitParams, GlobalKitStep, IKitRepository, KIT_NAME_TAKEN_MSG,
+    KIT_PROJECT_HAS_KIT_MSG, KIT_STALE_MSG, KitProjectInfo, SeedKit, UpdateKitParams,
 };
 
 /// SQLite implementation of [`IKitRepository`].
@@ -22,7 +22,7 @@ impl SqliteKitRepository {
     }
 }
 
-const KIT_COLUMNS: &str = "id, user_id, name, description, builtin_key, created_at, updated_at, deleted_at";
+const KIT_COLUMNS: &str = "id, user_id, name, description, builtin_key, project_id, created_at, updated_at, deleted_at";
 const ATTACHMENT_COLUMNS: &str = "id, user_id, level, target_id, item_kind, item_ref, op, created_at, updated_at";
 
 fn unique_violation(err: &sqlx::Error) -> bool {
@@ -100,7 +100,37 @@ pub(crate) async fn load_layers(pool: &SqlitePool, user_id: &str, scope: &KitSco
         query.push(")");
     }
     query.push(")");
-    let attachments: Vec<KitAttachmentRow> = query.build_query_as().fetch_all(pool).await?;
+    let mut attachments: Vec<KitAttachmentRow> = query.build_query_as().fetch_all(pool).await?;
+
+    // C28: the project kit is an implicit `project`/`add` attachment of its
+    // own project (no row), unless an explicit project-level row names it.
+    if let Some(project_id) = scope.target("project") {
+        let project_kit: Option<String> = sqlx::query_scalar(
+            "SELECT id FROM kits WHERE user_id = ? AND project_id = ? AND deleted_at IS NULL LIMIT 1",
+        )
+        .bind(user_id)
+        .bind(project_id)
+        .fetch_optional(pool)
+        .await?;
+        if let Some(kit_id) = project_kit {
+            let explicit = attachments
+                .iter()
+                .any(|a| a.level == "project" && a.item_kind == "kit" && a.item_ref == kit_id);
+            if !explicit {
+                attachments.push(KitAttachmentRow {
+                    id: format!("implicit:{kit_id}"),
+                    user_id: user_id.to_owned(),
+                    level: "project".to_owned(),
+                    target_id: project_id.to_owned(),
+                    item_kind: "kit".to_owned(),
+                    item_ref: kit_id,
+                    op: "add".to_owned(),
+                    created_at: 0,
+                    updated_at: 0,
+                });
+            }
+        }
+    }
 
     let kit_ids: Vec<&str> = attachments
         .iter()
@@ -190,6 +220,17 @@ impl IKitRepository for SqliteKitRepository {
         Ok(self.find_kit_any(user_id, id).await?.filter(|k| k.deleted_at.is_none()))
     }
 
+    async fn find_project_kit(&self, user_id: &str, project_id: &str) -> Result<Option<KitRow>, DbError> {
+        let sql = format!(
+            "SELECT {KIT_COLUMNS} FROM kits WHERE user_id = ? AND project_id = ? AND deleted_at IS NULL LIMIT 1"
+        );
+        Ok(sqlx::query_as::<_, KitRow>(&sql)
+            .bind(user_id)
+            .bind(project_id)
+            .fetch_optional(&self.pool)
+            .await?)
+    }
+
     async fn list_kit_items(&self, user_id: &str, kit_ids: Option<&[String]>) -> Result<Vec<KitItemRow>, DbError> {
         let mut q = QueryBuilder::<Sqlite>::new(
             "SELECT i.kit_id, i.user_id, i.kind, i.ref FROM kit_items i JOIN kits k ON k.id = i.kit_id \
@@ -216,18 +257,30 @@ impl IKitRepository for SqliteKitRepository {
         let now = aionui_common::now_ms();
         let mut tx = self.pool.begin().await?;
         sqlx::query(
-            "INSERT INTO kits (id, user_id, name, description, builtin_key, created_at, updated_at) \
-             VALUES (?, ?, ?, ?, NULL, ?, ?)",
+            "INSERT INTO kits (id, user_id, name, description, builtin_key, project_id, created_at, updated_at) \
+             VALUES (?, ?, ?, ?, NULL, ?, ?, ?)",
         )
         .bind(&id)
         .bind(p.user_id)
         .bind(p.name)
         .bind(p.description)
+        .bind(p.project_id)
         .bind(now)
         .bind(now)
         .execute(&mut *tx)
         .await
-        .map_err(|e| map_conflict(e, KIT_NAME_TAKEN_MSG))?;
+        .map_err(|e| {
+            // Two partial UNIQUE indexes can refuse the insert: name or project.
+            let project = matches!(&e, sqlx::Error::Database(db) if db.message().contains("project_id"));
+            map_conflict(
+                e,
+                if project {
+                    KIT_PROJECT_HAS_KIT_MSG
+                } else {
+                    KIT_NAME_TAKEN_MSG
+                },
+            )
+        })?;
         let m = p.members;
         for (kind, refs) in [
             ("skill", m.skills),
@@ -335,10 +388,100 @@ impl IKitRepository for SqliteKitRepository {
             }
             insert_items(&mut tx, &id, user_id, "skill", seed.skills).await?;
             insert_items(&mut tx, &id, user_id, "template", seed.mcp_templates).await?;
+            if seed.attach_globally {
+                sqlx::query(
+                    "INSERT OR IGNORE INTO kit_attachments \
+                     (id, user_id, level, target_id, item_kind, item_ref, op, created_at, updated_at) \
+                     VALUES (?, ?, 'global', '', 'kit', ?, 'add', ?, ?)",
+                )
+                .bind(aionui_common::generate_prefixed_id("kita"))
+                .bind(user_id)
+                .bind(&id)
+                .bind(now)
+                .bind(now)
+                .execute(&mut *tx)
+                .await?;
+            }
             inserted += 1;
         }
         tx.commit().await?;
         Ok(inserted)
+    }
+
+    async fn run_global_kit_step_once(
+        &self,
+        user_id: &str,
+        marker_key: &str,
+        off_global_keys: &[&str],
+        project_keys: &[&str],
+        project_names: &[&str],
+    ) -> Result<Option<GlobalKitStep>, DbError> {
+        let now = aionui_common::now_ms();
+        let mut tx = self.pool.begin().await?;
+        // Claim the marker first: a concurrent second run inserts nothing and stops.
+        let claimed = sqlx::query(
+            "INSERT OR IGNORE INTO client_preferences (user_id, key, value, updated_at) VALUES (?, ?, '1', ?)",
+        )
+        .bind(user_id)
+        .bind(marker_key)
+        .bind(now)
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if claimed == 0 {
+            return Ok(None);
+        }
+        let mut step = GlobalKitStep::default();
+        for key in off_global_keys {
+            step.removed_global += sqlx::query(
+                "DELETE FROM kit_attachments WHERE user_id = ? AND level = 'global' AND item_kind = 'kit' \
+                 AND item_ref IN (SELECT id FROM kits WHERE user_id = ? AND builtin_key = ?)",
+            )
+            .bind(user_id)
+            .bind(user_id)
+            .bind(*key)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        }
+        for name in project_names {
+            let projects: Vec<String> =
+                sqlx::query_scalar("SELECT project_id FROM projects WHERE user_id = ? AND name = ? ORDER BY id")
+                    .bind(user_id)
+                    .bind(*name)
+                    .fetch_all(&mut *tx)
+                    .await?;
+            for project_id in &projects {
+                for key in project_keys {
+                    let kit: Option<String> = sqlx::query_scalar(
+                        "SELECT id FROM kits WHERE user_id = ? AND builtin_key = ? AND deleted_at IS NULL",
+                    )
+                    .bind(user_id)
+                    .bind(*key)
+                    .fetch_optional(&mut *tx)
+                    .await?;
+                    let Some(kit_id) = kit else {
+                        continue;
+                    };
+                    step.attached_project += sqlx::query(
+                        "INSERT OR IGNORE INTO kit_attachments \
+                         (id, user_id, level, target_id, item_kind, item_ref, op, created_at, updated_at) \
+                         VALUES (?, ?, 'project', ?, 'kit', ?, 'add', ?, ?)",
+                    )
+                    .bind(aionui_common::generate_prefixed_id("kita"))
+                    .bind(user_id)
+                    .bind(project_id)
+                    .bind(&kit_id)
+                    .bind(now)
+                    .bind(now)
+                    .execute(&mut *tx)
+                    .await?
+                    .rows_affected();
+                }
+            }
+        }
+        tx.commit().await?;
+        Ok(Some(step))
     }
 
     async fn list_attachments(
@@ -423,6 +566,69 @@ impl IKitRepository for SqliteKitRepository {
 
     async fn conversation_scope(&self, user_id: &str, conversation_id: &str) -> Result<Option<KitScope>, DbError> {
         conversation_scope(&self.pool, user_id, conversation_id).await
+    }
+
+    async fn project_info(&self, user_id: &str, project_id: &str) -> Result<Option<KitProjectInfo>, DbError> {
+        let row: Option<(String, Option<String>)> = sqlx::query_as(
+            "SELECT p.name, f.resource_uri FROM projects p \
+             LEFT JOIN project_explorer pe ON pe.project_id = p.project_id AND pe.role = 'workspace' \
+             LEFT JOIN folders f ON f.folder_id = pe.folder_id \
+             WHERE p.user_id = ? AND p.project_id = ? LIMIT 1",
+        )
+        .bind(user_id)
+        .bind(project_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|(name, workspace_uri)| KitProjectInfo {
+            name,
+            workspace_uri: workspace_uri.filter(|u| !u.is_empty()),
+        }))
+    }
+
+    async fn add_kit_items(&self, user_id: &str, kit_id: &str, kind: &str, refs: &[String]) -> Result<u64, DbError> {
+        let mut tx = self.pool.begin().await?;
+        let live: Option<i64> =
+            sqlx::query_scalar("SELECT 1 FROM kits WHERE user_id = ? AND id = ? AND deleted_at IS NULL")
+                .bind(user_id)
+                .bind(kit_id)
+                .fetch_optional(&mut *tx)
+                .await?;
+        if live.is_none() {
+            return Err(DbError::NotFound(format!("kit {kit_id}")));
+        }
+        let mut added = 0;
+        for item in refs {
+            added += sqlx::query("INSERT OR IGNORE INTO kit_items (kit_id, user_id, kind, ref) VALUES (?, ?, ?, ?)")
+                .bind(kit_id)
+                .bind(user_id)
+                .bind(kind)
+                .bind(item)
+                .execute(&mut *tx)
+                .await?
+                .rows_affected();
+        }
+        if added > 0 {
+            sqlx::query("UPDATE kits SET updated_at = MAX(?, updated_at + 1) WHERE user_id = ? AND id = ?")
+                .bind(aionui_common::now_ms())
+                .bind(user_id)
+                .bind(kit_id)
+                .execute(&mut *tx)
+                .await?;
+        }
+        tx.commit().await?;
+        Ok(added)
+    }
+
+    async fn conversation_workspace(&self, user_id: &str, conversation_id: &str) -> Result<Option<String>, DbError> {
+        let row: Option<Option<String>> = sqlx::query_scalar(
+            "SELECT CASE WHEN json_valid(extra) THEN json_extract(extra, '$.workspace') END \
+             FROM conversations WHERE user_id = ? AND id = ?",
+        )
+        .bind(user_id)
+        .bind(conversation_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.flatten().filter(|w| !w.is_empty()))
     }
 
     async fn conversation_skills(

@@ -13,9 +13,26 @@ use aionui_extension::{ExternalPathsManager, SkillPaths, SkillRouterState};
 use aionui_file::FileService;
 use aionui_system::VersionCheckService;
 
+/// `AppServices` for tests: the real services, except that building them does
+/// not launch the agent CLIs installed on the host for `--version` probes
+/// (seconds per app and host-dependent; the probe has its own unit tests).
+pub async fn test_services(db: aionui_db::Database, config: &AppConfig) -> AppServices {
+    AppServices::from_config_with_probe_policy(db, config, aionui_ai_agent::ProbePolicy::without_version_probe())
+        .await
+        .unwrap()
+}
+
+/// bcrypt hash for a test account. Cost 4 (the minimum) instead of the
+/// production cost 12, which takes ~1 s per hash and per login in a debug
+/// build. Login verification is unchanged: bcrypt reads the cost from the
+/// hash. Production hashing keeps its own tests (`aionui-auth`, `auth_e2e`).
+pub fn test_password_hash(password: &str) -> String {
+    bcrypt::hash(password, 4).unwrap()
+}
+
 pub async fn build_app() -> (axum::Router, AppServices) {
     let db = aionui_db::init_database_memory().await.unwrap();
-    let services = AppServices::from_config(db, &AppConfig::default()).await.unwrap();
+    let services = test_services(db, &AppConfig::default()).await;
     let router = create_router(&services).await.expect("build router");
     (router, services)
 }
@@ -36,7 +53,7 @@ pub async fn build_app_with_skill_paths(root: &std::path::Path) -> (axum::Router
         work_dir: root.to_path_buf(),
         ..Default::default()
     };
-    let services = AppServices::from_config(db, &config).await.unwrap();
+    let services = test_services(db, &config).await;
     sqlx::query("DELETE FROM skill_import_records")
         .execute(services.database.pool())
         .await
@@ -94,7 +111,7 @@ pub async fn sync_skill_catalog_for_test(services: &AppServices, paths: &SkillPa
 
 pub async fn build_app_with_noop_opener() -> (axum::Router, AppServices) {
     let db = aionui_db::init_database_memory().await.unwrap();
-    let services = AppServices::from_config(db, &AppConfig::default()).await.unwrap();
+    let services = test_services(db, &AppConfig::default()).await;
     let (mut states, _) = build_module_states(&services).await.expect("build module states");
     states.shell.shell_service = std::sync::Arc::new(aionui_shell::ShellService::new(std::sync::Arc::new(
         aionui_shell::NoopSystemOpener,
@@ -105,7 +122,7 @@ pub async fn build_app_with_noop_opener() -> (axum::Router, AppServices) {
 
 pub async fn build_app_with_file_roots(allowed_roots: Vec<std::path::PathBuf>) -> (axum::Router, AppServices) {
     let db = aionui_db::init_database_memory().await.unwrap();
-    let services = AppServices::from_config(db, &AppConfig::default()).await.unwrap();
+    let services = test_services(db, &AppConfig::default()).await;
     let (mut states, _) = build_module_states(&services).await.expect("build module states");
     states.file.file_service = std::sync::Arc::new(FileService::new(services.event_bus.clone(), allowed_roots));
     let router = create_router_with_states(&services, states);
@@ -117,7 +134,7 @@ pub async fn build_app_with_mock_version(
     mock_server: &MockServer,
 ) -> (axum::Router, AppServices) {
     let db = aionui_db::init_database_memory().await.unwrap();
-    let services = AppServices::from_config(db, &AppConfig::default()).await.unwrap();
+    let services = test_services(db, &AppConfig::default()).await;
     let (mut states, _) = build_module_states(&services).await.expect("build module states");
     states.system.version_check_service =
         VersionCheckService::with_api_base(reqwest::Client::new(), current_version.to_owned(), mock_server.uri());
@@ -147,9 +164,8 @@ pub async fn build_app_with_mock_agents() -> (axum::Router, AppServices) {
     });
     let wtm: std::sync::Arc<dyn aionui_ai_agent::IWorkerTaskManager> =
         std::sync::Arc::new(WorkerTaskManagerImpl::new(factory));
-    let services = AppServices::from_config(db, &AppConfig::default())
+    let services = test_services(db, &AppConfig::default())
         .await
-        .unwrap()
         .with_worker_task_manager(wtm);
     let router = create_router(&services).await.expect("build router");
     (router, services)
@@ -312,7 +328,7 @@ pub async fn setup_and_login(
     username: &str,
     password: &str,
 ) -> (String, String) {
-    let hash = aionui_auth::hash_password(password).unwrap();
+    let hash = test_password_hash(password);
     if username == "admin" {
         services
             .user_repo
