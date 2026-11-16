@@ -1,7 +1,8 @@
 //! R10: every board write runs in a `board_write` span carrying `kind`,
 //! `card_id`, `actor_kind`, `actor_ref`.
 
-use crate::common;
+#[path = "common/mod.rs"]
+mod common;
 
 use std::sync::{Arc, Mutex};
 
