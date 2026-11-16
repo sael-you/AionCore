@@ -15,7 +15,7 @@ use futures_util::StreamExt;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
-use crate::frames::{error_frame, state_frame, to_text};
+use crate::frames::{error_frame, to_text};
 use crate::ports::AuthRejected;
 use crate::runner_drafts::ClientEvent;
 use crate::service::VoiceService;
