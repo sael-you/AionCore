@@ -245,35 +245,20 @@ async fn r2_only_two_globals() {
 // -- R3 ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn r3_write_is_claude_only_never_global_and_prod_needs_approval() {
+async fn r3_relaxed_write_runs_on_every_cli_and_prod_write_can_be_active() {
+    // D50: full tools on every CLI; a production write instance may be active
+    // without an approval record (the guard is the per-change owner OK rule).
     let f = fx().await;
     let mut req = paddle_write("tb-paddle-write");
     req.clis = vec!["claude".into(), "codex".into()];
-    assert!(invalid(f.market.create_instance(USER, req).await.unwrap_err()).contains("Claude-only"));
-
-    let inst = f
-        .market
-        .create_instance(USER, paddle_write("tb-paddle-write"))
-        .await
-        .unwrap();
+    let inst = f.market.create_instance(USER, req).await.unwrap();
     assert_eq!(inst.plain_env["PADDLE_MCP_TOOLS"], "non-destructive", "tier_env forced");
-    f.market
-        .set_secret(USER, &inst.id, "PADDLE_API_KEY", FIXTURE_SECRET)
+    activate(&f, &inst.id).await;
+    assert_eq!(f.market.get_instance(USER, &inst.id).await.unwrap().status, "active");
+    assign(&f, &inst.id, Some("proj-a"), None, &["claude", "codex"])
         .await
         .unwrap();
-    let err = f
-        .market
-        .update_instance(
-            USER,
-            &inst.id,
-            UpdateMcpMarketInstanceRequest {
-                status: Some("active".into()),
-                ..Default::default()
-            },
-        )
-        .await
-        .unwrap_err();
-    assert!(invalid(err).contains("owner decision 3"));
+    // The optional record is still validated, and clearing it changes nothing.
     assert!(
         invalid(
             f.market
@@ -287,20 +272,10 @@ async fn r3_write_is_claude_only_never_global_and_prod_needs_approval() {
         .set_approval(USER, &inst.id, Some("OA-20261115-paddle-write".into()))
         .await
         .unwrap();
-    activate(&f, &inst.id).await;
-    // Write assignments: Claude only, never global.
-    assert!(
-        invalid(
-            assign(&f, &inst.id, Some("proj-a"), None, &["codex"])
-                .await
-                .unwrap_err()
-        )
-        .contains("R3")
-    );
-    assign(&f, &inst.id, Some("proj-a"), None, &["claude"]).await.unwrap();
-    // Clearing the record of an active prod write instance makes it dormant.
     let back = f.market.set_approval(USER, &inst.id, None).await.unwrap();
-    assert_eq!(back.status, "dormant");
+    assert_eq!(back.status, "active");
+    // Write is still never global (R2).
+    assert!(assign(&f, &inst.id, None, None, &["claude"]).await.is_err());
 }
 
 // -- R4 / R5 -----------------------------------------------------------------------
@@ -844,7 +819,7 @@ fn plain_permits(plan: &aionui_mcp::market::LaunchPlan, tool: &str) -> bool {
 }
 
 #[tokio::test]
-async fn launcher_global_only_for_global_ids_and_refuses_write_on_codex() {
+async fn launcher_global_only_for_global_ids_and_runs_write_on_codex() {
     let f = fx().await;
     let ctx = f
         .market
@@ -872,24 +847,18 @@ async fn launcher_global_only_for_global_ids_and_refuses_write_on_codex() {
         .unwrap_err();
     assert!(forbidden(err).contains("no stdio command"));
 
-    let w = f.market.create_instance(USER, paddle_write("tb-w")).await.unwrap();
-    f.market
-        .set_approval(USER, &w.id, Some("OA-20261115-tb-w".into()))
-        .await
-        .unwrap();
+    let mut wreq = paddle_write("tb-w");
+    wreq.clis = vec!["claude".into(), "codex".into()];
+    let w = f.market.create_instance(USER, wreq).await.unwrap();
     activate(&f, &w.id).await;
-    assign(&f, &w.id, Some("proj-a"), None, &["claude"]).await.unwrap();
-    // Even if someone inserted a codex row behind the service's back, the launcher refuses.
-    sqlx::query("INSERT INTO mcp_assignments (id, user_id, mcp_server_id, project_id, assistant_id, cli, created_at, updated_at) VALUES ('x', ?, ?, 'proj-a', NULL, 'codex', 1, 1)")
-        .bind(USER)
-        .bind(&w.id)
-        .execute(f.db.pool())
+    assign(&f, &w.id, Some("proj-a"), None, &["claude", "codex"])
         .await
         .unwrap();
+    // D50: a production write instance launches on Codex too, without an approval record.
     assert!(
         resolve_launch(f.repo.as_ref(), &KEY, &req("tb-w", project("proj-a"), "codex"))
             .await
-            .is_err()
+            .is_ok()
     );
     let plan = resolve_launch(f.repo.as_ref(), &KEY, &req("tb-w", project("proj-a"), "claude"))
         .await

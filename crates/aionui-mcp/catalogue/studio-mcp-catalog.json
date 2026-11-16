@@ -840,7 +840,7 @@
       {
         "id": "keyword-planner",
         "name": "Google Ads Keyword Planner",
-        "description": "Community keyword-planner-mcp (GroMarketing, MIT, 0.1.1 of 2026-10-05, low adoption): keyword ideas, search volumes and location lookup. Read-only tools. Google sunset developer tokens on 2026-09-09; the README still asks for one.",
+        "description": "Community keyword-planner-mcp (GroMarketing, MIT, 0.1.1 of 2026-10-05): weak (4 stars, single maintainer) and needs a Google Ads developer token. Keyword ideas, search volumes and location lookup; read-only tools.",
         "market": {
           "version": "0.1.1",
           "transport": "stdio",
@@ -882,8 +882,8 @@
             },
             "GOOGLE_ADS_DEVELOPER_TOKEN": {
               "kind": "secret",
-              "required": false,
-              "description": "Developer token (sunset by Google on 2026-09-09; set only if the server still asks for it)"
+              "required": true,
+              "description": "Google Ads API developer token (the server requires it)"
             }
           },
           "tiers": [
@@ -904,7 +904,7 @@
           "vendor": "Community (GroMarketing)",
           "official": false,
           "optional": false,
-          "summary": "Keyword ideas and search volumes from Google Ads"
+          "summary": "Keyword ideas and search volumes (community, weak, needs a developer token)"
         }
       },
       {

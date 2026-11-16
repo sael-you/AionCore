@@ -337,26 +337,9 @@ pub fn instance_problems(spec: &InstanceSpec<'_>, t: &McpMarketTemplate, secrets
             p.push(format!("{w}: cli \"{cli}\" is not supported by the template"));
         }
     }
-    // R3: write = Claude only, production write dormant without the owner's recorded exception.
-    if spec.tier == "write" {
-        let other: Vec<&str> = spec
-            .clis
-            .iter()
-            .map(String::as_str)
-            .filter(|c| *c != "claude")
-            .collect();
-        if !other.is_empty() {
-            p.push(format!(
-                "{w}: write instances are Claude-only; remove {} (R3, O-5)",
-                other.join(",")
-            ));
-        }
-        if spec.environment == "production" && spec.status == "active" && spec.approval_ref.is_none() {
-            p.push(format!(
-                "{w}: production write instances stay dormant without the owner's recorded exception (approval_ref; owner decision 3)"
-            ));
-        }
-    }
+    // R3 relaxed by D50: write (full tools) runs on every CLI the template supports and a
+    // production write instance may be active. The guard is the rule that a production
+    // write needs the owner's typed OK per change; `approval_ref` is an optional record.
     if let Some(r) = spec.approval_ref
         && !is_valid_approval_ref(r)
     {

@@ -82,9 +82,6 @@ impl McpMarketService {
             } else if !inst.clis.contains(cli) {
                 problems.push(format!("instance \"{name}\" is not enabled for {cli}"));
             }
-            if inst.tier == "write" && cli != "claude" {
-                problems.push(format!("write instance \"{name}\" is Claude-only (R3)"));
-            }
         }
         // R7: one delivery channel per (instance, project, cli).
         if let Some(p) = project {
