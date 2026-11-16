@@ -209,6 +209,21 @@ impl Builder {
         self
     }
 
+    /// Run the child as this user id (unix). The caller must hold the right to
+    /// switch to it (CAP_SETUID); the child cannot gain privileges back.
+    #[cfg(unix)]
+    pub fn uid(&mut self, id: u32) -> &mut Self {
+        self.inner.uid(id);
+        self
+    }
+
+    /// Run the child with this group id (unix), see [`Builder::uid`].
+    #[cfg(unix)]
+    pub fn gid(&mut self, id: u32) -> &mut Self {
+        self.inner.gid(id);
+        self
+    }
+
     /// Spawn the process and return the standard `tokio::process::Child`.
     pub fn spawn(mut self) -> io::Result<Child> {
         self.inner.spawn()
@@ -367,6 +382,19 @@ mod tests {
     use super::*;
     use crate::ResolvedCommand;
     use std::time::{Duration, Instant};
+
+    /// The child runs with the uid/gid the builder was given (here the caller's
+    /// own ids, which needs no privilege).
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn uid_and_gid_are_applied_to_the_child() {
+        let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+        let mut builder = Builder::clean_cli("id");
+        builder.arg("-u").uid(uid).gid(gid);
+        let out = builder.output().await.expect("id runs");
+        assert!(out.status.success());
+        assert_eq!(String::from_utf8_lossy(&out.stdout).trim(), uid.to_string());
+    }
 
     #[tokio::test]
     async fn clean_cli_captures_stdout_and_strips_env_pollution() {
