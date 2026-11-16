@@ -105,6 +105,12 @@ pub struct VoiceTimings {
     /// Conversation voice mode: how long the binding outlives its call when
     /// no voice socket of the user is connected any more (C26).
     pub binding_grace: Duration,
+    /// Conversation mode: a final waits this long for the next one before it
+    /// is posted (TASK-112), and at most `utterance_cap` from its first one.
+    pub utterance_window: Duration,
+    pub utterance_cap: Duration,
+    /// MiniMax cascade: silence after a final before the brain answers.
+    pub cascade_answer_silence: Duration,
 }
 
 impl Default for VoiceTimings {
@@ -122,6 +128,9 @@ impl Default for VoiceTimings {
             reattach_retry_delay: Duration::from_millis(500),
             hello_timeout: Duration::from_secs(5),
             binding_grace: Duration::from_secs(30 * 60),
+            utterance_window: crate::utterance::MERGE_WINDOW,
+            utterance_cap: crate::utterance::MERGE_CAP,
+            cascade_answer_silence: crate::engine::minimax_cascade::ANSWER_AFTER_SILENCE,
         }
     }
 }

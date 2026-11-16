@@ -1012,7 +1012,7 @@ pub(crate) mod workspace_harness {
 
         // This harness deliberately models NO assistant MCP bindings: the tests
         // built on it cover scheduling, mailbox and runtime lifecycle, not MCP
-        // injection (see `tests/session_service_integration.rs` for that). Stated
+        // injection (see `tests/it/session_service_integration.rs` for that). Stated
         // explicitly rather than inherited from a trait default so that "no MCP
         // here" is a choice this double makes, not an accident.
         async fn resolve_assistant_mcp_selection(

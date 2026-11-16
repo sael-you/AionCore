@@ -61,7 +61,7 @@ mod tests {
     /// would pull in full AcpSessionParams plumbing for no gain).
     ///
     /// Multi-hook ordering + real ctx plumbing are exercised by the
-    /// integration tests in `tests/prompt_pipeline_integration.rs`.
+    /// integration tests in `tests/it/prompt_pipeline_integration.rs`.
     #[tokio::test]
     async fn empty_pipeline_is_identity() {
         let pipeline = PromptPipeline::new(vec![]);

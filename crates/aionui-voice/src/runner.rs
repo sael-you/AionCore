@@ -20,6 +20,7 @@ use crate::ports::AuthRejected;
 use crate::runner_drafts::{ClientEvent, TurnState};
 use crate::service::{LiveCall, ServiceInner};
 use crate::settings::micros_to_usd;
+use crate::utterance::PendingUtterance;
 
 pub(crate) enum CallCommand {
     End {
@@ -66,6 +67,10 @@ pub(crate) struct CallRunner {
     end_waiters: Vec<oneshot::Sender<()>>,
     /// Cascade engines: voices the answer sentences (spawned on first use).
     mouth: Option<Mouth>,
+    /// Conversation mode: finals held for one message (TASK-112).
+    pub(crate) pending_utterance: Option<PendingUtterance>,
+    /// "Done" was pressed: the next final is posted at once.
+    pub(crate) flush_next_final: bool,
 }
 
 impl CallRunner {
@@ -96,6 +101,8 @@ impl CallRunner {
             speech_start_ms: None,
             end_waiters: Vec::new(),
             mouth: None,
+            pending_utterance: None,
+            flush_next_final: false,
             turn: TurnState::default(),
             carry,
         }
@@ -121,7 +128,21 @@ impl CallRunner {
         let mut tick = tokio::time::interval(self.inner.timings.tick);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         loop {
+            let timings = self.inner.timings;
+            let utterance_due = self
+                .pending_utterance
+                .as_ref()
+                .map(|p| p.deadline(timings.utterance_window, timings.utterance_cap));
             let outcome = tokio::select! {
+                _ = async {
+                    match utterance_due {
+                        Some(due) => tokio::time::sleep_until(due).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    self.flush_utterance().await;
+                    None
+                },
                 event = self.engine_call.next_event(), if self.attached => match event {
                     Some(event) => self.on_event(event).await,
                     None => self.on_event(EngineEvent::ControlLost).await,
@@ -260,12 +281,18 @@ impl CallRunner {
                 if let Some(mouth) = &self.mouth {
                     mouth.hush();
                 }
+                if let Some(pending) = &mut self.pending_utterance {
+                    pending.speech_started();
+                }
                 self.on_user_speech_started();
                 self.send(state_frame(Some(self.session_id()), "listening", None));
             }
             EngineEvent::UserSpeechStopped { audio_end_ms } => {
                 if let (Some(start), Some(end)) = (self.speech_start_ms.take(), audio_end_ms) {
                     self.meter.on_user_audio(end.saturating_sub(start));
+                }
+                if let Some(pending) = &mut self.pending_utterance {
+                    pending.speech_stopped(Instant::now());
                 }
                 self.send(state_frame(Some(self.session_id()), "thinking", None));
             }
@@ -509,6 +536,11 @@ impl CallRunner {
 
     /// Provider hangup + persisted end + notification (§3.6.6).
     async fn finish(mut self, reason: EndReason) {
+        // Words held for the merge window are still the user's message, unless
+        // the call ends because voice was switched off or the session revoked.
+        if !matches!(reason, EndReason::Disabled | EndReason::AuthRevoked) {
+            self.flush_utterance().await;
+        }
         if let Some(mouth) = self.mouth.take() {
             mouth.hush();
         }

@@ -684,9 +684,9 @@ P1 新子系统（Team Guide MCP）：详见 §4.7，需要独立的 server + st
 | [`task_board.rs` 内联](../../../crates/aionui-team/src/task_board.rs) 149-418 | CRUD、依赖链、unblock 传播 | 是 |
 | [`prompts.rs` 内联](../../../crates/aionui-team/src/prompts.rs) 159-410 | 三个 builder 的 snapshot 式检查 | N/A（纯函数） |
 | [`mcp/server.rs` / `mcp/protocol.rs` / `mcp/tools.rs`](../../../crates/aionui-team/src/mcp/) | 协议帧 roundtrip、tool 描述、parse_tool_call | 是 |
-| [`tests/mcp_server_integration.rs`](../../../crates/aionui-team/tests/mcp_server_integration.rs) | 完整 TCP 握手 + tools/list + tools/call | 是（内存 repo） |
-| [`tests/session_service_integration.rs`](../../../crates/aionui-team/tests/session_service_integration.rs) | TeamSessionService CRUD + ensure_session | 是 |
-| [`tests/scheduler_integration.rs`](../../../crates/aionui-team/tests/scheduler_integration.rs) | Scheduler 跨组件 | 是 |
+| [`tests/it/mcp_server_integration.rs`](../../../crates/aionui-team/tests/it/mcp_server_integration.rs) | 完整 TCP 握手 + tools/list + tools/call | 是（内存 repo） |
+| [`tests/it/session_service_integration.rs`](../../../crates/aionui-team/tests/it/session_service_integration.rs) | TeamSessionService CRUD + ensure_session | 是 |
+| [`tests/it/scheduler_integration.rs`](../../../crates/aionui-team/tests/it/scheduler_integration.rs) | Scheduler 跨组件 | 是 |
 
 **整个 `aionui-team` crate 不依赖真正的 ACP/agent 进程做 e2e 测试。** P0 gap 修好之后需要在 `crates/aionui-app/tests/` 加 e2e 测试跑真的 ACP（起 `claude --experimental-acp` 子进程或其它可用 CLI）来验证。
 

@@ -802,7 +802,7 @@ fn empty_finish_tip_code(stop_reason: StopReason) -> &'static str {
 mod tests {
     //! Contract tests for the post-`warmup_session` session invariant.
     //!
-    //! The integration-test harness in `tests/acp_agent_integration.rs`
+    //! The integration-test harness in `tests/it/acp_agent_integration.rs`
     //! cannot drive `AcpAgentManager` through a JSON-RPC mock today (all
     //! existing ACP tests there are `#[ignore]` for the same reason), so we
     //! pin the observable contract at the aggregate-root layer instead:

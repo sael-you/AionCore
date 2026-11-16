@@ -36,9 +36,13 @@ build-debug *FLAGS:
 install: build
     @{{install_script}} release
 
-# Run all tests
-test:
-    @just _cargo nextest run --workspace
+# Run all tests: nextest (each test in its own process; config in .config/nextest.toml)
+# plus doctests, which nextest does not run. Needs cargo-nextest 0.9.152:
+# `cargo install cargo-nextest --locked --version 0.9.152`.
+# Integration tests live in one binary per crate: crates/<crate>/tests/it/main.rs.
+test *ARGS:
+    @just _cargo nextest run --workspace --features aionui-voice/voice-test {{ARGS}}
+    @just _cargo test --workspace --doc --features aionui-voice/voice-test
 
 # Ensure already-shipped database migrations stay immutable
 migration-check:
