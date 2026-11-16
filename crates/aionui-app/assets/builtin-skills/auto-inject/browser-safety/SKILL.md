@@ -5,10 +5,10 @@ description: Using AionUi's server browser through playwright-cli. Read, search,
 
 # Browser Safety
 
-The owner lets agents use AionUi's server browser: a real Chrome on the server. Instance 1 is the
-one in the browser panel, signed in to the owner's own accounts; instances 2 and up are separate
-Chromes with their own profiles. You may open and close tabs, navigate, click, type and run page
-JavaScript.
+The owner lets agents use AionUi's server browser: a real Chrome on the server. It has one or more
+named profiles (for example "Main", "TB Discord", "Personal"), each a separate Chrome with its own
+logins. Profile 1 ("Main" unless the owner renamed it) is the one the browser panel opens first. You
+may open and close tabs, navigate, click, type and run page JavaScript.
 You act FOR the owner, with the owner's accounts, and the owner can watch the browser panel live.
 Behave like a careful assistant sitting at the owner's desk.
 
@@ -45,20 +45,27 @@ End your reply with the risky steps you did not take and why, for example:
 "Skipped: pressing Send in the DM to Alex (needs your OK)."
 
 ## Tools
-- Use the Playwright CLI, through the AionUi bridge only. Instance 1 (the browser the owner sees):
+- Use the Playwright CLI, through the AionUi bridge only. Profile 1 (the browser the panel opens):
   ```bash
   playwright-cli -s=aionui attach --cdp "http://127.0.0.1:$AIONUI_CDP_ACTIVE_PORT"
   playwright-cli -s=aionui snapshot
   playwright-cli -s=aionui click e12
   playwright-cli -s=aionui detach
   ```
-  Another instance n: its bridge port is in `$AIONUI_CDP_PORTS` (`1:<port>,2:<port>,...`):
+- Profiles by name: when the owner names a profile ("use TB Discord"), find its bridge port in
+  `$AIONUI_CDP_INSTANCES`, a JSON list `[{"instance": 2, "name": "TB Discord", "port": <port>}, ...]`:
   ```bash
-  port=$(printf '%s' "$AIONUI_CDP_PORTS" | tr ',' '\n' | sed -n 's/^2://p')
-  playwright-cli -s=aionui-2 attach --cdp "http://127.0.0.1:$port"
+  port=$(printf '%s' "$AIONUI_CDP_INSTANCES" | jq -r --arg n "TB Discord" \
+    '.[] | select((.name | ascii_downcase) == ($n | ascii_downcase)) | .port')
+  playwright-cli -s=aionui-tb attach --cdp "http://127.0.0.1:$port"
   ```
-  Instances above the owner's limit are refused (`BROWSER_INSTANCE_LIMIT`).
-- Tabs: open what you need, up to the owner's limit per instance (`BROWSER_TAB_LIMIT`), and close
+  Use one `-s=` session name per profile. No profile with that name (empty `$port`)? Tell the owner
+  which names exist and ask; never use another profile instead, it has other accounts. Profiles are
+  read when your conversation starts: one the owner added later needs a new conversation.
+  `$AIONUI_CDP_PORTS` (`1:<port>,2:<port>,...`) has the same ports by profile number.
+  A deleted profile answers `BROWSER_INSTANCE_NOT_FOUND`; one above the owner's limit is refused
+  (`BROWSER_INSTANCE_LIMIT`).
+- Tabs: open what you need, up to the owner's limit per profile (`BROWSER_TAB_LIMIT`), and close
   the tabs you opened when you are done. Do not close the owner's own tabs.
 - `BROWSER_AGENTS_DISABLED`: the owner turned agent use off. Tell the owner; do not try another way.
   Never `playwright-cli open` a browser of your own for the owner's accounts; it has none of the
