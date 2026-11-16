@@ -97,6 +97,18 @@ impl Call {
         .await
         .unwrap_or_else(|| panic!("draft never reached {state}"))
     }
+
+    /// Wait until the conversation port recorded `n` sends. `sending` is
+    /// written before the send itself (`start_send` → `deliver`), so the
+    /// state alone does not mean the message went out yet.
+    async fn wait_sends(&self, n: usize) {
+        let h = &self.h;
+        wait_for(Duration::from_secs(10), || async {
+            (h.conversations.sends().len() >= n).then_some(())
+        })
+        .await
+        .unwrap_or_else(|| panic!("never saw {n} send(s)"));
+    }
 }
 
 fn received_of(h: &Harness, call_id: &str, kind: &str) -> Vec<Value> {
@@ -262,6 +274,7 @@ async fn spoken_send_with_full_evidence_confirms() {
     c.say("send it");
     c.draft_in("committing").await;
     c.wait_state(&id, version, "sending").await;
+    c.wait_sends(1).await;
     assert_eq!(c.h.conversations.sends().len(), 1);
 }
 
@@ -641,6 +654,7 @@ async fn pending_draft_is_reannounced_to_the_next_call_and_confirmable_by_voice(
     c.say("send it");
     c.draft_in("committing").await;
     c.wait_state(&id, version, "sending").await;
+    c.wait_sends(1).await;
     assert_eq!(c.h.conversations.sends().len(), 1);
 }
 
