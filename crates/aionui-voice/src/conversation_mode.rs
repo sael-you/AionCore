@@ -81,6 +81,9 @@ pub enum Intent {
     EndVoice,
     /// Post as the user's message (wake phrase stripped).
     Message(String),
+    /// A task with a leading or trailing end-voice request ("fix this and
+    /// stop voice"): post the task part, then end conversation voice mode.
+    MessageThenEnd(String),
     /// Nothing left after stripping the wake phrase.
     Empty,
 }
@@ -124,6 +127,32 @@ const END: &[&str] = &[
 const FILLERS: &[&str] = &["hey", "ok", "okay", "jarvis", "please", "now", "so", "um", "uh"];
 /// Controls are whole utterances of at most this many words (after fillers).
 const MAX_CONTROL_WORDS: usize = 4;
+/// Polite words allowed around an end-voice request only ("you can stop the
+/// voice experience, please"); never stripped for "stop" or "cancel".
+const POLITE: &[&str] = &[
+    "you", "can", "could", "would", "will", "yes", "yeah", "thanks", "thank", "just", "now", "and", "then",
+];
+/// "<verb> [the|this|my] <object>" or "<turn|switch|shut> [the] <object> off".
+const END_VERBS: &[&str] = &[
+    "stop",
+    "end",
+    "close",
+    "exit",
+    "quit",
+    "turn off",
+    "switch off",
+    "shut off",
+];
+const OFF_VERBS: &[&str] = &["turn", "switch", "shut"];
+const END_OBJECTS: &[&str] = &[
+    "voice",
+    "voice mode",
+    "voice experience",
+    "voice chat",
+    "voice session",
+    "listening",
+];
+const ARTICLES: &[&str] = &["the", "this", "my"];
 
 /// Classify one final transcript. Anything longer than a control, or with
 /// other words, is a message — even when it contains "stop".
@@ -146,7 +175,100 @@ pub fn classify(transcript: &str) -> Intent {
             return Intent::EndVoice;
         }
     }
+    if is_end_voice(&normalized) {
+        return Intent::EndVoice;
+    }
+    if let Some(task) = split_end_voice(&message) {
+        return Intent::MessageThenEnd(task);
+    }
     Intent::Message(message)
+}
+
+/// Clause cuts of an utterance: `,` `;` `.` `!` `?` and the words "and" /
+/// "then", as `(start, end)` byte ranges of the separator.
+fn clause_cuts(text: &str) -> Vec<(usize, usize)> {
+    let mut cuts = Vec::new();
+    let mut word_start: Option<usize> = None;
+    let push_word = |start: usize, end: usize, cuts: &mut Vec<(usize, usize)>| {
+        let word = text[start..end].to_lowercase();
+        if word == "and" || word == "then" {
+            cuts.push((start, end));
+        }
+    };
+    for (i, c) in text.char_indices() {
+        if c.is_alphanumeric() || c == '\'' {
+            word_start.get_or_insert(i);
+            continue;
+        }
+        if let Some(start) = word_start.take() {
+            push_word(start, i, &mut cuts);
+        }
+        if ",;.!?".contains(c) {
+            cuts.push((i, i + c.len_utf8()));
+        }
+    }
+    if let Some(start) = word_start {
+        push_word(start, text.len(), &mut cuts);
+    }
+    cuts
+}
+
+/// Has words beyond fillers and polite words (a real task).
+fn has_task_words(text: &str) -> bool {
+    normalize_utterance(text)
+        .split(' ')
+        .any(|w| !w.is_empty() && !FILLERS.contains(&w) && !POLITE.contains(&w))
+}
+
+fn clean_clause(text: &str) -> String {
+    text.trim_matches(|c: char| c.is_whitespace() || ",;:-".contains(c))
+        .to_owned()
+}
+
+/// "Okay, fix this and stop voice." → `Some("Okay, fix this")`; "stop voice
+/// and add a test" → `Some("add a test")`. The end-voice part must be a whole
+/// clause on its own, so "close the voice mode bug ticket" stays a message.
+fn split_end_voice(message: &str) -> Option<String> {
+    let cuts = clause_cuts(message);
+    // Trailing: the last clause that ends voice, with a task before it.
+    for &(start, end) in cuts.iter().rev() {
+        let (head, tail) = (&message[..start], &message[end..]);
+        if is_end_voice(&normalize_utterance(tail)) && has_task_words(head) {
+            return Some(clean_clause(head));
+        }
+    }
+    // Leading: "stop voice and …".
+    for &(start, end) in &cuts {
+        let (head, tail) = (&message[..start], &message[end..]);
+        if is_end_voice(&normalize_utterance(head)) && has_task_words(tail) {
+            return Some(clean_clause(tail));
+        }
+    }
+    None
+}
+
+/// A whole utterance asking to end voice mode, polite words allowed around
+/// it. Any other word (a real task) keeps it a message.
+fn is_end_voice(normalized: &str) -> bool {
+    let words: Vec<&str> = normalized
+        .split(' ')
+        .filter(|w| !w.is_empty() && !FILLERS.contains(w) && !POLITE.contains(w))
+        .collect();
+    let object = |rest: &[&str]| {
+        let rest = match rest.first() {
+            Some(first) if ARTICLES.contains(first) => &rest[1..],
+            _ => rest,
+        };
+        END_OBJECTS.contains(&rest.join(" ").as_str())
+    };
+    for verb in END_VERBS {
+        let verb: Vec<&str> = verb.split(' ').collect();
+        if words.len() > verb.len() && words[..verb.len()] == verb[..] && object(&words[verb.len()..]) {
+            return true;
+        }
+    }
+    // "turn the voice off", "switch voice mode off".
+    matches!(words.as_slice(), [verb, middle @ .., "off"] if OFF_VERBS.contains(verb) && object(middle))
 }
 
 /// Drop a leading "hey Jarvis," (the barge-in wake phrase) from a transcript.
@@ -251,7 +373,9 @@ impl CallRunner {
         let asks = &self.inner.asks;
         match &intent {
             // A control wins over the bound agent's open question.
-            Intent::Silence | Intent::CancelTurn | Intent::EndVoice => {
+            // Voice ends after "fix this and stop voice": the task part is a
+            // message for the chat, never an answer to the open question.
+            Intent::Silence | Intent::CancelTurn | Intent::EndVoice | Intent::MessageThenEnd(_) => {
                 asks.cancel_conversation(&user_id, &conversation_id);
             }
             // An answer to the bound agent's `voice ask`: never posted, never an approval.
@@ -296,24 +420,36 @@ impl CallRunner {
                 None
             }
             Intent::Message(message) => {
-                let delivered = drafts
-                    .send_voice_message(&user_id, &session_id, &conversation_id, &message, self.call.car)
-                    .await;
-                if !matches!(
-                    delivered,
-                    crate::drafts::Delivered::Failed | crate::drafts::Delivered::Lost
-                ) {
-                    self.inner
-                        .audit(
-                            &user_id,
-                            Some(&session_id),
-                            AUDIT_VOICE_MESSAGE,
-                            serde_json::json!({"conversationId": conversation_id}),
-                        )
-                        .await;
-                }
+                self.post_voice_message(&conversation_id, &message).await;
                 None
             }
+            Intent::MessageThenEnd(message) => {
+                self.post_voice_message(&conversation_id, &message).await;
+                Some(EndReason::Sleep)
+            }
+        }
+    }
+
+    /// Post the user's words into the bound conversation (and audit it).
+    async fn post_voice_message(&mut self, conversation_id: &str, message: &str) {
+        let (user_id, session_id) = (&self.call.user_id, &self.call.session_id);
+        let delivered = self
+            .inner
+            .drafts
+            .send_voice_message(user_id, session_id, conversation_id, message, self.call.car)
+            .await;
+        if !matches!(
+            delivered,
+            crate::drafts::Delivered::Failed | crate::drafts::Delivered::Lost
+        ) {
+            self.inner
+                .audit(
+                    user_id,
+                    Some(session_id),
+                    AUDIT_VOICE_MESSAGE,
+                    serde_json::json!({"conversationId": conversation_id}),
+                )
+                .await;
         }
     }
 }
@@ -324,6 +460,7 @@ fn intent_name(intent: &Intent) -> &'static str {
         Intent::CancelTurn => "cancel_turn",
         Intent::EndVoice => "end_voice",
         Intent::Message(_) => "message",
+        Intent::MessageThenEnd(_) => "message_then_end_voice",
         Intent::Empty => "empty",
     }
 }
@@ -366,6 +503,68 @@ mod tests {
         for text in ["stop voice", "End voice.", "Jarvis, sleep", "go to sleep"] {
             assert_eq!(classify(text), Intent::EndVoice, "{text}");
         }
+    }
+
+    #[test]
+    fn polite_and_longer_ways_to_end_voice_end_it() {
+        for text in [
+            // The owner's exact words (posted as a message before).
+            "you can stop the voice experience, please",
+            "Okay, you can end voice mode now.",
+            "Please turn off the voice.",
+            "yes, close voice mode please",
+            "So, stop listening.",
+            "Can you turn the voice off?",
+            "switch voice mode off",
+            "Thank you, you can end the voice session.",
+        ] {
+            assert_eq!(classify(text), Intent::EndVoice, "{text}");
+        }
+    }
+
+    #[test]
+    fn a_task_with_a_trailing_or_leading_end_voice_posts_the_task_then_ends() {
+        // The owner's exact words.
+        assert_eq!(
+            classify("Okay, fix this and stop voice."),
+            Intent::MessageThenEnd("Okay, fix this".into())
+        );
+        assert_eq!(classify("you can stop the voice experience, please"), Intent::EndVoice);
+        assert_eq!(
+            classify("Stop voice and add a test for the 404 case."),
+            Intent::MessageThenEnd("add a test for the 404 case.".into())
+        );
+        assert_eq!(
+            classify("Run the tests, then turn off voice mode please"),
+            Intent::MessageThenEnd("Run the tests".into())
+        );
+        // A clause that only looks like it stays inside the message.
+        for text in [
+            "fix the login and stop listening to the old queue",
+            "close the voice mode bug ticket and stop",
+            "Okay, and stop voice.",
+        ] {
+            assert!(!matches!(classify(text), Intent::MessageThenEnd(_)), "{text}");
+        }
+        assert_eq!(classify("Okay, and stop voice."), Intent::EndVoice);
+    }
+
+    #[test]
+    fn near_misses_with_a_real_task_stay_messages() {
+        for text in [
+            "stop the voice recording feature from crashing",
+            "please end the voice experience section of the doc with a summary",
+            "close the voice mode bug ticket",
+            "you can stop the build please",
+            "turn off the linter in voice mode",
+        ] {
+            assert!(matches!(classify(text), Intent::Message(_)), "{text}");
+        }
+        // Unchanged: a bare stop silences, stop the task cancels.
+        assert_eq!(classify("you can stop"), Intent::Message("you can stop".into()));
+        assert_eq!(classify("stop, please"), Intent::Silence);
+        assert_eq!(classify("please stop the task"), Intent::CancelTurn);
+        assert_eq!(classify("cancel"), Intent::CancelTurn);
     }
 
     #[test]

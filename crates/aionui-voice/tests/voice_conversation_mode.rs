@@ -266,6 +266,32 @@ async fn stop_voice_ends_the_call_as_sleep() {
     assert!(c.h.conversations.sends().is_empty());
 }
 
+#[tokio::test]
+async fn the_owners_polite_end_voice_ends_the_call_without_posting() {
+    let c = call().await;
+    c.say("you can stop the voice experience, please");
+    let row = c.h.wait_ended(&c.user, &c.session).await;
+    assert_eq!(row.end_reason.as_deref(), Some("sleep"));
+    assert!(c.h.conversations.sends().is_empty(), "a control, never a message");
+}
+
+#[tokio::test]
+async fn a_task_then_stop_voice_posts_the_task_and_ends_voice_mode() {
+    let c = call().await;
+    c.say("Okay, fix this and stop voice.");
+    let row = c.h.wait_ended(&c.user, &c.session).await;
+    assert_eq!(row.end_reason.as_deref(), Some("sleep"));
+    let sends = c.h.conversations.sends();
+    assert_eq!(sends.len(), 1, "the task part is posted once");
+    assert!(
+        sends[0].text.starts_with("Okay, fix this\n\n[[AION_VOICE]]"),
+        "{}",
+        sends[0].text
+    );
+    assert!(!sends[0].text.contains("stop voice"));
+    assert!(!c.h.service.is_bound(&c.user.id, "c-build"), "voice mode ended");
+}
+
 // ------------------------------------------------------------- agent speech
 
 #[tokio::test]
