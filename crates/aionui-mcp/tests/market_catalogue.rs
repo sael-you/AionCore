@@ -145,6 +145,19 @@ async fn builtin_catalogue_serves_every_template() {
             .unwrap()
             .contains("2026-11-30")
     );
+    let kwp = market
+        .list_templates(USER)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|t| t.id == "keyword-planner")
+        .unwrap();
+    let text = kwp.description.clone().unwrap_or_default();
+    assert!(
+        text.contains("Community") && text.contains("weak") && text.contains("developer token"),
+        "{text}"
+    );
+    assert!(kwp.env["GOOGLE_ADS_DEVELOPER_TOKEN"].required);
 }
 
 #[test]
