@@ -3667,6 +3667,42 @@ impl ConversationService {
         Ok(())
     }
 
+    /// Move the running tool call `call_id` to the background (TASK-8): the
+    /// agent writes the request; its outcome (a running-in-background card or a
+    /// `TOOL_BACKGROUND_*` tip) arrives on the conversation stream.
+    pub async fn background_tool_call(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        call_id: &str,
+        task_manager: &Arc<dyn IWorkerTaskManager>,
+    ) -> Result<(), ConversationError> {
+        let valid = !call_id.is_empty()
+            && call_id.len() <= 200
+            && call_id
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-');
+        if !valid {
+            return Err(ConversationError::BadRequest {
+                reason: "invalid tool call id".into(),
+            });
+        }
+        self.conversation_repo
+            .get(user_id, conversation_id)
+            .await?
+            .ok_or_else(|| ConversationError::NotFound {
+                id: conversation_id.to_owned(),
+            })?;
+        let agent = task_manager
+            .get_task(conversation_id)
+            .ok_or_else(|| ConversationError::ActiveAgentNotFound {
+                conversation_id: conversation_id.to_owned(),
+            })?;
+        agent.background_tool(call_id)?;
+        tracing::info!(conversation_id, call_id, "tool call background requested");
+        Ok(())
+    }
+
     /// Answer a pending structured question (AskUserQuestion) over its
     /// DEDICATED channel (2026-08-05 ruling: not the permission confirm path).
     /// `answers: None` = the user dismissed the card (deny on the wire).

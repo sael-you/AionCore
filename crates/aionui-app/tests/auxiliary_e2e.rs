@@ -297,6 +297,66 @@ async fn confirm_call_no_task() {
     assert_eq!(resp.status(), StatusCode::NOT_FOUND);
 }
 
+// ── "Continue in background" on a running tool call (TASK-8) ─────
+
+#[tokio::test]
+async fn background_tool_call_is_a_csrf_protected_write() {
+    let (app, _) = build_app().await;
+    let req = axum::http::Request::builder()
+        .method("POST")
+        .uri("/api/conversations/test-conv/tool-calls/toolu_1/background")
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from("{}"))
+        .unwrap();
+    let resp = app.oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(body_json(resp).await["code"], "CSRF_INVALID");
+}
+
+#[tokio::test]
+async fn background_tool_call_validates_the_call_and_the_owner() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass123").await;
+    let conv_id = create_conversation(&mut app, &token, &csrf, "Bg Test", "acp").await;
+    let post = |path: String, token: &str, csrf: &str| json_with_token("POST", &path, json!({}), token, csrf);
+
+    // A call id that could not be a tool_use_id (it rides the control request id).
+    let resp = app
+        .clone()
+        .oneshot(post(
+            format!("/api/conversations/{conv_id}/tool-calls/bad%20id/background"),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+    // Another user's conversation does not exist for them.
+    let (token2, csrf2) = setup_and_login(&mut app, &services, "user2", "pass123").await;
+    let resp = app
+        .clone()
+        .oneshot(post(
+            format!("/api/conversations/{conv_id}/tool-calls/toolu_1/background"),
+            &token2,
+            &csrf2,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    // No running agent for the conversation: nothing to background.
+    let resp = app
+        .oneshot(post(
+            format!("/api/conversations/{conv_id}/tool-calls/toolu_1/background"),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+}
+
 // ── Dedicated ask-answer route (2026-08-05: question answers do not ride
 // the permission confirm endpoint) ─────
 

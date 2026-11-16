@@ -598,6 +598,13 @@ pub mod invariants {
             ("list_checkpoints", Command::ListCheckpoints, |c| {
                 c.supported_commands.list_checkpoints
             }),
+            (
+                "background_tool",
+                Command::BackgroundTool {
+                    call_id: "toolu_test".into(),
+                },
+                |c| c.supported_commands.background_tool,
+            ),
         ]
     }
 

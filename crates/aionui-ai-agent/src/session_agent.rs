@@ -819,6 +819,32 @@ impl SessionAgentTask {
         Ok(())
     }
 
+    /// Move the running tool call `call_id` to the background (TASK-8). Refused
+    /// at once when the backend does not advertise `background_tool`; otherwise
+    /// the request is written and the outcome arrives as a stream event
+    /// (backgrounded card, or a `TOOL_BACKGROUND_*` tip).
+    pub fn background_tool(&self, call_id: &str) -> Result<(), AgentError> {
+        if !self.backend.capabilities().supported_commands.background_tool {
+            return Err(AgentError::BadRequest(
+                "background_tool is not supported by this agent".into(),
+            ));
+        }
+        let backend = self.backend.clone();
+        let call_id = call_id.to_owned();
+        let conv_id = self.conversation_id.clone();
+        tokio::spawn(async move {
+            if let Err(e) = backend
+                .dispatch(Command::BackgroundTool {
+                    call_id: call_id.clone(),
+                })
+                .await
+            {
+                tracing::error!(conv_id = %conv_id, %call_id, error = %e, "background_tool request not delivered");
+            }
+        });
+        Ok(())
+    }
+
     /// `always_allow` (legacy flag) forces AllowAlways regardless.
     pub fn confirm(
         &self,
@@ -3963,6 +3989,10 @@ fn update_workflow_cards(
                     } else {
                         WorkflowCard::new_background(call_id.clone(), name, args, r#ref, desc, now_ms)
                     };
+                    // TASK-8: a call the USER backgrounded already has a
+                    // placeholder card keyed by its call id; the task's own card
+                    // replaces it (same row, now with the real task id).
+                    cards.remove(&call_id);
                     tracing::info!(
                         conv_id = %conversation_id,
                         task_id = %r#ref,
@@ -3985,7 +4015,16 @@ fn update_workflow_cards(
                 }
             }
             terminal => {
-                let Some(mut card) = cards.remove(r#ref) else {
+                // TASK-8: a user-backgrounded call's placeholder is keyed by its
+                // call id, which the task_notification names as `tool_use_id`.
+                let placeholder = parent_ref
+                    .as_deref()
+                    .filter(|call| cards.get(*call).is_some_and(|c| c.call_id() == *call));
+                let card = match cards.remove(r#ref) {
+                    Some(card) => Some(card),
+                    None => placeholder.map(str::to_owned).and_then(|call| cards.remove(&call)),
+                };
+                let Some(mut card) = card else {
                     // A terminal for a card THIS pump never opened. Real case
                     // (live 2026-08-04): the conversation was idle-killed while a
                     // background bash kept working; the RESUMED session reported
@@ -4094,6 +4133,38 @@ fn update_workflow_cards(
                     settle_only: false,
                 });
             }
+        }
+        // TASK-8: the user moved a running call to the background. Its blocking
+        // tool_result ("running in the background") completes the row, so — like
+        // a `local_bash` task_started — a background card must flip it back to a
+        // live running row until the task settles. Keyed by the call id until the
+        // task's own frames (if any) name the real task id.
+        SessionEvent::ToolBackgrounded { call_id } => {
+            if cards.values().any(|c| c.call_id() == call_id) {
+                return out;
+            }
+            let Some(name) = tool_name.get(call_id).cloned() else {
+                tracing::warn!(conv_id = %conversation_id, %call_id,
+                    "session-pump: backgrounded call is not a known main-stream tool call");
+                return out;
+            };
+            let args = tool_args.get(call_id).cloned().unwrap_or(serde_json::Value::Null);
+            let desc = args
+                .get("description")
+                .and_then(|v| v.as_str())
+                .or_else(|| args.get("command").and_then(|v| v.as_str()))
+                .map(str::to_string);
+            let mut card = WorkflowCard::new_background(call_id.clone(), name, args, call_id, desc, now_ms);
+            tracing::info!(conv_id = %conversation_id, %call_id,
+                "session-pump: user-backgrounded call card opened");
+            if let Some((card_frame, agents)) = card.take_emission(now_ms, true) {
+                out.push(WorkflowProgressData {
+                    card: card_frame,
+                    agents,
+                    settle_only: false,
+                });
+            }
+            cards.insert(call_id.clone(), card);
         }
         SessionEvent::WorkflowPhase { task_id, index, title } => {
             let Some(card) = cards.get_mut(task_id) else {
@@ -4600,6 +4671,25 @@ fn translate_event(event: SessionEvent, conversation_id: &str, terminal_result_s
                 code,
                 params,
                 supersedes_key,
+            })]
+        }
+        // TASK-8: the backend would not background the call: say so (the button
+        // hides on the frontend for a session-wide refusal). `content` is the
+        // English default for the `TOOL_BACKGROUND_*` i18n code.
+        SessionEvent::ToolBackgroundRefused { call_id, reason } => {
+            use aionui_session::BackgroundRefusal;
+            let content = match reason {
+                BackgroundRefusal::Disabled => "Background tasks are disabled in this session.",
+                BackgroundRefusal::Unsupported => "This agent cannot move this tool call to the background.",
+                BackgroundRefusal::NotRunning => "The tool call had already finished.",
+                BackgroundRefusal::Failed => "The tool call could not be moved to the background.",
+            };
+            vec![AgentStreamEvent::Tips(TipsEventData {
+                content: content.to_owned(),
+                tip_type: TipType::Warning,
+                code: Some(format!("TOOL_BACKGROUND_{}", reason.as_str().to_ascii_uppercase())),
+                params: Some(serde_json::json!({ "call_id": call_id })),
+                supersedes_key: None,
             })]
         }
         // Agent-generated session title (claude generate_session_title, spec
@@ -8415,6 +8505,130 @@ mod pump_tests {
     /// `claude_2.1.220_background_bash_turn.ndjsonl` for local_bash,
     /// `claude_2.1.169_single_tool_turn.ndjson` for local_agent), so its card
     /// rides that call. Shape mirrors the local_bash capture.
+    /// TASK-8: a FOREGROUND Bash the user moved to the background. The CLI's
+    /// blocking call returns a "running in the background" result and our
+    /// `background_tasks` reply arrives as `ToolBackgrounded`; the call must turn
+    /// back into a live card that outlives the turn and settles on the task's
+    /// notification (`tool_use_id` = the call), even when no `task_started`
+    /// names it (RESEARCH.md §1.2; the exact frames await the staging probe).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn user_backgrounded_call_stays_live_and_settles_on_its_notification() {
+        use aionui_session::SubagentStatus;
+        let script = vec![
+            env(SessionEvent::ToolCall {
+                tool_use_id: "toolu_fg".into(),
+                name: "Bash".into(),
+                subagent: aionui_session::SubagentKind::Inline,
+                input: serde_json::json!({"command": "sleep 120", "description": "Wait two minutes"}),
+                parent_tool_use_id: None,
+            }),
+            env(SessionEvent::ToolResult {
+                tool_use_id: "toolu_fg".into(),
+                is_error: false,
+                content: vec![aionui_session::ToolResultContent::Text(
+                    "Command is running in the background".into(),
+                )],
+                parent_tool_use_id: None,
+            }),
+            env(SessionEvent::ToolBackgrounded {
+                call_id: "toolu_fg".into(),
+            }),
+            env(SessionEvent::TurnResult {
+                is_error: false,
+                api_error_status: None,
+                result_text: String::new(),
+                epoch: 0,
+                outcome: aionui_session::TurnOutcome::EndTurn,
+            }),
+            env(SessionEvent::SubagentUpdate {
+                r#ref: "b0task9".into(),
+                label: None,
+                status: SubagentStatus::Completed,
+                parent_ref: Some("toolu_fg".into()),
+                kind: None,
+            }),
+        ];
+        let frames = drain_script(script).await;
+        let progress = wf_frames(&frames);
+        let open = progress.first().expect("the backgrounded call gets a card");
+        assert_eq!(open.card.call_id, "toolu_fg");
+        assert_eq!(open.card.status, ToolCallStatus::Running, "flips the call back to live");
+        assert!(!open.settle_only);
+        let settle = progress.last().unwrap();
+        assert_eq!(settle.card.call_id, "toolu_fg");
+        assert_eq!(settle.card.status, ToolCallStatus::Completed, "{settle:?}");
+        assert!(
+            !settle.settle_only,
+            "the pump's own card settles, not a status-only patch"
+        );
+        assert!(
+            !frames.iter().any(|f| matches!(f, AgentStreamEvent::ToolCall(d)
+                if d.call_id == "toolu_fg" && d.status == ToolCallStatus::Canceled)),
+            "a clean turn end leaves a background card running"
+        );
+    }
+
+    /// TASK-8: if the CLI does announce the task (`task_started`, local_bash) for
+    /// the backgrounded call, its card replaces the placeholder: one live card,
+    /// one settle.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn task_started_takes_over_a_user_backgrounded_card() {
+        use aionui_session::{SubagentStatus, SubagentTaskKind};
+        let update = |status, kind| {
+            env(SessionEvent::SubagentUpdate {
+                r#ref: "b0task9".into(),
+                label: None,
+                status,
+                parent_ref: Some("toolu_fg".into()),
+                kind,
+            })
+        };
+        let script = vec![
+            env(SessionEvent::ToolCall {
+                tool_use_id: "toolu_fg".into(),
+                name: "Bash".into(),
+                subagent: aionui_session::SubagentKind::Inline,
+                input: serde_json::json!({"command": "sleep 120"}),
+                parent_tool_use_id: None,
+            }),
+            env(SessionEvent::ToolBackgrounded {
+                call_id: "toolu_fg".into(),
+            }),
+            update(SubagentStatus::Running, Some(SubagentTaskKind::Other)),
+            update(SubagentStatus::Completed, None),
+        ];
+        let frames = drain_script(script).await;
+        let settles: Vec<_> = wf_frames(&frames)
+            .into_iter()
+            .filter(|p| p.card.status == ToolCallStatus::Completed)
+            .collect();
+        assert_eq!(settles.len(), 1, "one settle for one task");
+        assert_eq!(settles[0].card.call_id, "toolu_fg");
+        assert!(!settles[0].settle_only);
+    }
+
+    /// TASK-8: a refusal is said plainly, with a code the frontend localizes and
+    /// uses to hide the button.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_background_refusal_becomes_a_coded_warning_tip() {
+        let script = vec![env(SessionEvent::ToolBackgroundRefused {
+            call_id: "toolu_fg".into(),
+            reason: aionui_session::BackgroundRefusal::Disabled,
+        })];
+        let frames = drain_script(script).await;
+        let tip = frames
+            .iter()
+            .find_map(|f| match f {
+                AgentStreamEvent::Tips(t) => Some(t),
+                _ => None,
+            })
+            .expect("a tip");
+        assert_eq!(tip.tip_type, TipType::Warning);
+        assert_eq!(tip.code.as_deref(), Some("TOOL_BACKGROUND_DISABLED"));
+        assert_eq!(tip.params.as_ref().unwrap()["call_id"], "toolu_fg");
+        assert!(tip.content.contains("disabled"), "{}", tip.content);
+    }
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn background_bash_gets_a_live_card_and_settles_on_notification() {
         use aionui_session::{SubagentStatus, SubagentTaskKind};

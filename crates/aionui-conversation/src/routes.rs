@@ -155,6 +155,10 @@ pub fn conversation_routes(state: ConversationRouterState) -> Router {
         // Confirmation system
         .route("/api/conversations/{id}/confirmations", get(list_confirmations))
         .route("/api/conversations/{id}/confirmations/{callId}/confirm", post(confirm))
+        .route(
+            "/api/conversations/{id}/tool-calls/{callId}/background",
+            post(background_tool_call),
+        )
         .route("/api/conversations/{id}/asks/{requestId}/answer", post(answer_ask))
         .route("/api/conversations/{id}/approvals/check", get(check_approval))
         .route("/api/conversations/active-count", get(active_count))
@@ -518,6 +522,22 @@ async fn confirm(
         .await
         .map_err(ApiError::from)?;
     Ok(Json(ApiResponse::success()))
+}
+
+/// "Continue in background" on a running tool call (TASK-8). Same router (auth,
+/// CSRF, Origin) as the confirmation answer it sits next to. 202: the request
+/// is on its way; the outcome arrives on the conversation stream.
+async fn background_tool_call(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(params): Path<ConfirmPathParams>,
+) -> Result<(axum::http::StatusCode, Json<ApiResponse<()>>), ApiError> {
+    state
+        .service
+        .background_tool_call(&user.id, &params.id, &params.call_id, &state.task_manager)
+        .await
+        .map_err(ApiError::from)?;
+    Ok((axum::http::StatusCode::ACCEPTED, Json(ApiResponse::success())))
 }
 
 #[derive(serde::Deserialize)]

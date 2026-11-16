@@ -1931,6 +1931,9 @@ async fn reader_task(
                 // First-turn title generation reply (keyed ctl-title-N) →
                 // SessionEvent::SessionTitle. Done on the RAW frame.
                 sniff_session_title(v, &event_tx, &session_id, cur_gen, &title_gen);
+                // TASK-8: our `background_tasks` request answered (ctl-bgt-N-<call>)
+                // → ToolBackgrounded / ToolBackgroundRefused. RAW frame.
+                sniff_background_reply(v, &event_tx, &session_id, cur_gen);
                 // Subagent roster: claude emits system/task_* frames for
                 // Task/Workflow subagents (§6b b1). Translate them to
                 // SubagentUpdate so the reducer upserts Running.subagents —
@@ -2845,6 +2848,9 @@ const QSI_COST_PREFIX: &str = "ctl-qsi-cost-";
 /// Request-id prefix of the one-shot `generate_session_title` control_request
 /// (spec 2026-08-04); `sniff_session_title` routes the reply by it.
 const TITLE_PREFIX: &str = "ctl-title-";
+/// Request-id prefix of a `BackgroundTool` control_request (TASK-8):
+/// `ctl-bgt-{seq}-{tool_use_id}`; `sniff_background_reply` recovers the call id.
+const BGT_PREFIX: &str = "ctl-bgt-";
 
 /// The synthetic reasoning-effort level that mirrors the claude CLI's own interactive
 /// effort-picker entry `"ultracode (xhigh + dynamic workflow orchestration; this session
@@ -2971,6 +2977,76 @@ fn sniff_session_info(
         return; // not a QuerySessionInfo reply (initialize / set_mode / can_use_tool ack)
     };
 
+    let _ = event_tx.send(SessionEnvelope {
+        session_id: session_id.to_string(),
+        turn_gen,
+        event,
+    });
+}
+
+/// Sniff the reply to our `background_tasks` control_request (TASK-8, keyed
+/// `ctl-bgt-{seq}-{tool_use_id}`). Success `{backgrounded:true}` →
+/// `ToolBackgrounded`; success without it → refused `NotRunning`; an error reply
+/// → refused, classified by the CLI handler's documented messages (RESEARCH.md
+/// §1.2: "Background tasks are disabled in this session", "not supported in this
+/// context (callback not registered)"). The error field's exact name is not
+/// pinned by a capture yet, so `error` and `message` are both read.
+fn sniff_background_reply(
+    frame: &serde_json::Value,
+    event_tx: &broadcast::Sender<SessionEnvelope>,
+    session_id: &str,
+    turn_gen: u64,
+) {
+    use crate::event::BackgroundRefusal;
+    use serde_json::Value;
+    if frame.get("type").and_then(Value::as_str) != Some("control_response") {
+        return;
+    }
+    let response = frame.get("response").unwrap_or(&Value::Null);
+    let request_id = response.get("request_id").and_then(Value::as_str).unwrap_or("");
+    let Some(call_id) = request_id
+        .strip_prefix(BGT_PREFIX)
+        .and_then(|rest| rest.split_once('-'))
+        .map(|(_, call)| call)
+        .filter(|call| !call.is_empty())
+    else {
+        return;
+    };
+    let event = if response.get("subtype").and_then(Value::as_str) == Some("success") {
+        let backgrounded = response
+            .get("response")
+            .and_then(|r| r.get("backgrounded"))
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if backgrounded {
+            SessionEvent::ToolBackgrounded {
+                call_id: call_id.to_string(),
+            }
+        } else {
+            SessionEvent::ToolBackgroundRefused {
+                call_id: call_id.to_string(),
+                reason: BackgroundRefusal::NotRunning,
+            }
+        }
+    } else {
+        let message = ["error", "message"]
+            .iter()
+            .find_map(|k| response.get(*k).and_then(Value::as_str))
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let reason = if message.contains("disabled") {
+            BackgroundRefusal::Disabled
+        } else if message.contains("not supported") {
+            BackgroundRefusal::Unsupported
+        } else {
+            BackgroundRefusal::Failed
+        };
+        SessionEvent::ToolBackgroundRefused {
+            call_id: call_id.to_string(),
+            reason,
+        }
+    };
+    tracing::info!(session_id, call_id, ?event, "background_tasks answered");
     let _ = event_tx.send(SessionEnvelope {
         session_id: session_id.to_string(),
         turn_gen,
@@ -3390,6 +3466,34 @@ impl SessionBackend for ClaudeSessionBackend {
                     "request": { "subtype": subtype },
                 });
                 self.write_control_frame(&frame).await?;
+                Ok(CommandReceipt {
+                    accepted: true,
+                    admission: Admission::NoTurn,
+                    turn_gen: self.turn_gen.load(Ordering::SeqCst),
+                })
+            }
+            // TASK-8: background the running tool call `call_id` (= claude's
+            // tool_use_id). Schema from the CLI binary (RESEARCH.md §1.2):
+            // `control_request{subtype:"background_tasks", tool_use_id}` →
+            // `{backgrounded?:bool}`; the blocking call then returns a "running in
+            // the background" tool_result and the turn continues; the task emits a
+            // task_notification when it settles. The call id rides the request_id
+            // (claude echoes it verbatim) so the reply needs no shared state:
+            // `sniff_background_reply` turns it into ToolBackgrounded / Refused.
+            // Written immediately: the point is to unblock the RUNNING turn.
+            Command::BackgroundTool { call_id } => {
+                use std::sync::atomic::Ordering;
+                let request_id = format!(
+                    "{BGT_PREFIX}{}-{call_id}",
+                    self.control_seq.fetch_add(1, Ordering::SeqCst) + 1
+                );
+                let frame = serde_json::json!({
+                    "type": "control_request",
+                    "request_id": request_id,
+                    "request": { "subtype": "background_tasks", "tool_use_id": call_id },
+                });
+                self.write_control_frame(&frame).await?;
+                tracing::info!(session_id = %self.session_id, %call_id, "background_tasks requested");
                 Ok(CommandReceipt {
                     accepted: true,
                     admission: Admission::NoTurn,
@@ -7792,6 +7896,123 @@ mod tests {
             1,
             "the latch survives an error turn and fires on the next success, wire: {written:?}"
         );
+    }
+
+    /// Read events until `pick` matches one (2 s), from a backend fed `frames`.
+    async fn first_background_event(frames: &[String]) -> Option<SessionEvent> {
+        let bytes = frames.iter().map(|f| format!("{f}\n")).collect::<String>().into_bytes();
+        let backend = ClaudeSessionBackend::build_with_io("s", Box::new(FakeAgentIo::never_exits(bytes))).await;
+        let mut events = backend.events();
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while let Some(env) = events.next().await {
+                if matches!(
+                    env.event,
+                    SessionEvent::ToolBackgrounded { .. } | SessionEvent::ToolBackgroundRefused { .. }
+                ) {
+                    return Some(env.event);
+                }
+            }
+            None
+        })
+        .await
+        .ok()
+        .flatten()
+    }
+
+    #[tokio::test]
+    async fn background_tool_writes_background_tasks_with_the_tool_use_id() {
+        // TASK-8: schema per RESEARCH.md §1.2 (CLI binary): {subtype:"background_tasks", tool_use_id}.
+        let fake = FakeAgentIo::never_exits(Vec::new());
+        let captured = fake.captured_stdin();
+        let backend = ClaudeSessionBackend::build_with_io("s", Box::new(fake)).await;
+        assert!(backend.capabilities().supported_commands.background_tool);
+        let receipt = backend
+            .dispatch(Command::BackgroundTool {
+                call_id: "toolu_01Sleep".into(),
+            })
+            .await
+            .expect("claude advertises background_tool");
+        assert!(receipt.accepted && receipt.admission == Admission::NoTurn);
+        let written = {
+            let mut s = String::new();
+            for _ in 0..40 {
+                s = String::from_utf8_lossy(&captured.lock().await.clone()).to_string();
+                if s.contains("background_tasks") {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+            s
+        };
+        let line = written
+            .lines()
+            .find(|l| l.contains("background_tasks"))
+            .unwrap_or_else(|| panic!("no background_tasks frame in {written}"));
+        let v: serde_json::Value = serde_json::from_str(line).unwrap();
+        assert_eq!(v["type"], "control_request");
+        assert_eq!(v["request"]["subtype"], "background_tasks");
+        assert_eq!(v["request"]["tool_use_id"], "toolu_01Sleep");
+        let rid = v["request_id"].as_str().unwrap();
+        assert!(rid.starts_with(BGT_PREFIX) && rid.ends_with("-toolu_01Sleep"), "{rid}");
+    }
+
+    #[tokio::test]
+    async fn background_reply_success_maps_to_tool_backgrounded() {
+        let ok = format!(
+            r#"{{"type":"control_response","response":{{"subtype":"success","request_id":"{BGT_PREFIX}7-toolu_01Sleep","response":{{"backgrounded":true}}}}}}"#
+        );
+        assert_eq!(
+            first_background_event(&[ok]).await,
+            Some(SessionEvent::ToolBackgrounded {
+                call_id: "toolu_01Sleep".into()
+            })
+        );
+        // Success without `backgrounded:true`: the call was no longer running.
+        let not_running = format!(
+            r#"{{"type":"control_response","response":{{"subtype":"success","request_id":"{BGT_PREFIX}8-toolu_02","response":{{}}}}}}"#
+        );
+        assert_eq!(
+            first_background_event(&[not_running]).await,
+            Some(SessionEvent::ToolBackgroundRefused {
+                call_id: "toolu_02".into(),
+                reason: crate::event::BackgroundRefusal::NotRunning,
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn background_reply_errors_are_classified() {
+        use crate::event::BackgroundRefusal;
+        let err = |n: u32, msg: &str| {
+            format!(
+                r#"{{"type":"control_response","response":{{"subtype":"error","request_id":"{BGT_PREFIX}{n}-toolu_{n}","error":"{msg}"}}}}"#
+            )
+        };
+        for (n, msg, want) in [
+            (
+                1,
+                "Background tasks are disabled in this session",
+                BackgroundRefusal::Disabled,
+            ),
+            (
+                2,
+                "background_tasks is not supported in this context (callback not registered)",
+                BackgroundRefusal::Unsupported,
+            ),
+            (3, "boom", BackgroundRefusal::Failed),
+        ] {
+            assert_eq!(
+                first_background_event(&[err(n, msg)]).await,
+                Some(SessionEvent::ToolBackgroundRefused {
+                    call_id: format!("toolu_{n}"),
+                    reason: want,
+                }),
+                "{msg}"
+            );
+        }
+        // Other control replies never produce a background event.
+        let other = r#"{"type":"control_response","response":{"subtype":"success","request_id":"ctl-qsi-usage-1","response":{}}}"#;
+        assert_eq!(first_background_event(&[other.to_string()]).await, None);
     }
 
     #[tokio::test]
