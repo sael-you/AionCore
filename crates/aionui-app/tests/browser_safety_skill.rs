@@ -80,3 +80,12 @@ fn agents_pick_a_profile_by_name_and_never_substitute_another() {
     assert!(prose.contains("BROWSER_INSTANCE_NOT_FOUND"), "{prose}");
 }
 
+
+#[test]
+fn the_owners_own_browser_is_named_and_its_pauses_are_respected() {
+    let prose = skill_prose();
+    assert!(prose.contains(r#""kind": "device", "name": "Mac · Chrome""#), "{prose}");
+    assert!(prose.contains("BROWSER_APPROVAL_DENIED"), "{prose}");
+    assert!(prose.contains("never retry"), "{prose}");
+    assert!(prose.contains("instead of switching to a server profile"), "{prose}");
+}
