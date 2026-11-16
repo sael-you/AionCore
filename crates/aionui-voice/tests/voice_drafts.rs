@@ -845,3 +845,81 @@ async fn a_pending_ask_never_swallows_the_draft_confirmation() {
     let answer = ask.await.unwrap().unwrap();
     assert_eq!(answer.status, "pending", "the confirmation was not taken as the answer");
 }
+
+#[tokio::test]
+async fn a_saved_but_not_started_message_is_started_by_voice_after_a_new_confirmation() {
+    let mut c = call().await;
+    let (draft, _) = c
+        .request_draft("tell the kanban build to rerun the failing tests", "call_s")
+        .await;
+    let id = draft["draftId"].as_str().unwrap().to_owned();
+    ws_send(
+        &mut c.ws,
+        json!({"name": "voice.confirmTap", "data": {"voiceSessionId": c.session, "draftId": id, "version": 1,
+            "hash": draft["hash"]}}),
+    )
+    .await;
+    c.wait_state(&id, 1, "sending").await;
+    // Saved, but no turn ran and nothing replied: `saved_not_started`.
+    sqlx::query("UPDATE voice_drafts SET send_started_at = 0 WHERE id = ?")
+        .bind(&id)
+        .execute(c.h.db.pool())
+        .await
+        .unwrap();
+    c.h.service.run_draft_sweep(false, 0).await;
+    c.wait_state(&id, 1, "saved_not_started").await;
+    let first = c.h.conversations.sends();
+    assert_eq!(first.len(), 1);
+
+    // "Start it": the same message comes back as version 2, read back again.
+    c.say("Okay, start it.");
+    let again = c.draft_in("drafted").await;
+    assert_eq!(again["draftId"], id.as_str());
+    assert_eq!(again["version"], 2);
+    c.frame("voice.readbackReady").await;
+    let row = c.draft_row(&id, 2).await;
+    assert_eq!(
+        row.text.as_deref(),
+        Some(first[0].text.as_str()),
+        "the exact saved text"
+    );
+    assert_eq!(row.target_id.as_deref(), Some("c-build"));
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eq!(
+        c.h.conversations.sends().len(),
+        1,
+        "never sent without its own confirmation"
+    );
+    assert_eq!(
+        c.draft_row(&id, 1).await.state,
+        "saved_not_started",
+        "the old version stays as it was"
+    );
+
+    // Confirmed like any draft (a tap with this version's hash), then sent with its own key.
+    ws_send(
+        &mut c.ws,
+        json!({"name": "voice.confirmTap", "data": {"voiceSessionId": c.session, "draftId": id, "version": 2,
+            "hash": again["hash"]}}),
+    )
+    .await;
+    c.wait_state(&id, 2, "sending").await;
+    let sends = c.h.conversations.sends();
+    assert_eq!(sends.len(), 2);
+    assert_eq!(sends[1].key, format!("{id}:2"));
+    assert_eq!(sends[1].text, sends[0].text, "the exact saved text, not rewritten");
+}
+
+#[tokio::test]
+async fn start_it_without_a_saved_message_is_just_words_for_the_model() {
+    let c = call().await;
+    c.say("start it");
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(c.h.conversations.sends().is_empty());
+    let drafts =
+        c.h.voice_repo
+            .user_drafts_in_states(&c.user.id, &["drafted"])
+            .await
+            .unwrap();
+    assert!(drafts.is_empty(), "no draft appears from nothing");
+}

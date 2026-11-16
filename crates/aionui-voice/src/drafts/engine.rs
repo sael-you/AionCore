@@ -69,6 +69,9 @@ pub trait SpeechFactory: Send + Sync {
 #[derive(Debug, Clone, Default)]
 pub struct DraftRequest {
     pub transcript: String,
+    /// Keep `transcript` exactly as the message (no refiner): a saved
+    /// message started again by voice must not be rewritten.
+    pub verbatim: bool,
     pub new_conversation: bool,
     pub focus: Option<String>,
     pub tool_refs: Vec<String>,
@@ -478,16 +481,25 @@ impl DraftEngine {
         let mut allowed = req.tool_refs.clone();
         allowed.extend(conversations.iter().map(|c| c.name.clone()));
         allowed.extend(projects.iter().map(|p| p.name.clone()));
-        let refined = refine_draft(
-            kit.refiner.as_deref(),
-            &RefineInput {
-                transcript: req.transcript.clone(),
-                target_name: target.as_ref().map(|(_, n)| n.clone()).unwrap_or_default(),
-                allowed_references: allowed,
-                tool_snippets: req.tool_snippets.clone(),
-            },
-        )
-        .await;
+        let refined = if req.verbatim {
+            crate::refiner::Refined {
+                summary: req.transcript.split_whitespace().take(12).collect::<Vec<_>>().join(" "),
+                text: req.transcript.clone(),
+                references: Vec::new(),
+                fell_back: false,
+            }
+        } else {
+            refine_draft(
+                kit.refiner.as_deref(),
+                &RefineInput {
+                    transcript: req.transcript.clone(),
+                    target_name: target.as_ref().map(|(_, n)| n.clone()).unwrap_or_default(),
+                    allowed_references: allowed,
+                    tool_snippets: req.tool_snippets.clone(),
+                },
+            )
+            .await
+        };
 
         let (delivery, project_id) = match (action, &target) {
             (DraftAction::CreateConversation, Some((pid, _))) => (Delivery::NewConversation, Some(pid.clone())),
@@ -642,6 +654,54 @@ impl DraftEngine {
             target.filter(|_| row.action == DraftAction::SendMessage.as_str()),
         )
         .await
+    }
+
+    /// "Start it" (§3.3.6): a message saved without a turn becomes the next
+    /// version of the same draft, with the same target and the exact saved
+    /// text, read back again. It is confirmed like any draft (a tap with its
+    /// hash, or complete spoken evidence) and sent with its own key.
+    pub async fn restart_saved(&self, row: &VoiceDraftRow, session_id: &str) -> Option<VoiceDraftRow> {
+        if row.state != DraftState::SavedNotStarted.as_str() || row.action != DraftAction::SendMessage.as_str() {
+            return None;
+        }
+        let target = row.target_id.clone().zip(row.target_name.clone())?;
+        let text = row.text.clone().filter(|t| !t.trim().is_empty())?;
+        tracing::info!(draft_id = %row.id, version = row.version + 1, "voice saved message started again by voice");
+        self.build_version(
+            &row.user_id,
+            Some(session_id),
+            &row.id,
+            row.version + 1,
+            DraftRequest {
+                transcript: text,
+                verbatim: true,
+                ..Default::default()
+            },
+            Some(target),
+        )
+        .await
+    }
+
+    /// The call's newest `saved_not_started` draft from the last
+    /// [`DRAFT_TTL_MS`] (the one "start it" refers to), unless a newer
+    /// version of it already exists.
+    pub async fn latest_saved(&self, user_id: &str, session_id: &str) -> Option<VoiceDraftRow> {
+        let since = now_ms() - DRAFT_TTL_MS;
+        let row = self
+            .repo
+            .user_drafts_in_states(user_id, &[DraftState::SavedNotStarted.as_str()])
+            .await
+            .ok()?
+            .into_iter()
+            .filter(|r| r.session_id.as_deref() == Some(session_id) && r.updated_at >= since)
+            .max_by_key(|r| (r.updated_at, r.version))?;
+        let newer = self
+            .repo
+            .get_draft(user_id, &row.id, row.version + 1)
+            .await
+            .ok()
+            .flatten();
+        newer.is_none().then_some(row)
     }
 
     /// Answer to "A or B?": pick among the offered options only.
@@ -969,7 +1029,7 @@ impl DraftEngine {
             self.outcome_line(
                 row,
                 "saved_not_started",
-                &format!("Saved in {name}, but it did not start. Tap to start it."),
+                &format!("Saved in {name}, but it did not start. Say start it, or start it on screen."),
             )
             .await;
         }

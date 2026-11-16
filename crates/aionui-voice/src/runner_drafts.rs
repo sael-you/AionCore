@@ -156,6 +156,7 @@ impl CallRunner {
         }
         let request = DraftRequest {
             transcript,
+            verbatim: false,
             new_conversation,
             focus: self.call.focus.clone(),
             tool_refs: self.turn.tool_refs.clone(),
@@ -284,6 +285,9 @@ impl CallRunner {
         }
 
         let Some(row) = self.turn.active.clone() else {
+            if is_start_phrase(text) && self.start_saved().await {
+                return;
+            }
             self.push_final(text);
             return;
         };
@@ -319,6 +323,21 @@ impl CallRunner {
                 self.respond().await;
             }
         }
+    }
+
+    /// "Start it" with no draft open: the call's message that was saved
+    /// without a turn becomes a fresh draft version, read back and confirmed
+    /// like any draft. `false` when there is none (the words go to the model).
+    async fn start_saved(&mut self) -> bool {
+        let drafts = self.inner.drafts.clone();
+        let Some(saved) = drafts.latest_saved(&self.call.user_id, &self.call.session_id).await else {
+            return false;
+        };
+        self.set_manual(true).await;
+        let next = drafts.restart_saved(&saved, &self.call.session_id).await;
+        let started = next.is_some();
+        self.adopt_draft(next).await;
+        started
     }
 
     fn push_final(&mut self, text: &str) {
@@ -511,5 +530,55 @@ impl CallRunner {
             .hold
             .as_ref()
             .map(|h| (h.remaining(Instant::now()).min(HOLD).as_millis() as u64, h.is_frozen()))
+    }
+}
+
+/// "Start it" / "send it again" and the like, as a whole utterance (fillers
+/// allowed): the request to start a saved message, never its confirmation.
+pub(crate) fn is_start_phrase(text: &str) -> bool {
+    const FILLERS: &[&str] = &[
+        "ok", "okay", "yes", "yeah", "please", "jarvis", "hey", "now", "so", "then",
+    ];
+    const PHRASES: &[&str] = &[
+        "start it",
+        "start",
+        "start that",
+        "start it again",
+        "start the turn",
+        "send it",
+        "send it again",
+        "send that again",
+        "resend it",
+    ];
+    let normalized = crate::drafts::evidence::normalize_utterance(text);
+    let core: Vec<&str> = normalized
+        .split(' ')
+        .filter(|w| !w.is_empty() && !FILLERS.contains(w))
+        .collect();
+    PHRASES.contains(&core.join(" ").as_str())
+}
+
+#[cfg(test)]
+mod start_phrase_tests {
+    use super::is_start_phrase;
+
+    #[test]
+    fn start_phrases_are_whole_utterances() {
+        for text in [
+            "Start it.",
+            "okay, send it again",
+            "Jarvis, start it please",
+            "resend it",
+        ] {
+            assert!(is_start_phrase(text), "{text}");
+        }
+        for text in [
+            "start the build",
+            "send it to the spec conversation",
+            "don't start it",
+            "",
+        ] {
+            assert!(!is_start_phrase(text), "{text}");
+        }
     }
 }
