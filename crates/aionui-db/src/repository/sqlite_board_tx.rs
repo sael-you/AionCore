@@ -14,12 +14,12 @@ use crate::models::{
     BoardReviewRow, BoardSettingsRow,
 };
 use crate::repository::board::{
-    BOARD_POSITION_GAP, BoardEventSeq, BoardPlacement, BoardPlacementOutcome, IBoardTx, NewBoardEvent,
+    BOARD_POSITION_GAP, BoardCardCreator, BoardEventSeq, BoardPlacement, BoardPlacementOutcome, IBoardTx, NewBoardEvent,
 };
 use crate::repository::sqlite_board::{
-    IDEMPOTENCY_COLS, QUESTION_COLS, REVIEW_COLS, fetch_card, fetch_cards_by_ids, fetch_columns, fetch_count_cards,
-    fetch_dependencies, fetch_dependents, fetch_idempotency, fetch_last_seq, fetch_project_dependencies,
-    fetch_settings,
+    IDEMPOTENCY_COLS, QUESTION_COLS, REVIEW_COLS, fetch_card, fetch_card_creators, fetch_cards_by_ids, fetch_columns,
+    fetch_count_cards, fetch_dependencies, fetch_dependents, fetch_idempotency, fetch_last_seq,
+    fetch_project_dependencies, fetch_settings,
 };
 
 /// One open board write transaction.
@@ -262,6 +262,10 @@ impl IBoardTx for SqliteBoardTx {
 
     async fn cards_by_ids(&mut self, user_id: &str, ids: &[String]) -> Result<Vec<BoardCardRow>, DbError> {
         fetch_cards_by_ids(self.conn(), user_id, ids).await
+    }
+
+    async fn card_creators(&mut self, user_id: &str, card_ids: &[String]) -> Result<Vec<BoardCardCreator>, DbError> {
+        fetch_card_creators(self.conn(), user_id, card_ids).await
     }
 
     async fn count_cards(&mut self, user_id: &str, project_id: &str, include_archived: bool) -> Result<i64, DbError> {

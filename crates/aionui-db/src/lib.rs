@@ -60,13 +60,13 @@ pub use repository::team::{UpdateTaskParams, UpdateTeamParams};
 pub use repository::voice::{CreateVoiceSessionParams, NewVoiceAuditEntry, VoiceUsageDelta};
 pub use repository::voice_draft::{DraftPatch, DraftTransition, IVoiceDraftRepository, NewVoiceTranscript};
 pub use repository::{
-    ActivityCursor, ArchiveScope, BOARD_POSITION_GAP, BoardCallerRow, BoardCardCursor, BoardCardFilter,
-    BoardConversationInfo, BoardEventQuery, BoardEventScope, BoardEventSeq, BoardPlacement, BoardPlacementOutcome,
-    BoardProjectRow, CreateAcpSessionParams, FeedbackDiagnosticsDbContext, FeedbackDiagnosticsProfile,
-    FeedbackDiagnosticsProfileResult, FeedbackDiagnosticsRequest, FeedbackDiagnosticsResult, IAcpSessionRepository,
-    IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
-    IAssistantOverrideRepository, IAssistantPreferenceRepository, IAssistantRepository, IBoardStore, IBoardTx,
-    IChannelRepository, IClientPreferenceRepository, IConversationRepository, ICronRepository,
+    ActivityCursor, ArchiveScope, BOARD_POSITION_GAP, BoardCallerRow, BoardCardCreator, BoardCardCursor,
+    BoardCardFilter, BoardConversationInfo, BoardEventQuery, BoardEventScope, BoardEventSeq, BoardPlacement,
+    BoardPlacementOutcome, BoardProjectRow, CreateAcpSessionParams, FeedbackDiagnosticsDbContext,
+    FeedbackDiagnosticsProfile, FeedbackDiagnosticsProfileResult, FeedbackDiagnosticsRequest,
+    FeedbackDiagnosticsResult, IAcpSessionRepository, IAgentMetadataRepository, IAssistantDefinitionRepository,
+    IAssistantOverlayRepository, IAssistantOverrideRepository, IAssistantPreferenceRepository, IAssistantRepository,
+    IBoardStore, IBoardTx, IChannelRepository, IClientPreferenceRepository, IConversationRepository, ICronRepository,
     IFeedbackDiagnosticsRepository, IMcpMarketRepository, IMcpServerRepository, IOAuthTokenRepository, IProjectStore,
     IProviderRepository, IRemoteAgentRepository, ISettingsRepository, ISidebarStore, ISkillRepository, ITeamRepository,
     IUserOrderStore, IUserRepository, IVoiceAuditRepository, IVoiceSessionRepository, IVoiceSettingsRepository,

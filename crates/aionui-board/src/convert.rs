@@ -2,13 +2,16 @@
 //! binary does not know (a row written by a newer build) falls back to the
 //! column default instead of failing the whole read.
 
+use std::collections::HashMap;
+
 use aionui_api_types::{
     AgentMove, AssigneeKind, BoardActorKind, BoardCardDto, BoardCardSummaryDto, BoardColumnDto, BoardDependencyDto,
     BoardEventDto, BoardLinkDto, BoardLinkStatus, BoardQuestionDto, BoardReviewDto, BoardSettingsDto, BoardTemplate,
     CardPriority, CardSize, CardTier, CardType, ColumnCategory, ColumnKind, ColumnResolution, LinkRole,
 };
 use aionui_db::{
-    BoardCardRow, BoardColumnRow, BoardEventRow, BoardLinkViewRow, BoardQuestionRow, BoardReviewRow, BoardSettingsRow,
+    BoardCardCreator, BoardCardRow, BoardColumnRow, BoardEventRow, BoardLinkViewRow, BoardQuestionRow, BoardReviewRow,
+    BoardSettingsRow,
 };
 use serde_json::{Value, json};
 
@@ -111,6 +114,8 @@ pub fn card_dto(row: &BoardCardRow, dependencies: Vec<BoardDependencyDto>) -> Bo
         routing: string_list(&row.routing),
         creator_kind: BoardActorKind::parse(&row.creator_kind).unwrap_or(BoardActorKind::User),
         creator_ref: row.creator_ref.clone(),
+        creator_conversation_id: None,
+        creator_name: None,
         assignee_kind: row.assignee_kind.as_deref().and_then(AssigneeKind::parse),
         assignee_ref: row.assignee_ref.clone(),
         blocked: row.blocked,
@@ -124,6 +129,48 @@ pub fn card_dto(row: &BoardCardRow, dependencies: Vec<BoardDependencyDto>) -> Bo
         archived_at: row.archived_at,
         created_at: row.created_at,
         updated_at: row.updated_at,
+    }
+}
+
+/// Creator conversations by card id (see [`IBoardStore::card_creators`]).
+///
+/// [`IBoardStore::card_creators`]: aionui_db::IBoardStore::card_creators
+pub type CardCreators = HashMap<String, BoardCardCreator>;
+
+/// Index [`BoardCardCreator`] rows by card id (the first `card_created` wins).
+pub fn card_creators(rows: Vec<BoardCardCreator>) -> CardCreators {
+    let mut creators = CardCreators::new();
+    for row in rows {
+        creators.entry(row.card_id.clone()).or_insert(row);
+    }
+    creators
+}
+
+/// Ids of the agent-created cards among `rows` (the only ones with a
+/// creator conversation).
+pub fn agent_card_ids<'a>(rows: impl IntoIterator<Item = &'a BoardCardRow>) -> Vec<String> {
+    rows.into_iter()
+        .filter(|row| row.creator_kind == BoardActorKind::Agent.as_str())
+        .map(|row| row.id.clone())
+        .collect()
+}
+
+/// Fill `creator_conversation_id` / `creator_name` from the card's creator
+/// conversation, when known.
+pub fn set_creator(
+    card_id: &str,
+    conversation_id: &mut Option<String>,
+    name: &mut Option<String>,
+    creators: &CardCreators,
+) {
+    if let Some(creator) = creators.get(card_id) {
+        *conversation_id = Some(creator.conversation_id.clone());
+        *name = creator
+            .conversation_name
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned);
     }
 }
 
@@ -151,6 +198,8 @@ pub fn card_summary(
         skills: card.skills,
         creator_kind: card.creator_kind,
         creator_ref: card.creator_ref,
+        creator_conversation_id: card.creator_conversation_id,
+        creator_name: card.creator_name,
         assignee_kind: card.assignee_kind,
         assignee_ref: card.assignee_ref,
         assignee_name: None,

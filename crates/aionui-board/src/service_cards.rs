@@ -17,7 +17,7 @@ use serde_json::{Value, json};
 use tracing::Instrument;
 
 use crate::actor::BoardActor;
-use crate::convert::{card_dto, dependency_dto, reference};
+use crate::convert::{agent_card_ids, card_creators, card_dto, dependency_dto, reference, set_creator};
 use crate::error::{BoardError, BoardErrorCode, BoardResult};
 use crate::events::{
     CARD_ARCHIVED, CARD_BLOCKED, CARD_CREATED, CARD_MOVED, CARD_RESTORED, CARD_UNBLOCKED, CARD_UPDATED, DEPLOY_FORCED,
@@ -242,10 +242,15 @@ impl BoardService {
             .map(|dep| dep.depends_on_card_id)
             .collect();
         let targets = tx.cards_by_ids(&card.user_id, &ids).await?;
-        Ok(card_dto(
-            card,
-            targets.iter().map(|t| dependency_dto(t, &columns)).collect(),
-        ))
+        let mut dto = card_dto(card, targets.iter().map(|t| dependency_dto(t, &columns)).collect());
+        let creators = card_creators(tx.card_creators(&card.user_id, &agent_card_ids([card])).await?);
+        set_creator(
+            &card.id,
+            &mut dto.creator_conversation_id,
+            &mut dto.creator_name,
+            &creators,
+        );
+        Ok(dto)
     }
 
     /// The full card as read outside a transaction.
@@ -259,10 +264,15 @@ impl BoardService {
             .map(|dep| dep.depends_on_card_id)
             .collect();
         let targets = store.cards_by_ids(&card.user_id, &ids).await?;
-        Ok(card_dto(
-            card,
-            targets.iter().map(|t| dependency_dto(t, &columns)).collect(),
-        ))
+        let mut dto = card_dto(card, targets.iter().map(|t| dependency_dto(t, &columns)).collect());
+        let creators = card_creators(store.card_creators(&card.user_id, &agent_card_ids([card])).await?);
+        set_creator(
+            &card.id,
+            &mut dto.creator_conversation_id,
+            &mut dto.creator_name,
+            &creators,
+        );
+        Ok(dto)
     }
 
     /// Write a changed card, append its single event, commit, broadcast.
@@ -343,17 +353,23 @@ impl BoardService {
                         .find(|c| c.key == key)
                         .copied()
                         .ok_or_else(|| BoardError::invalid("column", format!("unknown column `{key}`")))?;
+                    // Agents create in the first active column. Naming another
+                    // one counts as moving there: only a column open to agents
+                    // (the Board Keeper: any non-gate column).
+                    if let Some(agent) = actor.as_agent() {
+                        let first = active.first().map_or("", |c| c.key.as_str());
+                        let open = column.key == first
+                            || (column.key != DEPLOYING
+                                && !is_gate(column)
+                                && (column.agent_move == AgentMove::Allow.as_str() || agent.keeper));
+                        if !open {
+                            return Err(agent_create_denied(&column.key, first));
+                        }
+                    }
                     if column.key == DEPLOYING || (is_gate(column) && !actor.is_user()) {
                         return Err(gate_use_decision(&column.key));
                     }
                     check_barrier(actor, &columns, None, column)?;
-                    // Creating straight into a column counts as moving there.
-                    if let Some(agent) = actor.as_agent() {
-                        let open = column.agent_move == AgentMove::Allow.as_str() || (agent.keeper && !is_gate(column));
-                        if !open {
-                            return Err(agent_move_denied(&column.key));
-                        }
-                    }
                     column
                 }
             };
@@ -413,11 +429,20 @@ impl BoardService {
                 updated_at: now,
             };
             tx.insert_card(&card).await?;
-            let dto = card_dto(&card, Vec::new());
+            let mut dto = card_dto(&card, Vec::new());
             let mut payload = json!({ "card": dto, "version": card.version });
             add_reordered(&mut payload, tx.as_mut());
             let event =
                 Self::append_event(tx.as_mut(), actor, project_id, Some(&card.id), CARD_CREATED, payload).await?;
+            // The creator conversation is read back from the event just
+            // appended (the payload keeps the card as stored).
+            let creators = card_creators(tx.card_creators(user_id, &agent_card_ids([&card])).await?);
+            set_creator(
+                &card.id,
+                &mut dto.creator_conversation_id,
+                &mut dto.creator_name,
+                &creators,
+            );
             self.commit(tx, user_id, &Committed::card(event, dto.clone())).await?;
             Ok(dto)
         }
@@ -931,6 +956,19 @@ pub(crate) fn agent_move_denied(column: &str) -> BoardError {
         format!("agents may not move cards into or out of `{column}`"),
     )
     .with_details(json!({ "column": column }))
+}
+
+/// An agent named a create column other than the first one (and not open
+/// to it). Same code as a denied move; the message states the create rule.
+pub(crate) fn agent_create_denied(column: &str, first_column: &str) -> BoardError {
+    BoardError::new(
+        BoardErrorCode::AgentMoveDenied,
+        format!(
+            "agents can only create cards in the first column `{first_column}`: leave out `column` \
+             (`{column}` is not open to agents; ask the owner or the Board Keeper to move the card)"
+        ),
+    )
+    .with_details(json!({ "column": column, "first_column": first_column }))
 }
 
 pub(crate) fn wip_limit(column: &str, limit: i64, count: i64) -> BoardError {
