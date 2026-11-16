@@ -105,11 +105,14 @@ pub use board::{
 };
 pub use board_tools::{BoardToolDescriptor, board_tool_descriptors, board_tool_for_cli_command};
 pub use browser::{
-    BROWSER_MAX_INSTANCES_LIMIT, BROWSER_MAX_TABS_LIMIT, BrowserClientMessage, BrowserDialog, BrowserDialogKind,
-    BrowserErrorCode, BrowserFileChooser, BrowserFileChooserMode, BrowserFrameMeta, BrowserInstanceSettings,
-    BrowserInstanceStatus, BrowserKeyEventKind, BrowserKeyInput, BrowserMouseButton, BrowserMouseEventKind,
-    BrowserMouseInput, BrowserRunStatus, BrowserServerMessage, BrowserSettings, BrowserSettingsUpdate, BrowserState,
-    BrowserStatusResponse, BrowserTab, BrowserWsError, BrowserWsQuery,
+    BROWSER_EXTENSION_ID, BROWSER_MAX_INSTANCES_LIMIT, BROWSER_MAX_TABS_LIMIT, BrowserActivityOutcome,
+    BrowserActivityQuery, BrowserApproval, BrowserApprovalDecision, BrowserApprovalResolved, BrowserClientMessage,
+    BrowserDevice, BrowserDeviceActivity, BrowserDialog, BrowserDialogKind, BrowserErrorCode, BrowserFileChooser,
+    BrowserFileChooserMode, BrowserFrameMeta, BrowserInstanceSettings, BrowserInstanceStatus, BrowserKeyEventKind,
+    BrowserKeyInput, BrowserMouseButton, BrowserMouseEventKind, BrowserMouseInput, BrowserPairingCode,
+    BrowserRunStatus, BrowserServerMessage, BrowserSettings, BrowserSettingsUpdate, BrowserState,
+    BrowserStatusResponse, BrowserTab, BrowserWsError, BrowserWsQuery, ExtensionError, ExtensionInbound,
+    ExtensionOutbound, ExtensionTab,
 };
 pub use channel::{
     ApprovePairingRequest, BridgeResponse, ChannelAssistantSettingRequest, ChannelAssistantSettingResponse,

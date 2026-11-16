@@ -50,6 +50,12 @@ pub fn code_str(code: BrowserErrorCode) -> &'static str {
         BrowserErrorCode::BrowserTabNotFound => "BROWSER_TAB_NOT_FOUND",
         BrowserErrorCode::BrowserBadMessage => "BROWSER_BAD_MESSAGE",
         BrowserErrorCode::BrowserBusy => "BROWSER_BUSY",
+        BrowserErrorCode::BrowserPairingInvalid => "BROWSER_PAIRING_INVALID",
+        BrowserErrorCode::BrowserDeviceRevoked => "BROWSER_DEVICE_REVOKED",
+        BrowserErrorCode::BrowserDeviceNotFound => "BROWSER_DEVICE_NOT_FOUND",
+        BrowserErrorCode::BrowserApprovalDenied => "BROWSER_APPROVAL_DENIED",
+        BrowserErrorCode::BrowserApprovalTimeout => "BROWSER_APPROVAL_TIMEOUT",
+        BrowserErrorCode::BrowserApprovalExpired => "BROWSER_APPROVAL_EXPIRED",
     }
 }
 
@@ -75,7 +81,11 @@ fn api_error(e: BrowserError) -> ApiError {
                 }
                 BrowserErrorCode::BrowserInstanceLimit => StatusCode::BAD_REQUEST,
                 BrowserErrorCode::BrowserBusy => StatusCode::CONFLICT,
-                BrowserErrorCode::BrowserTabNotFound => StatusCode::NOT_FOUND,
+                BrowserErrorCode::BrowserTabNotFound | BrowserErrorCode::BrowserDeviceNotFound => StatusCode::NOT_FOUND,
+                BrowserErrorCode::BrowserApprovalExpired => StatusCode::GONE,
+                BrowserErrorCode::BrowserPairingInvalid | BrowserErrorCode::BrowserDeviceRevoked => {
+                    StatusCode::UNAUTHORIZED
+                }
                 _ => StatusCode::SERVICE_UNAVAILABLE,
             };
             ApiError::coded(status, code_str(code), e.to_string(), None)
@@ -175,6 +185,12 @@ mod tests {
             BrowserErrorCode::BrowserTabNotFound,
             BrowserErrorCode::BrowserBadMessage,
             BrowserErrorCode::BrowserBusy,
+            BrowserErrorCode::BrowserPairingInvalid,
+            BrowserErrorCode::BrowserDeviceRevoked,
+            BrowserErrorCode::BrowserDeviceNotFound,
+            BrowserErrorCode::BrowserApprovalDenied,
+            BrowserErrorCode::BrowserApprovalTimeout,
+            BrowserErrorCode::BrowserApprovalExpired,
         ] {
             assert_eq!(serde_json::to_value(code).unwrap(), code_str(code));
         }

@@ -23,6 +23,8 @@ struct StoredSettings {
     max_tabs: u8,
     #[serde(default)]
     hide_automation: Vec<u8>,
+    #[serde(default)]
+    devices_agents_enabled: bool,
 }
 
 impl Default for StoredSettings {
@@ -33,6 +35,7 @@ impl Default for StoredSettings {
             max_instances: d.max_instances,
             max_tabs: d.max_tabs,
             hide_automation: Vec::new(),
+            devices_agents_enabled: d.devices_agents_enabled,
         }
     }
 }
@@ -43,6 +46,7 @@ impl StoredSettings {
             agents_enabled: self.agents_enabled,
             max_instances: self.max_instances,
             max_tabs: self.max_tabs,
+            devices_agents_enabled: self.devices_agents_enabled,
             instances: (1..=self.max_instances)
                 .map(|instance| BrowserInstanceSettings {
                     instance,
@@ -79,6 +83,9 @@ pub fn apply_update(
     let mut next = current.clone();
     if let Some(v) = update.agents_enabled {
         next.agents_enabled = v;
+    }
+    if let Some(v) = update.devices_agents_enabled {
+        next.devices_agents_enabled = v;
     }
     if let Some(v) = update.max_instances {
         if !(1..=BROWSER_MAX_INSTANCES_LIMIT).contains(&v) {
@@ -143,6 +150,7 @@ impl SettingsStore {
         stored.agents_enabled = next.agents_enabled;
         stored.max_instances = next.max_instances;
         stored.max_tabs = next.max_tabs;
+        stored.devices_agents_enabled = next.devices_agents_enabled;
         if let Some(rows) = &update.instances {
             for row in rows {
                 stored.hide_automation.retain(|n| *n != row.instance);

@@ -34,12 +34,27 @@ pub enum BrowserErrorCode {
     BrowserBadMessage,
     /// `clear` while that profile is being wiped already.
     BrowserBusy,
+    /// Extension pairing code unknown, used or expired (or too many tries).
+    BrowserPairingInvalid,
+    /// The device's token was revoked (or never existed).
+    BrowserDeviceRevoked,
+    /// No such paired device.
+    BrowserDeviceNotFound,
+    /// The owner denied an action on a high-value origin.
+    BrowserApprovalDenied,
+    /// Nobody answered the approval in time.
+    BrowserApprovalTimeout,
+    /// The approval is no longer pending (answered or expired).
+    BrowserApprovalExpired,
 }
 
 /// Hard upper bound of `max_instances` (one bridge port per possible instance).
 pub const BROWSER_MAX_INSTANCES_LIMIT: u8 = 5;
 /// Hard upper bound of `max_tabs`.
 pub const BROWSER_MAX_TABS_LIMIT: u8 = 20;
+/// The AionUi browser extension (manifest key pinned; C34). The extension
+/// socket only accepts `Origin: chrome-extension://<this id>`.
+pub const BROWSER_EXTENSION_ID: &str = "bdgcogndgcbcmaijgnhahjddbaclknbb";
 
 // ---------------------------------------------------------------------------
 // HTTP
@@ -54,6 +69,10 @@ pub struct BrowserSettings {
     pub max_instances: u8,
     /// 1..=20, default 10, per instance.
     pub max_tabs: u8,
+    /// "Agents may use my Mac browser" (C34, default false). Device commands
+    /// also need `agents_enabled`.
+    #[serde(default)]
+    pub devices_agents_enabled: bool,
     /// One row per instance 1..=max_instances.
     pub instances: Vec<BrowserInstanceSettings>,
 }
@@ -75,6 +94,7 @@ impl Default for BrowserSettings {
             agents_enabled: true,
             max_instances,
             max_tabs: 10,
+            devices_agents_enabled: false,
             instances: (1..=max_instances)
                 .map(|instance| BrowserInstanceSettings {
                     instance,
@@ -97,6 +117,8 @@ pub struct BrowserSettingsUpdate {
     pub max_instances: Option<u8>,
     #[serde(default)]
     pub max_tabs: Option<u8>,
+    #[serde(default)]
+    pub devices_agents_enabled: Option<bool>,
     /// Only the listed instances change (instance 1..=5).
     #[serde(default)]
     pub instances: Option<Vec<BrowserInstanceSettings>>,
@@ -133,6 +155,184 @@ pub struct BrowserInstanceStatus {
 pub struct BrowserWsQuery {
     #[serde(default)]
     pub instance: Option<u8>,
+}
+
+// ---------------------------------------------------------------------------
+// C34: the owner's own browser through the AionUi extension
+// ---------------------------------------------------------------------------
+
+/// `POST /api/browser/devices/pairing-code`: one-time, 5 minutes; a new code
+/// replaces the previous one.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserPairingCode {
+    pub code: String,
+    /// Epoch ms.
+    pub expires_at: i64,
+}
+
+/// `GET /api/browser/devices` row. Never the token.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserDevice {
+    pub device_id: String,
+    pub name: String,
+    pub browser: String,
+    pub created_at: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_seen_at: Option<i64>,
+    pub online: bool,
+    /// The extension's "agents may open new tabs" switch.
+    pub new_tabs: bool,
+    pub shared_tabs: u16,
+}
+
+/// A paused agent action on a high-value origin, waiting for the owner.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserApproval {
+    pub approval_id: String,
+    pub device_id: String,
+    pub device_name: String,
+    pub tab_id: i64,
+    pub origin: String,
+    pub url: String,
+    pub method: String,
+    /// The method plus at most 120 characters of the expression / text.
+    pub summary: String,
+    pub requested_at: i64,
+    pub expires_at: i64,
+}
+
+/// `POST /api/browser/approvals/{approval_id}`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserApprovalDecision {
+    pub approve: bool,
+}
+
+/// Payload of the `browser.approvalResolved` event.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserApprovalResolved {
+    pub approval_id: String,
+    pub approved: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserActivityOutcome {
+    Ok,
+    Refused,
+    Paused,
+    Approved,
+    Denied,
+    Timeout,
+}
+
+/// `GET /api/browser/devices/{device_id}/activity` row: method names only,
+/// never params or results.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserDeviceActivity {
+    pub at: i64,
+    pub conversation_id: Option<String>,
+    pub tab_id: i64,
+    pub origin: String,
+    pub method: String,
+    pub outcome: BrowserActivityOutcome,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserActivityQuery {
+    #[serde(default)]
+    pub limit: Option<u32>,
+}
+
+/// A tab the owner shared from the extension.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExtensionTab {
+    pub tab_id: i64,
+    pub url: String,
+    #[serde(default)]
+    pub title: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExtensionError {
+    pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub code: Option<String>,
+}
+
+/// `WS /api/browser/extension`, extension → AionCore. The first frame is
+/// `pair` or `hello`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ExtensionInbound {
+    Pair {
+        code: String,
+        device_name: String,
+        #[serde(default)]
+        browser: String,
+    },
+    Hello {
+        token: String,
+        #[serde(default)]
+        browser: String,
+        #[serde(default)]
+        version: Option<u32>,
+    },
+    /// The FULL list of shared tabs, on every change.
+    State {
+        new_tabs: bool,
+        tabs: Vec<ExtensionTab>,
+    },
+    Result {
+        id: u64,
+        #[serde(default)]
+        result: Option<serde_json::Value>,
+        #[serde(default)]
+        error: Option<ExtensionError>,
+    },
+    Event {
+        tab_id: i64,
+        method: String,
+        #[serde(default)]
+        params: serde_json::Value,
+    },
+    Detached {
+        tab_id: i64,
+        #[serde(default)]
+        reason: Option<String>,
+    },
+    Ping,
+}
+
+/// `WS /api/browser/extension`, AionCore → extension.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum ExtensionOutbound {
+    /// `token` only in the reply to `pair`.
+    Welcome {
+        device_id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        token: Option<String>,
+    },
+    Error {
+        code: BrowserErrorCode,
+    },
+    Command {
+        id: u64,
+        tab_id: i64,
+        method: String,
+        params: serde_json::Value,
+    },
+    CreateTab {
+        id: u64,
+        url: String,
+    },
+    CloseTab {
+        id: u64,
+        tab_id: i64,
+    },
+    Pong,
 }
 
 // ---------------------------------------------------------------------------
@@ -394,11 +594,80 @@ mod tests {
         assert!(serde_json::from_value::<BrowserSettingsUpdate>(json!({"max_tabs": 5, "x": 1})).is_err());
         assert_eq!(
             serde_json::to_value(BrowserSettings::default()).unwrap(),
-            json!({"agents_enabled": true, "max_instances": 3, "max_tabs": 10, "instances": [
+            json!({"agents_enabled": true, "max_instances": 3, "max_tabs": 10, "devices_agents_enabled": false, "instances": [
                 {"instance": 1, "hide_automation": false},
                 {"instance": 2, "hide_automation": false},
                 {"instance": 3, "hide_automation": false}
             ]})
+        );
+    }
+
+    #[test]
+    fn extension_frames_match_the_agreed_wire() {
+        let pair: ExtensionInbound = serde_json::from_value(
+            json!({"type": "pair", "code": "ABCD-2345", "device_name": "Mac", "browser": "Chrome 157"}),
+        )
+        .unwrap();
+        assert!(matches!(pair, ExtensionInbound::Pair { ref code, .. } if code == "ABCD-2345"));
+        let hello: ExtensionInbound =
+            serde_json::from_value(json!({"type": "hello", "token": "t", "browser": "Chrome", "version": 1})).unwrap();
+        assert!(matches!(hello, ExtensionInbound::Hello { version: Some(1), .. }));
+        let state: ExtensionInbound = serde_json::from_value(json!({
+            "type": "state", "new_tabs": true, "tabs": [{"tab_id": 123, "url": "https://a.test/", "title": "A"}]
+        }))
+        .unwrap();
+        assert!(matches!(state, ExtensionInbound::State { new_tabs: true, ref tabs } if tabs[0].tab_id == 123));
+        let res: ExtensionInbound = serde_json::from_value(
+            json!({"type": "result", "id": 7, "error": {"message": "off", "code": "new_tabs_disabled"}}),
+        )
+        .unwrap();
+        assert!(
+            matches!(res, ExtensionInbound::Result { id: 7, error: Some(ref e), .. } if e.code.as_deref() == Some("new_tabs_disabled"))
+        );
+        let ping: ExtensionInbound = serde_json::from_value(json!({"type": "ping"})).unwrap();
+        assert_eq!(ping, ExtensionInbound::Ping);
+
+        assert_eq!(
+            serde_json::to_value(ExtensionOutbound::Welcome {
+                device_id: "dev_1".into(),
+                token: None
+            })
+            .unwrap(),
+            json!({"type": "welcome", "device_id": "dev_1"})
+        );
+        assert_eq!(
+            serde_json::to_value(ExtensionOutbound::Error {
+                code: BrowserErrorCode::BrowserPairingInvalid
+            })
+            .unwrap(),
+            json!({"type": "error", "code": "BROWSER_PAIRING_INVALID"})
+        );
+        assert_eq!(
+            serde_json::to_value(ExtensionOutbound::Command {
+                id: 7,
+                tab_id: 123,
+                method: "Runtime.evaluate".into(),
+                params: json!({"expression": "1"})
+            })
+            .unwrap(),
+            json!({"type": "command", "id": 7, "tab_id": 123, "method": "Runtime.evaluate", "params": {"expression": "1"}})
+        );
+        assert_eq!(
+            serde_json::to_value(ExtensionOutbound::CreateTab {
+                id: 8,
+                url: "https://a.test/".into()
+            })
+            .unwrap(),
+            json!({"type": "create_tab", "id": 8, "url": "https://a.test/"})
+        );
+        assert_eq!(
+            serde_json::to_value(ExtensionOutbound::Pong).unwrap(),
+            json!({"type": "pong"})
+        );
+        assert!(serde_json::from_value::<BrowserApprovalDecision>(json!({"approve": true, "x": 1})).is_err());
+        assert_eq!(
+            serde_json::to_value(BrowserActivityOutcome::Timeout).unwrap(),
+            json!("timeout")
         );
     }
 }
