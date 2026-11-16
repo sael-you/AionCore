@@ -67,6 +67,7 @@ pub(crate) fn data() -> Value {
             "scope": "the board of THIS conversation's project; cards are addressed by number (N or TASK-N)",
             "selectors": "flags select (card number, filters, column, department, role); every payload is one JSON object on stdin",
             "versions": "update needs the card version from `show`; a stale one is board_version_conflict — show again and retry",
+            "create": "agents create cards only in the board's first column: leave out `column` (or name the first column); any other column is board_agent_move_denied — the Board Keeper alone may name another non-gate column",
             "moves": "department agents never move cards (every studio column has agent_move=deny); the project's Board Keeper (status.keeper=true) may move between non-gate columns",
             "reviews": "review only for the department your assignment link names (else board_department_mismatch); verdict questions become open questions",
             "status": "always answers {enabled, project_id|null, template, keeper, keeper_conversation_id|null}; keeper_conversation_id is the project's Board Keeper (Butler) conversation to report progress to, null when the board is missing or disabled; use the board only when asked",
@@ -128,6 +129,32 @@ mod tests {
             descriptor.description.contains("Board Keeper"),
             "{}",
             descriptor.description
+        );
+    }
+
+    #[test]
+    fn create_contract_states_the_first_column_rule() {
+        let create = data()["semantics"]["create"].as_str().unwrap().to_owned();
+        assert!(create.contains("only in the board's first column"), "{create}");
+        assert!(create.contains("board_agent_move_denied"), "{create}");
+        let descriptor = board_tool_descriptors()
+            .into_iter()
+            .find(|tool| tool.name == "board_create")
+            .unwrap();
+        assert!(
+            descriptor.description.contains("first column"),
+            "{}",
+            descriptor.description
+        );
+        let column = descriptor.input_schema["properties"]["column"]["description"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        assert!(column.contains("only the first column"), "{column}");
+        let skill = include_str!("../../assets/builtin-skills/auto-inject/board/SKILL.md");
+        assert!(
+            skill.contains("only in the first column"),
+            "board skill states the create rule"
         );
     }
 

@@ -717,15 +717,33 @@ async fn department_agents_cannot_move_on_the_studio_board() {
         ),
         "board_invalid"
     );
-    assert_eq!(
-        code(
-            env.service
-                .create_card(&agent, PROJECT, create_in("x", "triage"))
-                .await
-                .unwrap_err()
-        ),
-        "board_agent_move_denied"
+    let error = env
+        .service
+        .create_card(&agent, PROJECT, create_in("x", "triage"))
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("agents can only create cards in the first column `ideas`"),
+        "{error}"
     );
+    assert_eq!(code(error), "board_agent_move_denied");
+    // TASK-39: naming the first column is the same as leaving it out; a gate
+    // is refused with the create rule, not a gate decision.
+    let named = env
+        .service
+        .create_card(&agent, PROJECT, create_in("y", "ideas"))
+        .await
+        .unwrap();
+    assert_eq!(named.column_key, "ideas");
+    let error = env
+        .service
+        .create_card(&agent, PROJECT, create_in("z", "decision"))
+        .await
+        .unwrap_err();
+    assert!(error.to_string().contains("first column `ideas`"), "{error}");
+    assert_eq!(code(error), "board_agent_move_denied");
 }
 
 #[tokio::test]

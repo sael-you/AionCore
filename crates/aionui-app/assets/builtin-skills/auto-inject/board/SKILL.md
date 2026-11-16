@@ -30,7 +30,9 @@ conversation's project.
    run `show` again and redo the change on the fresh card.
 6. Departments never move cards — the supervisor does. Only the Board Keeper
    (`status` says `keeper: true`) may move cards, between non-gate columns,
-   and only when the owner asks.
+   and only when the owner asks. `create` puts a card only in the first column
+   (ideas): leave out `column`; naming another column fails with
+   `board_agent_move_denied` (the Board Keeper may name a non-gate column).
 7. Never touch gates (Decision, Ready to deploy), never force a move, never
    deploy, never change settings or columns, never archive cards. Those belong
    to the owner.

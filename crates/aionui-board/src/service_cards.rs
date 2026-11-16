@@ -353,17 +353,23 @@ impl BoardService {
                         .find(|c| c.key == key)
                         .copied()
                         .ok_or_else(|| BoardError::invalid("column", format!("unknown column `{key}`")))?;
+                    // Agents create in the first active column. Naming another
+                    // one counts as moving there: only a column open to agents
+                    // (the Board Keeper: any non-gate column).
+                    if let Some(agent) = actor.as_agent() {
+                        let first = active.first().map_or("", |c| c.key.as_str());
+                        let open = column.key == first
+                            || (column.key != DEPLOYING
+                                && !is_gate(column)
+                                && (column.agent_move == AgentMove::Allow.as_str() || agent.keeper));
+                        if !open {
+                            return Err(agent_create_denied(&column.key, first));
+                        }
+                    }
                     if column.key == DEPLOYING || (is_gate(column) && !actor.is_user()) {
                         return Err(gate_use_decision(&column.key));
                     }
                     check_barrier(actor, &columns, None, column)?;
-                    // Creating straight into a column counts as moving there.
-                    if let Some(agent) = actor.as_agent() {
-                        let open = column.agent_move == AgentMove::Allow.as_str() || (agent.keeper && !is_gate(column));
-                        if !open {
-                            return Err(agent_move_denied(&column.key));
-                        }
-                    }
                     column
                 }
             };
@@ -950,6 +956,19 @@ pub(crate) fn agent_move_denied(column: &str) -> BoardError {
         format!("agents may not move cards into or out of `{column}`"),
     )
     .with_details(json!({ "column": column }))
+}
+
+/// An agent named a create column other than the first one (and not open
+/// to it). Same code as a denied move; the message states the create rule.
+pub(crate) fn agent_create_denied(column: &str, first_column: &str) -> BoardError {
+    BoardError::new(
+        BoardErrorCode::AgentMoveDenied,
+        format!(
+            "agents can only create cards in the first column `{first_column}`: leave out `column` \
+             (`{column}` is not open to agents; ask the owner or the Board Keeper to move the card)"
+        ),
+    )
+    .with_details(json!({ "column": column, "first_column": first_column }))
 }
 
 pub(crate) fn wip_limit(column: &str, limit: i64, count: i64) -> BoardError {
