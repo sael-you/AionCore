@@ -106,6 +106,20 @@ pub async fn create_router(services: &AppServices) -> Result<Router, RouterBuild
     Ok(router)
 }
 
+/// The C11 WebSocket-origin rule, except for the C34 extension socket whose
+/// origin is `chrome-extension://<pinned id>`: its handler checks that exact
+/// origin itself (`aionui_browser::routes::extension_origin`).
+async fn websocket_origin_except_extension(
+    state: axum::extract::State<Arc<aionui_auth::OriginPolicy>>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Result<axum::response::Response, aionui_common::ApiError> {
+    if request.uri().path() == "/api/browser/extension" {
+        return Ok(next.run(request).await);
+    }
+    websocket_origin_middleware(state, request, next).await
+}
+
 /// Create the application router and return runtime handles needed by
 /// background services started outside the router tree.
 pub async fn create_router_with_runtime(services: &AppServices) -> Result<(Router, RouterRuntime), RouterBuildError> {
@@ -552,6 +566,16 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         ))
     }
     .merge(ws_routes)
+    // C34 (TASK-125): the browser extension socket. Outside the session and
+    // CSRF layers (the extension has no session); the WebSocket-origin layer
+    // exempts it (see `websocket_origin_except_extension`). The handler
+    // accepts exactly the pinned chrome-extension:// origin and authenticates
+    // the first frame (pairing code or device token, within 5 s).
+    .merge(aionui_browser::browser_extension_routes(
+        aionui_browser::BrowserRouterState {
+            service: services.browser_service.clone(),
+        },
+    ))
     .merge(runtime_team_tools)
     .merge(session_message_runtime)
     .merge(conversation_runtime)
@@ -573,21 +597,11 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     let router = if services.identity_mode == crate::config::IdentityMode::WebUi {
         router.layer(middleware::from_fn_with_state(
             services.origin_policy.clone(),
-            websocket_origin_middleware,
+            websocket_origin_except_extension,
         ))
     } else {
         router
     };
-    // C34 (TASK-125): the browser extension socket. Merged AFTER the session,
-    // CSRF and WebSocket-origin layers on purpose: the extension has no
-    // session, and its origin is chrome-extension://. The handler accepts
-    // exactly the pinned extension origin and authenticates the first frame
-    // (pairing code or device token, within 5 s).
-    let router = router.merge(aionui_browser::browser_extension_routes(
-        aionui_browser::BrowserRouterState {
-            service: services.browser_service.clone(),
-        },
-    ));
     let router = with_access_log(router);
     tracing::info!(
         elapsed_ms = boot.elapsed().as_millis(),

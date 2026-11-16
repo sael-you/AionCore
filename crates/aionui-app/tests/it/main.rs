@@ -21,6 +21,7 @@ mod auth_e2e;
 mod auxiliary_e2e;
 mod board_report_skill;
 mod board_routes_e2e;
+mod browser_extension_route;
 mod c11_auth_e2e;
 mod capabilities_cli_e2e;
 mod channel_e2e;

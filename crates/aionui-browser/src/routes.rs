@@ -291,7 +291,11 @@ async fn decide_approval(
     Ok(Json(ApiResponse::ok(())))
 }
 
-async fn extension_ws(State(s): State<BrowserRouterState>, headers: HeaderMap, ws: WebSocketUpgrade) -> Response {
+async fn extension_ws(
+    State(s): State<BrowserRouterState>,
+    headers: HeaderMap,
+    ws: Result<WebSocketUpgrade, axum::extract::ws::rejection::WebSocketUpgradeRejection>,
+) -> Response {
     let origin_ok = headers
         .get(axum::http::header::ORIGIN)
         .and_then(|v| v.to_str().ok())
@@ -304,6 +308,10 @@ async fn extension_ws(State(s): State<BrowserRouterState>, headers: HeaderMap, w
             None,
         ));
     }
+    let ws = match ws {
+        Ok(ws) => ws,
+        Err(rejection) => return axum::response::IntoResponse::into_response(rejection),
+    };
     learn_host(&s, &headers);
     let hub = s.service.device_hub().clone();
     ws.max_message_size(crate::relay::MAX_EXTENSION_FRAME)
