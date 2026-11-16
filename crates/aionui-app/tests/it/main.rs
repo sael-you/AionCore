@@ -42,6 +42,7 @@ mod mcp_crud_e2e;
 mod mcp_e2e;
 mod mcp_exec_launcher;
 mod mcp_market_origin_e2e;
+mod memory_routes_e2e;
 mod message_e2e;
 mod midturn_e2e;
 mod office_e2e;

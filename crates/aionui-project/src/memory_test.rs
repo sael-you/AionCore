@@ -233,12 +233,12 @@ async fn a_put_with_a_stale_mtime_is_a_conflict_and_a_fresh_one_writes_with_a_tr
             current_modified: read.modified
         })
     );
-    assert_eq!(
+    assert!(
         tokio::fs::read_to_string(dir.join("rule.md"))
             .await
             .unwrap()
             .contains("Old."),
-        true
+        "a refused write leaves the file as it was"
     );
 
     let written = service

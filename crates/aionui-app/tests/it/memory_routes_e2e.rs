@@ -3,7 +3,7 @@
 //! the session AND a trusted Origin, the agent runtime-token channel refused.
 //! The memory root is a temp dir (the real `~/.claude` is never touched).
 
-mod common;
+use crate::common;
 
 use std::sync::Arc;
 
