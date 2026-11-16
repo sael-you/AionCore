@@ -64,7 +64,10 @@ async fn migration_907_creates_kit_tables() {
 async fn kit_crud_replaces_member_sets_and_rejects_duplicates_and_stale_writes() {
     let (_db, repo) = setup().await;
     let kit = create(&repo, "Platform", &["pf-core", "cs-build"], &["mcp-1"]).await;
-    let items = repo.list_kit_items(USER, Some(&[kit.id.clone()])).await.unwrap();
+    let items = repo
+        .list_kit_items(USER, Some(std::slice::from_ref(&kit.id)))
+        .await
+        .unwrap();
     assert_eq!(items.len(), 3);
 
     let dup = repo
@@ -93,7 +96,10 @@ async fn kit_crud_replaces_member_sets_and_rejects_duplicates_and_stale_writes()
         .unwrap();
     assert_eq!(updated.description, "ui");
     assert!(updated.updated_at > kit.updated_at);
-    let items = repo.list_kit_items(USER, Some(&[kit.id.clone()])).await.unwrap();
+    let items = repo
+        .list_kit_items(USER, Some(std::slice::from_ref(&kit.id)))
+        .await
+        .unwrap();
     let refs: Vec<(&str, &str)> = items.iter().map(|i| (i.kind.as_str(), i.item_ref.as_str())).collect();
     // skills replaced, the mcp member untouched (its list was not sent)
     assert_eq!(refs, vec![("mcp", "mcp-1"), ("skill", "pf-ui")]);
