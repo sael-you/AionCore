@@ -264,11 +264,12 @@ pub use team_tools::{
 };
 pub use voice::{
     CreateVoiceSessionRequest, CreateVoiceSessionResponse, EndVoiceSessionRequest, UpdateVoiceSettingsRequest,
-    VoiceAgentCapabilities, VoiceAgentReply, VoiceAskRequest, VoiceAssistantAudioFinished, VoiceBudget, VoiceCallEnded,
-    VoiceCaption, VoiceClientFrame, VoiceDiffOp, VoiceDraftTap, VoiceDraftTarget, VoiceDraftUpdated, VoiceErrorFrame,
-    VoiceFollowUp, VoiceHeartbeat, VoiceHello, VoicePlaybackFinished, VoiceQuotesAttached, VoiceReadbackReady,
-    VoiceReady, VoiceSayRequest, VoiceServerCapabilities, VoiceServerFrame, VoiceSessionRef, VoiceSessionResponse,
-    VoiceSettingsResponse, VoiceSpeechOnset, VoiceStateFrame, VoiceStatusResponse, VoiceWake,
+    VoiceAgentCapabilities, VoiceAgentReply, VoiceAskRequest, VoiceAssistantAudioFinished, VoiceAttachQuotes,
+    VoiceBudget, VoiceCallEnded, VoiceCaption, VoiceClientFrame, VoiceDiffOp, VoiceDraftTap, VoiceDraftTarget,
+    VoiceDraftUpdated, VoiceErrorFrame, VoiceFollowUp, VoiceHeartbeat, VoiceHello, VoicePlaybackFinished,
+    VoiceQuotesAttached, VoiceReadbackReady, VoiceReady, VoiceSayRequest, VoiceServerCapabilities, VoiceServerFrame,
+    VoiceSessionRef, VoiceSessionResponse, VoiceSettingsResponse, VoiceSpeechOnset, VoiceStateFrame,
+    VoiceStatusResponse, VoiceWake,
 };
 pub use websocket::WebSocketMessage;
 
