@@ -114,6 +114,12 @@ pub enum Command {
     /// `SessionEvent::SessionInfo`. claude maps to `control_request{get_context_usage}`
     /// / `{get_session_cost}`. A read-only query — never moves the FSM.
     QuerySessionInfo { kind: SessionInfoKind },
+    /// Background the running tool call `call_id` (claude `tool_use_id`): its
+    /// blocking call returns a "running in the background" result and the turn
+    /// continues; the task settles later via its task notification. The outcome
+    /// arrives as `SessionEvent::ToolBackgrounded` / `ToolBackgroundRefused`.
+    /// Gated by `supported_commands.background_tool`.
+    BackgroundTool { call_id: String },
 }
 
 /// Which cumulative session-info query [`Command::QuerySessionInfo`] requests.
@@ -420,6 +426,7 @@ pub fn command_name(cmd: &Command) -> &'static str {
         Command::Rewind { .. } => "rewind",
         Command::ListCheckpoints => "list_checkpoints",
         Command::QuerySessionInfo { .. } => "query_session_info",
+        Command::BackgroundTool { .. } => "background_tool",
     }
 }
 

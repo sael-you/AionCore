@@ -266,6 +266,7 @@ pub fn acp_capabilities() -> Capabilities {
             rewind: false,
             list_checkpoints: false,
             query_session_info: false,
+            background_tool: false,
         },
         prompt_blocks: BlockSet {
             // ACP baseline mandates Text + ResourceLink; image/audio are optional
@@ -2526,6 +2527,9 @@ impl SessionBackend for AcpSessionBackend {
                 command: "list_checkpoints",
             }),
             // ACP has no cumulative usage/cost query wire → reject (cap=false).
+            Command::BackgroundTool { .. } => Err(BackendError::CommandNotSupported {
+                command: "background_tool",
+            }),
             Command::QuerySessionInfo { .. } => Err(BackendError::CommandNotSupported {
                 command: "query_session_info",
             }),

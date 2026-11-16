@@ -149,6 +149,11 @@ pub struct CommandSet {
     /// `{get_session_cost}` (live-confirmed 2.1.186); other backends have no such
     /// query wire today → false. Replies `SessionEvent::SessionInfo`.
     pub query_session_info: bool,
+    /// Move a RUNNING foreground tool call to the background so the turn goes
+    /// on (C5 / TASK-8). claude: `control_request{subtype:"background_tasks",
+    /// tool_use_id}` (schema in the CLI binary, design/background-tasks/
+    /// RESEARCH.md §1.2; live check pending). Others have no such wire → false.
+    pub background_tool: bool,
 }
 
 /// 007 §C6: which `ContentBlock` kinds `Send` accepts.

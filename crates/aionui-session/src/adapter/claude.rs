@@ -1285,6 +1285,8 @@ impl BackendAdapter for ClaudeAdapter {
                 // (live-confirmed 2.1.186) → QuerySessionInfo dispatch over the same
                 // in-band control plane, sniffed back as SessionEvent::SessionInfo.
                 query_session_info: true,
+                // TASK-8: `background_tasks{tool_use_id}` (CLI schema, RESEARCH.md §1.2).
+                background_tool: true,
             },
             prompt_blocks: crate::capability::BlockSet {
                 text: true,

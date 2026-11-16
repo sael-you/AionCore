@@ -126,6 +126,12 @@ pub trait IMockAgent: IAgentTask {
     ) -> Result<(), AgentError> {
         Ok(())
     }
+    /// Move a running tool call to the background (TASK-8). Default: unsupported.
+    fn background_tool(&self, _call_id: &str) -> Result<(), AgentError> {
+        Err(AgentError::BadRequest(
+            "background_tool is not supported by this agent".into(),
+        ))
+    }
     /// Answer a structured question card (AskUserQuestion) — the DEDICATED
     /// channel, separate from the permission confirm path (2026-08-05 ruling).
     /// `answers: None` = the user dismissed the card (a deny on the wire).
@@ -362,6 +368,20 @@ impl AgentInstance {
             Self::Session(m) => m.confirm(msg_id, call_id, data, always_allow),
             #[cfg(any(test, feature = "test-support"))]
             Self::Mock(m) => m.confirm(msg_id, call_id, data, always_allow),
+        }
+    }
+
+    /// Move a running tool call to the background (TASK-8). Only the direct-CLI
+    /// session path can (claude `background_tasks`); the session agent refuses
+    /// for backends that do not advertise it.
+    pub fn background_tool(&self, call_id: &str) -> Result<(), AgentError> {
+        match self {
+            Self::Acp(_) | Self::Aionrs(_) => Err(AgentError::BadRequest(
+                "background_tool is not supported by this agent".into(),
+            )),
+            Self::Session(m) => m.background_tool(call_id),
+            #[cfg(any(test, feature = "test-support"))]
+            Self::Mock(m) => m.background_tool(call_id),
         }
     }
 

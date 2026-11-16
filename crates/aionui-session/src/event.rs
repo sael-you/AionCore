@@ -44,6 +44,31 @@ impl UsageBreakdown {
     }
 }
 
+/// Why a `BackgroundTool` request was refused (TASK-8). The claude CLI's
+/// handler errors (RESEARCH.md §1.2): "Background tasks are disabled in this
+/// session" → `Disabled`; "not supported in this context" → `Unsupported`; a
+/// success with `backgrounded:false` (the call was no longer running) →
+/// `NotRunning`; anything else → `Failed`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BackgroundRefusal {
+    Disabled,
+    Unsupported,
+    NotRunning,
+    Failed,
+}
+
+impl BackgroundRefusal {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::Unsupported => "unsupported",
+            Self::NotRunning => "not_running",
+            Self::Failed => "failed",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)] // +Serialize/Deserialize (Addendum 2a, 007 §C2). only PartialEq — see FIX 4a above
 pub enum SessionEvent {
     // ---- command lower (FIX 2): orchestration lowers Command::Send here ----
@@ -571,6 +596,16 @@ pub enum SessionEvent {
         cost_text: Option<String>,
     },
 
+    /// `BackgroundTool` receipt (TASK-8): the running tool call `call_id` now runs
+    /// in the background (claude `background_tasks` success with
+    /// `backgrounded:true`). Its blocking call returns a "running in the
+    /// background" result and the turn goes on; the task settles later via its
+    /// task notification. Reducer no-op; capability-gated by `background_tool`.
+    ToolBackgrounded { call_id: String },
+    /// `BackgroundTool` refused (TASK-8): the call keeps running in the
+    /// foreground. Reducer no-op.
+    ToolBackgroundRefused { call_id: String, reason: BackgroundRefusal },
+
     /// Agent-generated session title (claude `generate_session_title` reply,
     /// sniffed off the success control_response; the ACP path never reaches
     /// this enum — it flows through the legacy bridge's `session_info_update`
@@ -983,6 +1018,8 @@ pub fn classify(event: &SessionEvent) -> EventClass {
         | MessageFinalized(..)
         | SessionInfo { .. }
         | SessionTitle { .. }
+        | ToolBackgrounded { .. }
+        | ToolBackgroundRefused { .. }
         | CheckpointList { .. }
         | MessageLifecycle { .. } => EventClass::BackendProduced,
     }
@@ -1016,6 +1053,8 @@ pub fn persist_tier(event: &SessionEvent) -> PersistTier {
             CheckpointList { .. } => PersistTier::Ephemeral,                     // query response, not history
             CatalogUpdated { .. } => PersistTier::Ephemeral, // async catalog discovery, re-discovered on open (not history)
             SessionInfo { .. } => PersistTier::Ephemeral, // on-demand query snapshot, re-queryable (not history)
+            // TASK-8: a BackgroundTool reply; its effect (card / tip) is persisted downstream.
+            ToolBackgrounded { .. } | ToolBackgroundRefused { .. } => PersistTier::Ephemeral,
             SessionTitle { .. } => PersistTier::Ephemeral, // applied to conversations.name by the conversation layer, not history
             SubagentDetail { .. } => PersistTier::Ephemeral, // transient per-agent progress (roster fill, re-derivable)
             // the phase list is re-declared on the next run's first progress frame
@@ -1294,6 +1333,23 @@ mod additive_tests {
                 "SessionTitle",
                 SessionEvent::SessionTitle {
                     title: "Fix login bug".into(),
+                },
+                BackendProduced,
+                Ephemeral,
+            ),
+            (
+                "ToolBackgrounded",
+                SessionEvent::ToolBackgrounded {
+                    call_id: "toolu_1".into(),
+                },
+                BackendProduced,
+                Ephemeral,
+            ),
+            (
+                "ToolBackgroundRefused",
+                SessionEvent::ToolBackgroundRefused {
+                    call_id: "toolu_1".into(),
+                    reason: BackgroundRefusal::Disabled,
                 },
                 BackendProduced,
                 Ephemeral,

@@ -750,6 +750,7 @@ pub fn codex_capabilities() -> Capabilities {
             // codex has a usage notification (thread/tokenUsage/updated) but no
             // on-demand cumulative context/cost QUERY wire → false.
             query_session_info: false,
+            background_tool: false,
         },
         prompt_blocks: BlockSet {
             text: true,
@@ -4568,6 +4569,9 @@ impl SessionBackend for CodexSessionBackend {
             }),
             // codex streams per-turn usage (thread/tokenUsage/updated) but has no
             // on-demand cumulative context/cost QUERY wire → reject (cap=false).
+            Command::BackgroundTool { .. } => Err(BackendError::CommandNotSupported {
+                command: "background_tool",
+            }),
             Command::QuerySessionInfo { .. } => Err(BackendError::CommandNotSupported {
                 command: "query_session_info",
             }),

@@ -157,6 +157,7 @@ pub fn antigravity_capabilities() -> Capabilities {
             rewind: false,
             list_checkpoints: false,
             query_session_info: false,
+            background_tool: false,
         },
         prompt_blocks: BlockSet {
             text: true,
@@ -986,6 +987,9 @@ impl SessionBackend for AntigravitySessionBackend {
             }),
             Command::Steer { .. } => Err(BackendError::CommandNotSupported { command: "steer" }),
             Command::Rewind { .. } => Err(BackendError::CommandNotSupported { command: "rewind" }),
+            Command::BackgroundTool { .. } => Err(BackendError::CommandNotSupported {
+                command: "background_tool",
+            }),
             Command::AnswerAuth { .. } => Err(BackendError::CommandNotSupported { command: "answer_auth" }),
             _ => Err(BackendError::CommandNotSupported { command: "unsupported" }),
         }
