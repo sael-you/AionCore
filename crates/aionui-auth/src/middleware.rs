@@ -3,7 +3,7 @@
 use std::sync::Arc;
 
 use axum::extract::{Request, State};
-use axum::http::StatusCode;
+use axum::http::{Method, StatusCode};
 use axum::middleware::Next;
 use axum::response::Response;
 
@@ -37,7 +37,19 @@ pub const RUNTIME_CONVERSATION_ID_HEADER: &str = "x-aionui-conversation-id";
 /// token bound to exactly this (user_id, conversation_id) pair.
 pub trait IRuntimeTokenVerifier: Send + Sync {
     fn verify_conversation_helper(&self, token: &str, user_id: &str, conversation_id: &str) -> bool;
+
+    /// Route scope of the runtime-token channel (card C13): whether a request
+    /// authenticated by a valid runtime token may call `method path`. The
+    /// composition layer owns the allowlist (the routes the agent-facing
+    /// helper CLIs call); everything else is refused with 403
+    /// `RUNTIME_SCOPE`, so a runtime token never acts with full owner scope.
+    /// `path` is the request path without the query string.
+    fn allows_route(&self, method: &Method, path: &str) -> bool;
 }
+
+/// Error code returned when a valid runtime token calls a route outside its
+/// allowlist ([`IRuntimeTokenVerifier::allows_route`]).
+pub const RUNTIME_SCOPE_ERROR_CODE: &str = "RUNTIME_SCOPE";
 
 /// Authenticated user injected into request extensions by the auth middleware.
 ///
@@ -211,6 +223,23 @@ async fn runtime_token_channel(state: &AuthState, mut request: Request, next: Ne
 
     if !verifier.verify_conversation_helper(&token, &user_id, &conversation_id) {
         return Err(ApiError::Unauthorized("Invalid runtime token".into()));
+    }
+
+    // C13: a valid runtime token only reaches the routes the agent-facing
+    // helper CLIs call; it never acts with the owner's full scope.
+    if !verifier.allows_route(request.method(), request.uri().path()) {
+        tracing::warn!(
+            method = %request.method(),
+            path = request.uri().path(),
+            conversation_id = %conversation_id,
+            "runtime token refused outside its route scope"
+        );
+        return Err(ApiError::coded(
+            StatusCode::FORBIDDEN,
+            RUNTIME_SCOPE_ERROR_CODE,
+            "Runtime token is not allowed on this route.",
+            None,
+        ));
     }
 
     let user = state
