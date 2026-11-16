@@ -119,7 +119,9 @@ impl McpMarketService {
             .find_kit(user_id, id)
             .await?
             .ok_or_else(|| kit_error(KitErrorCode::NotFound, format!("kit {id} not found")))?;
-        let items = kits.list_kit_items(user_id, Some(&[row.id.clone()])).await?;
+        let items = kits
+            .list_kit_items(user_id, Some(std::slice::from_ref(&row.id)))
+            .await?;
         let instances = self.instances_by_id(user_id).await?;
         Ok(kit_response(&row, &items, &instances))
     }
