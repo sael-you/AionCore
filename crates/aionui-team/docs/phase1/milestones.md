@@ -123,7 +123,7 @@ M0 共识冻结 → M1 W1 完工 → M2 W2 骨架 → M3 W2 闭环跑通 → M4 
 **时点**：M2 后 2 天。
 
 **产出物清单**：
-- ⬜ D11 smoke test `crates/aionui-app/tests/team_phase1_smoke.rs` 合并
+- ⬜ D11 smoke test `crates/aionui-app/tests/it/team_phase1_smoke.rs` 合并
 - ⬜ 本地机器安装 `claude --experimental-acp` 并跑通 smoke
 - ⬜ 测试日志 / WS 事件流贴到 phase1 PR
 

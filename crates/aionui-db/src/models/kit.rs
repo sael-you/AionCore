@@ -9,6 +9,8 @@ pub struct KitRow {
     pub description: String,
     /// `K1`..`K12` for the kits seeded from KITS.md; `None` for owner kits.
     pub builtin_key: Option<String>,
+    /// C28 (migration 908): `Some` = the project kit of this project.
+    pub project_id: Option<String>,
     pub created_at: TimestampMs,
     pub updated_at: TimestampMs,
     pub deleted_at: Option<TimestampMs>,

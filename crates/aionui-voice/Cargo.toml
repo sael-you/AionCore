@@ -47,30 +47,5 @@ tokio = { workspace = true, features = ["test-util"] }
 tower = { workspace = true, features = ["util"] }
 tracing-subscriber.workspace = true
 
-[[test]]
-name = "voice_http_e2e"
-required-features = ["voice-test"]
-
-[[test]]
-name = "voice_call_lifecycle"
-required-features = ["voice-test"]
-
-[[test]]
-name = "voice_admission_races"
-required-features = ["voice-test"]
-
-[[test]]
-name = "voice_drafts"
-required-features = ["voice-test"]
-
-[[test]]
-name = "voice_speech_adapters"
-required-features = ["voice-test"]
-
-[[test]]
-name = "voice_conversation_mode"
-required-features = ["voice-test"]
-
-[[test]]
-name = "voice_minimax_cascade"
-required-features = ["voice-test"]
+# Integration tests: one binary, tests/it/main.rs; its voice modules are gated on
+# `voice-test` (run with `--features voice-test`).

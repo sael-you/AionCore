@@ -429,15 +429,15 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn read_propagates_real_io_errors() {
-        use std::os::unix::fs::PermissionsExt;
         let dir = tempfile::tempdir().unwrap();
         let path = agent_process_registry_path(dir.path());
-        fs::create_dir_all(path.parent().unwrap()).unwrap();
-        fs::write(&path, br#"{"version":1,"processes":[]}"#).unwrap();
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o000)).unwrap();
+        // A directory at the registry path: opening succeeds, reading fails
+        // with EISDIR — a real I/O error that is neither NotFound nor
+        // corruption, and (unlike a mode-000 file) one root cannot bypass.
+        fs::create_dir_all(&path).unwrap();
 
         let err = read_registry_file(&path).unwrap_err();
-        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+        assert_eq!(err.kind(), io::ErrorKind::IsADirectory);
     }
 
     #[test]

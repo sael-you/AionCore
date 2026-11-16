@@ -14,7 +14,8 @@ use axum::routing::{delete, get, post};
 
 use aionui_api_types::{
     ApiResponse, AttachKitItemRequest, CreateKitRequest, KitAttachmentResponse, KitEffectiveQuery,
-    KitEffectiveSetResponse, KitResponse, ListKitAttachmentsQuery, UpdateKitRequest,
+    KitEffectiveSetResponse, KitImportPreviewResponse, KitImportRequest, KitImportResponse, KitResponse,
+    ListKitAttachmentsQuery, ListKitsQuery, UpdateKitRequest,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -27,6 +28,7 @@ pub fn kit_read_routes(state: McpMarketRouterState) -> Router {
         .route("/api/kits/attachments", get(list_attachments))
         .route("/api/kits/effective", get(effective))
         .route("/api/kits/{id}", get(get_kit))
+        .route("/api/projects/{project_id}/kit", get(get_project_kit))
         .with_state(state)
 }
 
@@ -36,6 +38,10 @@ pub fn kit_write_routes(state: McpMarketRouterState) -> Router {
         .route("/api/kits/attachments", post(attach))
         .route("/api/kits/attachments/{id}", delete(detach))
         .route("/api/kits/{id}", axum::routing::put(update_kit).delete(delete_kit))
+        // C28 §5: both on the write stack (session channel + OriginGuard): the
+        // preview reads a file that holds credentials, even if it returns none.
+        .route("/api/projects/{project_id}/kit/import-preview", get(import_preview))
+        .route("/api/projects/{project_id}/kit/import", post(import))
         .with_state(state)
 }
 
@@ -44,9 +50,28 @@ pub fn kit_write_routes(state: McpMarketRouterState) -> Router {
 async fn list_kits(
     State(state): State<McpMarketRouterState>,
     Extension(user): Extension<CurrentUser>,
+    Query(query): Query<ListKitsQuery>,
 ) -> Result<Json<ApiResponse<Vec<KitResponse>>>, ApiError> {
-    let kits = state.market.list_kits(&user.id).await.map_err(market_api_error)?;
+    let kits = state
+        .market
+        .list_kits(&user.id, query)
+        .await
+        .map_err(market_api_error)?;
     Ok(Json(ApiResponse::ok(kits)))
+}
+
+/// C28: the project kit of a project, or 404 `KIT_NOT_FOUND`.
+async fn get_project_kit(
+    State(state): State<McpMarketRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(project_id): Path<String>,
+) -> Result<Json<ApiResponse<KitResponse>>, ApiError> {
+    let kit = state
+        .market
+        .get_project_kit(&user.id, &project_id)
+        .await
+        .map_err(market_api_error)?;
+    Ok(Json(ApiResponse::ok(kit)))
 }
 
 async fn get_kit(
@@ -155,4 +180,40 @@ async fn detach(
         .await
         .map_err(market_api_error)?;
     Ok(Json(ApiResponse::success()))
+}
+
+/// C28 §5: which `.mcp.json` servers match the catalogue and which secret
+/// fields the file holds (names and found flags only).
+async fn import_preview(
+    State(state): State<McpMarketRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    channel: Channel,
+    Path(project_id): Path<String>,
+) -> Result<Json<ApiResponse<KitImportPreviewResponse>>, ApiError> {
+    require_session(&channel)?;
+    let preview = state
+        .market
+        .kit_import_preview(&user.id, &project_id)
+        .await
+        .map_err(market_api_error)?;
+    Ok(Json(ApiResponse::ok(preview)))
+}
+
+/// C28 §5: create catalogue instances with the file's credentials and add
+/// them to the project kit.
+async fn import(
+    State(state): State<McpMarketRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    channel: Channel,
+    Path(project_id): Path<String>,
+    body: Result<Json<KitImportRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<KitImportResponse>>, ApiError> {
+    require_session(&channel)?;
+    let Json(req) = body.map_err(ApiError::from)?;
+    let result = state
+        .market
+        .kit_import(&user.id, &project_id, req)
+        .await
+        .map_err(market_api_error)?;
+    Ok(Json(ApiResponse::ok(result)))
 }

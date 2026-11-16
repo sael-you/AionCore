@@ -1,0 +1,112 @@
+name: Gate
+
+# Pre-merge gate on GitHub's free runners (public repo), TASK-110: the same checks as the local gate
+# (fmt, clippy, migration check, the whole test suite) without holding the container's build lock.
+# Tests are built once into a nextest archive and run on 4 partitioned runners.
+# Deploys are NOT triggered from here: youssef-build.yml builds and deploys pushes to `youssef`.
+#
+# Third-party actions are pinned by commit SHA (tag in the trailing comment).
+
+on:
+  push:
+    branches: ['train*', 'wip/**']
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: gate-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '0'
+  RUST_TOOLCHAIN: '1.95.0'      # = rust-toolchain.toml
+  NEXTEST_VERSION: '0.9.152'    # = .config/nextest.toml `recommended`
+  # The voice e2e suites only compile with this feature (tests/it/main.rs of aionui-voice).
+  TEST_FEATURES: aionui-voice/voice-test
+
+jobs:
+  fmt:
+    name: fmt
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal -c rustfmt
+      - run: cargo fmt --all -- --check
+
+  migration-check:
+    name: migration-check
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0   # the immutability check compares with origin/main
+      - run: bash scripts/migration/check-immutability.test.sh
+      - run: bash scripts/migration/check-immutability.sh
+
+  clippy:
+    name: clippy
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal -c clippy
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: clippy
+      - run: cargo clippy --workspace --all-targets --features "$TEST_FEATURES" -- -D warnings
+
+  build-tests:
+    name: build tests + doctests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Free disk space (the test build is large)
+        run: sudo rm -rf /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL && df -h /
+      - run: rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: tests
+      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
+        with:
+          tool: nextest@${{ env.NEXTEST_VERSION }}
+      - name: Build the test archive
+        run: cargo nextest archive --workspace --features "$TEST_FEATURES" --archive-file nextest-archive.tar.zst
+      - uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: nextest-archive
+          path: nextest-archive.tar.zst
+          retention-days: 1
+      - name: Doctests (nextest does not run them)
+        run: cargo test --workspace --doc --features "$TEST_FEATURES"
+
+  test:
+    name: test ${{ matrix.partition }}/4
+    needs: build-tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        partition: [1, 2, 3, 4]
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+      - uses: taiki-e/install-action@ab49d3c64680143e184118bed66a46419fc15519 # v2.90.5
+        with:
+          tool: nextest@${{ env.NEXTEST_VERSION }}
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          name: nextest-archive
+      - name: Git identity for tests that commit
+        run: git config --global user.name gate && git config --global user.email gate@example.invalid
+      - name: Run partition ${{ matrix.partition }}/4
+        run: >-
+          cargo nextest run --profile ci
+          --archive-file nextest-archive.tar.zst --workspace-remap .
+          --partition count:${{ matrix.partition }}/4

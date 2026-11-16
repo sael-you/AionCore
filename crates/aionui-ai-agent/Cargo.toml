@@ -70,7 +70,5 @@ sqlx.workspace = true
 
 # Integration tests under `tests/` need the `AgentInstance::Mock` variant.
 # Unlike unit tests (which see `cfg(test)` on the library), integration
-# tests compile as separate binaries and must opt in via a feature.
-[[test]]
-name = "agent_types_integration"
-required-features = ["test-support"]
+# tests compile as separate binaries and must opt in via a feature: the
+# `agent_types_integration` module of tests/it/main.rs is gated on `test-support`.

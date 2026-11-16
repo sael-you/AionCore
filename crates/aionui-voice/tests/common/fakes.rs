@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use aionui_voice::drafts::{SpeechFactory, SpeechKit};
 use aionui_voice::{
     Clip, ClipVoice, ConversationInfo, ConversationPort, ConversationStatus, MessageHit, ProjectInfo, RawRefinement,
-    RefineInput, RefinerPort, SendOutcome, SendProbe, SynthPort, TranscribePort,
+    RefineInput, RefinerPort, SendOutcome, SendProbe, SynthPort, TranscribePort, UserMessage,
 };
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -23,6 +23,9 @@ pub struct ConversationState {
     pub projects: Vec<ProjectInfo>,
     pub statuses: std::collections::HashMap<String, ConversationStatus>,
     pub replies: std::collections::HashMap<String, String>,
+    /// Latest user-side message per conversation (voice sends update it);
+    /// none recorded = the owner typed the last one.
+    pub user_messages: std::collections::HashMap<String, UserMessage>,
     /// Every send attempt (idempotency keys included).
     pub sends: Vec<SentMessage>,
     /// Next send outcome override (`Busy`, `Rejected`…); `None` → delivered.
@@ -55,6 +58,17 @@ impl FakeConversations {
             name: name.into(),
             root: root.map(str::to_owned),
         });
+    }
+
+    /// The latest user-side message of a conversation (who started its turn).
+    pub fn set_user_message(&self, id: &str, text: &str, hidden: bool) {
+        self.state.lock().unwrap().user_messages.insert(
+            id.into(),
+            UserMessage {
+                text: text.into(),
+                hidden,
+            },
+        );
     }
 
     pub fn set_status(&self, id: &str, status: ConversationStatus) {
@@ -104,6 +118,16 @@ impl ConversationPort for FakeConversations {
         Ok(self.state.lock().unwrap().replies.get(conversation_id).cloned())
     }
 
+    async fn last_user_message(&self, _user_id: &str, conversation_id: &str) -> Result<Option<UserMessage>, String> {
+        let state = self.state.lock().unwrap();
+        Ok(Some(state.user_messages.get(conversation_id).cloned().unwrap_or(
+            UserMessage {
+                text: "typed by the owner".into(),
+                hidden: false,
+            },
+        )))
+    }
+
     async fn search_messages(&self, _user_id: &str, keyword: &str, _limit: usize) -> Result<Vec<MessageHit>, String> {
         let state = self.state.lock().unwrap();
         Ok(state
@@ -131,6 +155,13 @@ impl ConversationPort for FakeConversations {
         idempotency_key: &str,
     ) -> SendOutcome {
         let mut state = self.state.lock().unwrap();
+        state.user_messages.insert(
+            conversation_id.into(),
+            UserMessage {
+                text: text.into(),
+                hidden: false,
+            },
+        );
         state.sends.push(SentMessage {
             conversation_id: conversation_id.into(),
             text: text.into(),

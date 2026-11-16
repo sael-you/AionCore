@@ -51,6 +51,10 @@ pub struct ProbePolicy {
     pub inline_budget: std::time::Duration,
     pub recheck_budget: std::time::Duration,
     pub slow_threshold_ms: i64,
+    /// Run `<cli> --version` for builtin agents found on PATH. `false` keeps
+    /// the PATH lookup but settles the row without launching the CLI, the
+    /// same outcome as the npx skip-list (`version_checked: false`).
+    pub version_probe: bool,
 }
 
 impl Default for ProbePolicy {
@@ -59,6 +63,20 @@ impl Default for ProbePolicy {
             inline_budget: crate::cli_probe::CLI_VERSION_TIMEOUT,
             recheck_budget: crate::cli_probe::CLI_VERSION_RECHECK_TIMEOUT,
             slow_threshold_ms: 2_000,
+            version_probe: true,
+        }
+    }
+}
+
+impl ProbePolicy {
+    /// No `--version` launches. For integration tests that build the whole
+    /// app: they must not start whichever real agent CLIs the host has
+    /// installed (seconds per app, and host-dependent); the probe itself is
+    /// covered by the registry and `cli_probe` unit tests.
+    pub fn without_version_probe() -> Self {
+        Self {
+            version_probe: false,
+            ..Self::default()
         }
     }
 }
@@ -954,6 +972,10 @@ async fn validate_cli_availability(
     let Some(binary) = crate::cli_probe::command_name(&meta).map(str::to_owned) else {
         return (meta, reason, InlineProbeOutcome::NotProbed);
     };
+
+    if !policy.version_probe {
+        return (meta, None, InlineProbeOutcome::Settled);
+    }
 
     if has_slow_probe_history(&meta, &policy) {
         return (meta, None, InlineProbeOutcome::PendingRecheck);
