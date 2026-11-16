@@ -19,7 +19,7 @@ pub mod fakes;
 use axum::Router;
 use axum::body::Body;
 use axum::http::{Request, Response};
-pub use fakes::{FakeConversations, FakeSpeech};
+pub use fakes::{FakeConversations, FakeSpeech, GatedSettings};
 use http_body_util::BodyExt;
 use serde_json::Value;
 use tokio::net::TcpListener;
@@ -94,6 +94,7 @@ pub struct Harness {
     pub users: Arc<dyn IUserRepository>,
     pub auth_state: AuthState,
     pub voice_repo: Arc<SqliteVoiceRepository>,
+    pub settings_gate: Arc<GatedSettings>,
 }
 
 impl Harness {
@@ -117,11 +118,15 @@ impl Harness {
         let voice_repo = Arc::new(SqliteVoiceRepository::new(db.pool().clone()));
         let conversations = Arc::new(FakeConversations::default());
         let speech = Arc::new(FakeSpeech::default());
+        let settings_gate = Arc::new(GatedSettings {
+            inner: voice_repo.clone(),
+            slow_next: Default::default(),
+        });
         let service = VoiceService::new(VoiceServiceDeps {
             conversations: conversations.clone(),
             drafts: voice_repo.clone(),
             speech: speech.clone(),
-            settings: voice_repo.clone(),
+            settings: settings_gate.clone(),
             sessions: voice_repo.clone(),
             audit: voice_repo.clone(),
             credentials: Arc::new(FakeCredentials),
@@ -156,6 +161,7 @@ impl Harness {
             users,
             auth_state,
             voice_repo,
+            settings_gate,
         }
     }
 

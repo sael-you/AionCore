@@ -19,6 +19,8 @@ pub(crate) struct VoiceConversationAdapter {
     pub service: ConversationService,
     pub task_manager: Arc<dyn IWorkerTaskManager>,
     pub sidebar: Arc<dyn ISidebarStore>,
+    /// Per draft key: one conversation create at a time.
+    pub create_locks: std::sync::Mutex<std::collections::HashMap<String, Arc<tokio::sync::Mutex<()>>>>,
 }
 
 const LIST_LIMIT: u32 = 200;
@@ -213,6 +215,16 @@ impl ConversationPort for VoiceConversationAdapter {
         title: &str,
         draft_key: &str,
     ) -> Result<String, String> {
+        // One create per draft key at a time: a concurrent retry waits and
+        // then finds the conversation by its key.
+        let lock = self
+            .create_locks
+            .lock()
+            .map_err(|_| "voice create lock poisoned".to_owned())?
+            .entry(draft_key.to_owned())
+            .or_default()
+            .clone();
+        let _guard = lock.lock().await;
         let conversations = self.list(user_id).await?;
         if let Some(existing) = conversations
             .iter()
@@ -227,9 +239,16 @@ impl ConversationPort for VoiceConversationAdapter {
             .filter(|c| project_id.is_none() || c.project_id.as_deref() == project_id)
             .max_by_key(|c| c.modified_at)
             .ok_or_else(|| "no conversation in that project to copy the setup from".to_owned())?;
+        // The key is stored by the create itself: a crash can never leave a
+        // conversation without it (a retry would then create a duplicate).
+        let mut keys = serde_json::Map::new();
+        keys.insert(
+            "voice_draft_key".to_owned(),
+            serde_json::Value::String(draft_key.to_owned()),
+        );
         let created = self
             .service
-            .create_for_conversation_helper(
+            .create_for_conversation_helper_with_extra(
                 user_id,
                 &source.id,
                 &ConversationCreateRequest {
@@ -239,14 +258,7 @@ impl ConversationPort for VoiceConversationAdapter {
                     detached: true,
                     report_to_parent: false,
                 },
-            )
-            .await
-            .map_err(|e| e.to_string())?;
-        self.service
-            .update_extra(
-                user_id,
-                &created.id,
-                serde_json::json!({ "voice_draft_key": draft_key }),
+                &keys,
             )
             .await
             .map_err(|e| e.to_string())?;

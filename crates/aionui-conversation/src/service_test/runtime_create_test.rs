@@ -173,6 +173,37 @@ async fn inherits_the_assistant_snapshot_and_the_aionrs_model_verbatim() {
     assert_eq!(snapshot.assistant_id, "asst-aionrs");
 }
 
+/// TASK-66: extra keys are stored by the create itself (one write), so a
+/// retry that looks the conversation up by them never creates a duplicate.
+#[tokio::test]
+async fn extra_keys_are_stored_by_the_create_itself() {
+    let (svc, _broadcaster, repo) = make_service_with_mock_task_manager(Arc::new(MockTaskManager::new()));
+    let workspace = ensure_test_workspace_path();
+    insert_caller(
+        &repo,
+        "caller-voice",
+        "acp",
+        json!({ "workspace": workspace, "backend": "claude", "agent_id": "2d23ff1c", "agent_source": "builtin" }),
+        None,
+    )
+    .await;
+    let mut keys = serde_json::Map::new();
+    keys.insert("voice_draft_key".to_owned(), json!("vd_1:1"));
+    keys.insert("workspace".to_owned(), json!("/elsewhere"));
+    let created = svc
+        .create_for_conversation_helper_with_extra(USER, "caller-voice", &create_req("Voice task", None, None), &keys)
+        .await
+        .unwrap();
+    let row = repo.get(USER, &created.id).await.unwrap().unwrap();
+    let extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap();
+    assert_eq!(extra["voice_draft_key"], json!("vd_1:1"));
+    assert_eq!(
+        extra["workspace"],
+        json!(workspace),
+        "extra keys never override the create's own"
+    );
+}
+
 #[tokio::test]
 async fn an_explicit_workspace_is_used_instead_of_the_callers() {
     let (svc, _broadcaster, repo) = make_service_with_mock_task_manager(Arc::new(MockTaskManager::new()));

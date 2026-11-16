@@ -743,3 +743,105 @@ async fn a_page_that_connects_late_gets_the_pending_draft_card() {
     }
     assert!(!frames.iter().any(|f| f["name"] == "voice.draftUpdated"), "{frames:?}");
 }
+
+/// TASK-63: `ask` shares the `say` budget and a conversation has one open ask.
+#[tokio::test]
+async fn agent_ask_is_rate_limited_and_one_per_conversation() {
+    let mut c = call().await;
+    let (draft, _) = c.request_draft("tell the kanban build to report back", "call_q").await;
+    ws_send(
+        &mut c.ws,
+        json!({"name": "voice.confirmTap", "data": {"voiceSessionId": c.session,
+        "draftId": draft["draftId"], "version": 1, "hash": draft["hash"]}}),
+    )
+    .await;
+    c.wait_state(draft["draftId"].as_str().unwrap(), 1, "sending").await;
+
+    // An open ask blocks a second one for the same conversation.
+    let service = c.h.service.clone();
+    let uid = c.user.id.clone();
+    let open = tokio::spawn(async move {
+        service
+            .agent_ask(&uid, "c-build", "Which port should I use?", Duration::from_secs(3))
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let second =
+        c.h.service
+            .agent_ask(&c.user.id, "c-build", "And which host?", Duration::from_millis(200))
+            .await;
+    assert!(
+        matches!(second, Err(aionui_voice::VoiceError::RateLimited)),
+        "{second:?}"
+    );
+    assert_eq!(open.await.unwrap().unwrap().status, "pending");
+
+    // Asks count against the per-minute `say` budget (2 used above).
+    for _ in 0..4 {
+        c.h.service
+            .agent_say(&c.user.id, "c-build", "still running")
+            .await
+            .unwrap();
+    }
+    let over =
+        c.h.service
+            .agent_ask(&c.user.id, "c-build", "Another question?", Duration::from_millis(200))
+            .await;
+    assert!(matches!(over, Err(aionui_voice::VoiceError::RateLimited)), "{over:?}");
+}
+
+/// TASK-64: while a draft waits for its spoken confirmation, "send it" is the
+/// draft's, never the answer to a pending agent ask.
+#[tokio::test]
+async fn a_pending_ask_never_swallows_the_draft_confirmation() {
+    let mut c = call().await;
+    // Make c-build a voice conversation (one send), so it may ask.
+    let (first, _) = c.request_draft("tell the kanban build to report back", "call_a").await;
+    ws_send(
+        &mut c.ws,
+        json!({"name": "voice.confirmTap", "data": {"voiceSessionId": c.session,
+        "draftId": first["draftId"], "version": 1, "hash": first["hash"]}}),
+    )
+    .await;
+    c.wait_state(first["draftId"].as_str().unwrap(), 1, "sending").await;
+
+    let (draft, readback) = c
+        .request_draft("tell the kanban build to run the linter", "call_b")
+        .await;
+    let (id, version) = (
+        draft["draftId"].as_str().unwrap().to_owned(),
+        draft["version"].as_i64().unwrap(),
+    );
+    let service = c.h.service.clone();
+    let uid = c.user.id.clone();
+    let ask = tokio::spawn(async move {
+        service
+            .agent_ask(&uid, "c-build", "Which port should I use?", Duration::from_secs(4))
+            .await
+    });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let rb = readback["readbackId"].as_str().unwrap().to_owned();
+    ws_send(
+        &mut c.ws,
+        json!({"name": "voice.playbackFinished",
+        "data": {"voiceSessionId": c.session, "readbackId": rb, "tEnd": 10.0}}),
+    )
+    .await;
+    ws_send(
+        &mut c.ws,
+        json!({"name": "voice.speechOnset", "data": {"voiceSessionId": c.session, "t": 10.6}}),
+    )
+    .await;
+    c.draft_in("pending_transcript").await;
+    c.h.fake.push_event(
+        &c.call_id,
+        json!({"type": "input_audio_buffer.speech_started", "audio_start_ms": 100}),
+    );
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    c.say("send it");
+    c.draft_in("committing").await;
+    c.wait_state(&id, version, "sending").await;
+    let answer = ask.await.unwrap().unwrap();
+    assert_eq!(answer.status, "pending", "the confirmation was not taken as the answer");
+}

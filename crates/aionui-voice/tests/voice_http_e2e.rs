@@ -483,3 +483,33 @@ async fn kill_switch_hangs_up_closes_sockets_and_refuses_sessions() {
     assert_eq!(status, 403, "{body}");
     assert_eq!(body["code"], "VOICE_DISABLED");
 }
+
+/// TASK-62: a settings update that read `enabled: true` before the kill switch
+/// must not land after it and turn voice back on.
+#[tokio::test]
+async fn a_concurrent_settings_update_never_re_enables_voice_after_the_kill_switch() {
+    let h = Harness::new(Options::default()).await;
+    let user = h.enabled_user("alice").await;
+    h.settings_gate.slow_next_read();
+    let budget = h.send(
+        Req::browser("PUT", "/api/voice/settings", &user)
+            .json(json!({"daily_budget_usd": 3.0}))
+            .build(),
+    );
+    let kill = async {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        h.send(
+            Req::browser("PUT", "/api/voice/settings", &user)
+                .json(json!({"enabled": false}))
+                .build(),
+        )
+        .await
+    };
+    let ((budget_status, budget_body), (kill_status, kill_body)) = tokio::join!(budget, kill);
+    assert_eq!(budget_status, 200, "{budget_body}");
+    assert_eq!(kill_status, 200, "{kill_body}");
+    let (status, body) = h.send(Req::browser("GET", "/api/voice/settings", &user).build()).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["data"]["enabled"], false, "the kill switch wins: {body}");
+    assert_eq!(body["data"]["daily_budget_usd"], 3.0, "both changes applied: {body}");
+}

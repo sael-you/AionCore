@@ -84,6 +84,7 @@ impl VoiceService {
             .await;
         if !self.has_live_call(user_id)
             && let Some(clip_id) = clip
+            && self.inner.wake_limiter.check_and_increment(user_id).is_ok()
         {
             self.inner.sockets.send_user(
                 user_id,
@@ -127,7 +128,13 @@ impl VoiceService {
         if self.inner.sockets.count_for_user(user_id) == 0 {
             return Ok(reply("no_device", None, None));
         }
-        let id = self.inner.asks.create(user_id, conversation_id);
+        // Same budget as `say` (each ask is spoken), one open ask per conversation.
+        if self.inner.say_limiter.check_and_increment(conversation_id).is_err() {
+            return Err(VoiceError::RateLimited);
+        }
+        let Some(id) = self.inner.asks.create(user_id, conversation_id) else {
+            return Err(VoiceError::RateLimited);
+        };
         tracing::info!(user_id, conversation_id, ask_id = %id, "voice agent ask");
         // While the ask is pending the model may not act on the answer.
         let calls: Vec<_> = self

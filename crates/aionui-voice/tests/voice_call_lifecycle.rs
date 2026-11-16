@@ -698,3 +698,19 @@ async fn logs_never_contain_transcripts_or_keys() {
     assert!(!logs.contains(API_KEY_PREFIX), "API key leaked into logs");
     assert!(!logs.contains(&user.token), "session token leaked into logs");
 }
+
+/// TASK-65: a call recovered after a restart whose device never reconnects
+/// still goes stale (liveness counts from the recovery).
+#[tokio::test]
+async fn a_recovered_call_without_a_device_goes_stale() {
+    let first = Harness::new(Options::default()).await;
+    let user = first.enabled_user("alice").await;
+    let (session, _) = live_session(&first, &user).await;
+    first.service.simulate_crash();
+    let mut timings = fast_timings();
+    timings.heartbeat_stale = Duration::from_millis(400);
+    let second = Harness::with_db(first.db.clone(), first.fake.clone(), Options { timings }).await;
+    assert_eq!(second.service.recover_open_sessions().await, 1);
+    let row = second.wait_ended(&user, &session).await;
+    assert_eq!(row.end_reason.as_deref(), Some("device_stale"));
+}

@@ -106,8 +106,14 @@ pub struct FollowUpWatcher {
     pub wake_limiter: Arc<RateLimiter>,
 }
 
-/// Server wakes per user per hour (§3.4 default).
+/// Server wakes per user per hour (§3.4 default), follow-ups and agent
+/// `say`/`ask` together.
 pub const MAX_WAKES_PER_HOUR: u32 = 6;
+
+/// The per-user wake limiter shared by follow-ups and agent lines.
+pub fn wake_limiter() -> Arc<RateLimiter> {
+    Arc::new(RateLimiter::new(MAX_WAKES_PER_HOUR, Duration::from_secs(3600)))
+}
 
 impl FollowUpWatcher {
     pub fn new(
@@ -115,13 +121,14 @@ impl FollowUpWatcher {
         drafts: Arc<DraftEngine>,
         sockets: VoiceSockets,
         presence: Arc<dyn CallPresence>,
+        wake_limiter: Arc<RateLimiter>,
     ) -> Self {
         Self {
             bus,
             drafts,
             sockets,
             presence,
-            wake_limiter: Arc::new(RateLimiter::new(MAX_WAKES_PER_HOUR, Duration::from_secs(3600))),
+            wake_limiter,
         }
     }
 

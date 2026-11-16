@@ -43,8 +43,16 @@ pub struct AskRegistry {
 }
 
 impl AskRegistry {
-    pub fn create(&self, user_id: &str, conversation_id: &str) -> String {
+    /// A new pending ask, or `None` while this conversation already has one.
+    pub fn create(&self, user_id: &str, conversation_id: &str) -> Option<String> {
         self.expire();
+        if self
+            .items
+            .iter()
+            .any(|i| i.conversation_id == conversation_id && i.user_id == user_id && i.status == AskStatus::Pending)
+        {
+            return None;
+        }
         let id = aionui_common::generate_prefixed_id("ask");
         self.items.insert(
             id.clone(),
@@ -57,7 +65,7 @@ impl AskRegistry {
             },
         );
         self.queue.entry(user_id.to_owned()).or_default().push_back(id.clone());
-        id
+        Some(id)
     }
 
     fn expire(&self) {
@@ -68,6 +76,16 @@ impl AskRegistry {
             }
         }
         self.items.retain(|_, item| item.created.elapsed() < ASK_TTL * 2);
+        // Queues keep only asks that can still be answered.
+        for mut queue in self.queue.iter_mut() {
+            queue.retain(|id| self.is_pending(id));
+        }
+        self.queue.retain(|_, queue| !queue.is_empty());
+    }
+
+    #[cfg(test)]
+    fn queued(&self) -> usize {
+        self.queue.iter().map(|q| q.len()).sum()
     }
 
     /// Whether the user has an unanswered ask (the model may not act on the
@@ -140,7 +158,7 @@ mod tests {
     #[tokio::test]
     async fn ask_is_answered_by_the_next_utterance() {
         let registry = Arc::new(AskRegistry::default());
-        let id = registry.create("u1", "c1");
+        let id = registry.create("u1", "c1").unwrap();
         assert!(registry.has_pending("u1"));
         let waiter = {
             let registry = registry.clone();
@@ -154,9 +172,24 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn one_open_ask_per_conversation_and_the_queue_is_pruned() {
+        let registry = AskRegistry::default();
+        let first = registry.create("u1", "c1").unwrap();
+        assert!(registry.create("u1", "c1").is_none(), "c1 already has an open ask");
+        assert!(registry.create("u1", "c2").is_some(), "another conversation may ask");
+        assert_eq!(registry.answer_next("u1", "yes").as_deref(), Some(first.as_str()));
+        assert!(registry.create("u1", "c1").is_some(), "answered: c1 may ask again");
+        // Unanswered asks expire and leave the queue.
+        tokio::time::advance(ASK_TTL * 2).await;
+        registry.expire();
+        assert_eq!(registry.queued(), 0);
+        assert!(!registry.has_pending("u1"));
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn wait_times_out_as_pending_and_is_caller_bound() {
         let registry = AskRegistry::default();
-        let id = registry.create("u1", "c1");
+        let id = registry.create("u1", "c1").unwrap();
         assert_eq!(
             registry.wait("u1", "c1", &id, Duration::from_secs(1)).await,
             Some(AskStatus::Pending)
