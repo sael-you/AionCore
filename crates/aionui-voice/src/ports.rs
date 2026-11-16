@@ -67,25 +67,6 @@ pub trait CredentialPort: Send + Sync {
     async fn provider_credentials(&self, user_id: &str) -> Result<Vec<ProviderCredential>, String>;
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn api_key_debug_is_redacted() {
-        let key = ApiKey::new("sk-live-secret");
-        assert_eq!(format!("{key:?}"), "ApiKey(<redacted>)");
-        let cred = ProviderCredential {
-            provider_id: "p".into(),
-            platform: "OpenAI".into(),
-            base_url: "https://api.openai.com/v1".into(),
-            enabled: true,
-            api_key: key,
-        };
-        assert!(!format!("{cred:?}").contains("sk-live"));
-    }
-}
-
 /// The owner's messaging channel (Telegram, Lark, … from `aionui-channel`):
 /// an agent's `say` / `ask` goes there as text when no voice device is
 /// connected (§3.4 "No armed device → Channels message if configured").
@@ -121,5 +102,24 @@ pub struct NoSkills;
 impl SkillPort for NoSkills {
     async fn skill_markdown(&self, _user_id: &str, _name: &str) -> Option<String> {
         None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn api_key_debug_is_redacted() {
+        let key = ApiKey::new("sk-live-secret");
+        assert_eq!(format!("{key:?}"), "ApiKey(<redacted>)");
+        let cred = ProviderCredential {
+            provider_id: "p".into(),
+            platform: "OpenAI".into(),
+            base_url: "https://api.openai.com/v1".into(),
+            enabled: true,
+            api_key: key,
+        };
+        assert!(!format!("{cred:?}").contains("sk-live"));
     }
 }
