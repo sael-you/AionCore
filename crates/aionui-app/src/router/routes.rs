@@ -306,8 +306,32 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         file_routes(states.file).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
 
     // Project control-plane routes protected by auth middleware
+    let memory_project = states.project.project.clone();
     let project_authenticated =
         project_routes(states.project).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
+
+    // Project memory review (C29): reads behind the ordinary auth middleware;
+    // writes need a verified browser session (never the agent runtime-token
+    // channel) and a trusted Origin, like the MCP market writes. No route-private
+    // CSRF layer: webui gets the global C11 CSRF + Origin layer.
+    let memory_state = aionui_project::MemoryRouterState {
+        project: memory_project,
+        memory: services.memory_service.clone(),
+    };
+    let memory_read = aionui_project::memory_read_routes(memory_state.clone())
+        .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
+    let memory_write = aionui_project::memory_write_routes(memory_state)
+        .route_layer(from_fn_with_state(
+            super::mcp_market::market_write_auth_state(services),
+            auth_middleware,
+        ))
+        .route_layer(from_fn_with_state(
+            OriginGuard {
+                policy: services.origin_policy.clone(),
+                same_origin_via_web_host: services.identity_mode.is_local(),
+            },
+            require_trusted_origin_middleware,
+        ));
 
     // Board user router (owner + Local-mode supervisor) protected by auth
     // middleware; the handlers refuse the runtime-token channel themselves.
@@ -463,6 +487,8 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         .merge(connection_test_authenticated)
         .merge(file_authenticated)
         .merge(project_authenticated)
+        .merge(memory_read)
+        .merge(memory_write)
         .merge(sidebar_authenticated)
         .merge(board_authenticated)
         .merge(mcp_authenticated)

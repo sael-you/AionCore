@@ -58,6 +58,9 @@ pub struct AppServices {
     /// Project-bind service (project-bind side branch). Shared by conversation
     /// and team wiring to bind/backfill project/folder rows. Cheap to clone.
     pub project_service: ProjectService,
+    /// Claude Code memory of project workspaces (C29): `$HOME/.claude/projects`.
+    /// Tests replace it with a temp root before building the router.
+    pub memory_service: Arc<aionui_project::MemoryService>,
     /// Sidebar ordering store (`user_order` table). Shared by the conversation
     /// delete hook (path-1 cascade), the team service (path-2 cascade), and the
     /// sidebar read state. Cheap to clone (Arc). See sidebar design §4.
@@ -536,6 +539,10 @@ impl AppServices {
             session_message_queue,
             session_message_notify,
             project_service,
+            memory_service: Arc::new(
+                aionui_project::MemoryService::from_home()
+                    .unwrap_or_else(|| aionui_project::MemoryService::new("/root/.claude/projects")),
+            ),
             user_order_store,
             board_service,
             task_manager_delete_hook: Some(task_manager_delete_hook),

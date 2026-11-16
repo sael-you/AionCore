@@ -11,6 +11,8 @@
 pub mod canonical;
 pub mod chat_files;
 pub mod containment;
+pub mod memory;
+pub mod memory_routes;
 pub mod monitor;
 pub mod routes;
 pub mod runtime;
@@ -19,6 +21,8 @@ mod service;
 pub mod types;
 
 pub use chat_files::ResolvedChatMessage;
+pub use memory::{MemoryError, MemoryService};
+pub use memory_routes::{MemoryRouterState, memory_read_routes, memory_write_routes};
 pub use routes::{ProjectRouterState, project_routes};
 pub use service::ProjectService;
 pub use types::{

@@ -392,6 +392,24 @@ impl ProjectService {
         }
     }
 
+    /// The filesystem path of the project's workspace folder (memory review,
+    /// C29); `None` when the project has no local workspace folder.
+    pub async fn workspace_path(&self, user_id: &str, project_id: &str) -> Result<Option<PathBuf>, ProjectError> {
+        self.store
+            .get_project(user_id, project_id)
+            .await?
+            .ok_or_else(|| ProjectError::ProjectNotFound {
+                project_id: project_id.to_owned(),
+            })?;
+        Ok(self
+            .store
+            .list_entries(user_id, project_id)
+            .await?
+            .into_iter()
+            .find(|(entry, _)| entry.role == Role::Workspace.as_str())
+            .and_then(|(_, folder)| canonical::uri_to_path(&folder.resource_canonical).ok()))
+    }
+
     // ── filesystem helpers ──────────────────────────────────────────────
 
     /// Stat a canonical folder to confirm it is an existing directory.
