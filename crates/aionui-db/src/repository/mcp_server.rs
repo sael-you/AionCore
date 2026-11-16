@@ -130,10 +130,20 @@ pub struct MarketDelivery {
     pub assistant_id: Option<String>,
     /// `read` or `write`.
     pub tier: String,
+    /// `production`, `staging`, `sandbox` or `local` (`market_environment`).
+    pub environment: String,
     /// JSON array (read tier allowlist), as stored.
     pub tools_allow: Option<String>,
     /// JSON array (blocklist), as stored.
     pub tools_block: Option<String>,
+}
+
+impl MarketDelivery {
+    /// A write-tier instance on production data (TASK-97): every tool call must
+    /// be confirmed by the owner, so each CLI is configured to ask first.
+    pub fn requires_owner_approval(&self) -> bool {
+        self.environment == "production" && self.tier == "write"
+    }
 }
 
 /// Parameters for creating a new MCP server.
