@@ -121,6 +121,8 @@ pub(crate) struct ServiceInner {
     pub credentials: Arc<dyn CredentialPort>,
     pub credential_policy: CredentialPolicy,
     pub engine: Arc<dyn VoiceEngine>,
+    /// `minimax-cascade`, built over [`Self::engine`] as its ear.
+    pub cascade: Arc<dyn VoiceEngine>,
     pub verifier: Arc<dyn AuthVerifier>,
     pub sockets: VoiceSockets,
     pub timings: VoiceTimings,
@@ -298,6 +300,7 @@ impl VoiceService {
                 audit: deps.audit,
                 credentials: deps.credentials,
                 credential_policy: deps.credential_policy,
+                cascade: Arc::new(crate::engine::MiniMaxCascadeEngine::new(deps.engine.clone())),
                 engine: deps.engine,
                 verifier: deps.verifier,
                 sockets: deps.sockets,

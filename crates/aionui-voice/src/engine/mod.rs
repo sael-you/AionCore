@@ -2,6 +2,8 @@
 //! `close` + events. Drafts, budgets and confirmation rules only see these
 //! types, never provider event names.
 
+pub mod minimax_cascade;
+pub(crate) mod minimax_chat;
 pub mod openai;
 mod openai_config;
 mod openai_events;
@@ -11,6 +13,7 @@ use std::time::Duration;
 use crate::credentials::ResolvedCredential;
 use crate::pricing::Usage;
 
+pub use minimax_cascade::MiniMaxCascadeEngine;
 pub use openai::OpenAiRealtimeEngine;
 
 /// Server-owned call configuration (§3.1). Mid-session only
@@ -37,6 +40,9 @@ pub struct OpenCallRequest {
     pub credential: ResolvedCredential,
     pub sdp_offer: String,
     pub config: EngineSessionConfig,
+    /// The brain's credential for cascade engines (MiniMax); `None` for
+    /// realtime engines, whose model answers itself.
+    pub brain: Option<ResolvedCredential>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,6 +104,12 @@ pub enum EngineEvent {
         call_id: String,
         name: String,
         arguments: String,
+    },
+    /// Cascade engines: a sentence of the answer the backend voices itself
+    /// (a TTS clip), in order. Realtime engines speak on their own.
+    AssistantSpeech {
+        response_id: String,
+        text: String,
     },
     /// Unsolicited config acknowledgement.
     ConfigApplied,

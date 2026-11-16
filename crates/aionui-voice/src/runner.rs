@@ -15,6 +15,7 @@ use crate::engine::{EngineCall, EngineError, EngineEvent};
 use crate::error::VoiceError;
 use crate::frames::{call_ended_frame, error_frame, state_frame};
 use crate::lifecycle::{EndReason, TickInputs, tick_decision};
+use crate::mouth::Mouth;
 use crate::ports::AuthRejected;
 use crate::runner_drafts::{ClientEvent, TurnState};
 use crate::service::{LiveCall, ServiceInner};
@@ -63,6 +64,8 @@ pub(crate) struct CallRunner {
     speaking: bool,
     speech_start_ms: Option<u64>,
     end_waiters: Vec<oneshot::Sender<()>>,
+    /// Cascade engines: voices the answer sentences (spawned on first use).
+    mouth: Option<Mouth>,
 }
 
 impl CallRunner {
@@ -92,6 +95,7 @@ impl CallRunner {
             speaking: false,
             speech_start_ms: None,
             end_waiters: Vec::new(),
+            mouth: None,
             turn: TurnState::default(),
             carry,
         }
@@ -253,6 +257,9 @@ impl CallRunner {
         match event {
             EngineEvent::UserSpeechStarted { audio_start_ms } => {
                 self.speech_start_ms = audio_start_ms;
+                if let Some(mouth) = &self.mouth {
+                    mouth.hush();
+                }
                 self.on_user_speech_started();
                 self.send(state_frame(Some(self.session_id()), "listening", None));
             }
@@ -342,6 +349,14 @@ impl CallRunner {
                 arguments,
             } => {
                 self.on_tool_call(&call_id, &name, &arguments).await;
+            }
+            EngineEvent::AssistantSpeech { response_id: _, text } => {
+                let call = &self.call;
+                self.mouth
+                    .get_or_insert_with(|| {
+                        Mouth::spawn(self.inner.drafts.clone(), call.user_id.clone(), call.session_id.clone())
+                    })
+                    .say(text);
             }
             EngineEvent::ProviderError { code } => {
                 tracing::warn!(session_id = %self.call.session_id, code = %code, "voice provider error event");
@@ -488,6 +503,9 @@ impl CallRunner {
 
     /// Provider hangup + persisted end + notification (§3.6.6).
     async fn finish(mut self, reason: EndReason) {
+        if let Some(mouth) = self.mouth.take() {
+            mouth.hush();
+        }
         if let Err(err) = self.engine_call.close(reason.as_str()).await {
             tracing::warn!(session_id = %self.call.session_id, error = %err, "voice provider hangup failed");
         }

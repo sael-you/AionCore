@@ -50,6 +50,12 @@ impl From<VoiceError> for ApiError {
                 "Add an enabled OpenAI provider (official API URL) to use voice.",
                 None,
             ),
+            VoiceError::NoMiniMaxProvider => ApiError::coded(
+                StatusCode::PRECONDITION_FAILED,
+                "VOICE_NO_MINIMAX_PROVIDER",
+                "Add an enabled MiniMax provider (api.minimax.io) to use the MiniMax voice engine.",
+                None,
+            ),
             VoiceError::NotFound(msg) => ApiError::NotFound(msg),
             VoiceError::BadRequest(msg) => ApiError::BadRequest(msg),
             VoiceError::Forbidden(msg) => ApiError::Forbidden(msg),

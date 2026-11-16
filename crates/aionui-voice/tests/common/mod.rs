@@ -36,7 +36,8 @@ pub struct TestUser {
     pub token: String,
 }
 
-/// Credentials: every user except `no-provider*` has one official OpenAI row.
+/// Credentials: every user except `no-provider*` has one official OpenAI row;
+/// `mm-*` users also have a MiniMax row (cascade brain + voice).
 struct FakeCredentials;
 
 #[async_trait::async_trait]
@@ -45,13 +46,23 @@ impl CredentialPort for FakeCredentials {
         if user_id.starts_with("no-provider") {
             return Ok(vec![]);
         }
-        Ok(vec![ProviderCredential {
+        let mut rows = vec![ProviderCredential {
             provider_id: format!("prov-{user_id}"),
             platform: "OpenAI".into(),
             base_url: "https://api.openai.com/v1".into(),
             enabled: true,
             api_key: ApiKey::new(format!("{API_KEY_PREFIX}{user_id}")),
-        }])
+        }];
+        if user_id.starts_with("mm-") {
+            rows.push(ProviderCredential {
+                provider_id: format!("mm-prov-{user_id}"),
+                platform: "MiniMax".into(),
+                base_url: "https://api.minimax.io/v1".into(),
+                enabled: true,
+                api_key: ApiKey::new(format!("{API_KEY_PREFIX}minimax-{user_id}")),
+            });
+        }
+        Ok(rows)
     }
 }
 

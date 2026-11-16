@@ -286,7 +286,7 @@ impl DraftEngine {
         self.send_line(user_id, session_id, conversation_id, status, line, None);
     }
 
-    fn send_line(
+    pub(crate) fn send_line(
         &self,
         user_id: &str,
         session_id: Option<&str>,

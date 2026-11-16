@@ -6,6 +6,7 @@ use aionui_db::VoiceSettingsRow;
 use crate::error::VoiceError;
 
 pub const ENGINE_OPENAI_REALTIME: &str = "openai-realtime";
+pub const ENGINE_MINIMAX_CASCADE: &str = "minimax-cascade";
 pub const MODEL_FULL: &str = "gpt-realtime-2.1";
 pub const MODEL_MINI: &str = "gpt-realtime-2.1-mini";
 pub const DEFAULT_VOICE: &str = "marin";
@@ -13,10 +14,13 @@ pub const DEFAULT_DAILY_BUDGET_MICROS: i64 = 5_000_000;
 /// Upper bound for the daily budget setting (guards typos like 5000).
 pub const MAX_DAILY_BUDGET_MICROS: i64 = 100_000_000;
 
-/// Engines selectable in this build. `openai-relay` arrives with S3,
-/// `minimax-cascade` with S4.
-const SUPPORTED_ENGINES: &[&str] = &[ENGINE_OPENAI_REALTIME];
+/// Engines selectable in this build. `openai-relay` arrives with S3.
+const SUPPORTED_ENGINES: &[&str] = &[ENGINE_OPENAI_REALTIME, ENGINE_MINIMAX_CASCADE];
 const SUPPORTED_MODELS: &[&str] = &[MODEL_FULL, MODEL_MINI];
+/// Brain models of `minimax-cascade` (S0-B: M3 with thinking off; M3.1-Flash
+/// cannot turn thinking off and is too slow to speak). Kept in settings so a
+/// MiniMax model change needs no code change to the stored value.
+const CASCADE_MODELS: &[&str] = &[crate::engine::minimax_chat::MINIMAX_BRAIN_MODEL];
 const SUPPORTED_EAGERNESS: &[&str] = &["auto", "low", "medium", "high"];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -146,7 +150,8 @@ impl VoiceSettings {
             next.engine = engine.clone();
         }
         if let Some(model) = &req.model {
-            ensure_one_of("model", model, SUPPORTED_MODELS)?;
+            let allowed: Vec<&str> = SUPPORTED_MODELS.iter().chain(CASCADE_MODELS).copied().collect();
+            ensure_one_of("model", model, &allowed)?;
             next.model = model.clone();
         }
         if let Some(wake_word) = req.wake_word_enabled {
@@ -196,6 +201,27 @@ impl VoiceSettings {
     }
 
     pub fn call_profile(&self) -> CallProfile {
+        if self.engine == ENGINE_MINIMAX_CASCADE {
+            // The model is the cascade's brain; the ear's realtime model is
+            // fixed by the engine. A realtime model id left in the setting
+            // (the engine was switched alone) falls back to the default brain.
+            let model = if CASCADE_MODELS.contains(&self.model.as_str()) {
+                self.model.clone()
+            } else {
+                crate::engine::minimax_chat::MINIMAX_BRAIN_MODEL.to_owned()
+            };
+            return CallProfile {
+                engine: self.engine.clone(),
+                model,
+                voice: self.voice.clone(),
+                eagerness: if self.car_mode {
+                    "low".into()
+                } else {
+                    self.eagerness.clone()
+                },
+                noise_reduction: "far_field".into(),
+            };
+        }
         if self.car_mode {
             CallProfile {
                 engine: self.engine.clone(),
@@ -207,7 +233,12 @@ impl VoiceSettings {
         } else {
             CallProfile {
                 engine: self.engine.clone(),
-                model: self.model.clone(),
+                // A brain model left in the setting after switching back.
+                model: if SUPPORTED_MODELS.contains(&self.model.as_str()) {
+                    self.model.clone()
+                } else {
+                    MODEL_FULL.into()
+                },
                 voice: self.voice.clone(),
                 eagerness: self.eagerness.clone(),
                 noise_reduction: "far_field".into(),
@@ -270,7 +301,7 @@ mod tests {
 
         for bad in [
             UpdateVoiceSettingsRequest {
-                engine: Some("minimax-cascade".into()),
+                engine: Some("openai-relay".into()),
                 ..Default::default()
             },
             UpdateVoiceSettingsRequest {
@@ -317,6 +348,52 @@ mod tests {
         assert!(!VoiceSettings::from_row(row).wake_word_enabled());
         assert!(!off.to_response(Some(1_500_000)).wake_word_enabled);
         assert_eq!(off.to_response(Some(1_500_000)).used_today_usd, Some(1.5));
+    }
+
+    #[test]
+    fn minimax_cascade_is_selectable_and_profiles_its_brain_model() {
+        let base = VoiceSettings::default();
+        let cascade = base
+            .apply(&UpdateVoiceSettingsRequest {
+                engine: Some(ENGINE_MINIMAX_CASCADE.into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(cascade.engine, ENGINE_MINIMAX_CASCADE);
+        // The realtime model left in the setting falls back to the default brain.
+        assert_eq!(cascade.model, MODEL_FULL);
+        assert_eq!(cascade.call_profile().model, "MiniMax-M3");
+        let car = VoiceSettings {
+            car_mode: true,
+            ..cascade.clone()
+        };
+        assert_eq!(car.call_profile().model, "MiniMax-M3", "car mode keeps the brain");
+        assert_eq!(car.call_profile().eagerness, "low");
+        let explicit = cascade
+            .apply(&UpdateVoiceSettingsRequest {
+                model: Some("MiniMax-M3".into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(explicit.call_profile().model, "MiniMax-M3");
+        let back = explicit
+            .apply(&UpdateVoiceSettingsRequest {
+                engine: Some(ENGINE_OPENAI_REALTIME.into()),
+                ..Default::default()
+            })
+            .unwrap();
+        assert_eq!(
+            back.call_profile().model,
+            MODEL_FULL,
+            "a realtime call never gets a MiniMax model"
+        );
+        assert!(matches!(
+            base.apply(&UpdateVoiceSettingsRequest {
+                model: Some("MiniMax-M3.1-Flash".into()),
+                ..Default::default()
+            }),
+            Err(VoiceError::BadRequest(_))
+        ));
     }
 
     #[test]
