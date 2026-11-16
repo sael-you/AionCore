@@ -12,7 +12,7 @@ use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use aionui_api_types::{CreateVoiceSessionRequest, CreateVoiceSessionResponse};
-use aionui_db::{CreateVoiceSessionParams, DbError, IVoiceAuditRepository, VoiceSessionRow};
+use aionui_db::{CreateVoiceSessionParams, DbError, VoiceSessionRow};
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
