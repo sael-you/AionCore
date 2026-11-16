@@ -22,7 +22,7 @@ const CONVERSATION_ID: &str = "conv-c13";
 
 async fn app(config: aionui_app::AppConfig) -> (axum::Router, String) {
     let db = aionui_db::init_database_memory().await.unwrap();
-    let services = aionui_app::AppServices::from_config(db, &config).await.unwrap();
+    let services = crate::common::test_services(db, &config).await;
     let router = aionui_app::create_router(&services).await.expect("build router");
     let token = services
         .runtime_token_service

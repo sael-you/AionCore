@@ -113,9 +113,8 @@ async fn build_midturn_app(supports_midturn: bool) -> MidturnRig {
     });
     let wtm: std::sync::Arc<dyn aionui_ai_agent::IWorkerTaskManager> =
         std::sync::Arc::new(WorkerTaskManagerImpl::new(factory));
-    let services = AppServices::from_config(db, &AppConfig::default())
+    let services = crate::common::test_services(db, &AppConfig::default())
         .await
-        .unwrap()
         .with_worker_task_manager(wtm);
     let app = aionui_app::create_router(&services).await.expect("build router");
     MidturnRig {

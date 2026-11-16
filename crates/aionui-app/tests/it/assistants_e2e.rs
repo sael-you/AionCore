@@ -216,7 +216,7 @@ async fn fixture() -> Fixture {
 
     // Bring up in-memory DB + services + default module states.
     let db = init_database_memory().await.unwrap();
-    let services = AppServices::from_config(db, &AppConfig::default()).await.unwrap();
+    let services = crate::common::test_services(db, &AppConfig::default()).await;
     let (mut states, _): (ModuleStates, _) = build_module_states(&services).await.expect("build module states");
     for table in [
         "assistant_preferences",

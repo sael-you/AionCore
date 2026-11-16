@@ -50,7 +50,7 @@ async fn app_with_policy(local: bool, policy: aionui_auth::OriginPolicy) -> (axu
         local,
         ..Default::default()
     };
-    let mut services = aionui_app::AppServices::from_config(db, &config).await.unwrap();
+    let mut services = crate::common::test_services(db, &config).await;
     services.origin_policy = Arc::new(policy);
     // Legacy cookie names in both identities (http), independent of the env.
     services.cookie_config = Arc::new(aionui_auth::CookieConfig::for_identity(!local, false));

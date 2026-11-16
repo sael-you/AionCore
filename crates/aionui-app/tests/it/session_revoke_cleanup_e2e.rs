@@ -64,7 +64,7 @@ async fn http_revoke_runs_the_real_cleanup_hook_end_to_end() {
         work_dir: tmp.path().to_path_buf(),
         ..Default::default()
     };
-    let services = aionui_app::AppServices::from_config(db, &config).await.unwrap();
+    let services = crate::common::test_services(db, &config).await;
     // Full production router: the session_revoked_hook inside is the REAL
     // closure over the real module services, not a test double.
     let app = aionui_app::create_router(&services).await.expect("build router");

@@ -64,9 +64,7 @@ async fn create_conversation(app: &mut axum::Router, token: &str, csrf: &str, na
 
 async fn build_app() -> (axum::Router, aionui_app::AppServices) {
     let db = aionui_db::init_database_memory().await.unwrap();
-    let services = aionui_app::AppServices::from_config(db, &aionui_app::AppConfig::default())
-        .await
-        .unwrap();
+    let services = crate::common::test_services(db, &aionui_app::AppConfig::default()).await;
     let router = aionui_app::create_router(&services).await.expect("build router");
     (router, services)
 }

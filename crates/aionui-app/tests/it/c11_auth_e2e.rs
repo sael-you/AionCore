@@ -18,7 +18,7 @@ async fn local_app() -> (axum::Router, aionui_app::AppServices) {
         local: true,
         ..Default::default()
     };
-    let services = aionui_app::AppServices::from_config(db, &config).await.unwrap();
+    let services = crate::common::test_services(db, &config).await;
     let router = aionui_app::create_router(&services).await.expect("build router");
     (router, services)
 }
@@ -34,9 +34,7 @@ async fn session_app_with_cookies(
     cookies: Option<aionui_auth::CookieConfig>,
 ) -> (axum::Router, aionui_app::AppServices) {
     let db = aionui_db::init_database_memory().await.unwrap();
-    let mut services = aionui_app::AppServices::from_config(db, &aionui_app::AppConfig::default())
-        .await
-        .unwrap();
+    let mut services = crate::common::test_services(db, &aionui_app::AppConfig::default()).await;
     services.origin_policy = Arc::new(policy);
     if let Some(cookies) = cookies {
         services.cookie_config = Arc::new(cookies);
@@ -465,7 +463,7 @@ async fn aionpro_keeps_mirror_cors_and_no_origin_rules() {
         bootstrap_secret: Some("bootstrap-secret".to_string()),
         ..Default::default()
     };
-    let services = aionui_app::AppServices::from_config(db, &config).await.unwrap();
+    let services = crate::common::test_services(db, &config).await;
     let app = aionui_app::create_router(&services).await.expect("build router");
     let response = app.clone().oneshot(preflight("https://evil.example")).await.unwrap();
     assert_eq!(

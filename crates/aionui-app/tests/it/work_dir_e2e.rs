@@ -1,7 +1,7 @@
 //! Integration tests verifying that --work-dir is used for conversation workspace creation.
 
 use aionui_api_types::CreateConversationRequest;
-use aionui_app::{AppConfig, AppServices, build_conversation_state};
+use aionui_app::{AppConfig, build_conversation_state};
 use aionui_common::AgentType;
 
 #[tokio::test]
@@ -16,7 +16,7 @@ async fn conversation_workspace_uses_work_dir() {
         local: true,
         ..Default::default()
     };
-    let services = AppServices::from_config(db, &config).await.unwrap();
+    let services = crate::common::test_services(db, &config).await;
     let state = build_conversation_state(&services, None, None);
 
     let request = CreateConversationRequest {
@@ -55,7 +55,7 @@ async fn user_specified_workspace_is_not_overridden() {
         local: true,
         ..Default::default()
     };
-    let services = AppServices::from_config(db, &config).await.unwrap();
+    let services = crate::common::test_services(db, &config).await;
     let state = build_conversation_state(&services, None, None);
 
     let request = CreateConversationRequest {
@@ -90,7 +90,7 @@ async fn workspace_defaults_to_data_dir_when_work_dir_equals_data_dir() {
         local: true,
         ..Default::default()
     };
-    let services = AppServices::from_config(db, &config).await.unwrap();
+    let services = crate::common::test_services(db, &config).await;
     let state = build_conversation_state(&services, None, None);
 
     let request = CreateConversationRequest {

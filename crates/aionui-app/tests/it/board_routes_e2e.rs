@@ -21,7 +21,7 @@ async fn local_app() -> (axum::Router, aionui_app::AppServices) {
         local: true,
         ..Default::default()
     };
-    let services = aionui_app::AppServices::from_config(db, &config).await.unwrap();
+    let services = crate::common::test_services(db, &config).await;
     let router = aionui_app::create_router(&services).await.expect("build router");
     (router, services)
 }

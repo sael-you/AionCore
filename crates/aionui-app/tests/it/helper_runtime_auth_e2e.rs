@@ -20,7 +20,7 @@ async fn build_aionpro_app() -> (axum::Router, aionui_app::AppServices, String) 
         bootstrap_secret: Some("bootstrap-secret".to_string()),
         ..Default::default()
     };
-    let services = aionui_app::AppServices::from_config(db, &config).await.unwrap();
+    let services = crate::common::test_services(db, &config).await;
     let router = aionui_app::create_router(&services).await.expect("build router");
 
     let provision_response = router

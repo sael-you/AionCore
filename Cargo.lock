@@ -431,6 +431,7 @@ dependencies = [
  "async-trait",
  "axum",
  "base64",
+ "bcrypt",
  "chrono",
  "clap",
  "dirs",

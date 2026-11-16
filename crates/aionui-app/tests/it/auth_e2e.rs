@@ -17,7 +17,7 @@ use aionui_app::{AppConfig, AppServices};
 
 async fn build_app() -> (axum::Router, AppServices) {
     let db = aionui_db::init_database_memory().await.unwrap();
-    let services = AppServices::from_config(db, &AppConfig::default()).await.unwrap();
+    let services = crate::common::test_services(db, &AppConfig::default()).await;
     let router = aionui_app::create_router(&services).await.expect("build router");
     (router, services)
 }

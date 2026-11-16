@@ -161,7 +161,7 @@ async fn build_app_with_extension_root(ext_root: &std::path::Path) -> (axum::Rou
         app_version: "1.0.0".to_string(),
         ..Default::default()
     };
-    let services = AppServices::from_config(db, &config).await.unwrap();
+    let services = crate::common::test_services(db, &config).await;
     let (states, _) = build_module_states(&services).await.expect("build module states");
     states
         .extension

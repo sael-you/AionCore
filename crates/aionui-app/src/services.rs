@@ -6,7 +6,7 @@ use std::sync::Arc;
 use crate::config::{AppConfig, IdentityMode, derive_encryption_key};
 use aionui_ai_agent::{
     AcpSessionSyncService, AcpSkillManager, ActiveLeaseRegistry, AgentFactoryDeps, AgentRegistry, IWorkerTaskManager,
-    RuntimeTokenService, WorkerTaskManagerImpl, build_agent_factory,
+    ProbePolicy, RuntimeTokenService, WorkerTaskManagerImpl, build_agent_factory,
 };
 use aionui_auth::{CookieConfig, JwtService, QrTokenStore, resolve_encryption_secret, resolve_jwt_secret};
 use aionui_board::BoardService;
@@ -202,6 +202,27 @@ impl AppServices {
         config: &AppConfig,
         backend_binary_path: PathBuf,
     ) -> anyhow::Result<Self> {
+        Self::build(database, config, backend_binary_path, ProbePolicy::default()).await
+    }
+
+    /// [`Self::from_config`] with the agent registry's CLI probe policy given.
+    /// Integration tests pass [`ProbePolicy::without_version_probe`] so building
+    /// the app never launches the agent CLIs installed on the host.
+    pub async fn from_config_with_probe_policy(
+        database: Database,
+        config: &AppConfig,
+        probe_policy: ProbePolicy,
+    ) -> anyhow::Result<Self> {
+        let backend_binary_path = std::env::current_exe().unwrap_or_else(|_| PathBuf::from("aioncore"));
+        Self::build(database, config, backend_binary_path, probe_policy).await
+    }
+
+    async fn build(
+        database: Database,
+        config: &AppConfig,
+        backend_binary_path: PathBuf,
+        probe_policy: ProbePolicy,
+    ) -> anyhow::Result<Self> {
         // `dunce`, not `std::fs`: this path is embedded into agent-facing config
         // files (e.g. antigravity's `.agents/hooks.json` command line, executed
         // through cmd.exe on Windows), and `std::fs::canonicalize` on Windows
@@ -314,7 +335,7 @@ impl AppServices {
 
         let agent_metadata_repo: Arc<dyn IAgentMetadataRepository> =
             Arc::new(SqliteAgentMetadataRepository::new(database.pool().clone()));
-        let agent_registry = AgentRegistry::new(agent_metadata_repo);
+        let agent_registry = AgentRegistry::new_with_probe_policy(agent_metadata_repo, probe_policy);
         agent_registry
             .hydrate()
             .await

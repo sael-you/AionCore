@@ -10,7 +10,7 @@ async fn test_local_mode_skips_auth() {
         local: true,
         ..Default::default()
     };
-    let services = aionui_app::AppServices::from_config(db, &config).await.unwrap();
+    let services = crate::common::test_services(db, &config).await;
 
     let router = aionui_app::create_router(&services).await.expect("build router");
 
@@ -35,9 +35,7 @@ async fn test_local_mode_skips_auth() {
 #[tokio::test]
 async fn test_non_local_mode_requires_auth() {
     let db = aionui_db::init_database_memory().await.unwrap();
-    let services = aionui_app::AppServices::from_config(db, &aionui_app::AppConfig::default())
-        .await
-        .unwrap();
+    let services = crate::common::test_services(db, &aionui_app::AppConfig::default()).await;
 
     let router = aionui_app::create_router(&services).await.expect("build router");
 
@@ -61,7 +59,7 @@ async fn test_local_mode_aionpro_requires_session_and_allows_bootstrap_provision
         bootstrap_secret: Some("bootstrap-secret".to_string()),
         ..Default::default()
     };
-    let services = aionui_app::AppServices::from_config(db, &config).await.unwrap();
+    let services = crate::common::test_services(db, &config).await;
     let router = aionui_app::create_router(&services).await.expect("build router");
 
     let business_response = router

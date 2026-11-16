@@ -30,7 +30,7 @@ async fn aionpro_services(data_dir: &Path) -> aionui_app::AppServices {
         work_dir: data_dir.to_path_buf(),
         ..Default::default()
     };
-    aionui_app::AppServices::from_config(db, &config).await.unwrap()
+    crate::common::test_services(db, &config).await
 }
 
 async fn seed_user(services: &aionui_app::AppServices, username: &str) -> String {

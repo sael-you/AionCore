@@ -45,7 +45,7 @@ async fn build_office_app_with_roots(
         work_dir: data_dir,
         ..Default::default()
     };
-    let services = AppServices::from_config(db, &config).await.unwrap();
+    let services = crate::common::test_services(db, &config).await;
     let (mut states, _) = build_module_states(&services).await.expect("build module states");
 
     states.office = build_test_office_state(allowed_roots, std::sync::Arc::new(services.project_service.clone()));
