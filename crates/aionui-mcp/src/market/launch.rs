@@ -84,15 +84,6 @@ async fn allowed_instance(
     if !inst.clis.iter().any(|c| c == req.cli) {
         return Err(refuse(format!("{} is not enabled for {}", req.instance, req.cli)));
     }
-    if inst.tier == "write" && req.cli != "claude" {
-        return Err(refuse(format!(
-            "{} is a write instance (Claude only, R3)",
-            req.instance
-        )));
-    }
-    if inst.tier == "write" && inst.environment == "production" && inst.approval_ref.is_none() {
-        return Err(refuse(format!("{} has no owner exception record", req.instance)));
-    }
     let (project, assistant) = match req.scope {
         LaunchScope::Global => {
             if !GLOBAL_IDS.contains(&req.instance) || inst.tier == "write" {

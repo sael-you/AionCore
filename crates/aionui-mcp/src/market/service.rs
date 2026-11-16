@@ -402,7 +402,8 @@ impl McpMarketService {
         Ok(())
     }
 
-    /// Record (or clear) the owner's written exception for a production write instance.
+    /// Record (or clear) an optional owner approval id on an instance (D50: a record
+    /// only; it no longer gates activation or launch).
     pub async fn set_approval(
         &self,
         user_id: &str,
@@ -411,14 +412,6 @@ impl McpMarketService {
     ) -> Result<McpMarketInstanceResponse, MarketError> {
         let mut inst = self.load(user_id, id).await?;
         inst.approval_ref = approval_ref;
-        if inst.approval_ref.is_none()
-            && inst.tier == "write"
-            && inst.environment == "production"
-            && inst.status == "active"
-        {
-            // Clearing the record of an active production write instance makes it dormant.
-            inst.status = "dormant".to_owned();
-        }
         let secrets = self.set_secret_keys(user_id, &inst).await?;
         reject(instance_problems(&inst.spec(), &inst.template, &secrets))?;
         let row = self
