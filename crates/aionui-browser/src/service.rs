@@ -8,8 +8,8 @@ use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 
 use aionui_api_types::{
-    BROWSER_MAX_INSTANCES_LIMIT, BrowserErrorCode, BrowserInstanceStatus, BrowserSettings, BrowserSettingsUpdate,
-    BrowserStatusResponse,
+    BrowserErrorCode, BrowserInstanceCreate, BrowserInstancePatch, BrowserInstanceStatus, BrowserSettings,
+    BrowserSettingsUpdate, BrowserStatusResponse,
 };
 use dashmap::DashMap;
 use tokio::sync::Mutex;
@@ -146,16 +146,6 @@ impl BrowserService {
     ) -> Result<BrowserSettings, BrowserError> {
         let s = self.settings.update(user_id, update)?;
         self.max_tabs_cell(user_id).store(s.max_tabs, Ordering::Relaxed);
-        // A lowered limit stops the instances above it.
-        let above: Vec<Arc<ChromeInstance>> = self
-            .instances
-            .iter()
-            .filter(|e| e.key().0 == user_id && e.key().1 > s.max_instances)
-            .map(|e| e.value().clone())
-            .collect();
-        for inst in above {
-            inst.stop().await;
-        }
         tracing::info!(
             user_id,
             agents_enabled = s.agents_enabled,
@@ -196,11 +186,16 @@ impl BrowserService {
                 let _ = svc.ensure_chrome().await;
             });
         }
-        let instances = (1..=s.max_instances)
-            .map(|n| {
-                let inst = self.running(user_id, n);
+        let instances = s
+            .instances
+            .iter()
+            .map(|row| {
+                let inst = self.running(user_id, row.instance);
                 BrowserInstanceStatus {
-                    instance: n,
+                    instance: row.instance,
+                    name: row.name.clone(),
+                    color: row.color.clone(),
+                    emoji: row.emoji.clone(),
                     running: inst.is_some(),
                     tabs: inst.as_ref().map(|i| i.tab_count() as u16).unwrap_or(0),
                     agent_active: inst.as_ref().is_some_and(|i| i.agent_active()),
@@ -292,14 +287,67 @@ impl BrowserService {
         }
     }
 
+    /// Instance `n` must exist for `user_id` (404 `BROWSER_INSTANCE_NOT_FOUND`).
     fn check_instance(&self, user_id: &str, n: u8) -> Result<BrowserSettings, BrowserError> {
         let s = self.settings(user_id)?;
-        if n == 0 || n > s.max_instances || n > BROWSER_MAX_INSTANCES_LIMIT {
+        if !s.instances.iter().any(|i| i.instance == n) {
             return Err(BrowserError::coded(
-                BrowserErrorCode::BrowserInstanceLimit,
-                format!("instance {n} is above the limit"),
+                BrowserErrorCode::BrowserInstanceNotFound,
+                format!("no instance {n}"),
             ));
         }
+        Ok(s)
+    }
+
+    /// Whether instance `n` exists for `user_id`.
+    pub fn instance_exists(&self, user_id: &str, n: u8) -> bool {
+        self.settings.exists(user_id, n).unwrap_or(false)
+    }
+
+    // -- instances (TASK-124 named profiles) ----------------------------------
+
+    pub fn create_instance(&self, user_id: &str, req: &BrowserInstanceCreate) -> Result<BrowserSettings, BrowserError> {
+        let (s, n) = self.settings.create(user_id, req)?;
+        tracing::info!(user_id, instance = n, "browser instance created");
+        Ok(s)
+    }
+
+    pub fn patch_instance(
+        &self,
+        user_id: &str,
+        n: u8,
+        req: &BrowserInstancePatch,
+    ) -> Result<BrowserSettings, BrowserError> {
+        self.settings.patch(user_id, n, req)
+    }
+
+    /// Stop instance `n`, wipe its profile (as the account) and remove it.
+    pub async fn delete_instance(self: &Arc<Self>, user_id: &str, n: u8) -> Result<BrowserSettings, BrowserError> {
+        if n == 1 {
+            return Err(BrowserError::coded(
+                BrowserErrorCode::BrowserInstanceProtected,
+                "the main instance cannot be deleted",
+            ));
+        }
+        self.check_instance(user_id, n)?;
+        let key = (user_id.to_owned(), n);
+        let lock = self.start_locks.entry(key.clone()).or_default().clone();
+        let Ok(_held) = lock.try_lock() else {
+            return Err(BrowserError::coded(
+                BrowserErrorCode::BrowserBusy,
+                "the profile is busy",
+            ));
+        };
+        if let Some(inst) = self.running(user_id, n) {
+            inst.stop().await;
+            self.instances.remove(&key);
+        }
+        let profile = self.cfg.layout.profile_dir(user_id, n)?;
+        if let Some((uid, gid)) = self.cfg.run_as_override.or_else(existing_browser_user) {
+            crate::host::wipe_profile(&profile, uid, gid).await?;
+        }
+        let s = self.settings.delete(user_id, n)?;
+        tracing::info!(user_id, instance = n, "browser instance deleted and its profile wiped");
         Ok(s)
     }
 
@@ -370,12 +418,7 @@ impl BrowserService {
 
     /// Wipe instance `n`'s profile (all logins); restart if it was running.
     pub async fn clear(self: &Arc<Self>, user_id: &str, n: u8) -> Result<BrowserStatusResponse, BrowserError> {
-        if n == 0 || n > BROWSER_MAX_INSTANCES_LIMIT {
-            return Err(BrowserError::coded(
-                BrowserErrorCode::BrowserInstanceLimit,
-                "no such instance",
-            ));
-        }
+        self.check_instance(user_id, n)?;
         let key = (user_id.to_owned(), n);
         let lock = self.start_locks.entry(key.clone()).or_default().clone();
         let Ok(held) = lock.try_lock() else {
@@ -434,11 +477,35 @@ impl BrowserService {
             return Vec::new();
         };
         let mut env = bridge.env();
-        if self.devices_allowed_now(user_id) {
-            let devices = self.device_env(user_id, bridge.token()).await;
-            if !devices.is_empty() {
-                env.push((ENV_DEVICES.to_owned(), serde_json::Value::Array(devices).to_string()));
-            }
+        // Name → port of the existing instances, as at agent spawn.
+        let mut instances: Vec<serde_json::Value> = self
+            .settings(user_id)
+            .map(|s| s.instances)
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|row| {
+                bridge
+                    .port_of(row.instance)
+                    .map(|port| serde_json::json!({"instance": row.instance, "name": row.name, "port": port}))
+            })
+            .collect();
+        // C34: the owner's own browser is one more entry next to the named
+        // server profiles ("Mac · Chrome", `kind: "device"`, no profile number),
+        // so picking a profile by name finds it too.
+        let devices = if self.devices_allowed_now(user_id) {
+            self.device_env(user_id, bridge.token()).await
+        } else {
+            Vec::new()
+        };
+        instances.extend(devices.iter().map(|d| {
+            serde_json::json!({"kind": "device", "device_id": d["device_id"], "name": d["name"], "port": d["port"]})
+        }));
+        env.push((
+            crate::bridge::ENV_INSTANCES.to_owned(),
+            serde_json::Value::Array(instances).to_string(),
+        ));
+        if !devices.is_empty() {
+            env.push((ENV_DEVICES.to_owned(), serde_json::Value::Array(devices).to_string()));
         }
         env
     }
@@ -633,13 +700,60 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn instance_numbers_above_the_limit_are_refused() {
+    async fn instances_that_do_not_exist_are_refused() {
         let t = tempfile::tempdir().unwrap();
         let svc = service(t.path());
         for n in [0, 4, 6] {
             let err = svc.start("u1", n).await.unwrap_err();
-            assert_eq!(err.code(), Some(BrowserErrorCode::BrowserInstanceLimit), "{n}");
+            assert_eq!(err.code(), Some(BrowserErrorCode::BrowserInstanceNotFound), "{n}");
         }
+        assert!(svc.instance_exists("u1", 3) && !svc.instance_exists("u1", 4));
+    }
+
+    /// TASK-124: delete wipes only that profile (as the account) and removes
+    /// the row; instance 1 is protected; status rows carry the names.
+    #[tokio::test]
+    async fn delete_wipes_only_that_profile_and_status_lists_names() {
+        let t = tempfile::tempdir().unwrap();
+        let ids = unsafe { (libc::getuid(), libc::getgid()) };
+        let svc = BrowserService::new(BrowserServiceConfig {
+            layout: BrowserLayout::new(t.path().join("b"), t.path().join("d")),
+            host: None,
+            idle_timeout: DEFAULT_IDLE_TIMEOUT,
+            guard: NavigationGuard::default(),
+            chrome_override: Some(t.path().join("no-chrome")),
+            run_as_override: Some(ids),
+        })
+        .unwrap();
+        svc.patch_instance(
+            "u1",
+            2,
+            &BrowserInstancePatch {
+                name: Some("TB Discord".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        for n in [1u8, 2] {
+            let dir = t.path().join("b/u1").join(n.to_string());
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("Cookies"), "x").unwrap();
+        }
+        assert_eq!(
+            svc.delete_instance("u1", 1).await.unwrap_err().code(),
+            Some(BrowserErrorCode::BrowserInstanceProtected)
+        );
+        let s = svc.delete_instance("u1", 2).await.unwrap();
+        assert!(!s.instances.iter().any(|i| i.instance == 2));
+        assert!(!t.path().join("b/u1/2").exists(), "profile 2 wiped");
+        assert!(t.path().join("b/u1/1/Cookies").exists(), "profile 1 untouched");
+        assert_eq!(
+            svc.delete_instance("u1", 2).await.unwrap_err().code(),
+            Some(BrowserErrorCode::BrowserInstanceNotFound)
+        );
+        let st = svc.status("u1").unwrap();
+        let names: Vec<&str> = st.instances.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(names, vec!["Main", "Instance 3"]);
     }
 
     #[tokio::test]
@@ -688,5 +802,24 @@ mod tests {
             env[crate::bridge::ENV_ACTIVE_TOKEN],
             "per-user token"
         );
+        // TASK-124: name → port of the existing instances.
+        svc.patch_instance(
+            "u1",
+            2,
+            &BrowserInstancePatch {
+                name: Some("Work, \"x\"".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let env: std::collections::HashMap<_, _> = svc.agent_env("u1").await.into_iter().collect();
+        let rows: Vec<serde_json::Value> = serde_json::from_str(&env[crate::bridge::ENV_INSTANCES]).unwrap();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[1]["name"], "Work, \"x\"");
+        let ports: std::collections::HashMap<String, String> = env[crate::bridge::ENV_PORTS]
+            .split(',')
+            .filter_map(|p| p.split_once(':').map(|(n, port)| (n.to_owned(), port.to_owned())))
+            .collect();
+        assert_eq!(rows[1]["port"].to_string(), ports["2"]);
     }
 }

@@ -39,6 +39,9 @@ use crate::instance::ChromeInstance;
 pub const ENV_ACTIVE_PORT: &str = "AIONUI_CDP_ACTIVE_PORT";
 pub const ENV_ACTIVE_TOKEN: &str = "AIONUI_CDP_ACTIVE_TOKEN";
 pub const ENV_PORTS: &str = "AIONUI_CDP_PORTS";
+/// JSON `[{"instance": n, "name": "…", "port": p}, …]` of the existing
+/// instances (TASK-124: agents pick a browser profile by name).
+pub const ENV_INSTANCES: &str = "AIONUI_CDP_INSTANCES";
 /// Read by playwright-cli / Playwright MCP: one `Name: value` header.
 pub const ENV_PLAYWRIGHT_HEADERS: &str = "PLAYWRIGHT_MCP_CDP_HEADERS";
 pub const TOKEN_HEADER: &str = "x-aionui-bridge-token";
@@ -98,6 +101,11 @@ impl AgentBridge {
         self.token.clone()
     }
 
+    /// The loopback port of instance `n`'s bridge.
+    pub fn port_of(&self, n: u8) -> Option<u16> {
+        self.ports.iter().find(|(i, _)| *i == n).map(|(_, p)| *p)
+    }
+
     /// The agent env pairs (see the module docs).
     pub fn env(&self) -> Vec<(String, String)> {
         let first = self.ports.first().map(|(_, p)| p.to_string()).unwrap_or_default();
@@ -154,6 +162,7 @@ fn backend_error(e: BrowserError) -> Response {
     let status = match code {
         BrowserErrorCode::BrowserAgentsDisabled => StatusCode::FORBIDDEN,
         BrowserErrorCode::BrowserInstanceLimit => StatusCode::FORBIDDEN,
+        BrowserErrorCode::BrowserInstanceNotFound => StatusCode::NOT_FOUND,
         _ => StatusCode::SERVICE_UNAVAILABLE,
     };
     error_response(status, code, "the server browser is not available to agents")

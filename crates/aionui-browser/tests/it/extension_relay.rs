@@ -715,6 +715,19 @@ async fn the_switches_and_the_token_gate_the_device_bridge() {
     let devices: Value = serde_json::from_str(&env[ENV_DEVICES]).unwrap();
     assert_eq!(devices[0]["device_id"], ext.device_id.as_str());
     let port = devices[0]["port"].as_u64().unwrap();
+    // Next to the named server profiles, under the same name (TASK-124 + C34).
+    let instances: Value = serde_json::from_str(&env[aionui_browser::bridge::ENV_INSTANCES]).unwrap();
+    let names: Vec<&str> = instances
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter_map(|r| r["name"].as_str())
+        .collect();
+    assert_eq!(names, ["Main", "Instance 2", "Instance 3", "Mac · Chrome"]);
+    let mac = &instances[3];
+    assert_eq!(mac["kind"], "device");
+    assert_eq!(mac["port"].as_u64(), Some(port));
+    assert!(mac.get("instance").is_none(), "no server profile number");
     let http = reqwest::Client::new();
     let url = format!("http://127.0.0.1:{port}/json/version");
     assert_eq!(http.get(&url).send().await.unwrap().status(), 401);
@@ -746,7 +759,9 @@ async fn the_switches_and_the_token_gate_the_device_bridge() {
         )
         .await
         .unwrap();
-    assert!(!agent_env(&h.svc).await.contains_key(ENV_DEVICES));
+    let env_off = agent_env(&h.svc).await;
+    assert!(!env_off.contains_key(ENV_DEVICES));
+    assert!(!env_off[aionui_browser::bridge::ENV_INSTANCES].contains("Mac"));
     let off = http
         .get(&url)
         .header(TOKEN_HEADER, &env[ENV_ACTIVE_TOKEN])
