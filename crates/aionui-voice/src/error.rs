@@ -16,6 +16,10 @@ pub enum VoiceError {
     /// No enabled OpenAI provider with an official base URL and a key.
     #[error("no eligible OpenAI provider is configured for voice")]
     NoProvider,
+    /// The `minimax-cascade` engine needs an enabled MiniMax provider
+    /// (official host) for its brain and voice.
+    #[error("no eligible MiniMax provider is configured for the MiniMax voice engine")]
+    NoMiniMaxProvider,
     #[error("not found: {0}")]
     NotFound(String),
     #[error("invalid request: {0}")]

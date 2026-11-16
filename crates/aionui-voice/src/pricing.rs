@@ -32,6 +32,19 @@ pub const PRICING_MINI: ModelPricing = ModelPricing {
     audio_out: 20_000_000,
 };
 
+/// `MiniMax-M3` on the `priority` tier (≤ 512k input; MiniMax pricing page as
+/// saved in S0-B, 2026-11-14: $0.45 in / $1.80 out / $0.09 cache read per 1M).
+/// Text only: the audio rates equal the text rates so a usage block without
+/// details is never undercharged.
+pub const PRICING_MINIMAX_M3_PRIORITY: ModelPricing = ModelPricing {
+    text_in: 450_000,
+    text_cached: 90_000,
+    text_out: 1_800_000,
+    audio_in: 450_000,
+    audio_cached: 90_000,
+    audio_out: 1_800_000,
+};
+
 /// `gpt-transcribe` ≈ $0.07/h of input audio (S0-A estimate) → 20 µUSD/s.
 pub const STT_MICROS_PER_SECOND: u64 = 20;
 
@@ -52,7 +65,9 @@ pub const USER_AUDIO_TOKENS_PER_SECOND: u64 = 10;
 
 /// Pricing for a model id; unknown ids get the (more expensive) full model.
 pub fn pricing_for(model: &str) -> ModelPricing {
-    if model.ends_with("-mini") {
+    if model.starts_with("MiniMax-") {
+        PRICING_MINIMAX_M3_PRIORITY
+    } else if model.ends_with("-mini") {
         PRICING_MINI
     } else {
         PRICING_FULL
@@ -221,5 +236,17 @@ mod tests {
     fn unknown_models_are_priced_as_full() {
         assert_eq!(pricing_for("gpt-realtime-3"), PRICING_FULL);
         assert_eq!(pricing_for("gpt-realtime-2.1-mini"), PRICING_MINI);
+        assert_eq!(pricing_for("MiniMax-M3"), PRICING_MINIMAX_M3_PRIORITY);
+        // 1k prompt (800 cached) + 100 output tokens on M3 priority:
+        // 200 × 0.45 + 800 × 0.09 + 100 × 1.80 = 90 + 72 + 180 = 342 µUSD.
+        let usage = Usage {
+            input_tokens: 1000,
+            output_tokens: 100,
+            input_text: 1000,
+            cached_text: 800,
+            output_text: 100,
+            ..Default::default()
+        };
+        assert_eq!(usage_cost_micros(&PRICING_MINIMAX_M3_PRIORITY, &usage), 342);
     }
 }

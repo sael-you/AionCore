@@ -60,6 +60,7 @@ impl VoiceEngine for OpenAiRealtimeEngine {
             credential,
             sdp_offer,
             config,
+            brain: _,
         } = request;
         let url = format!("{}/v1/realtime/calls", credential.base_url);
         let session = super::openai_config::session_object(&config).to_string();
