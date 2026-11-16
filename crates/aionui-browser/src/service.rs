@@ -14,7 +14,10 @@ use aionui_api_types::{
 use dashmap::DashMap;
 use tokio::sync::Mutex;
 
+use crate::approvals::{ApprovalBroker, BrowserEventSink};
 use crate::bridge::{AgentBridge, BridgeBackend};
+use crate::device_bridge::{DeviceBackend, DeviceListener, ENV_DEVICES, start_listener};
+use crate::devices::DeviceStore;
 use crate::error::BrowserError;
 use crate::guard::NavigationGuard;
 use crate::host::{
@@ -24,6 +27,7 @@ use crate::install::{ChromeInstaller, installed_version};
 use crate::instance::{ChromeInstance, LaunchSpec};
 use crate::layout::BrowserLayout;
 use crate::panel::PanelBackend;
+use crate::relay::{DeviceHub, instance_name};
 use crate::settings::SettingsStore;
 
 /// Default idle stop (no panel input and no agent traffic).
@@ -62,6 +66,10 @@ pub struct BrowserService {
     launch_lock: Mutex<()>,
     install_error: std::sync::Mutex<Option<String>>,
     guard: Arc<NavigationGuard>,
+    /// C34: paired devices of the owner's own browser.
+    devices: Arc<DeviceHub>,
+    device_listeners: DashMap<String, DeviceListener>,
+    device_lock: Mutex<()>,
 }
 
 impl BrowserService {
@@ -69,6 +77,11 @@ impl BrowserService {
         let installer = ChromeInstaller::new(cfg.layout.clone())?;
         let settings = SettingsStore::new(cfg.layout.settings_dir());
         let guard = Arc::new(cfg.guard.clone());
+        let devices = Arc::new(DeviceHub::new(
+            DeviceStore::open(cfg.layout.devices_dir()),
+            Arc::new(ApprovalBroker::default()),
+            guard.clone(),
+        ));
         Ok(Arc::new_cyclic(|me| Self {
             me: me.clone(),
             cfg,
@@ -83,6 +96,9 @@ impl BrowserService {
             launch_lock: Mutex::new(()),
             install_error: std::sync::Mutex::new(None),
             guard,
+            devices,
+            device_listeners: DashMap::new(),
+            device_lock: Mutex::new(()),
         }))
     }
 
@@ -409,29 +425,99 @@ impl BrowserService {
 
     /// Env for an agent of `user_id`: the bridge ports + token, or nothing
     /// while "Agents can use the browser" is off or Chrome is unavailable.
+    /// With "Agents may use my Mac browser" on, also `AIONUI_CDP_DEVICES`.
     pub async fn agent_env(self: &Arc<Self>, user_id: &str) -> Vec<(String, String)> {
         if !self.agents_enabled_now(user_id) {
             return Vec::new();
         }
+        let Some(bridge) = self.ensure_bridge(user_id).await else {
+            return Vec::new();
+        };
+        let mut env = bridge.env();
+        if self.devices_allowed_now(user_id) {
+            let devices = self.device_env(user_id, bridge.token()).await;
+            if !devices.is_empty() {
+                env.push((ENV_DEVICES.to_owned(), serde_json::Value::Array(devices).to_string()));
+            }
+        }
+        env
+    }
+
+    async fn ensure_bridge(self: &Arc<Self>, user_id: &str) -> Option<AgentBridge> {
         if let Some(b) = self.bridges.get(user_id) {
-            return b.env();
+            return Some(b.clone());
         }
         let _held = self.bridge_lock.lock().await;
         if let Some(b) = self.bridges.get(user_id) {
-            return b.env();
+            return Some(b.clone());
         }
         let backend: Arc<dyn BridgeBackend> = self.clone();
         match AgentBridge::start(user_id, backend).await {
             Ok(bridge) => {
-                let env = bridge.env();
-                self.bridges.insert(user_id.to_owned(), bridge);
-                env
+                self.bridges.insert(user_id.to_owned(), bridge.clone());
+                Some(bridge)
             }
             Err(e) => {
                 tracing::warn!(user_id, error = %e, "browser agent bridge did not start");
-                Vec::new()
+                None
             }
         }
+    }
+
+    /// One loopback listener per paired device of the user (started once).
+    async fn device_env(self: &Arc<Self>, user_id: &str, token: Arc<String>) -> Vec<serde_json::Value> {
+        let _held = self.device_lock.lock().await;
+        let mut rows = Vec::new();
+        for d in self.devices.store().devices(user_id) {
+            let port = match self.device_listeners.get(&d.device_id) {
+                Some(l) => l.port,
+                None => {
+                    let backend: Arc<dyn DeviceBackend> = self.clone();
+                    match start_listener(user_id, &d.device_id, token.clone(), self.devices.clone(), backend).await {
+                        Ok(l) => {
+                            let port = l.port;
+                            self.device_listeners.insert(d.device_id.clone(), l);
+                            port
+                        }
+                        Err(e) => {
+                            tracing::warn!(user_id, device_id = %d.device_id, error = %e, "browser device bridge did not start");
+                            continue;
+                        }
+                    }
+                }
+            };
+            rows.push(serde_json::json!({
+                "device_id": d.device_id,
+                "name": instance_name(&d.name, &d.browser),
+                "port": port,
+            }));
+        }
+        rows
+    }
+
+    fn devices_allowed_now(&self, user_id: &str) -> bool {
+        self.settings
+            .load(user_id)
+            .map(|s| s.agents_enabled && s.devices_agents_enabled)
+            .unwrap_or(false)
+    }
+
+    // -- devices (C34) ------------------------------------------------------
+
+    pub fn device_hub(&self) -> &Arc<DeviceHub> {
+        &self.devices
+    }
+
+    /// Where approval and device events go (the app's per-user sockets).
+    pub fn set_event_sink(&self, sink: Arc<dyn BrowserEventSink>) {
+        self.devices.approvals().set_sink(sink);
+    }
+
+    /// Revoke a device: its token, socket, approvals and agent listener.
+    pub fn revoke_device(&self, user_id: &str, device_id: &str) -> Result<(), BrowserError> {
+        self.devices.revoke(user_id, device_id)?;
+        self.device_listeners.remove_if(device_id, |_, l| l.user_id == user_id);
+        Ok(())
     }
 
     /// Whether the `browser-safety` skill should be delivered.
@@ -462,6 +548,16 @@ impl BridgeBackend for BrowserService {
 
     fn agents_enabled(&self, user_id: &str) -> bool {
         self.agents_enabled_now(user_id)
+    }
+}
+
+impl DeviceBackend for BrowserService {
+    fn devices_allowed(&self, user_id: &str) -> bool {
+        self.devices_allowed_now(user_id)
+    }
+
+    fn max_tabs(&self, user_id: &str) -> u8 {
+        self.max_tabs_cell(user_id).load(Ordering::Relaxed)
     }
 }
 

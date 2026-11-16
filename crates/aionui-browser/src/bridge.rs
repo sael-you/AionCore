@@ -93,6 +93,11 @@ impl AgentBridge {
         Ok(Self { token, ports })
     }
 
+    /// The shared header token (the device listeners use the same one).
+    pub(crate) fn token(&self) -> Arc<String> {
+        self.token.clone()
+    }
+
     /// The agent env pairs (see the module docs).
     pub fn env(&self) -> Vec<(String, String)> {
         let first = self.ports.first().map(|(_, p)| p.to_string()).unwrap_or_default();
@@ -114,7 +119,7 @@ impl AgentBridge {
     }
 }
 
-fn new_token() -> String {
+pub(crate) fn new_token() -> String {
     format!("{}{}", uuid::Uuid::new_v4().simple(), uuid::Uuid::new_v4().simple())
 }
 

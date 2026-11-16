@@ -70,6 +70,12 @@ impl BrowserLayout {
         self.data_dir.join("browser").join("settings")
     }
 
+    /// Paired devices of the owner's own browser (C34): root-only, never in
+    /// the browser account's tree.
+    pub fn devices_dir(&self) -> PathBuf {
+        self.data_dir.join("browser").join("devices")
+    }
+
     pub fn staging_dir(&self) -> PathBuf {
         self.data_dir.join("browser").join("staging")
     }
