@@ -6,6 +6,7 @@
 //! under one rule set (SPEC v1.0 §2–§7, §12), plus the per-project Board
 //! Keeper conversation (D40). Every board uses the `studio` flow (D39).
 
+pub mod access;
 pub mod actor;
 mod convert;
 pub mod error;

@@ -58,6 +58,16 @@ fn card_fields(required_version: bool) -> Value {
     properties
 }
 
+/// `board_update`: the card fields plus the conversation assignee (TASK-116).
+fn update_fields() -> Value {
+    let mut properties = card_fields(true);
+    properties["assignee_conversation"] = json!({
+        "type": "string",
+        "description": "Assign the card to this conversation id of yours (assignee_kind = conversation)."
+    });
+    properties
+}
+
 fn specs() -> Vec<Spec> {
     let empty = json!({ "type": "object", "properties": {}, "additionalProperties": false });
     let mut create_props = card_fields(false);
@@ -126,34 +136,38 @@ fn specs() -> Vec<Spec> {
                           — show the card again and retry.",
             input_schema: json!({
                 "type": "object",
-                "properties": card_fields(true),
+                "properties": update_fields(),
                 "required": ["version"],
                 "additionalProperties": false
             }),
             cli_command: &["update"],
             selectors: &["<N|TASK-N>"],
             when: "A card you work on needs a corrected title, description or fields.",
-            input_summary: "{ version, title?, description?, type?, priority?, size?, tier?, labels?, skills?, routing?, metadata?, change_id? }",
+            input_summary: "{ version, title?, description?, type?, priority?, size?, tier?, labels?, skills?, routing?, metadata?, change_id?, assignee_conversation? } (--assignee-conversation <id>)",
             reads_stdin: true,
         },
         Spec {
             name: "board_move",
             description: "Move a card to a column. Department agents cannot move cards (every studio column is \
                           closed to agents); the project's Board Keeper may move between non-gate columns. \
+                          Gates follow the board's agent_access: `full` = agents move cards into, out of and \
+                          past every gate; `approval` = only with --approval-note saying how the owner approved \
+                          (recorded on the card). `deploying` is never entered by a move. \
                           Optional stdin places it before/after another card number.",
             input_schema: json!({
                 "type": "object",
                 "properties": {
                     "before": { "type": "integer", "description": "Card number to land before." },
                     "after": { "type": "integer", "description": "Card number to land after." },
-                    "expected_column": { "type": "string", "description": "Refuse if the card left this column meanwhile." }
+                    "expected_column": { "type": "string", "description": "Refuse if the card left this column meanwhile." },
+                    "approval_note": { "type": "string", "maxLength": 500, "description": "How the owner approved crossing a gate (boards with agent_access: approval); also --approval-note." }
                 },
                 "additionalProperties": false
             }),
             cli_command: &["move"],
             selectors: &["<N|TASK-N>", "<column>"],
             when: "You are the Board Keeper and the owner asked you to move a card.",
-            input_summary: "{ before?, after?, expected_column? } (stdin optional)",
+            input_summary: "{ before?, after?, expected_column?, approval_note? } (stdin optional; --approval-note)",
             reads_stdin: true,
         },
         Spec {

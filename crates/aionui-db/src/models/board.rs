@@ -82,6 +82,11 @@ pub struct BoardCardRow {
     pub creator_ref: String,
     pub assignee_kind: Option<String>,
     pub assignee_ref: Option<String>,
+    /// The conversation the card is assigned to (909, TASK-116); set →
+    /// `assignee_kind`/`assignee_ref` are `None` and the wire says
+    /// `assignee_kind = conversation`.
+    #[serde(default)]
+    pub assignee_conversation_id: Option<String>,
     pub blocked: bool,
     pub blocked_reason: Option<String>,
     /// Actor kind that set the manual block (`user|agent|system`).

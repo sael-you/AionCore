@@ -28,21 +28,26 @@ fn string_list(raw: &str) -> Vec<String> {
     serde_json::from_str(raw).unwrap_or_default()
 }
 
-pub fn settings_dto(project_id: &str, row: Option<&BoardSettingsRow>) -> BoardSettingsDto {
+/// `project_name` decides the default `agent_access` (TASK-116).
+pub fn settings_dto(project_id: &str, row: Option<&BoardSettingsRow>, project_name: &str) -> BoardSettingsDto {
     match row {
-        Some(row) => BoardSettingsDto {
-            project_id: row.project_id.clone(),
-            exists: true,
-            enabled: row.enabled,
-            template: BoardTemplate::parse(&row.template).unwrap_or(BoardTemplate::Studio),
-            next_number: row.next_number,
-            version: row.version,
-            settings: json_or(&row.settings, json!({})),
-            archived_at: row.archived_at,
-            keeper_conversation_id: row.keeper_conversation_id.clone(),
-            created_at: Some(row.created_at),
-            updated_at: Some(row.updated_at),
-        },
+        Some(row) => {
+            let settings = json_or(&row.settings, json!({}));
+            BoardSettingsDto {
+                agent_access: crate::access::effective(&settings, project_name),
+                project_id: row.project_id.clone(),
+                exists: true,
+                enabled: row.enabled,
+                template: BoardTemplate::parse(&row.template).unwrap_or(BoardTemplate::Studio),
+                next_number: row.next_number,
+                version: row.version,
+                settings,
+                archived_at: row.archived_at,
+                keeper_conversation_id: row.keeper_conversation_id.clone(),
+                created_at: Some(row.created_at),
+                updated_at: Some(row.updated_at),
+            }
+        }
         None => BoardSettingsDto {
             project_id: project_id.to_owned(),
             exists: false,
@@ -51,6 +56,7 @@ pub fn settings_dto(project_id: &str, row: Option<&BoardSettingsRow>) -> BoardSe
             next_number: 1,
             version: 0,
             settings: json!({}),
+            agent_access: crate::access::default_for(project_name),
             archived_at: None,
             keeper_conversation_id: None,
             created_at: None,
@@ -116,8 +122,15 @@ pub fn card_dto(row: &BoardCardRow, dependencies: Vec<BoardDependencyDto>) -> Bo
         creator_ref: row.creator_ref.clone(),
         creator_conversation_id: None,
         creator_name: None,
-        assignee_kind: row.assignee_kind.as_deref().and_then(AssigneeKind::parse),
-        assignee_ref: row.assignee_ref.clone(),
+        // A conversation assignee (909) wins over the 901 columns.
+        assignee_kind: match &row.assignee_conversation_id {
+            Some(_) => Some(AssigneeKind::Conversation),
+            None => row.assignee_kind.as_deref().and_then(AssigneeKind::parse),
+        },
+        assignee_ref: row
+            .assignee_conversation_id
+            .clone()
+            .or_else(|| row.assignee_ref.clone()),
         blocked: row.blocked,
         blocked_reason: row.blocked_reason.clone(),
         blocked_by: row.blocked_by.as_deref().and_then(BoardActorKind::parse),
@@ -330,6 +343,7 @@ mod tests {
             creator_ref: "u1".into(),
             assignee_kind: None,
             assignee_ref: None,
+            assignee_conversation_id: None,
             blocked: false,
             blocked_reason: None,
             blocked_by: None,

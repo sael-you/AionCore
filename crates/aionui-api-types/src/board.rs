@@ -99,7 +99,14 @@ wire_enum!(
     BoardActorKind { User => "user", Agent => "agent", System => "system" }
 );
 wire_enum!(
-    AssigneeKind { Assistant => "assistant", Team => "team", User => "user" }
+    /// `conversation` (TASK-116): `assignee_ref` is a conversation id.
+    AssigneeKind { Assistant => "assistant", Team => "team", User => "user", Conversation => "conversation" }
+);
+wire_enum!(
+    /// How far agents may move cards across gates (TASK-116), stored as
+    /// `settings.agent_access`: `full` = across every gate; `approval` =
+    /// across a gate only with an owner approval note on the move.
+    AgentAccess { Full => "full", Approval => "approval" }
 );
 wire_enum!(
     LinkRole { Lead => "lead", Review => "review", Build => "build", Brainstorm => "brainstorm", Qa => "qa", Other => "other" }
@@ -120,6 +127,9 @@ pub struct BoardSettingsDto {
     pub next_number: i64,
     pub version: i64,
     pub settings: Value,
+    /// The effective `settings.agent_access` (its default when unset:
+    /// `full` for the clauterm-studio and TB-test projects, else `approval`).
+    pub agent_access: AgentAccess,
     pub archived_at: Option<i64>,
     /// The project's Board Keeper conversation (D40).
     pub keeper_conversation_id: Option<String>,
@@ -530,6 +540,10 @@ pub struct UpdateBoardCardRequest {
     pub blocked: Option<bool>,
     #[serde(default, deserialize_with = "nullable", skip_serializing_if = "Option::is_none")]
     pub blocked_reason: Option<Option<String>>,
+    /// Assign the card to this conversation of the user (TASK-116): the card
+    /// then reads `assignee_kind = conversation`, `assignee_ref = <id>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assignee_conversation: Option<String>,
 }
 
 /// `POST /api/board/cards/{id}/move`.
@@ -786,6 +800,10 @@ pub struct AgentUpdateBoardCardRequest {
     pub metadata: Option<Value>,
     #[serde(default, deserialize_with = "nullable", skip_serializing_if = "Option::is_none")]
     pub change_id: Option<Option<String>>,
+    /// Assign the card to a conversation of the user (TASK-116):
+    /// `assignee_kind = conversation`, `assignee_ref = <id>`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub assignee_conversation: Option<String>,
 }
 
 impl From<AgentUpdateBoardCardRequest> for UpdateBoardCardRequest {
@@ -805,6 +823,7 @@ impl From<AgentUpdateBoardCardRequest> for UpdateBoardCardRequest {
             change_id: value.change_id,
             blocked: None,
             blocked_reason: None,
+            assignee_conversation: value.assignee_conversation,
         }
     }
 }
@@ -821,6 +840,10 @@ pub struct AgentMoveBoardCardRequest {
     /// Optional placement guard; default = the card's current column.
     #[serde(default)]
     pub expected_column: Option<String>,
+    /// How the owner approved crossing a gate (`agent_access: approval`):
+    /// recorded on the card's history as `{by: "owner", via, at}`.
+    #[serde(default)]
+    pub approval_note: Option<String>,
 }
 
 /// Agent `block <N>`.

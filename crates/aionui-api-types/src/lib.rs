@@ -88,7 +88,7 @@ pub use auth::{
     WebuiChangeUsernameResponse, WebuiGenerateQrTokenResponse, WebuiResetPasswordResponse, WsTokenResponse,
 };
 pub use board::{
-    AgentBlockBoardCardRequest, AgentLinkBoardCardRequest, AgentMove, AgentMoveBoardCardRequest,
+    AgentAccess, AgentBlockBoardCardRequest, AgentLinkBoardCardRequest, AgentMove, AgentMoveBoardCardRequest,
     AgentShowBoardCardQuery, AgentUpdateBoardCardRequest, AssigneeKind, BOARD_ACTOR_HEADER, BOARD_ACTOR_SUPERVISOR,
     BOARD_CHANGED_EVENT, BOARD_TOOLS_SCHEMA_VERSION, BoardActorKind, BoardAssignRequest, BoardAssignResponse,
     BoardBrainstormRequest, BoardCardDetail, BoardCardDto, BoardCardListQuery, BoardCardPage, BoardCardSummaryDto,

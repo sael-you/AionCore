@@ -587,6 +587,8 @@ impl BoardService {
             let expected = row.version;
             row.assignee_kind = Some(kind.to_owned());
             row.assignee_ref = Some(kind_ref);
+            // One assignee at a time: an assistant/team replaces a conversation.
+            row.assignee_conversation_id = None;
             row.version += 1;
             row.updated_at = now_ms();
             if !tx.update_card(&row, expected).await? {

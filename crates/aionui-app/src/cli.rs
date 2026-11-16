@@ -361,8 +361,9 @@ pub(crate) enum BoardCommand {
     Show(BoardShowArgs),
     /// Create a card. Stdin: {"title": …, …}.
     Create,
-    /// Update a card. Stdin: {"version": …, <fields>}.
-    Update(BoardCardSelector),
+    /// Update a card. Stdin: {"version": …, <fields>}; with
+    /// --assignee-conversation alone, stdin may be empty (the version is read).
+    Update(BoardUpdateArgs),
     /// Move a card to a column (Board Keeper only). Optional stdin:
     /// {"before"|"after": N}.
     Move(BoardMoveArgs),
@@ -450,6 +451,20 @@ pub(crate) struct BoardMoveArgs {
     pub card: String,
     /// Target column key (e.g. `in_progress`).
     pub column: String,
+    /// How the owner approved crossing a gate (boards with
+    /// `agent_access: approval`); recorded on the card as {by: owner, via, at}.
+    #[arg(long = "approval-note")]
+    pub approval_note: Option<String>,
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct BoardUpdateArgs {
+    /// Card number: `N` or `TASK-N`.
+    #[arg(value_parser = parse_card_selector)]
+    pub card: String,
+    /// Assign the card to this conversation id (it must be one of yours).
+    #[arg(long = "assignee-conversation")]
+    pub assignee_conversation: Option<String>,
 }
 
 #[derive(Args, Debug, Clone)]
