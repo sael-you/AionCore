@@ -175,8 +175,9 @@ impl Socket {
                         voice_session_id: id,
                         engine,
                         model,
+                        capabilities: Some(crate::frames::SERVER_CAPABILITIES),
                     })),
-                    None => self.send(&state_frame(session.as_deref(), "armed", None)),
+                    None => self.send(&crate::frames::hello_armed_frame(session.as_deref(), None)),
                 }
                 // A page that connects after the call is ready still gets the card.
                 for frame in self.service.pending_draft_frames(&self.user_id).await {
@@ -200,8 +201,9 @@ impl Socket {
                         voice_session_id: id,
                         engine,
                         model,
+                        capabilities: Some(crate::frames::SERVER_CAPABILITIES),
                     })),
-                    None => self.send(&state_frame(session.as_deref(), "armed", Some("resumed"))),
+                    None => self.send(&crate::frames::hello_armed_frame(session.as_deref(), Some("resumed"))),
                 }
             }
             VoiceClientFrame::PlaybackFinished(frame) => {
@@ -254,6 +256,20 @@ impl Socket {
                 self.service
                     .client_event(&self.user_id, session.as_deref(), ClientEvent::Commit)
                     .await;
+            }
+            VoiceClientFrame::AttachQuotes(quotes) => {
+                if let Err(reason) = self
+                    .service
+                    .attach_quotes(&self.user_id, session.as_deref(), quotes.text)
+                    .await
+                {
+                    tracing::info!(user_id = %self.user_id, reason, "voice quotes refused");
+                    self.send(&crate::frames::quotes_attached_frame(
+                        session.as_deref().unwrap_or_default(),
+                        false,
+                        reason,
+                    ));
+                }
             }
         }
         Flow::Continue

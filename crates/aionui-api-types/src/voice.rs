@@ -160,6 +160,10 @@ pub enum VoiceClientFrame {
     /// Conversation mode "Done": end the user's utterance now (C26).
     #[serde(rename = "voice.commit")]
     Commit(VoiceSessionRef),
+    /// TASK-118: quoted chat passages for the NEXT posted message of this call
+    /// (conversation mode). The whole stack each time (replaces); "" clears.
+    #[serde(rename = "voice.attachQuotes")]
+    AttachQuotes(VoiceAttachQuotes),
 }
 
 impl VoiceClientFrame {
@@ -172,6 +176,7 @@ impl VoiceClientFrame {
             Self::PlaybackFinished(f) => f.voice_session_id.as_deref(),
             Self::SpeechOnset(f) => f.voice_session_id.as_deref(),
             Self::ConfirmTap(f) | Self::CancelTap(f) => f.voice_session_id.as_deref(),
+            Self::AttachQuotes(f) => f.voice_session_id.as_deref(),
         }
     }
 }
@@ -198,6 +203,36 @@ pub struct VoiceHeartbeat {
     #[serde(default)]
     pub voice_session_id: Option<String>,
     pub t: f64,
+}
+
+/// `voice.attachQuotes` (TASK-118). `text` ≤ 8192 bytes, already formatted
+/// (quote lines + replies); "" clears the pending quotes.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VoiceAttachQuotes {
+    #[serde(default)]
+    pub voice_session_id: Option<String>,
+    pub text: String,
+}
+
+/// `voice.quotesAttached` (TASK-118): what became of the attached quotes.
+/// `consumed: true` only with `reason: "posted"` (they went out with a
+/// message); otherwise `too_large` | `no_call` | `unsupported_mode` | `cleared`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VoiceQuotesAttached {
+    pub voice_session_id: String,
+    pub consumed: bool,
+    pub reason: String,
+}
+
+/// What this backend supports on `/api/voice/ws`, sent with the hello reply
+/// (`voice.ready` / `voice.state` armed). Absent = an older backend.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VoiceServerCapabilities {
+    #[serde(default)]
+    pub attach_quotes: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -264,6 +299,8 @@ pub enum VoiceServerFrame {
     FollowUp(VoiceFollowUp),
     #[serde(rename = "voice.wake")]
     Wake(VoiceWake),
+    #[serde(rename = "voice.quotesAttached")]
+    QuotesAttached(VoiceQuotesAttached),
 }
 
 impl VoiceServerFrame {
@@ -281,6 +318,7 @@ impl VoiceServerFrame {
             Self::ReadbackReady(_) => "voice.readbackReady",
             Self::FollowUp(_) => "voice.followUp",
             Self::Wake(_) => "voice.wake",
+            Self::QuotesAttached(_) => "voice.quotesAttached",
         }
     }
 }
@@ -291,6 +329,9 @@ pub struct VoiceReady {
     pub voice_session_id: String,
     pub engine: String,
     pub model: String,
+    /// Set on the hello reply (TASK-118).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<VoiceServerCapabilities>,
 }
 
 /// `armed` | `listening` | `thinking` | `speaking` | `offline`.
@@ -301,6 +342,9 @@ pub struct VoiceStateFrame {
     pub state: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// Set on the hello reply (TASK-118).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<VoiceServerCapabilities>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -515,8 +559,15 @@ mod tests {
             voice_session_id: "vs_1".into(),
             engine: "openai-realtime".into(),
             model: "gpt-realtime-2.1".into(),
+            capabilities: None,
         });
         assert_eq!(serde_json::to_value(&ready).unwrap()["name"], "voice.ready");
+        assert!(
+            serde_json::to_value(&ready).unwrap()["data"]
+                .get("capabilities")
+                .is_none(),
+            "absent, not null, when not advertised"
+        );
 
         let ended = VoiceServerFrame::CallEnded(VoiceCallEnded {
             voice_session_id: "vs_1".into(),
