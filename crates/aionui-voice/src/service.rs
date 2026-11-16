@@ -335,7 +335,10 @@ impl VoiceService {
                 audit: deps.audit,
                 credentials: deps.credentials,
                 credential_policy: deps.credential_policy,
-                cascade: Arc::new(crate::engine::MiniMaxCascadeEngine::new(deps.engine.clone())),
+                cascade: Arc::new(crate::engine::MiniMaxCascadeEngine::with_answer_silence(
+                    deps.engine.clone(),
+                    deps.timings.cascade_answer_silence,
+                )),
                 engine: deps.engine,
                 verifier: deps.verifier,
                 sockets: deps.sockets,

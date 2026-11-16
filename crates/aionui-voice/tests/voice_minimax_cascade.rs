@@ -440,3 +440,47 @@ async fn the_answer_ends_only_after_its_last_sentence_was_delivered() {
         "the end comes after the last clip"
     );
 }
+
+// ------------------------------------------------------------- TASK-112
+
+/// The cascade waits for a silence after a final before it answers, and a
+/// fragment inside that silence joins the same user turn (one brain request).
+#[tokio::test]
+async fn the_cascade_waits_for_a_silence_and_merges_fragments() {
+    let timings = aionui_voice::VoiceTimings {
+        cascade_answer_silence: Duration::from_millis(1500),
+        ..fast_timings()
+    };
+    let h = Harness::new(Options { timings }).await;
+    let user = cascade_user(&h, "mm-dora").await;
+    let addr = h.serve().await;
+    let mut ws = ws_connect(&addr, &user, Some(ORIGIN)).await.unwrap();
+    ws_send(&mut ws, hello(None)).await;
+    let (_session, call_id) = live_session(&h, &user).await;
+    // The ear: the most tolerant end-of-turn the Realtime API documents.
+    let ear = h.fake.created_sessions().last().cloned().unwrap();
+    assert_eq!(ear["audio"]["input"]["turn_detection"]["type"], "semantic_vad");
+    assert_eq!(ear["audio"]["input"]["turn_detection"]["eagerness"], "low", "{ear}");
+
+    h.fake
+        .set_chat_script(vec![json!({"text": "You have two projects, aionui and clauterm."})]);
+    let say = |text: &str| {
+        h.fake.push_event(
+            &call_id,
+            json!({"type": "conversation.item.input_audio_transcription.completed", "transcript": text,
+                "usage": {"type": "duration", "seconds": 1}}),
+        );
+    };
+    let t0 = std::time::Instant::now();
+    say("What projects");
+    tokio::time::sleep(Duration::from_millis(700)).await;
+    assert!(h.fake.chat_requests().is_empty(), "no answer inside the silence");
+    say("do I have?");
+    let request = wait_for(Duration::from_secs(5), || async { h.fake.chat_requests().pop() })
+        .await
+        .expect("the brain answers after the silence");
+    assert!(t0.elapsed() >= Duration::from_millis(2100), "{:?}", t0.elapsed());
+    assert_eq!(h.fake.chat_requests().len(), 1, "one user turn, one answer");
+    let messages = request["messages"].as_array().unwrap();
+    assert_eq!(messages.last().unwrap()["content"], "What projects do I have?");
+}

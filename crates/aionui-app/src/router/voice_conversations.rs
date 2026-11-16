@@ -13,6 +13,7 @@ use aionui_conversation::{ConversationError, ConversationService};
 use aionui_db::ISidebarStore;
 use aionui_voice::{
     ConversationInfo, ConversationPort, ConversationStatus, MessageHit, ProjectInfo, SendOutcome, SendProbe,
+    UserMessage,
 };
 
 pub(crate) struct VoiceConversationAdapter {
@@ -119,6 +120,28 @@ impl ConversationPort for VoiceConversationAdapter {
             .rev()
             .find(|m| m.r#type == MessageType::Text && m.position == Some(MessagePosition::Left))
             .and_then(|m| text_of(&m.content)))
+    }
+
+    async fn last_user_message(&self, user_id: &str, conversation_id: &str) -> Result<Option<UserMessage>, String> {
+        // A long turn adds many tool messages after the one that started it.
+        let page = self
+            .service
+            .list_messages(
+                user_id,
+                conversation_id,
+                ListMessagesQuery {
+                    limit: Some(100),
+                    ..Default::default()
+                },
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(page
+            .items
+            .iter()
+            .rev()
+            .find(|m| m.r#type == MessageType::Text && m.position == Some(MessagePosition::Right))
+            .and_then(|m| text_of(&m.content).map(|text| UserMessage { text, hidden: m.hidden })))
     }
 
     async fn search_messages(&self, user_id: &str, keyword: &str, limit: usize) -> Result<Vec<MessageHit>, String> {

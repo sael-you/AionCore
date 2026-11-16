@@ -16,6 +16,7 @@ use crate::error::VoiceError;
 use crate::lifecycle::EndReason;
 use crate::readback::ClipVoice;
 use crate::runner::CallRunner;
+use crate::utterance::PendingUtterance;
 
 /// What a voice session is for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -378,25 +379,30 @@ impl CallRunner {
             Intent::Silence | Intent::CancelTurn | Intent::EndVoice | Intent::MessageThenEnd(_) => {
                 asks.cancel_conversation(&user_id, &conversation_id);
             }
-            // An answer to the bound agent's `voice ask`: never posted, never an approval.
-            Intent::Message(message) => {
-                if let Some(ask_id) = asks.answer_next_for(&user_id, &conversation_id, message) {
-                    tracing::info!(session_id = %session_id, ask_id = %ask_id, "voice ask answered");
-                    return None;
-                }
-            }
-            Intent::Empty => {}
+            // Held for the merge window first: a cut-off fragment never answers
+            // an `ask` on its own (`flush_utterance` tries the merged text).
+            Intent::Message(_) | Intent::Empty => {}
         }
         tracing::info!(session_id = %session_id, conversation_id = %conversation_id,
             intent = intent_name(&intent), "voice conversation-mode utterance");
         match intent {
             Intent::Empty => None,
-            Intent::EndVoice => Some(EndReason::Sleep),
+            // Words held a moment ago are still the user's message.
+            Intent::EndVoice => {
+                self.flush_utterance().await;
+                Some(EndReason::Sleep)
+            }
             Intent::Silence => {
                 drafts.voice_line(&user_id, Some(&session_id), &conversation_id, STATUS_SILENCED, "Quiet.");
                 None
             }
             Intent::CancelTurn => {
+                // "Stop the task" also takes back what was not posted yet.
+                if let Some(held) = self.pending_utterance.take() {
+                    tracing::info!(session_id = %session_id, fragments = held.fragments(),
+                        "voice held utterance dropped by stop");
+                }
+                self.flush_next_final = false;
                 let dropped = drafts.cancel_voice_queue(&user_id, &conversation_id).await;
                 let (status, line) = match drafts.conversations.cancel_turn(&user_id, &conversation_id).await {
                     Ok(cancelled) if cancelled || dropped > 0 => (STATUS_STOPPED, "Stopped."),
@@ -420,14 +426,56 @@ impl CallRunner {
                 None
             }
             Intent::Message(message) => {
-                self.post_voice_message(&conversation_id, &message).await;
+                self.hold_utterance(&conversation_id, &message).await;
+                if std::mem::take(&mut self.flush_next_final) {
+                    self.flush_utterance().await;
+                }
                 None
             }
             Intent::MessageThenEnd(message) => {
-                self.post_voice_message(&conversation_id, &message).await;
+                self.hold_utterance(&conversation_id, &message).await;
+                self.flush_utterance().await;
                 Some(EndReason::Sleep)
             }
         }
+    }
+
+    /// Hold a final for the merge window, appended to the held one of the same
+    /// conversation (never across conversations: another one's is posted first).
+    async fn hold_utterance(&mut self, conversation_id: &str, message: &str) {
+        let now = tokio::time::Instant::now();
+        if self
+            .pending_utterance
+            .as_ref()
+            .is_some_and(|held| held.conversation_id != conversation_id)
+        {
+            self.flush_utterance().await;
+        }
+        match &mut self.pending_utterance {
+            Some(held) => held.append(message, now),
+            None => self.pending_utterance = Some(PendingUtterance::new(conversation_id, message, now)),
+        }
+    }
+
+    /// Post the held words as one message (or answer the bound agent's `ask`).
+    pub(crate) async fn flush_utterance(&mut self) {
+        self.flush_next_final = false;
+        let Some(held) = self.pending_utterance.take() else {
+            return;
+        };
+        let (user_id, session_id) = (self.call.user_id.clone(), self.call.session_id.clone());
+        tracing::info!(session_id = %session_id, conversation_id = %held.conversation_id,
+            fragments = held.fragments(), "voice conversation-mode message ready");
+        // An answer to the bound agent's `voice ask`: never posted, never an approval.
+        if let Some(ask_id) = self
+            .inner
+            .asks
+            .answer_next_for(&user_id, &held.conversation_id, held.text())
+        {
+            tracing::info!(session_id = %session_id, ask_id = %ask_id, "voice ask answered");
+            return;
+        }
+        self.post_voice_message(&held.conversation_id, held.text()).await;
     }
 
     /// Post the user's words into the bound conversation (and audit it).

@@ -33,6 +33,10 @@ const EAR_MODEL: &str = crate::settings::MODEL_MINI;
 pub(crate) const MAX_HISTORY: usize = 40;
 /// No first byte / no next chunk from the brain for this long = failed turn.
 const BRAIN_IDLE_TIMEOUT: Duration = Duration::from_secs(20);
+/// Silence after a final transcript before the brain answers (TASK-112, owner:
+/// "give a bit more time"): a fragment arriving meanwhile joins the same user
+/// turn. `semantic_vad` has no silence parameter, so the cascade adds it.
+pub const ANSWER_AFTER_SILENCE: Duration = Duration::from_millis(1500);
 /// Spoken when the brain fails, so the user is never left in silence.
 const BRAIN_FAILED_LINE: &str = "Sorry, I could not answer that. Please try again.";
 
@@ -40,17 +44,27 @@ const BRAIN_FAILED_LINE: &str = "Sorry, I could not answer that. Please try agai
 pub struct MiniMaxCascadeEngine {
     ear: Arc<dyn VoiceEngine>,
     http: reqwest::Client,
+    answer_silence: Duration,
 }
 
 impl MiniMaxCascadeEngine {
     pub fn new(ear: Arc<dyn VoiceEngine>) -> Self {
+        Self::with_answer_silence(ear, ANSWER_AFTER_SILENCE)
+    }
+
+    /// `answer_silence`: see [`ANSWER_AFTER_SILENCE`].
+    pub fn with_answer_silence(ear: Arc<dyn VoiceEngine>, answer_silence: Duration) -> Self {
         // Streamed answers: no total timeout, an idle timeout per chunk instead.
         let http = reqwest::Client::builder()
             .connect_timeout(Duration::from_secs(5))
             .pool_idle_timeout(Duration::from_secs(90))
             .build()
             .unwrap_or_else(|_| reqwest::Client::new());
-        Self { ear, http }
+        Self {
+            ear,
+            http,
+            answer_silence,
+        }
     }
 }
 
@@ -60,6 +74,9 @@ pub(crate) fn ear_config(config: &EngineSessionConfig) -> EngineSessionConfig {
     EngineSessionConfig {
         model: EAR_MODEL.to_owned(),
         instructions: TRANSCRIBE_ONLY_INSTRUCTIONS.to_owned(),
+        // The most tolerant end-of-turn the Realtime API documents ("lets the
+        // user take their time"); the cascade adds its own silence on top.
+        eagerness: "low".to_owned(),
         create_response: false,
         tools: Vec::new(),
         ..config.clone()
@@ -97,7 +114,15 @@ impl VoiceEngine for MiniMaxCascadeEngine {
             tools: chat_tools(&config.tools),
             max_output_tokens: config.max_output_tokens,
         };
-        Ok((answer, Box::new(CascadeCall::new(ear, Some(Arc::new(brain)), &config))))
+        Ok((
+            answer,
+            Box::new(CascadeCall::new(
+                ear,
+                Some(Arc::new(brain)),
+                &config,
+                self.answer_silence,
+            )),
+        ))
     }
 
     /// Without a brain: the ear alone, so a stray resume can still hang the
@@ -109,7 +134,7 @@ impl VoiceEngine for MiniMaxCascadeEngine {
         config: EngineSessionConfig,
     ) -> Box<dyn EngineCall> {
         let ear = self.ear.resume(credential, call_id, ear_config(&config));
-        Box::new(CascadeCall::new(ear, None, &config))
+        Box::new(CascadeCall::new(ear, None, &config, self.answer_silence))
     }
 }
 
@@ -134,7 +159,7 @@ impl MiniMaxCascadeEngine {
             tools: chat_tools(&config.tools),
             max_output_tokens: config.max_output_tokens,
         };
-        let mut call = CascadeCall::new(ear, Some(Arc::new(brain)), &config);
+        let mut call = CascadeCall::new(ear, Some(Arc::new(brain)), &config, self.answer_silence);
         for message in history {
             call.push_history(message);
         }
@@ -313,15 +338,26 @@ struct CascadeCall {
     queued: Option<String>,
     outstanding_tools: Vec<String>,
     seq: u64,
+    answer_silence: Duration,
+    /// When the held auto answer starts (no speech since the last final).
+    answer_at: Option<Instant>,
+    /// A final is held for the auto answer: the next one joins its user turn.
+    answer_held: bool,
 }
 
 enum Next {
     Ear(Option<EngineEvent>),
     Turn(Option<TurnMsg>),
+    Answer,
 }
 
 impl CascadeCall {
-    fn new(ear: Box<dyn EngineCall>, brain: Option<Arc<Brain>>, config: &EngineSessionConfig) -> Self {
+    fn new(
+        ear: Box<dyn EngineCall>,
+        brain: Option<Arc<Brain>>,
+        config: &EngineSessionConfig,
+        answer_silence: Duration,
+    ) -> Self {
         Self {
             ear,
             brain,
@@ -332,6 +368,9 @@ impl CascadeCall {
             queued: None,
             outstanding_tools: Vec::new(),
             seq: 0,
+            answer_silence,
+            answer_at: None,
+            answer_held: false,
         }
     }
 
@@ -425,6 +464,14 @@ impl CascadeCall {
         match &event {
             EngineEvent::UserSpeechStarted { .. } => {
                 self.cancel_turns();
+                // Still speaking: the held answer waits for this speech to end.
+                self.answer_at = None;
+                self.out.push_back(event);
+            }
+            EngineEvent::UserSpeechStopped { .. } => {
+                if self.answer_held {
+                    self.answer_at = Some(Instant::now() + self.answer_silence);
+                }
                 self.out.push_back(event);
             }
             EngineEvent::Transcript {
@@ -433,16 +480,40 @@ impl CascadeCall {
                 is_final: true,
                 ..
             } if !text.trim().is_empty() => {
-                let text = text.clone();
+                let text = text.trim().to_owned();
                 self.out.push_back(event);
-                self.push_history(json!({"role": "user", "content": text}));
+                self.add_user_text(&text);
                 if self.auto_respond && self.brain.is_some() && self.outstanding_tools.is_empty() {
-                    // A new utterance supersedes an answer still being written.
+                    // A new utterance supersedes an answer still being written;
+                    // the answer starts after the silence (TASK-112).
                     self.cancel_turns();
-                    let _ = self.announce_turn();
+                    self.answer_held = true;
+                    self.answer_at = Some(Instant::now() + self.answer_silence);
                 }
             }
             _ => self.out.push_back(event),
+        }
+    }
+
+    /// A final joins the held user turn, or starts a new one.
+    fn add_user_text(&mut self, text: &str) {
+        if self.answer_held
+            && let Some(last) = self.history.last_mut()
+            && last["role"] == "user"
+            && let Some(previous) = last["content"].as_str()
+        {
+            last["content"] = Value::String(format!("{previous} {text}"));
+            return;
+        }
+        self.push_history(json!({"role": "user", "content": text}));
+    }
+
+    /// The silence after the held final passed: answer now.
+    fn answer_held_turn(&mut self) {
+        self.answer_at = None;
+        self.answer_held = false;
+        if self.auto_respond && self.outstanding_tools.is_empty() {
+            let _ = self.announce_turn();
         }
     }
 
@@ -553,7 +624,14 @@ impl EngineCall for CascadeCall {
             let next = {
                 let ear = &mut self.ear;
                 let active = &mut self.active;
+                let answer_at = self.answer_at;
                 tokio::select! {
+                    _ = async {
+                        match answer_at {
+                            Some(at) => tokio::time::sleep_until(at).await,
+                            None => std::future::pending().await,
+                        }
+                    } => Next::Answer,
                     event = ear.next_event() => Next::Ear(event),
                     message = async {
                         match active {
@@ -567,6 +645,7 @@ impl EngineCall for CascadeCall {
                 Next::Ear(None) => return None,
                 Next::Ear(Some(event)) => self.on_ear(event),
                 Next::Turn(message) => self.on_turn(message),
+                Next::Answer => self.answer_held_turn(),
             }
         }
     }
@@ -574,6 +653,10 @@ impl EngineCall for CascadeCall {
     /// The ear never answers; this only switches the brain's auto answers.
     async fn set_create_response(&mut self, enabled: bool) -> Result<(), EngineError> {
         self.auto_respond = enabled;
+        if !enabled {
+            self.answer_at = None;
+            self.answer_held = false;
+        }
         Ok(())
     }
 
@@ -592,6 +675,8 @@ impl EngineCall for CascadeCall {
 
     async fn interrupt(&mut self) -> Result<(), EngineError> {
         self.cancel_turns();
+        self.answer_at = None;
+        self.answer_held = false;
         Ok(())
     }
 
@@ -616,6 +701,7 @@ impl EngineCall for CascadeCall {
             turn.task.abort();
         }
         self.queued = None;
+        self.answer_at = None;
         self.ear.close(reason).await
     }
 }

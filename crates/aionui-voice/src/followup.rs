@@ -38,6 +38,10 @@ impl FollowUpKind {
         }
     }
 
+    /// The bound conversation's finished line (owner: "just say that the task
+    /// is finished"): no conversation name, he is talking to that one.
+    pub const BOUND_FINISHED: &'static str = "The task is finished.";
+
     pub fn line(self, name: &str) -> String {
         match self {
             Self::Finished => format!("{name} finished."),
@@ -227,7 +231,7 @@ impl FollowUpWatcher {
                         .await;
                     return;
                 }
-                let line = self.line_for(&user_id, &conversation_id, &name, kind).await;
+                let line = self.line_for(&user_id, &conversation_id, &name, kind, false).await;
                 let clip = self
                     .drafts
                     .speak_line(&user_id, None, &conversation_id, kind.status(), &line, ClipVoice::Agent)
@@ -254,8 +258,20 @@ impl FollowUpWatcher {
     /// The spoken line: a finished turn adds a short summary of the
     /// conversation's last reply when one can be made (§3.4), kept within
     /// one clip; otherwise the template.
-    async fn line_for(&self, user_id: &str, conversation_id: &str, name: &str, kind: FollowUpKind) -> String {
-        let template = kind.line(name);
+    /// `bound`: the conversation the voice call is bound to (no name spoken).
+    async fn line_for(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        name: &str,
+        kind: FollowUpKind,
+        bound: bool,
+    ) -> String {
+        let template = if bound && kind == FollowUpKind::Finished {
+            FollowUpKind::BOUND_FINISHED.to_owned()
+        } else {
+            kind.line(name)
+        };
         if kind != FollowUpKind::Finished {
             return template;
         }
@@ -269,7 +285,11 @@ impl FollowUpWatcher {
             .flatten();
         match crate::summary::summary_of(kit.summarizer.as_deref(), reply.as_deref()).await {
             Some(summary) => {
-                let line = format!("{name} finished: {summary}");
+                let line = if bound {
+                    format!("{} {summary}", FollowUpKind::BOUND_FINISHED)
+                } else {
+                    format!("{name} finished: {summary}")
+                };
                 if line.chars().count() <= crate::conversation_mode::CLIP_MAX_CHARS {
                     line
                 } else {
@@ -277,6 +297,26 @@ impl FollowUpWatcher {
                 }
             }
             None => template,
+        }
+    }
+
+    /// Whether the conversation's latest user-side message is the owner's own
+    /// (typed or spoken), not a session message, a child result or a hidden
+    /// system prompt (cron). Unknown (lookup failed, nothing found) counts as
+    /// the owner's: better one line too many than his own turn left silent.
+    async fn owner_started(&self, user_id: &str, conversation_id: &str) -> bool {
+        match self
+            .drafts
+            .conversations
+            .last_user_message(user_id, conversation_id)
+            .await
+        {
+            Ok(Some(message)) => is_owner_message(&message),
+            Ok(None) => true,
+            Err(err) => {
+                tracing::warn!(conversation_id, error = %err, "voice turn origin unknown; announcing");
+                true
+            }
         }
     }
 
@@ -295,6 +335,19 @@ impl FollowUpWatcher {
     ) {
         self.presence.note_bound_turn_end(user_id, conversation_id);
         let spoke = self.drafts.spoke.remove(conversation_id).is_some();
+        // A finished turn the owner did not start (a session message, a child
+        // result, cron) is no news for him: nothing is said, no cue (TASK-112).
+        if kind == FollowUpKind::Finished
+            && !spoke
+            && outcome != Some("error")
+            && !self.owner_started(user_id, conversation_id).await
+        {
+            tracing::info!(
+                conversation_id,
+                "voice bound turn end not announced: not started by the owner"
+            );
+            return;
+        }
         let (kind, quiet) = match (kind, outcome) {
             (FollowUpKind::Finished, Some("cancelled")) => (FollowUpKind::Finished, true),
             (FollowUpKind::Finished, Some("error")) => (FollowUpKind::Failed, false),
@@ -307,11 +360,15 @@ impl FollowUpWatcher {
             kind.status()
         };
         if quiet {
-            self.drafts
-                .voice_line(user_id, None, conversation_id, status, &kind.line(name));
+            let line = if kind == FollowUpKind::Finished {
+                FollowUpKind::BOUND_FINISHED.to_owned()
+            } else {
+                kind.line(name)
+            };
+            self.drafts.voice_line(user_id, None, conversation_id, status, &line);
             return;
         }
-        let line = self.line_for(user_id, conversation_id, name, kind).await;
+        let line = self.line_for(user_id, conversation_id, name, kind, true).await;
         let clip = self
             .drafts
             .speak_line(user_id, None, conversation_id, status, &line, ClipVoice::Agent)
@@ -331,10 +388,46 @@ impl FollowUpWatcher {
     }
 }
 
+/// The owner's own message: not hidden and not delivered by another
+/// conversation (`[[AION_SESSION_MESSAGE]]`) or a child (`[[AION_CHILD_RESULT …]]`).
+pub(crate) fn is_owner_message(message: &crate::conversation_port::UserMessage) -> bool {
+    !message.hidden
+        && !message
+            .text
+            .contains(aionui_common::constants::AIONUI_SESSION_MESSAGE_MARKER)
+        && !message.text.trim_start().starts_with("[[AION_CHILD_RESULT")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn only_the_owners_own_messages_start_announced_turns() {
+        use crate::conversation_port::UserMessage;
+        let msg = |text: &str, hidden: bool| UserMessage {
+            text: text.into(),
+            hidden,
+        };
+        assert!(is_owner_message(&msg("fix the login test", false)));
+        assert!(is_owner_message(&msg(
+            "add a test\n\n[[AION_VOICE]]\n…\n[[/AION_VOICE]]",
+            false
+        )));
+        assert!(!is_owner_message(&msg(
+            "[[AION_SESSION_MESSAGE]]\nfrom: builder\n[[/AION_SESSION_MESSAGE]]\nTASK-91 done",
+            false
+        )));
+        assert!(!is_owner_message(&msg(
+            "[[AION_CHILD_RESULT child_id=c2 name=Builder status=finished]]\ndone\n[[/AION_CHILD_RESULT]]",
+            false
+        )));
+        assert!(
+            !is_owner_message(&msg("run the nightly check", true)),
+            "cron prompts are hidden"
+        );
+    }
 
     fn event(name: &str, data: Value) -> WebSocketMessage<Value> {
         WebSocketMessage::new(name, data)
