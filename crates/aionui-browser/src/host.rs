@@ -72,37 +72,78 @@ fn set_mode(path: &Path, mode: u32) -> std::io::Result<()> {
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
 }
 
-/// Steps 1 and 2. Returns the paths whose mode changed (for the info log).
-pub fn harden(paths: &HostPaths) -> std::io::Result<Vec<PathBuf>> {
-    let mut changed = Vec::new();
+/// What [`harden`] did.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub struct Hardened {
+    /// Paths whose mode changed (for the info log).
+    pub changed: Vec<PathBuf>,
+    /// Children on a read-only mount (`EROFS`): their mode cannot change, so
+    /// they keep their "other" access. Each one is logged once per start.
+    /// Production: `/root/.gitconfig` (ro bind mount, 0644, no credentials;
+    /// accepted by the director 2026-11-16).
+    pub read_only: Vec<PathBuf>,
+}
+
+fn is_read_only_fs(e: &std::io::Error) -> bool {
+    e.raw_os_error() == Some(libc::EROFS)
+}
+
+/// Steps 1 and 2.
+pub fn harden(paths: &HostPaths) -> std::io::Result<Hardened> {
+    harden_with(paths, set_mode)
+}
+
+/// [`harden`] with the chmod injected (tests simulate `EROFS` / `EACCES`).
+/// Only `EROFS` on a child is skipped; every other error aborts, naming the path.
+fn harden_with(paths: &HostPaths, chmod: impl Fn(&Path, u32) -> std::io::Result<()>) -> std::io::Result<Hardened> {
+    let with_path = |p: &Path, e: std::io::Error| std::io::Error::new(e.kind(), format!("{}: {e}", p.display()));
+    let mut done = Hardened::default();
     for (dir, keep) in [(&paths.home, &paths.home_keep), (&paths.clauterm, &paths.clauterm_keep)] {
-        for child in children_except(dir, keep)? {
-            if let Some(bits) = other_bits(&child)?
+        for child in children_except(dir, keep).map_err(|e| with_path(dir, e))? {
+            if let Some(bits) = other_bits(&child).map_err(|e| with_path(&child, e))?
                 && bits != 0
             {
-                let mode = std::fs::symlink_metadata(&child)?.permissions().mode() & 0o7777;
-                set_mode(&child, mode & !0o007)?;
-                changed.push(child);
+                let mode = std::fs::symlink_metadata(&child)
+                    .map_err(|e| with_path(&child, e))?
+                    .permissions()
+                    .mode()
+                    & 0o7777;
+                match chmod(&child, mode & !0o007) {
+                    Ok(()) => done.changed.push(child),
+                    Err(e) if is_read_only_fs(&e) => {
+                        tracing::warn!(
+                            path = %child.display(),
+                            "browser host: child is on a read-only mount; its 'other' access stays (skipped)"
+                        );
+                        done.read_only.push(child);
+                    }
+                    Err(e) => return Err(with_path(&child, e)),
+                }
             }
         }
     }
     for dir in [&paths.home, &paths.clauterm] {
-        let mode = std::fs::metadata(dir)?.permissions().mode() & 0o7777;
+        let mode = std::fs::metadata(dir)
+            .map_err(|e| with_path(dir, e))?
+            .permissions()
+            .mode()
+            & 0o7777;
         if mode != 0o711 {
-            set_mode(dir, 0o711)?;
-            changed.push(dir.clone());
+            chmod(dir, 0o711).map_err(|e| with_path(dir, e))?;
+            done.changed.push(dir.clone());
         }
     }
-    Ok(changed)
+    Ok(done)
 }
 
 /// Every child "other" can still reach, plus a traversed dir that "other"
-/// can list or write. Empty = safe to start.
-pub fn self_check(paths: &HostPaths) -> std::io::Result<Vec<PathBuf>> {
+/// can list or write. Empty = safe to start. `read_only` children (see
+/// [`Hardened::read_only`]) are accepted.
+pub fn self_check(paths: &HostPaths, read_only: &[PathBuf]) -> std::io::Result<Vec<PathBuf>> {
     let mut exposed = Vec::new();
     for (dir, keep) in [(&paths.home, &paths.home_keep), (&paths.clauterm, &paths.clauterm_keep)] {
         for child in children_except(dir, keep)? {
-            if other_bits(&child)?.is_some_and(|bits| bits != 0) {
+            if !read_only.contains(&child) && other_bits(&child)?.is_some_and(|bits| bits != 0) {
                 exposed.push(child);
             }
         }
@@ -288,16 +329,27 @@ pub async fn wipe_profile(profile: &Path, uid: u32, gid: u32) -> Result<(), Brow
 }
 
 /// Harden, then verify; `BROWSER_UNAVAILABLE` (and an error log naming the
-/// paths) when the host is still exposed.
+/// paths or the failure) when the host cannot be prepared or is still exposed.
 pub fn harden_and_verify(paths: &HostPaths) -> Result<(), BrowserError> {
-    let changed = harden(paths)?;
-    if !changed.is_empty() {
+    harden_and_verify_with(paths, set_mode)
+}
+
+fn harden_and_verify_with(
+    paths: &HostPaths,
+    chmod: impl Fn(&Path, u32) -> std::io::Result<()>,
+) -> Result<(), BrowserError> {
+    let unavailable = |what: &str, e: std::io::Error| {
+        tracing::error!(error = %e, "browser host {what} failed; not starting the browser");
+        BrowserError::coded(BrowserErrorCode::BrowserUnavailable, format!("host {what} failed"))
+    };
+    let done = harden_with(paths, chmod).map_err(|e| unavailable("preparation", e))?;
+    if !done.changed.is_empty() {
         tracing::info!(
-            count = changed.len(),
+            count = done.changed.len(),
             "browser host: removed 'other' access from root's directories"
         );
     }
-    let exposed = self_check(paths)?;
+    let exposed = self_check(paths, &done.read_only).map_err(|e| unavailable("self-check", e))?;
     if exposed.is_empty() {
         return Ok(());
     }
@@ -592,9 +644,9 @@ mod tests {
         let (_t, paths, browser) = fake_host();
         assert_eq!(paths.home_keep, ".clauterm");
         assert_eq!(paths.clauterm_keep, "aionui-browser");
-        assert!(!self_check(&paths).unwrap().is_empty(), "exposed before hardening");
+        assert!(!self_check(&paths, &[]).unwrap().is_empty(), "exposed before hardening");
 
-        harden(&paths).unwrap();
+        assert!(harden(&paths).unwrap().read_only.is_empty());
         assert_eq!(mode(&paths.home), 0o711);
         assert_eq!(mode(&paths.clauterm), 0o711);
         assert_eq!(mode(&paths.home.join(".token-pool")), 0o770);
@@ -607,8 +659,12 @@ mod tests {
                 .is_symlink()
         );
         assert!(browser.exists());
-        assert!(self_check(&paths).unwrap().is_empty());
-        assert!(harden(&paths).unwrap().is_empty(), "idempotent: nothing left to change");
+        assert!(self_check(&paths, &[]).unwrap().is_empty());
+        assert_eq!(
+            harden(&paths).unwrap(),
+            Hardened::default(),
+            "idempotent: nothing left to change"
+        );
     }
 
     #[test]
@@ -616,12 +672,54 @@ mod tests {
         let (_t, paths, _browser) = fake_host();
         harden_and_verify(&paths).unwrap();
         set_mode(&paths.clauterm.join("aionui"), 0o755).unwrap();
-        assert_eq!(self_check(&paths).unwrap(), vec![paths.clauterm.join("aionui")]);
+        assert_eq!(self_check(&paths, &[]).unwrap(), vec![paths.clauterm.join("aionui")]);
         set_mode(&paths.home, 0o755).unwrap();
         assert!(
-            self_check(&paths).unwrap().contains(&paths.home),
+            self_check(&paths, &[]).unwrap().contains(&paths.home),
             "a listable /root is exposed too"
         );
+    }
+
+    /// Production 2026-11-16: `/root/.gitconfig` is a read-only bind mount and
+    /// chmod fails with EROFS. That child is skipped (and accepted by the
+    /// self-check); everything else is still hardened.
+    #[test]
+    fn a_read_only_child_is_skipped_and_the_rest_hardened() {
+        let (_t, paths, _browser) = fake_host();
+        let ro = paths.home.join("notes.txt");
+        let chmod = |p: &Path, m: u32| {
+            if p == ro.as_path() {
+                Err(std::io::Error::from_raw_os_error(libc::EROFS))
+            } else {
+                set_mode(p, m)
+            }
+        };
+        let done = harden_with(&paths, chmod).unwrap();
+        assert_eq!(done.read_only, vec![ro.clone()]);
+        assert_eq!(mode(&ro), 0o644, "unchanged: the mount is read-only");
+        assert_eq!(mode(&paths.home.join(".token-pool")), 0o770);
+        assert_eq!(mode(&paths.home), 0o711);
+        assert!(self_check(&paths, &done.read_only).unwrap().is_empty());
+        assert_eq!(self_check(&paths, &[]).unwrap(), vec![ro.clone()]);
+        harden_and_verify_with(&paths, chmod).unwrap();
+    }
+
+    /// Any other chmod failure is NOT skipped: a coded, logged refusal.
+    #[test]
+    fn other_chmod_errors_refuse_the_start_with_a_code() {
+        let (_t, paths, _browser) = fake_host();
+        let denied = paths.home.join(".token-pool");
+        let chmod = |p: &Path, m: u32| {
+            if p == denied.as_path() {
+                Err(std::io::Error::from_raw_os_error(libc::EACCES))
+            } else {
+                set_mode(p, m)
+            }
+        };
+        let err = harden_with(&paths, chmod).unwrap_err();
+        assert!(err.to_string().contains(".token-pool"), "names the path: {err}");
+        let coded = harden_and_verify_with(&paths, chmod).unwrap_err();
+        assert_eq!(coded.code(), Some(BrowserErrorCode::BrowserUnavailable));
     }
 
     #[test]

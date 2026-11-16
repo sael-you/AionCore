@@ -287,8 +287,15 @@ impl BrowserService {
         Ok(s)
     }
 
-    /// Start instance `n` for `user_id` (or return the running one).
+    /// Start instance `n` for `user_id` (or return the running one). Every
+    /// failure is logged and carries a code the panel can show.
     pub async fn start(self: &Arc<Self>, user_id: &str, n: u8) -> Result<Arc<ChromeInstance>, BrowserError> {
+        self.start_inner(user_id, n)
+            .await
+            .map_err(|e| start_failure(user_id, n, e))
+    }
+
+    async fn start_inner(self: &Arc<Self>, user_id: &str, n: u8) -> Result<Arc<ChromeInstance>, BrowserError> {
         self.check_instance(user_id, n)?;
         if let Some(i) = self.running(user_id, n) {
             return Ok(i);
@@ -480,6 +487,21 @@ impl PanelBackend for BrowserService {
     }
 }
 
+/// Log a start failure and make sure it has a code (an uncoded error would
+/// reach the panel as a bare `BROWSER_NOT_RUNNING`).
+fn start_failure(user_id: &str, instance: u8, e: BrowserError) -> BrowserError {
+    match e.code() {
+        Some(code) => {
+            tracing::warn!(user_id, instance, ?code, error = %e, "server browser did not start");
+            e
+        }
+        None => {
+            tracing::error!(user_id, instance, error = %e, "server browser did not start");
+            BrowserError::coded(BrowserErrorCode::BrowserStartFailed, "the browser did not start")
+        }
+    }
+}
+
 impl BrowserService {
     fn self_arc(&self) -> Option<Arc<Self>> {
         self.me.upgrade()
@@ -500,6 +522,18 @@ mod tests {
             run_as_override: None,
         })
         .unwrap()
+    }
+
+    #[test]
+    fn start_failures_always_carry_a_code() {
+        let io = start_failure("u1", 1, BrowserError::Io(std::io::Error::other("boom")));
+        assert_eq!(io.code(), Some(BrowserErrorCode::BrowserStartFailed));
+        let coded = start_failure(
+            "u1",
+            1,
+            BrowserError::coded(BrowserErrorCode::BrowserUnavailable, "host self-check failed"),
+        );
+        assert_eq!(coded.code(), Some(BrowserErrorCode::BrowserUnavailable));
     }
 
     #[tokio::test]
