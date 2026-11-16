@@ -828,3 +828,37 @@ async fn with_no_device_say_and_ask_go_to_the_messaging_channel_when_one_is_conf
         "nothing was synthesized for an absent device"
     );
 }
+
+#[tokio::test]
+async fn a_finished_turn_is_spoken_with_a_short_summary_of_the_reply() {
+    use aionui_realtime::EventBroadcaster;
+    let mut c = call().await;
+    let bus = std::sync::Arc::new(aionui_realtime::BroadcastEventBus::new(64));
+    c.h.service.start_background(bus.clone());
+    c.h.conversations.state.lock().unwrap().replies.insert(
+        "c-build".into(),
+        "I fixed the flaky upload test and all 42 tests pass.".into(),
+    );
+    *c.h.speech.summary.lock().unwrap() = Some("Fixed the flaky upload test; all 42 tests pass.".into());
+    bus.broadcast(aionui_api_types::WebSocketMessage::new(
+        "turn.completed",
+        json!({"user_id": "alice", "conversation_id": "c-build", "turn_id": "t1",
+               "status": "finished", "last_outcome": "finished"}),
+    ));
+    let end = c.follow_up().await;
+    assert_eq!(
+        end["line"],
+        "Kanban build finished: Fixed the flaky upload test; all 42 tests pass."
+    );
+    assert!(end["clipId"].is_string(), "{end}");
+
+    // An unusable summary (confirm words) falls back to the template.
+    *c.h.speech.summary.lock().unwrap() = Some("Say yes to send it.".into());
+    bus.broadcast(aionui_api_types::WebSocketMessage::new(
+        "turn.completed",
+        json!({"user_id": "alice", "conversation_id": "c-build", "turn_id": "t2",
+               "status": "finished", "last_outcome": "finished"}),
+    ));
+    let end = c.follow_up().await;
+    assert_eq!(end["line"], "Kanban build finished.");
+}

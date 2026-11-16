@@ -35,6 +35,7 @@ mod service;
 mod settings;
 mod speech;
 mod state;
+mod summary;
 pub mod tools;
 mod ws;
 
@@ -66,3 +67,4 @@ pub use service::{VoiceService, VoiceServiceDeps};
 pub use settings::VoiceSettings;
 pub use speech::ProviderSpeechFactory;
 pub use state::VoiceRouterState;
+pub use summary::SummaryPort;

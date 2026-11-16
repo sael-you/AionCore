@@ -56,6 +56,8 @@ pub struct SpeechKit {
     pub synth: Option<Arc<dyn SynthPort>>,
     pub transcriber: Option<Arc<dyn TranscribePort>>,
     pub refiner: Option<Arc<dyn RefinerPort>>,
+    /// Follow-up summaries (§3.4); `None` → the template alone.
+    pub summarizer: Option<Arc<dyn crate::summary::SummaryPort>>,
 }
 
 #[async_trait::async_trait]

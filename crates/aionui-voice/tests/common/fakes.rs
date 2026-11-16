@@ -198,6 +198,8 @@ pub struct FakeSpeech {
     /// Synthesis of a text containing this marker takes this long.
     pub slow: Arc<Mutex<Option<(String, std::time::Duration)>>>,
     lines: Arc<Mutex<Vec<String>>>,
+    /// What the follow-up summarizer returns (`None`: no summarizer).
+    pub summary: Arc<Mutex<Option<String>>>,
 }
 
 impl FakeSpeech {
@@ -218,6 +220,14 @@ impl FakeSpeech {
 struct Synth(FakeSpeech);
 struct Transcriber(FakeSpeech);
 struct Refiner(FakeSpeech);
+struct Summarizer(String);
+
+#[async_trait::async_trait]
+impl aionui_voice::SummaryPort for Summarizer {
+    async fn summarize(&self, _reply: &str) -> Result<String, String> {
+        Ok(self.0.clone())
+    }
+}
 
 #[async_trait::async_trait]
 impl SynthPort for Synth {
@@ -273,6 +283,12 @@ impl SpeechFactory for FakeSpeech {
             synth,
             transcriber: Some(Arc::new(Transcriber(self.clone()))),
             refiner: Some(Arc::new(Refiner(self.clone()))),
+            summarizer: self
+                .summary
+                .lock()
+                .unwrap()
+                .clone()
+                .map(|s| Arc::new(Summarizer(s)) as Arc<dyn aionui_voice::SummaryPort>),
         }
     }
 }

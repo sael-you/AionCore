@@ -227,16 +227,10 @@ impl FollowUpWatcher {
                         .await;
                     return;
                 }
+                let line = self.line_for(&user_id, &conversation_id, &name, kind).await;
                 let clip = self
                     .drafts
-                    .speak_line(
-                        &user_id,
-                        None,
-                        &conversation_id,
-                        kind.status(),
-                        &kind.line(&name),
-                        ClipVoice::Agent,
-                    )
+                    .speak_line(&user_id, None, &conversation_id, kind.status(), &line, ClipVoice::Agent)
                     .await;
                 if !self.presence.has_live_call(&user_id)
                     && let Some(clip_id) = clip
@@ -257,6 +251,35 @@ impl FollowUpWatcher {
 }
 
 impl FollowUpWatcher {
+    /// The spoken line: a finished turn adds a short summary of the
+    /// conversation's last reply when one can be made (§3.4), kept within
+    /// one clip; otherwise the template.
+    async fn line_for(&self, user_id: &str, conversation_id: &str, name: &str, kind: FollowUpKind) -> String {
+        let template = kind.line(name);
+        if kind != FollowUpKind::Finished {
+            return template;
+        }
+        let kit = self.drafts.speech.for_user(user_id).await;
+        let reply = self
+            .drafts
+            .conversations
+            .last_reply(user_id, conversation_id)
+            .await
+            .ok()
+            .flatten();
+        match crate::summary::summary_of(kit.summarizer.as_deref(), reply.as_deref()).await {
+            Some(summary) => {
+                let line = format!("{name} finished: {summary}");
+                if line.chars().count() <= crate::conversation_mode::CLIP_MAX_CHARS {
+                    line
+                } else {
+                    template
+                }
+            }
+            None => template,
+        }
+    }
+
     /// The bound conversation (conversation voice mode): its own agent speaks
     /// with `say`; the watcher only fills gaps. A finished turn whose agent
     /// already spoke gets a text line (the "your turn" cue), otherwise the
@@ -288,16 +311,10 @@ impl FollowUpWatcher {
                 .voice_line(user_id, None, conversation_id, status, &kind.line(name));
             return;
         }
+        let line = self.line_for(user_id, conversation_id, name, kind).await;
         let clip = self
             .drafts
-            .speak_line(
-                user_id,
-                None,
-                conversation_id,
-                status,
-                &kind.line(name),
-                ClipVoice::Agent,
-            )
+            .speak_line(user_id, None, conversation_id, status, &line, ClipVoice::Agent)
             .await;
         if !self.presence.has_live_call(user_id)
             && let Some(clip_id) = clip

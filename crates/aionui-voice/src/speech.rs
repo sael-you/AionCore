@@ -80,7 +80,11 @@ impl SpeechFactory for ProviderSpeechFactory {
                 }) as Arc<dyn crate::readback::TranscribePort>
             }),
             refiner: openai
+                .clone()
                 .map(|credential| Arc::new(OpenAiRefiner::new(credential)) as Arc<dyn crate::refiner::RefinerPort>),
+            summarizer: openai.map(|credential| {
+                Arc::new(crate::summary::OpenAiSummarizer::new(credential)) as Arc<dyn crate::summary::SummaryPort>
+            }),
         }
     }
 }
