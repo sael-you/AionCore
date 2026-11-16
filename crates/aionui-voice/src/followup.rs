@@ -103,7 +103,14 @@ pub trait CallPresence: Send + Sync {
 
     /// The conversation the user's conversation voice mode is bound to (C26).
     fn bound_conversation(&self, user_id: &str) -> Option<String>;
+
+    /// The bound conversation's turn ended (restart recovery reads it).
+    fn note_bound_turn_end(&self, user_id: &str, conversation_id: &str);
 }
+
+/// `voice.followUp.status` of a failed TURN of the bound conversation
+/// (`failed` there means the send itself failed).
+pub const STATUS_TURN_FAILED: &str = "turn_failed";
 
 pub struct FollowUpWatcher {
     pub bus: Arc<BroadcastEventBus>,
@@ -261,6 +268,7 @@ impl FollowUpWatcher {
         kind: FollowUpKind,
         outcome: Option<&str>,
     ) {
+        self.presence.note_bound_turn_end(user_id, conversation_id);
         let spoke = self.drafts.spoke.remove(conversation_id).is_some();
         let (kind, quiet) = match (kind, outcome) {
             (FollowUpKind::Finished, Some("cancelled")) => (FollowUpKind::Finished, true),
@@ -268,9 +276,14 @@ impl FollowUpWatcher {
             (FollowUpKind::Finished, _) => (FollowUpKind::Finished, spoke),
             (other, _) => (other, false),
         };
+        let status = if kind == FollowUpKind::Failed {
+            STATUS_TURN_FAILED
+        } else {
+            kind.status()
+        };
         if quiet {
             self.drafts
-                .voice_line(user_id, None, conversation_id, kind.status(), &kind.line(name));
+                .voice_line(user_id, None, conversation_id, status, &kind.line(name));
             return;
         }
         let clip = self
@@ -279,7 +292,7 @@ impl FollowUpWatcher {
                 user_id,
                 None,
                 conversation_id,
-                kind.status(),
+                status,
                 &kind.line(name),
                 ClipVoice::Agent,
             )

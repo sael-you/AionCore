@@ -227,12 +227,23 @@ still applies (`VOICE_BUSY`).
   user (`user`, `sleep`), the kill switch, a revoked session or the budget.
 - Turn end of the bound conversation: `finished` as text when the agent
   spoke in that turn, spoken "<name> finished." when it did not; a
-  cancelled turn is text only; an error is the spoken `failed` line.
+  cancelled turn is text only; a failed TURN is the spoken status
+  `turn_failed` ("<name> failed."). `failed` in conversation mode always
+  means the send itself failed.
+- Idle: after 3 min without speech and without a running turn the call is
+  hung up (`voice.callEnded` `idle`) but voice mode stays armed on the
+  device and the binding lives 30 more minutes: the agent may still speak
+  (clips announced by `voice.wake`).
 - While the bound conversation runs a turn (or waits for an approval) the
   call is not idle-hung-up.
 - Restart: the binding is in memory only; a conversation-mode call (told
   apart by its instructions hash) is closed with `restart`, never re-attached
-  as a Jarvis call.
+  as a Jarvis call. When its last voice message (audit `voice_message`) had
+  no turn end after it (audit `voice_turn_end`) and the conversation is not
+  running, the next `voice.hello` of that user gets one spoken
+  `voice.followUp` `interrupted`: "The restart interrupted the task. Say Hey
+  Jarvis to continue." (the session's `session_created` audit carries its
+  `focus`).
 - Speech: MiniMax `speech-2.8-turbo` (4 s) → OpenAI `gpt-realtime-2.1-mini`
   → text. Every clip is charged 60 µUSD per character to the daily budget
   (the live session, else the user's latest).

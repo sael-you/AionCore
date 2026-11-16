@@ -28,7 +28,7 @@ use crate::error::VoiceError;
 use crate::frames::{VoiceSockets, call_ended_frame, error_frame};
 use crate::lifecycle::{EndReason, VoiceTimings};
 use crate::ports::{AuthRejected, AuthVerifier, CredentialPort, VerifiedUser};
-use crate::readback::{Clip, ClipStore};
+use crate::readback::{Clip, ClipStore, ClipVoice};
 use crate::runner::CallCommand;
 use crate::runner_drafts::ClientEvent;
 use crate::settings::{VoiceSettings, micros_to_usd};
@@ -136,6 +136,9 @@ pub(crate) struct ServiceInner {
     pub live: DashMap<String, Arc<LiveCall>>,
     /// user id → conversation voice-mode binding (C26).
     pub bindings: DashMap<String, Binding>,
+    /// user id → bound conversation whose turn a restart interrupted; spoken
+    /// once when the device says hello again (C26 §3.4).
+    pub interrupted: DashMap<String, String>,
     pub tasks: DashMap<String, tokio::task::AbortHandle>,
     /// Per-user admission lock: an admission, a resume and the kill switch of
     /// one user never interleave; other users are not blocked.
@@ -246,6 +249,7 @@ impl VoiceService {
                 timings: deps.timings,
                 live: DashMap::new(),
                 bindings: DashMap::new(),
+                interrupted: DashMap::new(),
                 tasks: DashMap::new(),
                 admission: DashMap::new(),
                 listening_since: std::sync::Mutex::new(None),
@@ -554,6 +558,28 @@ impl VoiceService {
         }
     }
 
+    /// A device said hello: if a restart interrupted the turn of the user's
+    /// bound conversation, say so once (a clip through the normal TTS path).
+    pub fn speak_interrupted(&self, user_id: &str) {
+        let Some((_, conversation_id)) = self.inner.interrupted.remove(user_id) else {
+            return;
+        };
+        let drafts = self.inner.drafts.clone();
+        let user_id = user_id.to_owned();
+        tokio::spawn(async move {
+            drafts
+                .speak_line(
+                    &user_id,
+                    None,
+                    &conversation_id,
+                    "interrupted",
+                    crate::conversation_mode::INTERRUPTED_LINE,
+                    ClipVoice::Agent,
+                )
+                .await;
+        });
+    }
+
     /// The user's pending draft card, replayed on `voice.hello`.
     pub async fn pending_draft_frames(&self, user_id: &str) -> Vec<VoiceServerFrame> {
         self.inner.drafts.replay_for(user_id).await
@@ -673,5 +699,23 @@ impl crate::followup::CallPresence for VoiceService {
 
     fn bound_conversation(&self, user_id: &str) -> Option<String> {
         self.inner.bound_conversation(user_id)
+    }
+
+    fn note_bound_turn_end(&self, user_id: &str, conversation_id: &str) {
+        let Some(session_id) = self.inner.bindings.get(user_id).map(|b| b.session_id.clone()) else {
+            return;
+        };
+        let inner = self.inner.clone();
+        let (user_id, conversation_id) = (user_id.to_owned(), conversation_id.to_owned());
+        tokio::spawn(async move {
+            inner
+                .audit(
+                    &user_id,
+                    Some(&session_id),
+                    crate::conversation_mode::AUDIT_TURN_END,
+                    json!({"conversationId": conversation_id}),
+                )
+                .await;
+        });
     }
 }

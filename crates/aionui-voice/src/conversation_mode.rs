@@ -59,6 +59,13 @@ pub const STATUS_SILENCED: &str = "silenced";
 /// `send_message`). Such rows never show a draft card and speak no outcome.
 pub const VOICE_MODE_DELIVERY: &str = "voice_mode";
 
+/// Spoken once after a restart killed the bound conversation's turn.
+pub const INTERRUPTED_LINE: &str = "The restart interrupted the task. Say Hey Jarvis to continue.";
+/// Audit events restart recovery reads to tell an interrupted turn: a voice
+/// message went in, and no turn end followed.
+pub const AUDIT_VOICE_MESSAGE: &str = "voice_message";
+pub const AUDIT_TURN_END: &str = "voice_turn_end";
+
 /// The longest `say` text from the bound conversation, and the longest clip.
 pub const BOUND_SAY_MAX_CHARS: usize = 1200;
 pub const CLIP_MAX_CHARS: usize = 300;
@@ -277,9 +284,22 @@ impl CallRunner {
                 None
             }
             Intent::Message(message) => {
-                drafts
+                let delivered = drafts
                     .send_voice_message(&user_id, &session_id, &conversation_id, &message, self.call.car)
                     .await;
+                if !matches!(
+                    delivered,
+                    crate::drafts::Delivered::Failed | crate::drafts::Delivered::Lost
+                ) {
+                    self.inner
+                        .audit(
+                            &user_id,
+                            Some(&session_id),
+                            AUDIT_VOICE_MESSAGE,
+                            serde_json::json!({"conversationId": conversation_id}),
+                        )
+                        .await;
+                }
                 None
             }
         }

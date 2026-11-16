@@ -12,7 +12,7 @@ use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use aionui_api_types::{CreateVoiceSessionRequest, CreateVoiceSessionResponse};
-use aionui_db::{CreateVoiceSessionParams, DbError, VoiceSessionRow};
+use aionui_db::{CreateVoiceSessionParams, DbError, IVoiceAuditRepository, VoiceSessionRow};
 use serde_json::{Value, json};
 use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
@@ -221,7 +221,8 @@ impl VoiceService {
                 Some(&session_id),
                 "session_created",
                 json!({"engine": engine_kind, "model": profile.model, "resumeOf": req.resume_of,
-                   "mode": if mode.is_conversation() { "conversation" } else { "jarvis" }}),
+                   "mode": if mode.is_conversation() { "conversation" } else { "jarvis" },
+                   "focus": if mode.is_conversation() { req.focus_conversation_id.as_deref() } else { None }}),
             )
             .await;
         tracing::info!(user_id, session_id = %session_id, engine = engine_kind, model = %profile.model,
@@ -426,6 +427,9 @@ impl VoiceService {
             match self.recover_one(&row).await {
                 Ok(()) => resumed += 1,
                 Err(reason) => {
+                    if row.instructions_hash.as_deref() == Some(conversation_instructions_hash().as_str()) {
+                        self.note_interrupted_turn(&row).await;
+                    }
                     let _ = self
                         .inner
                         .sessions
@@ -447,6 +451,43 @@ impl VoiceService {
             }
         }
         resumed
+    }
+
+    /// A conversation-mode call died with the process: when its last voice
+    /// message has no turn end after it and the conversation is not running
+    /// now, the restart interrupted that turn — say so on the next hello.
+    async fn note_interrupted_turn(&self, row: &VoiceSessionRow) {
+        use crate::conversation_mode::{AUDIT_TURN_END, AUDIT_VOICE_MESSAGE};
+        let Ok(events) = self.inner.audit.list(&row.user_id, 500).await else {
+            return;
+        };
+        let mine = events
+            .iter()
+            .filter(|e| e.session_id.as_deref() == Some(row.id.as_str()));
+        let focus = mine
+            .clone()
+            .find(|e| e.event == "session_created")
+            .and_then(|e| serde_json::from_str::<Value>(&e.detail).ok())
+            .and_then(|d| d["focus"].as_str().map(str::to_owned));
+        let Some(conversation_id) = focus else {
+            return;
+        };
+        // Newest first: the latest message-or-turn-end decides.
+        let last = mine
+            .clone()
+            .find(|e| e.event == AUDIT_VOICE_MESSAGE || e.event == AUDIT_TURN_END);
+        if last.is_none_or(|e| e.event != AUDIT_VOICE_MESSAGE) {
+            return;
+        }
+        let running = matches!(
+            self.inner.drafts.conversations.status(&row.user_id, &conversation_id).await,
+            Ok(Some(status)) if status.is_processing
+        );
+        if !running {
+            tracing::info!(session_id = %row.id, conversation_id = %conversation_id,
+                "voice recovery: the restart interrupted a bound turn");
+            self.inner.interrupted.insert(row.user_id.clone(), conversation_id);
+        }
     }
 
     async fn recover_one(&self, row: &VoiceSessionRow) -> Result<(), EndReason> {

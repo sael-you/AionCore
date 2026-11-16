@@ -380,4 +380,113 @@ async fn turn_end_is_spoken_only_when_the_agent_said_nothing() {
     bus.broadcast(completed("t3", "cancelled"));
     let end = c.follow_up().await;
     assert!(end.get("clipId").is_none(), "{end}");
+
+    // A failed TURN is `turn_failed` (`failed` is a failed send), spoken.
+    bus.broadcast(completed("t4", "error"));
+    let end = c.follow_up().await;
+    assert_eq!(end["status"], "turn_failed", "{end}");
+    assert_eq!(end["line"], "Kanban build failed.");
+    assert!(end["clipId"].is_string());
+}
+
+async fn conversation_harness_with(options: Options) -> (Harness, TestUser, String) {
+    let h = Harness::new(options).await;
+    h.conversations.add("c-build", "Kanban build", Some("p-aionui"));
+    let user = h.enabled_user("alice").await;
+    let (status, body) = create_conversation_session(&h, &user, Some("c-build")).await;
+    assert_eq!(status, 201, "{body}");
+    let session = body["data"]["voice_session_id"].as_str().unwrap().to_owned();
+    (h, user, session)
+}
+
+#[tokio::test]
+async fn after_the_idle_hangup_voice_mode_stays_armed_and_the_agent_may_still_speak() {
+    let timings = aionui_voice::VoiceTimings {
+        idle_hangup: Duration::from_millis(600),
+        heartbeat_stale: Duration::from_secs(60),
+        ..fast_timings()
+    };
+    let (h, user, session) = conversation_harness_with(Options { timings }).await;
+    // A running turn keeps the call open past the idle limit.
+    h.conversations.set_status("c-build", running(true, 0));
+    tokio::time::sleep(Duration::from_millis(1500)).await;
+    assert_eq!(
+        h.session_row(&user, &session).await.state,
+        "live",
+        "a running turn is not idle"
+    );
+
+    h.conversations.set_status("c-build", ConversationStatus::default());
+    let row = h.wait_ended(&user, &session).await;
+    assert_eq!(row.end_reason.as_deref(), Some("idle"));
+    assert!(
+        h.service.is_bound(&user.id, "c-build"),
+        "the idle hangup keeps voice mode bound"
+    );
+    let addr = h.serve().await;
+    let mut ws = ws_connect(&addr, &user, Some(ORIGIN)).await.unwrap();
+    ws_send(&mut ws, hello(None)).await;
+    let said = h
+        .service
+        .agent_say(&user.id, "c-build", "Done, all green.")
+        .await
+        .unwrap();
+    assert_eq!(said.status, "delivered");
+    let wake = ws_expect(&mut ws, "voice.wake").await;
+    assert_eq!(wake["data"]["reason"], "says", "announced without a call: {wake}");
+}
+
+#[tokio::test]
+async fn a_restart_during_a_bound_turn_is_spoken_once_on_the_next_hello() {
+    let c = call().await;
+    c.say("refactor the upload test");
+    wait_for(Duration::from_secs(5), || async {
+        (!c.h.conversations.sends().is_empty()).then_some(())
+    })
+    .await
+    .expect("sent");
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    c.h.service.simulate_crash();
+
+    let second = Harness::with_db(c.h.db.clone(), c.h.fake.clone(), Options::default()).await;
+    second.conversations.add("c-build", "Kanban build", None);
+    assert_eq!(second.service.recover_open_sessions().await, 0);
+    let addr = second.serve().await;
+    let mut ws = ws_connect(&addr, &c.user, Some(ORIGIN)).await.unwrap();
+    ws_send(&mut ws, hello(None)).await;
+    let line = ws_expect(&mut ws, "voice.followUp").await["data"].clone();
+    assert_eq!(line["status"], "interrupted", "{line}");
+    assert_eq!(line["conversationId"], "c-build");
+    assert!(line["line"].as_str().unwrap().contains("restart interrupted the task"));
+    assert!(line["clipId"].is_string(), "spoken through the normal TTS path");
+
+    // Once only.
+    let mut again = ws_connect(&addr, &c.user, Some(ORIGIN)).await.unwrap();
+    ws_send(&mut again, hello(None)).await;
+    assert!(!saw_follow_up(&mut again).await, "spoken once");
+}
+
+#[tokio::test]
+async fn a_restart_after_the_turn_ended_says_nothing() {
+    let c = call().await;
+    // No voice message in this call: nothing was interrupted.
+    c.h.service.simulate_crash();
+    let second = Harness::with_db(c.h.db.clone(), c.h.fake.clone(), Options::default()).await;
+    second.conversations.add("c-build", "Kanban build", None);
+    second.service.recover_open_sessions().await;
+    let addr = second.serve().await;
+    let mut ws = ws_connect(&addr, &c.user, Some(ORIGIN)).await.unwrap();
+    ws_send(&mut ws, hello(None)).await;
+    assert!(!saw_follow_up(&mut ws).await);
+}
+
+/// Whether a `voice.followUp` arrives within 800 ms.
+async fn saw_follow_up(ws: &mut Client) -> bool {
+    let deadline = tokio::time::Instant::now() + Duration::from_millis(800);
+    while let Some(frame) = ws_next(ws, deadline.saturating_duration_since(tokio::time::Instant::now())).await {
+        if frame["name"] == "voice.followUp" {
+            return true;
+        }
+    }
+    false
 }
