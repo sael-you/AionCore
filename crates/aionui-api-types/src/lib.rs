@@ -155,8 +155,8 @@ pub use file::{
 };
 pub use kit::{
     AttachKitItemRequest, CreateKitRequest, KitAttachmentResponse, KitEffectiveItem, KitEffectiveMcp,
-    KitEffectiveQuery, KitEffectiveSetResponse, KitItemKind, KitLevel, KitMcpMember, KitMissingTemplate, KitOp,
-    KitProvenance, KitResponse, ListKitAttachmentsQuery, UpdateKitRequest,
+    KitEffectiveQuery, KitEffectiveSetResponse, KitErrorCode, KitItemKind, KitLevel, KitMcpMember, KitMissingTemplate,
+    KitOp, KitProvenance, KitResponse, ListKitAttachmentsQuery, UpdateKitRequest,
 };
 pub use lifecycle::{GitHubReleaseAsset, SystemInfoResponse, UpdateCheckRequest, UpdateCheckResult, UpdateReleaseInfo};
 pub use mcp::{

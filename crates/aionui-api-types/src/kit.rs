@@ -4,7 +4,13 @@
 //! conversation gets. Design: `clauterm-studio/design/skills-mcp/C27-KITS.md`.
 //!
 //! Wire names are snake_case (like the MCP market types). Request types are
-//! `deny_unknown_fields`: the UI must send exactly these fields.
+//! `deny_unknown_fields`: the UI must send exactly these fields. Errors carry
+//! a [`KitErrorCode`] in `ErrorResponse.code`.
+//!
+//! Targets: `project` = `projects.project_id` (the id the sidebar/project
+//! routes use, = `conversations.project_id`); `assistant` = the assistant id of
+//! `/api/assistants/{id}` (= `extra.preset_assistant_id` of a conversation);
+//! `conversation` = the conversation id.
 
 use aionui_common::TimestampMs;
 use serde::{Deserialize, Serialize};
@@ -95,6 +101,69 @@ impl KitOp {
             "add" => Some(KitOp::Add),
             "remove" => Some(KitOp::Remove),
             _ => None,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Error codes
+// ---------------------------------------------------------------------------
+
+/// `ErrorResponse.code` of a refused kit request (with its HTTP status).
+///
+/// | code | status | when |
+/// |---|---|---|
+/// | `KIT_NAME_TAKEN` | 409 | create/rename: a live kit of the user already has this name (trimmed) |
+/// | `KIT_STALE` | 409 | update: `expected_updated_at` no longer matches (re-read, retry) |
+/// | `KIT_NOT_FOUND` | 404 | kit id unknown or deleted (GET/PUT/DELETE, or `item_kind: kit` attach) |
+/// | `KIT_ATTACHMENT_NOT_FOUND` | 404 | DELETE of an unknown attachment id |
+/// | `KIT_UNKNOWN_TARGET` | 404 | project/conversation `target_id` (or effective `conversation_id`) not found |
+/// | `KIT_INVALID_NAME` | 400 | name empty or > 80 chars, description > 500 chars |
+/// | `KIT_INVALID_ITEM` | 400 | bad skill name (`[A-Za-z0-9._-]{1,128}`), MCP instance not a live market instance of the user, template not in the catalogue, empty `item_ref`, > 200 members per kind |
+/// | `KIT_INVALID_TARGET` | 400 | `target_id` missing for project/assistant/conversation, or present for global |
+/// | `KIT_GLOBAL_NOT_ALLOWED` | 400 | R2/R3: a global add of a non-global (not context7/studio-memory) or write MCP instance, directly or inside the kit; also a member update of a globally attached kit |
+///
+/// There is no duplicate-item error: member lists are trimmed and
+/// de-duplicated, and attaching the same (level, target, kind, ref) again
+/// upserts (flips `op`). Malformed JSON / unknown fields → 400 without a kit
+/// code; a missing session → 401; a refused channel → 403
+/// `MCP_MARKET_SESSION_REQUIRED`; Origin → 403 `ORIGIN_REQUIRED`/`ORIGIN_FORBIDDEN`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KitErrorCode {
+    NameTaken,
+    Stale,
+    NotFound,
+    AttachmentNotFound,
+    UnknownTarget,
+    InvalidName,
+    InvalidItem,
+    InvalidTarget,
+    GlobalNotAllowed,
+}
+
+impl KitErrorCode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            KitErrorCode::NameTaken => "KIT_NAME_TAKEN",
+            KitErrorCode::Stale => "KIT_STALE",
+            KitErrorCode::NotFound => "KIT_NOT_FOUND",
+            KitErrorCode::AttachmentNotFound => "KIT_ATTACHMENT_NOT_FOUND",
+            KitErrorCode::UnknownTarget => "KIT_UNKNOWN_TARGET",
+            KitErrorCode::InvalidName => "KIT_INVALID_NAME",
+            KitErrorCode::InvalidItem => "KIT_INVALID_ITEM",
+            KitErrorCode::InvalidTarget => "KIT_INVALID_TARGET",
+            KitErrorCode::GlobalNotAllowed => "KIT_GLOBAL_NOT_ALLOWED",
+        }
+    }
+
+    pub fn http_status(self) -> u16 {
+        match self {
+            KitErrorCode::NameTaken | KitErrorCode::Stale => 409,
+            KitErrorCode::NotFound | KitErrorCode::AttachmentNotFound | KitErrorCode::UnknownTarget => 404,
+            KitErrorCode::InvalidName
+            | KitErrorCode::InvalidItem
+            | KitErrorCode::InvalidTarget
+            | KitErrorCode::GlobalNotAllowed => 400,
         }
     }
 }
