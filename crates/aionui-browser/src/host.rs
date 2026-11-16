@@ -220,6 +220,118 @@ pub fn harden_and_verify(paths: &HostPaths) -> Result<(), BrowserError> {
     ))
 }
 
+// ---------------------------------------------------------------------------
+// Processes of the browser account (root here has no CAP_KILL: every signal
+// is sent by a `kill` run AS the account, which may signal its own uid).
+// ---------------------------------------------------------------------------
+
+/// `kill -<sig> -- -<pgid>` as the browser account.
+pub(crate) async fn kill_group_as(uid: u32, gid: u32, pgid: u32, signal: &str) {
+    let mut cmd = aionui_runtime::Builder::clean_cli("kill");
+    cmd.uid(uid)
+        .gid(gid)
+        .arg(format!("-{signal}"))
+        .arg("--")
+        .arg(format!("-{pgid}"));
+    let _ = cmd.output().await;
+}
+
+/// `kill -<sig> <pid>…` as the browser account.
+pub(crate) async fn kill_pids_as(uid: u32, gid: u32, pids: &[u32], signal: &str) {
+    if pids.is_empty() {
+        return;
+    }
+    let mut cmd = aionui_runtime::Builder::clean_cli("kill");
+    cmd.uid(uid).gid(gid).arg(format!("-{signal}"));
+    for pid in pids {
+        cmd.arg(pid.to_string());
+    }
+    let _ = cmd.output().await;
+}
+
+/// `(real uid, pgid)` from `/proc/<pid>/status` and `/proc/<pid>/stat`.
+fn proc_identity(pid: u32) -> Option<(u32, u32)> {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
+    let uid = status
+        .lines()
+        .find_map(|l| l.strip_prefix("Uid:"))?
+        .split_whitespace()
+        .next()?
+        .parse()
+        .ok()?;
+    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    Some((uid, parse_stat_pgid(&stat)?))
+}
+
+/// The process group (field 5) of a `/proc/<pid>/stat` line; the command
+/// name in parentheses may itself contain spaces or `)`.
+pub(crate) fn parse_stat_pgid(stat: &str) -> Option<u32> {
+    let after = &stat[stat.rfind(')')? + 1..];
+    // state ppid pgrp …
+    after.split_whitespace().nth(2)?.parse().ok()
+}
+
+/// `(pid, pgid)` of every process running as `uid`.
+pub(crate) fn processes_of(uid: u32) -> Vec<(u32, u32)> {
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
+        .filter_map(|pid| {
+            let (owner, pgid) = proc_identity(pid)?;
+            (owner == uid).then_some((pid, pgid))
+        })
+        .collect()
+}
+
+/// Stop every process of the browser account outside `keep_pgids` (orphans
+/// of an AionCore that restarted): TERM, wait up to 5 s, then KILL. Refuses
+/// uid 0. Returns how many were found.
+pub async fn reap_strays(uid: u32, gid: u32, keep_pgids: &[u32]) -> usize {
+    if uid == 0 {
+        return 0;
+    }
+    let strays = |procs: Vec<(u32, u32)>| -> Vec<u32> {
+        procs
+            .into_iter()
+            .filter(|(_, pgid)| !keep_pgids.contains(pgid))
+            .map(|(pid, _)| pid)
+            .collect()
+    };
+    let found = strays(processes_of(uid));
+    if found.is_empty() {
+        return 0;
+    }
+    tracing::info!(
+        count = found.len(),
+        "browser: stopping processes left by a previous AionCore"
+    );
+    kill_pids_as(uid, gid, &found, "TERM").await;
+    for _ in 0..50 {
+        if strays(processes_of(uid)).is_empty() {
+            return found.len();
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    let left = strays(processes_of(uid));
+    kill_pids_as(uid, gid, &left, "KILL").await;
+    found.len()
+}
+
+/// Chrome's profile locks (`Singleton{Lock,Socket,Cookie}`, symlinks).
+pub(crate) fn remove_profile_locks(profile: &Path) {
+    for name in ["SingletonLock", "SingletonSocket", "SingletonCookie"] {
+        let _ = std::fs::remove_file(profile.join(name));
+    }
+}
+
+/// The browser account's ids if it exists (never creates it).
+pub fn existing_browser_user() -> Option<(u32, u32)> {
+    parse_passwd(&std::fs::read_to_string("/etc/passwd").ok()?, BROWSER_USER)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -284,6 +396,25 @@ mod tests {
             self_check(&paths).unwrap().contains(&paths.home),
             "a listable /root is exposed too"
         );
+    }
+
+    #[test]
+    fn stat_pgid_survives_odd_command_names() {
+        assert_eq!(parse_stat_pgid("123 (chrome) S 1 456 456 0 -1"), Some(456));
+        assert_eq!(parse_stat_pgid("123 (we ird) name)) S 1 789 789 0"), Some(789));
+        assert_eq!(parse_stat_pgid("garbage"), None);
+    }
+
+    #[test]
+    fn this_process_is_found_by_its_uid_and_group() {
+        let me = std::process::id();
+        let uid = unsafe { libc::getuid() };
+        assert!(processes_of(uid).iter().any(|(pid, _)| *pid == me));
+    }
+
+    #[tokio::test]
+    async fn reaping_never_touches_root() {
+        assert_eq!(reap_strays(0, 0, &[]).await, 0);
     }
 
     #[test]

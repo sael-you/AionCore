@@ -32,6 +32,7 @@ use tokio::sync::{Mutex, broadcast, watch};
 use crate::cdp::{CdpClient, CdpEvent};
 use crate::error::BrowserError;
 use crate::guard::{GuardDecision, NavigationGuard};
+use crate::host::kill_group_as as kill_as;
 
 /// Everything needed to launch one instance.
 #[derive(Debug, Clone)]
@@ -86,6 +87,8 @@ pub struct ChromeInstance {
     agent_last_ms: AtomicI64,
     agent_tab: std::sync::Mutex<Option<String>>,
     exited: watch::Receiver<bool>,
+    /// The egress proxy of this Chrome (lives and dies with the instance).
+    _proxy: crate::proxy::EgressProxy,
 }
 
 impl std::fmt::Debug for ChromeInstance {
@@ -125,9 +128,11 @@ fn release_display(n: u16) {
     DISPLAYS.lock().unwrap_or_else(|e| e.into_inner()).retain(|d| *d != n);
 }
 
-/// Chrome's launch arguments. No port, no token: the port is chosen by
+/// Chrome's launch arguments. No CDP port, no token: the port is chosen by
 /// Chrome (`--remote-debugging-port=0`) and read from `DevToolsActivePort`.
-pub fn chrome_args(profile: &Path, hide_automation: bool) -> Vec<String> {
+/// All traffic goes through the egress proxy (only the browser account may
+/// use it, so its port in argv opens nothing).
+pub fn chrome_args(profile: &Path, hide_automation: bool, proxy_port: u16) -> Vec<String> {
     let mut args = vec![
         // The container forbids every Chrome sandbox (NoNewPrivs, seccomp, no
         // user namespaces); isolation = the separate account (decision d).
@@ -142,6 +147,12 @@ pub fn chrome_args(profile: &Path, hide_automation: bool) -> Vec<String> {
         "--disable-breakpad".to_owned(),
         "--window-position=0,0".to_owned(),
         "--window-size=1280,800".to_owned(),
+        // Network-level egress guard (train-7 review): every request, WebSocket
+        // and TLS tunnel goes through AionCore's proxy; `<-loopback>` removes
+        // Chrome's implicit loopback bypass; WebRTC may not send UDP around it.
+        format!("--proxy-server=http://127.0.0.1:{proxy_port}"),
+        "--proxy-bypass-list=<-loopback>".to_owned(),
+        "--force-webrtc-ip-handling-policy=disable_non_proxied_udp".to_owned(),
     ];
     if hide_automation {
         args.push("--disable-blink-features=AutomationControlled".to_owned());
@@ -167,17 +178,6 @@ async fn wait_for(path: &Path, timeout: Duration) -> bool {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     false
-}
-
-/// `kill -<sig> -- -<pgid>` run AS the browser account (same uid may signal).
-async fn kill_as(uid: u32, gid: u32, pgid: u32, signal: &str) {
-    let mut cmd = aionui_runtime::Builder::clean_cli("kill");
-    cmd.uid(uid)
-        .gid(gid)
-        .arg(format!("-{signal}"))
-        .arg("--")
-        .arg(format!("-{pgid}"));
-    let _ = cmd.output().await;
 }
 
 impl ChromeInstance {
@@ -228,12 +228,23 @@ impl ChromeInstance {
             return Err(failed("Xvfb display did not appear"));
         }
 
+        let proxy = match crate::proxy::EgressProxy::start(spec.guard.clone(), spec.uid).await {
+            Ok(p) => p,
+            Err(_) => {
+                if let Some(pid) = xvfb_pid {
+                    kill_as(spec.uid, spec.gid, pid, "KILL").await;
+                }
+                return Err(failed("the egress proxy did not start"));
+            }
+        };
         let port_file = spec.profile.join("DevToolsActivePort");
         let _ = std::fs::remove_file(&port_file);
+        // A Chrome that died with AionCore leaves its profile lock behind.
+        crate::host::remove_profile_locks(&spec.profile);
         let mut chrome = aionui_runtime::Builder::new(&spec.chrome);
         base_env(&mut chrome);
         chrome
-            .args(chrome_args(&spec.profile, spec.hide_automation))
+            .args(chrome_args(&spec.profile, spec.hide_automation, proxy.port))
             .current_dir(&spec.home)
             .uid(spec.uid)
             .gid(spec.gid)
@@ -267,7 +278,15 @@ impl ChromeInstance {
             }
             tokio::time::sleep(Duration::from_millis(150)).await;
         };
-        let cdp = CdpClient::connect(&format!("ws://127.0.0.1:{port}{browser_path}")).await?;
+        let cdp = match CdpClient::connect(&format!("ws://127.0.0.1:{port}{browser_path}")).await {
+            Ok(c) => c,
+            Err(_) => {
+                for pid in [chrome_pid, xvfb_pid].into_iter().flatten() {
+                    kill_as(spec.uid, spec.gid, pid, "KILL").await;
+                }
+                return Err(failed("could not connect to Chrome"));
+            }
+        };
         let version = cdp
             .call("Browser.getVersion", json!({}), None)
             .await
@@ -300,30 +319,18 @@ impl ChromeInstance {
             agent_last_ms: AtomicI64::new(0),
             agent_tab: std::sync::Mutex::new(None),
             exited: exited_rx,
+            _proxy: proxy,
         });
 
         inst.clone().spawn_event_loop(spec.guard.clone());
         inst.clone().spawn_exit_watch(exited_tx);
         // Order matters: browser-wide interception before anything can navigate.
-        let patterns: Vec<Value> = spec
-            .guard
-            .fetch_patterns()
-            .into_iter()
-            .map(|p| json!({"urlPattern": p, "requestStage": "Request"}))
-            .collect();
-        inst.cdp
-            .call("Fetch.enable", json!({"patterns": patterns}), None)
-            .await?;
-        inst.cdp
-            .call(
-                "Target.setAutoAttach",
-                json!({"autoAttach": true, "waitForDebuggerOnStart": false, "flatten": true}),
-                None,
-            )
-            .await?;
-        inst.cdp
-            .call("Target.setDiscoverTargets", json!({"discover": true}), None)
-            .await?;
+        // Fail CLOSED: a Chrome without its guard is stopped, never handed out.
+        if let Err(e) = inst.setup_guard(&spec.guard).await {
+            tracing::error!(user_id = %inst.user_id, instance = inst.instance, error = %e, "browser guard setup failed; stopping Chrome");
+            inst.stop().await;
+            return Err(failed("the navigation guard could not be installed"));
+        }
         tracing::info!(
             user_id = %inst.user_id,
             instance = inst.instance,
@@ -332,6 +339,33 @@ impl ChromeInstance {
             "server browser instance started"
         );
         Ok(inst)
+    }
+
+    async fn setup_guard(&self, guard: &NavigationGuard) -> Result<(), BrowserError> {
+        let patterns: Vec<Value> = guard
+            .fetch_patterns()
+            .into_iter()
+            .map(|p| json!({"urlPattern": p, "requestStage": "Request"}))
+            .collect();
+        self.cdp
+            .call("Fetch.enable", json!({"patterns": patterns}), None)
+            .await?;
+        self.cdp
+            .call(
+                "Target.setAutoAttach",
+                json!({"autoAttach": true, "waitForDebuggerOnStart": false, "flatten": true}),
+                None,
+            )
+            .await?;
+        self.cdp
+            .call("Target.setDiscoverTargets", json!({"discover": true}), None)
+            .await?;
+        Ok(())
+    }
+
+    /// Process groups of this instance (Chrome and Xvfb lead their own).
+    pub fn process_groups(&self) -> Vec<u32> {
+        [self.chrome_pid, self.xvfb_pid].into_iter().flatten().collect()
     }
 
     fn spawn_exit_watch(self: Arc<Self>, exited: watch::Sender<bool>) {
@@ -572,14 +606,17 @@ mod tests {
 
     #[test]
     fn launch_args_carry_no_port_or_token_and_honour_hide_automation() {
-        let args = chrome_args(Path::new("/b/u/1"), false);
+        let args = chrome_args(Path::new("/b/u/1"), false, 41000);
         assert!(args.contains(&"--remote-debugging-port=0".to_owned()));
         assert!(args.contains(&"--remote-debugging-address=127.0.0.1".to_owned()));
         assert!(args.contains(&"--user-data-dir=/b/u/1".to_owned()));
         assert!(args.contains(&"--disable-dev-shm-usage".to_owned()));
         assert!(!args.iter().any(|a| a.contains("AutomationControlled")));
         assert!(!args.iter().any(|a| a.contains("token")));
-        let hidden = chrome_args(Path::new("/b/u/1"), true);
+        assert!(args.contains(&"--proxy-server=http://127.0.0.1:41000".to_owned()));
+        assert!(args.contains(&"--proxy-bypass-list=<-loopback>".to_owned()));
+        assert!(args.contains(&"--force-webrtc-ip-handling-policy=disable_non_proxied_udp".to_owned()));
+        let hidden = chrome_args(Path::new("/b/u/1"), true, 41000);
         assert!(hidden.contains(&"--disable-blink-features=AutomationControlled".to_owned()));
         assert_eq!(hidden.len(), args.len() + 1, "no other flag changes");
     }

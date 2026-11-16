@@ -101,15 +101,20 @@ async fn live_server_browser_end_to_end() {
         use std::os::unix::fs::PermissionsExt;
         std::fs::set_permissions(t.path(), std::fs::Permissions::from_mode(0o711)).unwrap();
     }
-    let svc = BrowserService::new(BrowserServiceConfig {
-        layout: BrowserLayout::new(t.path().join("aionui-browser"), t.path().join("data")),
-        host: None,
-        idle_timeout: Duration::from_secs(900),
-        guard: NavigationGuard::from_origins(["https://y.talkseeds.com"]),
-        chrome_override: Some(chrome),
-        run_as_override: None,
-    })
-    .unwrap();
+    let root = t.path().to_path_buf();
+    let chrome_bin = chrome.clone();
+    let make_svc = move || {
+        BrowserService::new(BrowserServiceConfig {
+            layout: BrowserLayout::new(root.join("aionui-browser"), root.join("data")),
+            host: None,
+            idle_timeout: Duration::from_secs(900),
+            guard: NavigationGuard::from_origins(["https://y.talkseeds.com"]),
+            chrome_override: Some(chrome_bin.clone()),
+            run_as_override: None,
+        })
+        .unwrap()
+    };
+    let svc = make_svc();
     let user = "live_user";
     svc.update_settings(
         user,
@@ -236,6 +241,102 @@ async fn live_server_browser_end_to_end() {
         "AionUi origin blocked: {aionui}"
     );
 
+    // 3b. Network-level egress guard (train-7 review): names that RESOLVE to
+    //     loopback, WebSockets and the AionUi ports are refused by the proxy.
+    let nav = agent
+        .call("Page.navigate", json!({"url": "http://example.com/"}), Some(&session))
+        .await;
+    assert!(nav["result"]["frameId"].is_string(), "{nav}");
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let targets = [
+        "http://localhost:25809/api/system/info".to_owned(),
+        format!("http://127.0.0.1:{blocked_port}/aioncore-port"),
+        format!("http://localtest.me:{blocked_port}/rebind"),
+    ];
+    let fetches = agent
+        .call(
+            "Runtime.evaluate",
+            json!({
+                "expression": format!(
+                    "Promise.all({}.map(u => fetch(u, {{method: 'POST', mode: 'no-cors', body: 'x'}}).then(() => 'ok', () => 'refused')))",
+                    serde_json::to_string(&targets).unwrap()
+                ),
+                "awaitPromise": true,
+                "returnByValue": true
+            }),
+            Some(&session),
+        )
+        .await;
+    eprintln!("page fetch results = {}", fetches["result"]["result"]["value"]);
+    let sockets = [
+        "ws://localhost:25809/api/browser/ws".to_owned(),
+        format!("ws://127.0.0.1:{blocked_port}/ws"),
+        format!("ws://localtest.me:{blocked_port}/ws"),
+    ];
+    let ws = agent
+        .call(
+            "Runtime.evaluate",
+            json!({
+                "expression": format!(
+                    "Promise.all({}.map(u => new Promise(r => {{ const w = new WebSocket(u); w.onopen = () => r('open'); w.onerror = () => r('refused'); setTimeout(() => r('timeout'), 6000); }})))",
+                    serde_json::to_string(&sockets).unwrap()
+                ),
+                "awaitPromise": true,
+                "returnByValue": true
+            }),
+            Some(&session),
+        )
+        .await;
+    let ws_values = ws["result"]["result"]["value"].clone();
+    eprintln!("page websocket results = {ws_values}");
+    assert!(
+        ws_values.as_array().is_some_and(|v| v.iter().all(|x| x != "open")),
+        "no WebSocket to an internal address opens: {ws}"
+    );
+    // Top-level navigation to a public NAME that resolves to loopback: only
+    // the proxy can catch it (the URL guard sees a public name).
+    let _ = agent
+        .call(
+            "Page.navigate",
+            json!({"url": format!("http://localtest.me:{blocked_port}/top")}),
+            Some(&session),
+        )
+        .await;
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    assert_eq!(
+        hits.load(Ordering::SeqCst),
+        0,
+        "fetch, WebSocket and navigation to loopback names never reach the server"
+    );
+    // Public sites still work through the proxy: Discord's login page renders.
+    let nav = agent
+        .call(
+            "Page.navigate",
+            json!({"url": "https://discord.com/login"}),
+            Some(&session),
+        )
+        .await;
+    assert!(nav["result"]["frameId"].is_string(), "{nav}");
+    let mut discord = Value::Null;
+    for _ in 0..20 {
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        discord = agent
+            .call(
+                "Runtime.evaluate",
+                json!({"expression": "!!document.querySelector('input[name=email]')", "returnByValue": true}),
+                Some(&session),
+            )
+            .await;
+        if discord["result"]["result"]["value"] == json!(true) {
+            break;
+        }
+    }
+    assert_eq!(
+        discord["result"]["result"]["value"],
+        json!(true),
+        "Discord login renders: {discord}"
+    );
+
     // 4. Cookie APIs refused, page JS allowed (owner change).
     let cookies = agent.call("Network.getAllCookies", json!({}), None).await;
     assert!(
@@ -360,8 +461,35 @@ async fn live_server_browser_end_to_end() {
         cpu += f.next().and_then(|v| v.parse::<f64>().ok()).unwrap_or(0.0);
     }
     eprintln!("idle (2 instances) RSS sum MB = {}, CPU % sum = {cpu:.1}", kb / 1024);
-    svc.stop(user, 1).await.unwrap();
-    svc.stop(user, 2).await.unwrap();
+    // 10. Restart cleanup: a new service (a restarted AionCore) finds the
+    //     previous Chrome processes (root cannot signal them), stops them, and
+    //     a fresh launch on the same profile works (locks removed).
+    let before = std::process::Command::new("pgrep")
+        .args(["-u", "aionui-browser"])
+        .output()
+        .unwrap();
+    assert!(
+        !String::from_utf8_lossy(&before.stdout).trim().is_empty(),
+        "previous Chrome still running"
+    );
+    let svc2 = make_svc();
+    let reaped = svc2.reap_orphans().await;
+    assert!(reaped > 0, "orphans found");
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    let after = std::process::Command::new("pgrep")
+        .args(["-u", "aionui-browser"])
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&after.stdout).trim().is_empty(),
+        "every orphan stopped (reaped {reaped})"
+    );
+    let again = svc2
+        .start(user, 1)
+        .await
+        .expect("relaunch on the same profile after a restart");
+    assert!(again.is_running());
+    svc2.stop(user, 1).await.unwrap();
     tokio::time::sleep(Duration::from_secs(2)).await;
     let left = std::process::Command::new("pgrep")
         .args(["-u", "aionui-browser"])

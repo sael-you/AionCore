@@ -17,7 +17,9 @@ use tokio::sync::Mutex;
 use crate::bridge::{AgentBridge, BridgeBackend};
 use crate::error::BrowserError;
 use crate::guard::NavigationGuard;
-use crate::host::{HostPaths, ensure_browser_user, harden_and_verify, prepare_dirs};
+use crate::host::{
+    HostPaths, ensure_browser_user, existing_browser_user, harden_and_verify, prepare_dirs, reap_strays,
+};
 use crate::install::{ChromeInstaller, installed_version};
 use crate::instance::{ChromeInstance, LaunchSpec};
 use crate::layout::BrowserLayout;
@@ -55,6 +57,9 @@ pub struct BrowserService {
     bridges: DashMap<String, AgentBridge>,
     bridge_lock: Mutex<()>,
     install_lock: Mutex<()>,
+    /// Reap + launch run one at a time: a reap must never see a Chrome that
+    /// is launching but not yet registered.
+    launch_lock: Mutex<()>,
     install_error: std::sync::Mutex<Option<String>>,
     guard: Arc<NavigationGuard>,
 }
@@ -75,13 +80,22 @@ impl BrowserService {
             bridges: DashMap::new(),
             bridge_lock: Mutex::new(()),
             install_lock: Mutex::new(()),
+            launch_lock: Mutex::new(()),
             install_error: std::sync::Mutex::new(None),
             guard,
         }))
     }
 
-    /// Idle reaper + daily update check (call once at startup).
+    /// Orphan cleanup, idle reaper + daily update check (call once at startup).
     pub fn spawn_background(self: &Arc<Self>) {
+        // A restart (every deploy) leaves Chrome and Xvfb running as the
+        // browser account: root cannot signal them, so they would keep their
+        // profile lock and their CDP port. Stop them first.
+        let svc = self.clone();
+        tokio::spawn(async move {
+            let _launching = svc.launch_lock.lock().await;
+            svc.reap_orphans().await;
+        });
         let weak = Arc::downgrade(self);
         tokio::spawn(async move {
             let mut tick = tokio::time::interval(Duration::from_secs(60));
@@ -240,6 +254,16 @@ impl BrowserService {
 
     // -- instances --------------------------------------------------------
 
+    /// Stop every process of the browser account that no tracked instance
+    /// owns. Returns how many processes were found.
+    pub async fn reap_orphans(&self) -> usize {
+        let Some((uid, gid)) = self.cfg.run_as_override.or_else(existing_browser_user) else {
+            return 0;
+        };
+        let keep: Vec<u32> = self.instances.iter().flat_map(|e| e.value().process_groups()).collect();
+        reap_strays(uid, gid, &keep).await
+    }
+
     pub fn running(&self, user_id: &str, n: u8) -> Option<Arc<ChromeInstance>> {
         let key = (user_id.to_owned(), n);
         let inst = self.instances.get(&key)?.clone();
@@ -283,6 +307,9 @@ impl BrowserService {
             None => ensure_browser_user().await?,
         };
         let profile = prepare_dirs(&self.cfg.layout, user_id, n, uid, gid)?;
+        let launching = self.launch_lock.lock().await;
+        // Leftovers of a crashed or restarted AionCore hold profile locks.
+        self.reap_orphans().await;
         let inst = ChromeInstance::launch(LaunchSpec {
             user_id: user_id.to_owned(),
             instance: n,
@@ -297,6 +324,7 @@ impl BrowserService {
         })
         .await?;
         self.instances.insert(key.clone(), inst.clone());
+        drop(launching);
         let weak = Arc::downgrade(self);
         let watched = inst.clone();
         tokio::spawn(async move {

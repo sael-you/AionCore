@@ -12,6 +12,7 @@ pub mod install;
 pub mod instance;
 pub mod layout;
 pub mod panel;
+pub mod proxy;
 pub mod routes;
 pub mod service;
 pub mod settings;

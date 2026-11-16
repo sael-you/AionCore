@@ -291,7 +291,7 @@ pub(crate) fn judge(text: &str, agents_enabled: bool, tab_count: usize, max_tabs
             "agents may not use the browser",
         );
     }
-    match decide(method) {
+    match decide(method, frame.get("params").unwrap_or(&Value::Null)) {
         FilterDecision::Forward => Verdict::Forward,
         FilterDecision::NeedsTabSlot if tab_count < usize::from(max_tabs) => Verdict::Forward,
         FilterDecision::NeedsTabSlot => refuse(BrowserErrorCode::BrowserTabLimit, "the tab limit is reached"),
@@ -356,12 +356,19 @@ async fn pump(
             tokio::select! {
                 up = u_rx.next() => {
                     let Some(Ok(msg)) = up else { break };
-                    let out = match msg {
-                        TMessage::Text(t) => AxMessage::Text(t.to_string().into()),
-                        TMessage::Binary(b) => AxMessage::Binary(b),
+                    // Every Chrome -> agent frame loses cookies and cookie
+                    // headers (Network.* events expose them, HttpOnly included).
+                    let text = match msg {
+                        TMessage::Text(t) => t.to_string(),
+                        TMessage::Binary(b) => String::from_utf8_lossy(&b).into_owned(),
                         TMessage::Close(_) => break,
                         _ => continue,
                     };
+                    let clean = crate::filter::sanitize(&text);
+                    if clean.is_empty() {
+                        continue;
+                    }
+                    let out = AxMessage::Text(clean.into_owned().into());
                     if c_tx.send(out).await.is_err() {
                         break;
                     }
@@ -428,6 +435,16 @@ mod tests {
         );
 
         assert!(matches!(judge("not json", true, 0, 10), Verdict::Refuse(_)));
+
+        // Train-7 review: tunnels and non-flat sessions are refused by params.
+        let tunnel = r#"{"id":4,"method":"Target.sendMessageToTarget","params":{"message":"{}"}}"#;
+        assert!(matches!(judge(tunnel, true, 0, 10), Verdict::Refuse(_)));
+        let non_flat = r#"{"id":5,"method":"Target.attachToTarget","params":{"targetId":"T"}}"#;
+        assert!(matches!(judge(non_flat, true, 0, 10), Verdict::Refuse(_)));
+        let flat = r#"{"id":6,"method":"Target.attachToTarget","params":{"targetId":"T","flatten":true}}"#;
+        assert_eq!(judge(flat, true, 0, 10), Verdict::Forward);
+        let fetch = r#"{"id":7,"method":"Fetch.continueRequest","params":{"requestId":"r"}}"#;
+        assert!(matches!(judge(fetch, true, 0, 10), Verdict::Refuse(_)));
     }
 
     #[test]
