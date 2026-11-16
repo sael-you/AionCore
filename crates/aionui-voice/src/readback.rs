@@ -7,7 +7,8 @@
 //! short-lived `gpt-realtime-2.1-mini` WebSocket session (text in, audio out,
 //! no tools) whose output transcript must equal the text. Spoken confirmation
 //! is allowed only when an independent transcription of the clip contains
-//! the exact target name (cached per name, voice and dictionary version).
+//! the exact target name (cached per name, the provider and voice that
+//! actually produced the clip, and dictionary version).
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -42,12 +43,17 @@ pub enum ClipVoice {
 pub struct Clip {
     pub bytes: Vec<u8>,
     pub mime: &'static str,
+    /// `<provider>/<voice id>` of the synthesiser that produced these bytes
+    /// (the name-check cache key): with [`FallbackSynth`] this is the
+    /// fallback's voice whenever the fallback spoke the clip.
+    pub voice: String,
 }
 
 #[async_trait::async_trait]
 pub trait SynthPort: Send + Sync {
     async fn synthesize(&self, text: &str, voice: ClipVoice) -> Result<Clip, String>;
-    /// Voice id used for `voice` (part of the name-check cache key).
+    /// Voice id this provider requests for `voice`. The name-check key is
+    /// [`Clip::voice`], which names the provider that actually spoke.
     fn voice_id(&self, voice: ClipVoice) -> String;
 }
 
@@ -149,6 +155,7 @@ impl SynthPort for MiniMaxSynth {
             Ok(Clip {
                 bytes: audio,
                 mime: "audio/mpeg",
+                voice: format!("minimax/{voice_id}"),
             })
         };
         tokio::time::timeout(SYNTH_TIMEOUT, run)
@@ -239,6 +246,7 @@ impl SynthPort for RealtimeMiniSynth {
             Ok(Clip {
                 bytes: wav_from_pcm16(&pcm, 24_000),
                 mime: "audio/wav",
+                voice: format!("openai/{voice_id}"),
             })
         };
         tokio::time::timeout(SYNTH_TIMEOUT, run)
@@ -328,7 +336,8 @@ impl TranscribePort for OpenAiTranscriber {
 }
 
 /// Name check: does an independent transcription contain the target name?
-/// Cached per (name, voice id, dictionary version) — only new names cost a pass.
+/// Cached per (name, [`Clip::voice`], dictionary version) — only new names
+/// cost a pass, and a MiniMax result never stands in for an OpenAI clip.
 #[derive(Default)]
 pub struct NameCheck {
     cache: DashMap<(String, String, u32), bool>,
@@ -340,10 +349,9 @@ impl NameCheck {
         transcriber: Option<&dyn TranscribePort>,
         clip: &Clip,
         target_name: &str,
-        voice_id: &str,
         dictionary_version: u32,
     ) -> bool {
-        let key = (target_name.to_owned(), voice_id.to_owned(), dictionary_version);
+        let key = (target_name.to_owned(), clip.voice.clone(), dictionary_version);
         if let Some(hit) = self.cache.get(&key) {
             return *hit;
         }
@@ -435,9 +443,14 @@ mod tests {
     }
 
     fn clip() -> Clip {
+        voiced("minimax/v")
+    }
+
+    fn voiced(voice: &str) -> Clip {
         Clip {
             bytes: vec![1, 2, 3],
             mime: "audio/mpeg",
+            voice: voice.to_owned(),
         }
     }
 
@@ -450,13 +463,12 @@ mod tests {
                     Some(&Hears("Message for AionCore: add logging.")),
                     &clip(),
                     "AionCore",
-                    "v",
                     1
                 )
                 .await
         );
         // Cached: a transcriber that would fail is not asked again.
-        assert!(check.passes(Some(&Hears("nothing")), &clip(), "AionCore", "v", 1).await);
+        assert!(check.passes(Some(&Hears("nothing")), &clip(), "AionCore", 1).await);
         // Misheard name fails; no transcriber → tap only.
         assert!(
             !check
@@ -464,12 +476,36 @@ mod tests {
                     Some(&Hears("Message for IonCore: add logging.")),
                     &clip(),
                     "Kanban build",
-                    "v",
                     1
                 )
                 .await
         );
-        assert!(!check.passes(None, &clip(), "Other", "v", 1).await);
+        assert!(!check.passes(None, &clip(), "Other", 1).await);
+    }
+
+    #[tokio::test]
+    async fn name_check_is_cached_per_provider_that_spoke_the_clip() {
+        let check = NameCheck::default();
+        // MiniMax mispronounced the name: cached as a failure for MiniMax only.
+        assert!(
+            !check
+                .passes(Some(&Hears("Message for IonCore.")), &clip(), "AionCore", 1)
+                .await
+        );
+        // The OpenAI fallback spoke it right: its own transcription decides.
+        let openai = voiced("openai/marin");
+        assert!(
+            check
+                .passes(Some(&Hears("Message for AionCore.")), &openai, "AionCore", 1)
+                .await
+        );
+        // Both results stay apart in the cache.
+        assert!(
+            !check
+                .passes(Some(&Hears("Message for AionCore.")), &clip(), "AionCore", 1)
+                .await
+        );
+        assert!(check.passes(Some(&Hears("nothing")), &openai, "AionCore", 1).await);
     }
 
     #[tokio::test]
@@ -492,6 +528,12 @@ mod tests {
 
     struct Fixed(Result<&'static str, &'static str>, Duration);
 
+    impl Fixed {
+        fn voice(&self) -> String {
+            format!("{}/fixed", self.0.unwrap_or("failed"))
+        }
+    }
+
     #[async_trait::async_trait]
     impl SynthPort for Fixed {
         fn voice_id(&self, _voice: ClipVoice) -> String {
@@ -504,6 +546,7 @@ mod tests {
                 .map(|tag| Clip {
                     bytes: tag.as_bytes().to_vec(),
                     mime: "audio/mpeg",
+                    voice: self.voice(),
                 })
                 .map_err(str::to_owned)
         }
@@ -522,9 +565,13 @@ mod tests {
         let ok = fallback(Fixed(Ok("minimax"), Duration::ZERO));
         assert_eq!(ok.synthesize("hi", ClipVoice::Agent).await.unwrap().bytes, b"minimax");
         let failing = fallback(Fixed(Err("task_failed"), Duration::ZERO));
+        let spoken = failing.synthesize("hi", ClipVoice::Agent).await.unwrap();
+        assert_eq!(spoken.bytes, b"openai");
+        // The clip names the provider that actually spoke it (name-check key).
+        assert_eq!(spoken.voice, "openai/fixed");
         assert_eq!(
-            failing.synthesize("hi", ClipVoice::Agent).await.unwrap().bytes,
-            b"openai"
+            ok.synthesize("hi", ClipVoice::Agent).await.unwrap().voice,
+            "minimax/fixed"
         );
         let stalled = fallback(Fixed(Ok("minimax"), Duration::from_secs(30)));
         assert_eq!(
