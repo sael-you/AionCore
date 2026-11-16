@@ -13,6 +13,7 @@ use tokio::time::Instant;
 
 use crate::drafts::evidence::{HOLD, is_cancel_phrase};
 use crate::drafts::{ConfirmTracker, DraftRequest, DraftState, HoldClock, HoldEvent, OnsetVerdict, TranscriptVerdict};
+use crate::lifecycle::EndReason;
 use crate::readback::ClipVoice;
 use crate::runner::CallRunner;
 use crate::tools::ToolEffect;
@@ -42,6 +43,8 @@ pub(crate) enum ClientEvent {
     },
     /// An agent `ask` is waiting for this user's next utterance.
     AskPending,
+    /// Conversation mode "Done": commit the utterance now.
+    Commit,
 }
 
 #[derive(Default)]
@@ -59,7 +62,8 @@ pub(crate) struct TurnState {
 impl CallRunner {
     /// Provider-initiated responses off/on (acknowledged by the provider).
     async fn set_manual(&mut self, manual: bool) {
-        if self.turn.manual == manual {
+        // Conversation mode never lets the provider answer (an ear only).
+        if self.turn.manual == manual || self.call.mode.is_conversation() {
             return;
         }
         match self.engine_call.set_create_response(!manual).await {
@@ -227,7 +231,8 @@ impl CallRunner {
     }
 
     /// A final user transcript (transcription model, not the conversational one).
-    pub(crate) async fn on_user_final(&mut self, text: &str) {
+    /// Returns an end reason when the utterance ends the call ("stop voice").
+    pub(crate) async fn on_user_final(&mut self, text: &str) -> Option<EndReason> {
         self.turn.turn_no += 1;
         let _ = self
             .inner
@@ -243,6 +248,11 @@ impl CallRunner {
             })
             .await;
 
+        // Conversation mode classifies first: a spoken control is never
+        // swallowed as an `ask` answer (it handles the bound conversation's asks).
+        if self.call.mode.is_conversation() {
+            return self.on_conversation_final(text).await;
+        }
         // An `ask` answer is never a command or an approval, and while a draft
         // awaits its confirmation or holds, the utterance belongs to the draft
         // ("yes, send it" must never be swallowed as an answer).
@@ -252,9 +262,13 @@ impl CallRunner {
         {
             tracing::info!(session_id = %self.call.session_id, ask_id = %ask_id, "voice ask answered");
             self.set_manual(false).await;
-            return;
+            return None;
         }
+        self.on_jarvis_final(text).await;
+        None
+    }
 
+    async fn on_jarvis_final(&mut self, text: &str) {
         let holding = self.turn.hold.is_some();
         if holding && let Some(row) = self.turn.active.clone() {
             if is_cancel_phrase(text) {
@@ -405,6 +419,13 @@ impl CallRunner {
                 }
             }
             ClientEvent::AskPending => self.set_manual(true).await,
+            ClientEvent::Commit => {
+                if self.call.mode.is_conversation()
+                    && let Err(err) = self.engine_call.commit_input().await
+                {
+                    tracing::debug!(session_id = %self.call.session_id, error = %err, "voice commit not sent");
+                }
+            }
         }
     }
 
@@ -443,6 +464,11 @@ impl CallRunner {
     /// After the config gate: carry the previous call's summary into the
     /// model context and re-announce a draft still waiting for the user.
     pub(crate) async fn on_call_ready(&mut self, carry: Option<String>) {
+        if self.call.mode.is_conversation() {
+            // An ear only: no model context, no Jarvis draft to re-announce.
+            self.turn.manual = true;
+            return;
+        }
         if let Some(summary) = carry
             && let Err(err) = self.engine_call.add_context(&summary).await
         {

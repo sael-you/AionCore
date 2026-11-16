@@ -55,6 +55,8 @@ pub enum Signal {
         conversation_id: String,
         turn_id: Option<String>,
         kind: FollowUpKind,
+        /// `turn.completed`'s `last_outcome` (`finished` | `error` | `cancelled`).
+        outcome: Option<String>,
     },
     /// The target may accept queued drafts now (turn ended / approval gone).
     Retry { user_id: String, conversation_id: String },
@@ -71,11 +73,13 @@ pub fn classify(event: &WebSocketMessage<Value>) -> Vec<Signal> {
         return Vec::new();
     };
     let turn_id = field(data, "turn_id");
+    let outcome = field(data, "last_outcome");
     let follow = |kind| Signal::FollowUp {
         user_id: user_id.clone(),
         conversation_id: conversation_id.clone(),
         turn_id: turn_id.clone(),
         kind,
+        outcome: outcome.clone(),
     };
     let retry = || Signal::Retry {
         user_id: user_id.clone(),
@@ -96,7 +100,17 @@ pub fn classify(event: &WebSocketMessage<Value>) -> Vec<Signal> {
 /// Is the user in a live call? (Without one, a clip is announced by `voice.wake`.)
 pub trait CallPresence: Send + Sync {
     fn has_live_call(&self, user_id: &str) -> bool;
+
+    /// The conversation the user's conversation voice mode is bound to (C26).
+    fn bound_conversation(&self, user_id: &str) -> Option<String>;
+
+    /// The bound conversation's turn ended (restart recovery reads it).
+    fn note_bound_turn_end(&self, user_id: &str, conversation_id: &str);
 }
+
+/// `voice.followUp.status` of a failed TURN of the bound conversation
+/// (`failed` there means the send itself failed).
+pub const STATUS_TURN_FAILED: &str = "turn_failed";
 
 pub struct FollowUpWatcher {
     pub bus: Arc<BroadcastEventBus>,
@@ -159,12 +173,14 @@ impl FollowUpWatcher {
                 user_id,
                 conversation_id,
             } => {
-                let queued = self
+                let mut queued = self
                     .drafts
                     .repo
                     .user_drafts_in_states(&user_id, &["queued"])
                     .await
                     .unwrap_or_default();
+                // Oldest first: queued messages keep the order they were said in.
+                queued.sort_by_key(|r| (r.created_at, r.id.clone()));
                 for row in queued
                     .into_iter()
                     .filter(|r| r.target_id.as_deref() == Some(&conversation_id))
@@ -177,8 +193,12 @@ impl FollowUpWatcher {
                 conversation_id,
                 turn_id,
                 kind,
+                outcome,
             } => {
-                if self.drafts.watched.get(&conversation_id).map(|u| u.clone()).as_deref() != Some(user_id.as_str()) {
+                let bound = self.presence.bound_conversation(&user_id).as_deref() == Some(conversation_id.as_str());
+                let watched =
+                    self.drafts.watched.get(&conversation_id).map(|u| u.clone()).as_deref() == Some(user_id.as_str());
+                if !bound && !watched {
                     return;
                 }
                 let key = (conversation_id.clone(), turn_id, kind);
@@ -201,7 +221,12 @@ impl FollowUpWatcher {
                     .ok()
                     .and_then(|list| list.into_iter().find(|c| c.id == conversation_id).map(|c| c.name))
                     .unwrap_or_else(|| "A conversation".to_owned());
-                tracing::info!(conversation_id = %conversation_id, status = kind.status(), "voice follow-up");
+                tracing::info!(conversation_id = %conversation_id, status = kind.status(), bound, "voice follow-up");
+                if bound {
+                    self.bound_follow_up(&user_id, &conversation_id, &name, kind, outcome.as_deref())
+                        .await;
+                    return;
+                }
                 let clip = self
                     .drafts
                     .speak_line(
@@ -227,6 +252,64 @@ impl FollowUpWatcher {
                     );
                 }
             }
+        }
+    }
+}
+
+impl FollowUpWatcher {
+    /// The bound conversation (conversation voice mode): its own agent speaks
+    /// with `say`; the watcher only fills gaps. A finished turn whose agent
+    /// already spoke gets a text line (the "your turn" cue), otherwise the
+    /// spoken "<name> finished."; a cancelled turn was already answered
+    /// with "Stopped.". Bound lines never count against the wake limit.
+    async fn bound_follow_up(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        name: &str,
+        kind: FollowUpKind,
+        outcome: Option<&str>,
+    ) {
+        self.presence.note_bound_turn_end(user_id, conversation_id);
+        let spoke = self.drafts.spoke.remove(conversation_id).is_some();
+        let (kind, quiet) = match (kind, outcome) {
+            (FollowUpKind::Finished, Some("cancelled")) => (FollowUpKind::Finished, true),
+            (FollowUpKind::Finished, Some("error")) => (FollowUpKind::Failed, false),
+            (FollowUpKind::Finished, _) => (FollowUpKind::Finished, spoke),
+            (other, _) => (other, false),
+        };
+        let status = if kind == FollowUpKind::Failed {
+            STATUS_TURN_FAILED
+        } else {
+            kind.status()
+        };
+        if quiet {
+            self.drafts
+                .voice_line(user_id, None, conversation_id, status, &kind.line(name));
+            return;
+        }
+        let clip = self
+            .drafts
+            .speak_line(
+                user_id,
+                None,
+                conversation_id,
+                status,
+                &kind.line(name),
+                ClipVoice::Agent,
+            )
+            .await;
+        if !self.presence.has_live_call(user_id)
+            && let Some(clip_id) = clip
+        {
+            self.sockets.send_user(
+                user_id,
+                &VoiceServerFrame::Wake(VoiceWake {
+                    voice_session_id: None,
+                    reason: "follow_up".to_owned(),
+                    item_id: clip_id,
+                }),
+            );
         }
     }
 }

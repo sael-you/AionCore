@@ -218,6 +218,16 @@ impl BudgetMeter {
         }
     }
 
+    /// A clip was synthesized and its cost already persisted (C26 TTS
+    /// metering): count it so the warning and the hangup see it.
+    pub fn on_external_charge(&mut self, micros: i64, this_session: bool) {
+        if this_session {
+            self.session_cost_micros += micros;
+        } else {
+            self.base_used_micros += micros;
+        }
+    }
+
     /// Threshold crossed since the last call (the warning fires once).
     pub fn threshold(&mut self) -> Option<BudgetThreshold> {
         let used = self.used_micros();

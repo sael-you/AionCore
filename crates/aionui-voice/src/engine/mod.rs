@@ -195,6 +195,10 @@ pub trait EngineCall: Send {
     /// Cancel the response in progress.
     async fn interrupt(&mut self) -> Result<(), EngineError>;
 
+    /// End the user's utterance now (conversation mode "Done"): the provider
+    /// commits the input buffer and transcribes it without waiting for VAD.
+    async fn commit_input(&mut self) -> Result<(), EngineError>;
+
     /// Answer a tool call (`call_id` from [`EngineEvent::ToolCall`]).
     async fn tool_result(&mut self, call_id: &str, output: &str) -> Result<(), EngineError>;
 

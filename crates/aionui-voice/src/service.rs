@@ -19,6 +19,7 @@ use tokio::time::Instant;
 
 use crate::agent::AskRegistry;
 use crate::budget::utc_day_start_ms;
+use crate::conversation_mode::SessionMode;
 use crate::conversation_port::ConversationPort;
 use crate::credentials::CredentialPolicy;
 use crate::drafts::{DraftEngine, SpeechFactory};
@@ -27,7 +28,7 @@ use crate::error::VoiceError;
 use crate::frames::{VoiceSockets, call_ended_frame, error_frame};
 use crate::lifecycle::{EndReason, VoiceTimings};
 use crate::ports::{AuthRejected, AuthVerifier, CredentialPort, VerifiedUser};
-use crate::readback::{Clip, ClipStore};
+use crate::readback::{Clip, ClipStore, ClipVoice};
 use crate::runner::CallCommand;
 use crate::runner_drafts::ClientEvent;
 use crate::settings::{VoiceSettings, micros_to_usd};
@@ -71,8 +72,12 @@ pub(crate) struct LiveCall {
     /// Session cookie the call re-validates every 60 s: the creating request's,
     /// or (recovered calls) the first socket's that binds the session.
     pub token: std::sync::Mutex<Option<String>>,
-    /// Conversation the user armed voice in (target when no name is said).
+    /// Conversation the user armed voice in (target when no name is said);
+    /// in conversation mode the bound conversation.
     pub focus: Option<String>,
+    pub mode: SessionMode,
+    /// Car mode at admission (shorter agent lines, `[[AION_VOICE]]` mode).
+    pub car: bool,
 }
 
 impl LiveCall {
@@ -96,6 +101,19 @@ impl LiveCall {
     }
 }
 
+/// The conversation a user's conversation voice mode is bound to (C26). Kept
+/// in memory only (no migration): a restart drops it and the client re-opens
+/// the session with its binding on the next wake or tap.
+#[derive(Debug, Clone)]
+pub(crate) struct Binding {
+    pub conversation_id: String,
+    pub session_id: String,
+    /// `None` while its call is live; after an idle/rotation hangup the mode
+    /// is still armed on the device: the binding holds while a voice socket of
+    /// the user is connected, and for `binding_grace` after.
+    pub until: Option<Instant>,
+}
+
 pub(crate) struct ServiceInner {
     pub settings: Arc<dyn IVoiceSettingsRepository>,
     pub sessions: Arc<dyn IVoiceSessionRepository>,
@@ -113,6 +131,14 @@ pub(crate) struct ServiceInner {
     /// `voice.wake` per user per hour, shared with the follow-up watcher.
     pub wake_limiter: Arc<aionui_auth::RateLimiter>,
     pub live: DashMap<String, Arc<LiveCall>>,
+    /// user id → conversation voice-mode binding (C26).
+    pub bindings: DashMap<String, Binding>,
+    /// user id → bound conversation whose turn a restart interrupted; spoken
+    /// once when the device says hello again (C26 §3.4).
+    pub interrupted: DashMap<String, String>,
+    /// conversation id → its serial speech queue: the bound agent's lines are
+    /// synthesized and delivered in the order they were said.
+    pub speech_queues: DashMap<String, mpsc::UnboundedSender<crate::agent_service::BoundLine>>,
     pub tasks: DashMap<String, tokio::task::AbortHandle>,
     /// Per-user admission lock: an admission, a resume and the kill switch of
     /// one user never interleave; other users are not blocked.
@@ -128,6 +154,52 @@ impl ServiceInner {
             .entry(user_id.to_owned())
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone()
+    }
+
+    /// The conversation the user's voice mode is bound to, if still valid:
+    /// while its call is live, while the armed device's voice socket is
+    /// connected (renewing the grace), or within the grace after.
+    pub(crate) fn bound_conversation(&self, user_id: &str) -> Option<String> {
+        let mut binding = self.bindings.get_mut(user_id)?;
+        let Some(until) = binding.until else {
+            return Some(binding.conversation_id.clone());
+        };
+        if self.sockets.count_for_user(user_id) > 0 {
+            binding.until = Some(Instant::now() + self.timings.binding_grace);
+            return Some(binding.conversation_id.clone());
+        }
+        (until > Instant::now()).then(|| binding.conversation_id.clone())
+    }
+
+    /// Daily budget left for spoken clips: limit minus today's spend.
+    pub(crate) async fn tts_remaining(&self, user_id: &str) -> i64 {
+        let limit = match self.settings.get(user_id).await {
+            Ok(row) => row.map(VoiceSettings::from_row).unwrap_or_default().daily_budget_micros,
+            Err(_) => return 0,
+        };
+        let used = self
+            .sessions
+            .cost_since(user_id, utc_day_start_ms(aionui_common::now_ms()))
+            .await
+            .unwrap_or(i64::MAX);
+        limit.saturating_sub(used)
+    }
+
+    /// A call ended: the user ended voice mode (drop the binding) or the
+    /// call merely went away (keep it for [`BINDING_GRACE`]).
+    pub(crate) fn release_binding(&self, user_id: &str, session_id: &str, reason: EndReason) {
+        let ends_mode = matches!(
+            reason,
+            EndReason::User | EndReason::Sleep | EndReason::Disabled | EndReason::AuthRevoked | EndReason::Budget
+        );
+        if ends_mode {
+            self.bindings
+                .remove_if(user_id, |_, binding| binding.session_id == session_id);
+        } else if let Some(mut binding) = self.bindings.get_mut(user_id)
+            && binding.session_id == session_id
+        {
+            binding.until = Some(Instant::now() + self.timings.binding_grace);
+        }
     }
 
     pub(crate) fn mark_listening(&self) {
@@ -166,12 +238,22 @@ pub struct VoiceService {
 
 impl VoiceService {
     pub fn new(deps: VoiceServiceDeps) -> Self {
+        let service = Self::build(deps);
+        let hook = TtsBudgetHook {
+            inner: Arc::downgrade(&service.inner),
+        };
+        let _ = service.inner.drafts.budget.set(Arc::new(hook));
+        service
+    }
+
+    fn build(deps: VoiceServiceDeps) -> Self {
         let drafts = Arc::new(DraftEngine::new(
             deps.drafts,
             deps.conversations.clone(),
             deps.speech,
             ClipStore::default(),
             deps.sockets.clone(),
+            deps.sessions.clone(),
         ));
         Self {
             inner: Arc::new(ServiceInner {
@@ -195,6 +277,9 @@ impl VoiceService {
                 sockets: deps.sockets,
                 timings: deps.timings,
                 live: DashMap::new(),
+                bindings: DashMap::new(),
+                interrupted: DashMap::new(),
+                speech_queues: DashMap::new(),
                 tasks: DashMap::new(),
                 admission: DashMap::new(),
                 listening_since: std::sync::Mutex::new(None),
@@ -264,6 +349,7 @@ impl VoiceService {
     /// first (and then sees voice off and hangs up its call itself).
     async fn kill_user(&self, user_id: &str, audit: bool) {
         let ended = self.end_user_calls(user_id, EndReason::Disabled).await;
+        self.inner.bindings.remove(user_id);
         let cancelled_drafts = self.inner.drafts.cancel_all_for_user(user_id).await;
         self.inner.asks.cancel_user(user_id);
         let sockets = &self.inner.sockets;
@@ -502,6 +588,28 @@ impl VoiceService {
         }
     }
 
+    /// A device said hello: if a restart interrupted the turn of the user's
+    /// bound conversation, say so once (a clip through the normal TTS path).
+    pub fn speak_interrupted(&self, user_id: &str) {
+        let Some((_, conversation_id)) = self.inner.interrupted.remove(user_id) else {
+            return;
+        };
+        let drafts = self.inner.drafts.clone();
+        let user_id = user_id.to_owned();
+        tokio::spawn(async move {
+            drafts
+                .speak_line(
+                    &user_id,
+                    None,
+                    &conversation_id,
+                    "interrupted",
+                    crate::conversation_mode::INTERRUPTED_LINE,
+                    ClipVoice::Agent,
+                )
+                .await;
+        });
+    }
+
     /// The user's pending draft card, replayed on `voice.hello`.
     pub async fn pending_draft_frames(&self, user_id: &str) -> Vec<VoiceServerFrame> {
         self.inner.drafts.replay_for(user_id).await
@@ -614,8 +722,57 @@ impl crate::drafts::LiveSessions for VoiceService {
     }
 }
 
+/// [`crate::drafts::TtsBudget`] over the service (weak: no Arc cycle).
+struct TtsBudgetHook {
+    inner: std::sync::Weak<ServiceInner>,
+}
+
+#[async_trait::async_trait]
+impl crate::drafts::TtsBudget for TtsBudgetHook {
+    async fn remaining_micros(&self, user_id: &str) -> i64 {
+        match self.inner.upgrade() {
+            Some(inner) => inner.tts_remaining(user_id).await,
+            None => 0,
+        }
+    }
+
+    fn charged(&self, user_id: &str, session_id: &str, micros: i64) {
+        let Some(inner) = self.inner.upgrade() else {
+            return;
+        };
+        for call in inner.live.iter().filter(|c| c.user_id == user_id) {
+            let _ = call.cmd_tx.try_send(CallCommand::ExternalCharge {
+                session_id: session_id.to_owned(),
+                micros,
+            });
+        }
+    }
+}
+
 impl crate::followup::CallPresence for VoiceService {
     fn has_live_call(&self, user_id: &str) -> bool {
         VoiceService::has_live_call(self, user_id)
+    }
+
+    fn bound_conversation(&self, user_id: &str) -> Option<String> {
+        self.inner.bound_conversation(user_id)
+    }
+
+    fn note_bound_turn_end(&self, user_id: &str, conversation_id: &str) {
+        let Some(session_id) = self.inner.bindings.get(user_id).map(|b| b.session_id.clone()) else {
+            return;
+        };
+        let inner = self.inner.clone();
+        let (user_id, conversation_id) = (user_id.to_owned(), conversation_id.to_owned());
+        tokio::spawn(async move {
+            inner
+                .audit(
+                    &user_id,
+                    Some(&session_id),
+                    crate::conversation_mode::AUDIT_TURN_END,
+                    json!({"conversationId": conversation_id}),
+                )
+                .await;
+        });
     }
 }

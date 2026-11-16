@@ -28,6 +28,10 @@ pub struct ConversationState {
     /// Next send outcome override (`Busy`, `Rejected`…); `None` → delivered.
     pub next_outcomes: std::collections::VecDeque<SendOutcome>,
     pub probe: SendProbe,
+    /// Conversations whose running turn was cancelled (`cancel_turn`).
+    pub cancelled: Vec<String>,
+    /// `cancel_turn` fails (the conversation service refused).
+    pub cancel_fails: bool,
 }
 
 #[derive(Default)]
@@ -146,6 +150,22 @@ impl ConversationPort for FakeConversations {
         Ok(self.state.lock().unwrap().probe.clone())
     }
 
+    async fn cancel_turn(&self, _user_id: &str, conversation_id: &str) -> Result<bool, String> {
+        let mut state = self.state.lock().unwrap();
+        if state.cancel_fails {
+            return Err("cancel refused".into());
+        }
+        let running = state.statuses.get(conversation_id).is_some_and(|s| s.is_processing);
+        if running {
+            state.cancelled.push(conversation_id.to_owned());
+            if let Some(status) = state.statuses.get_mut(conversation_id) {
+                status.is_processing = false;
+                status.active_turn_id = None;
+            }
+        }
+        Ok(running)
+    }
+
     async fn create_conversation(
         &self,
         _user_id: &str,
@@ -175,6 +195,8 @@ pub struct FakeSpeech {
     /// Replace (from, to) in what the transcriber hears (misheard names).
     pub mishear: Arc<Mutex<Option<(String, String)>>>,
     pub no_synth: Arc<Mutex<bool>>,
+    /// Synthesis of a text containing this marker takes this long.
+    pub slow: Arc<Mutex<Option<(String, std::time::Duration)>>>,
     lines: Arc<Mutex<Vec<String>>>,
 }
 
@@ -200,6 +222,12 @@ struct Refiner(FakeSpeech);
 #[async_trait::async_trait]
 impl SynthPort for Synth {
     async fn synthesize(&self, text: &str, _voice: ClipVoice) -> Result<Clip, String> {
+        let slow = self.0.slow.lock().unwrap().clone();
+        if let Some((marker, delay)) = slow
+            && text.contains(&marker)
+        {
+            tokio::time::sleep(delay).await;
+        }
         self.0.lines.lock().unwrap().push(text.to_owned());
         Ok(Clip {
             bytes: text.as_bytes().to_vec(),

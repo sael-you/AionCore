@@ -20,6 +20,7 @@ fn request() -> CreateVoiceSessionRequest {
         device_id: Some("web".into()),
         focus_conversation_id: None,
         resume_of: None,
+        mode: None,
     }
 }
 

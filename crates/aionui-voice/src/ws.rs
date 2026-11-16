@@ -180,6 +180,7 @@ impl Socket {
                 for frame in self.service.pending_draft_frames(&self.user_id).await {
                     self.send(&frame);
                 }
+                self.service.speak_interrupted(&self.user_id);
             }
             VoiceClientFrame::Heartbeat(_) => self.service.note_heartbeat(&self.user_id, session.as_deref()),
             VoiceClientFrame::Frozen(_) => {
@@ -245,6 +246,11 @@ impl Socket {
                             version: tap.version,
                         },
                     )
+                    .await;
+            }
+            VoiceClientFrame::Commit(_) => {
+                self.service
+                    .client_event(&self.user_id, session.as_deref(), ClientEvent::Commit)
                     .await;
             }
         }

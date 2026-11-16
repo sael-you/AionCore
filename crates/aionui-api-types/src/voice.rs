@@ -64,6 +64,10 @@ pub struct CreateVoiceSessionRequest {
     /// Previous session id when re-dialling after a network loss (§3.6.5).
     #[serde(default)]
     pub resume_of: Option<String>,
+    /// `jarvis` (default: the dispatcher) | `conversation` (C26: the call is
+    /// only an ear for `focus_conversation_id`, whose own agent answers).
+    #[serde(default)]
+    pub mode: Option<String>,
 }
 
 /// `POST /api/voice/sessions` response (201).
@@ -143,6 +147,9 @@ pub enum VoiceClientFrame {
     ConfirmTap(VoiceDraftTap),
     #[serde(rename = "voice.cancelTap")]
     CancelTap(VoiceDraftTap),
+    /// Conversation mode "Done": end the user's utterance now (C26).
+    #[serde(rename = "voice.commit")]
+    Commit(VoiceSessionRef),
 }
 
 impl VoiceClientFrame {
@@ -151,7 +158,7 @@ impl VoiceClientFrame {
         match self {
             Self::Hello(f) => f.voice_session_id.as_deref(),
             Self::Heartbeat(f) => f.voice_session_id.as_deref(),
-            Self::Frozen(f) | Self::Resumed(f) => f.voice_session_id.as_deref(),
+            Self::Frozen(f) | Self::Resumed(f) | Self::Commit(f) => f.voice_session_id.as_deref(),
             Self::PlaybackFinished(f) => f.voice_session_id.as_deref(),
             Self::SpeechOnset(f) => f.voice_session_id.as_deref(),
             Self::ConfirmTap(f) | Self::CancelTap(f) => f.voice_session_id.as_deref(),
@@ -382,7 +389,8 @@ pub struct VoiceFollowUp {
     pub voice_session_id: Option<String>,
     pub conversation_id: String,
     /// `finished` | `failed` | `needs_approval` | `says` | `asks` | draft outcomes
-    /// (`queued`, `sent`, `failed`, `saved_not_started`, `expired`, `interrupted`).
+    /// (`queued`, `sent`, `failed`, `saved_not_started`, `expired`, `interrupted`) |
+    /// conversation-mode outcomes (`sent`, `added`, `queued`, `failed`, `stopped`, `silenced`).
     pub status: String,
     pub line: String,
     /// Clip id for `/api/voice/readbacks/{clipId}`; absent → show `line` with the tone.
@@ -440,6 +448,8 @@ pub struct VoiceAgentCapabilities {
     pub max_wait_s: u64,
     pub say_per_minute: u32,
     pub note: String,
+    /// `on` while the calling conversation is in conversation voice mode (C26).
+    pub voice_mode: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

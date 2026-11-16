@@ -108,13 +108,22 @@ impl DraftWorker {
             "pending_transcript",
             "committing",
         ];
-        let rows = match self.engine.repo.drafts_in_states(&states).await {
+        let mut rows = match self.engine.repo.drafts_in_states(&states).await {
             Ok(rows) => rows,
             Err(err) => {
                 tracing::warn!(error = %err, "voice draft worker: listing drafts failed");
                 return;
             }
         };
+        // Conversation-mode messages go oldest first (FIFO by creation; a
+        // re-queue bumps `updated_at`); C9 drafts keep their order.
+        rows.sort_by_key(|r| {
+            if super::engine::is_voice_mode(r) {
+                (1, r.created_at)
+            } else {
+                (0, 0)
+            }
+        });
         let mut seen = HashSet::new();
         for row in rows {
             if !seen.insert((row.id.clone(), row.version)) {

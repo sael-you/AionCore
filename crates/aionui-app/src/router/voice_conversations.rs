@@ -208,6 +208,17 @@ impl ConversationPort for VoiceConversationAdapter {
         })
     }
 
+    async fn cancel_turn(&self, user_id: &str, conversation_id: &str) -> Result<bool, String> {
+        let Some(turn_id) = self.service.runtime_state().active_turn_id_for(conversation_id) else {
+            return Ok(false);
+        };
+        self.service
+            .cancel(user_id, conversation_id, &turn_id, &self.task_manager)
+            .await
+            .map(|_| true)
+            .map_err(|e| e.to_string())
+    }
+
     async fn create_conversation(
         &self,
         user_id: &str,

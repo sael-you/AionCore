@@ -18,6 +18,7 @@ use tokio::sync::{mpsc, oneshot};
 use tokio::time::Instant;
 
 use crate::budget::{BudgetMeter, VOICE_MAX_OUTPUT_TOKENS, utc_day_start_ms};
+use crate::conversation_mode::{SessionMode, TRANSCRIBE_ONLY_INSTRUCTIONS};
 use crate::credentials::ResolvedCredential;
 use crate::engine::{EngineCall, EngineSessionConfig, OpenCallRequest};
 use crate::error::VoiceError;
@@ -32,6 +33,9 @@ use crate::settings::{CallProfile, VoiceSettings};
 /// Largest SDP offer accepted (a browser audio-only offer is ≈ 2–6 KB).
 pub const MAX_SDP_BYTES: usize = 32 * 1024;
 const TRANSCRIPTION_MODEL: &str = "gpt-transcribe";
+/// Transcription keywords (conversation and project names) per call.
+const MAX_KEYWORDS: usize = 40;
+const MAX_KEYWORD_CHARS: usize = 60;
 
 /// What a runner starts from.
 pub(crate) struct RunnerStart {
@@ -47,6 +51,8 @@ pub(crate) struct RunnerStart {
     pub focus: Option<String>,
     /// Summary of the call this one resumes, added to the model context.
     pub carry: Option<String>,
+    pub session_mode: SessionMode,
+    pub car: bool,
 }
 
 impl VoiceService {
@@ -61,6 +67,11 @@ impl VoiceService {
         req: CreateVoiceSessionRequest,
     ) -> Result<CreateVoiceSessionResponse, VoiceError> {
         validate_create(&req)?;
+        if SessionMode::parse(req.mode.as_deref())?.is_conversation() && req.focus_conversation_id.is_none() {
+            return Err(VoiceError::BadRequest(
+                "conversation mode needs focus_conversation_id".into(),
+            ));
+        }
         self.inner.mark_listening();
         let this = self.clone();
         let user_id = user_id.to_owned();
@@ -82,6 +93,18 @@ impl VoiceService {
         if !settings.enabled {
             return Err(VoiceError::Disabled);
         }
+        let mode = SessionMode::parse(req.mode.as_deref())?;
+        if mode.is_conversation() {
+            // Only a conversation the user owns (`status` is user-scoped).
+            let conversation = req.focus_conversation_id.as_deref().unwrap_or_default();
+            match self.inner.drafts.conversations.status(user_id, conversation).await {
+                Ok(Some(_)) => {}
+                Ok(None) => {
+                    return Err(VoiceError::NotFound(format!("conversation '{conversation}' not found")));
+                }
+                Err(err) => return Err(VoiceError::Internal(err)),
+            }
+        }
         if let Some(engine) = req.engine.as_deref()
             && engine != settings.engine
         {
@@ -100,7 +123,16 @@ impl VoiceService {
         };
 
         let profile = settings.call_profile();
-        let tools: Vec<Value> = crate::tools::definitions();
+        let tools: Vec<Value> = if mode.is_conversation() {
+            Vec::new()
+        } else {
+            crate::tools::definitions()
+        };
+        let instructions = if mode.is_conversation() {
+            TRANSCRIBE_ONLY_INSTRUCTIONS
+        } else {
+            BASE_INSTRUCTIONS
+        };
         let used = self
             .inner
             .sessions
@@ -110,7 +142,7 @@ impl VoiceService {
             pricing_for(&profile.model),
             settings.daily_budget_micros,
             used,
-            estimate_prefix_tokens(BASE_INSTRUCTIONS, &tools),
+            estimate_prefix_tokens(instructions, &tools),
         );
         if !meter.can_afford_response() {
             self.inner
@@ -120,7 +152,11 @@ impl VoiceService {
         }
 
         let credential = self.resolve_credential(user_id, &settings).await?;
-        let config = session_config(&profile, &profile.model, tools.clone());
+        let config = if mode.is_conversation() {
+            conversation_session_config(&profile, &profile.model, self.transcription_keywords(user_id).await)
+        } else {
+            session_config(&profile, &profile.model, tools.clone())
+        };
         let hash = instructions_hash(&config.instructions, &tools);
         let session_id = aionui_common::generate_prefixed_id("vs");
         let engine_kind = self.inner.engine.kind();
@@ -184,7 +220,9 @@ impl VoiceService {
                 user_id,
                 Some(&session_id),
                 "session_created",
-                json!({"engine": engine_kind, "model": profile.model, "resumeOf": req.resume_of}),
+                json!({"engine": engine_kind, "model": profile.model, "resumeOf": req.resume_of,
+                   "mode": if mode.is_conversation() { "conversation" } else { "jarvis" },
+                   "focus": if mode.is_conversation() { req.focus_conversation_id.as_deref() } else { None }}),
             )
             .await;
         tracing::info!(user_id, session_id = %session_id, engine = engine_kind, model = %profile.model,
@@ -201,6 +239,8 @@ impl VoiceService {
             started: Instant::now(),
             focus: req.focus_conversation_id.clone(),
             carry,
+            session_mode: mode,
+            car: settings.car_mode,
         });
         Ok(CreateVoiceSessionResponse {
             voice_session_id: session_id,
@@ -208,6 +248,33 @@ impl VoiceService {
             engine: engine_kind.to_owned(),
             model: profile.model,
         })
+    }
+
+    /// Names that bias transcription: the user's conversations and projects.
+    async fn transcription_keywords(&self, user_id: &str) -> Vec<String> {
+        let conversations = &self.inner.drafts.conversations;
+        let mut names: Vec<String> = conversations
+            .list_projects(user_id)
+            .await
+            .unwrap_or_default()
+            .into_iter()
+            .map(|p| p.name)
+            .collect();
+        let mut recent = conversations.list_conversations(user_id).await.unwrap_or_default();
+        recent.sort_by_key(|c| std::cmp::Reverse(c.updated_at));
+        names.extend(recent.into_iter().map(|c| c.name));
+        let mut keywords: Vec<String> = Vec::new();
+        for name in names {
+            let name = name.trim();
+            if name.is_empty() || name.chars().count() > MAX_KEYWORD_CHARS || keywords.iter().any(|k| k == name) {
+                continue;
+            }
+            keywords.push(name.to_owned());
+            if keywords.len() >= MAX_KEYWORDS {
+                break;
+            }
+        }
+        keywords
     }
 
     /// Short summary of a previous call of this user from its last transcript
@@ -287,9 +354,27 @@ impl VoiceService {
                 frozen: false,
             }),
             token: std::sync::Mutex::new(start.token),
-            focus: start.focus,
+            focus: start.focus.clone(),
+            mode: start.session_mode,
+            car: start.car,
         });
         self.inner.live.insert(start.session_id.clone(), call.clone());
+        match (start.session_mode, start.focus) {
+            (SessionMode::Conversation, Some(conversation_id)) => {
+                self.inner.bindings.insert(
+                    call.user_id.clone(),
+                    crate::service::Binding {
+                        conversation_id,
+                        session_id: start.session_id.clone(),
+                        until: None,
+                    },
+                );
+            }
+            // Jarvis takes over: the user left conversation voice mode.
+            _ => {
+                self.inner.bindings.remove(&call.user_id);
+            }
+        }
         let runner = CallRunner::new(
             self.inner.clone(),
             call,
@@ -342,6 +427,9 @@ impl VoiceService {
             match self.recover_one(&row).await {
                 Ok(()) => resumed += 1,
                 Err(reason) => {
+                    if row.instructions_hash.as_deref() == Some(conversation_instructions_hash().as_str()) {
+                        self.note_interrupted_turn(&row).await;
+                    }
                     let _ = self
                         .inner
                         .sessions
@@ -365,12 +453,58 @@ impl VoiceService {
         resumed
     }
 
+    /// A conversation-mode call died with the process: when its last voice
+    /// message has no turn end of that conversation after it (in any of the
+    /// user's sessions: a rotation changes the session id) and the
+    /// conversation is not running now, the restart interrupted that turn —
+    /// say so on the next hello.
+    async fn note_interrupted_turn(&self, row: &VoiceSessionRow) {
+        use crate::conversation_mode::{AUDIT_TURN_END, AUDIT_VOICE_MESSAGE};
+        let Ok(events) = self.inner.audit.list(&row.user_id, 500).await else {
+            return;
+        };
+        let conversation_of = |detail: &str| {
+            serde_json::from_str::<Value>(detail)
+                .ok()
+                .and_then(|d| d["conversationId"].as_str().map(str::to_owned))
+        };
+        // Newest first: this session's last voice message names the conversation.
+        let Some(conversation_id) = events
+            .iter()
+            .find(|e| e.session_id.as_deref() == Some(row.id.as_str()) && e.event == AUDIT_VOICE_MESSAGE)
+            .and_then(|e| conversation_of(&e.detail))
+        else {
+            return;
+        };
+        let last = events.iter().find(|e| {
+            (e.event == AUDIT_VOICE_MESSAGE || e.event == AUDIT_TURN_END)
+                && conversation_of(&e.detail).as_deref() == Some(conversation_id.as_str())
+        });
+        if last.is_none_or(|e| e.event != AUDIT_VOICE_MESSAGE) {
+            return;
+        }
+        let running = matches!(
+            self.inner.drafts.conversations.status(&row.user_id, &conversation_id).await,
+            Ok(Some(status)) if status.is_processing
+        );
+        if !running {
+            tracing::info!(session_id = %row.id, conversation_id = %conversation_id,
+                "voice recovery: the restart interrupted a bound turn");
+            self.inner.interrupted.insert(row.user_id.clone(), conversation_id);
+        }
+    }
+
     async fn recover_one(&self, row: &VoiceSessionRow) -> Result<(), EndReason> {
         let call_id = row
             .call_id
             .clone()
             .filter(|_| row.state == "live")
             .ok_or(EndReason::Restart)?;
+        // A conversation-mode call has no persisted binding: hang it up; the
+        // client re-opens it with its binding on the next wake (C26 §3.4).
+        if row.instructions_hash.as_deref() == Some(conversation_instructions_hash().as_str()) {
+            return Err(EndReason::Restart);
+        }
         let lock = self.inner.user_lock(&row.user_id);
         let _guard = lock.lock().await;
         let settings = self.settings(&row.user_id).await.map_err(|_| EndReason::Restart)?;
@@ -409,6 +543,8 @@ impl VoiceService {
             started: started_from_created_at(row.created_at),
             focus: None,
             carry: None,
+            session_mode: SessionMode::Jarvis,
+            car: settings.car_mode,
         });
         Ok(())
     }
@@ -466,7 +602,31 @@ fn session_config(profile: &CallProfile, model: &str, tools: Vec<Value>) -> Engi
     }
 }
 
+/// The transcribe-only "ear" of conversation mode (C26 §2.3 1): no tools, no
+/// provider responses, tolerant end-of-turn, keywords for names.
+fn conversation_session_config(profile: &CallProfile, model: &str, keywords: Vec<String>) -> EngineSessionConfig {
+    EngineSessionConfig {
+        model: model.to_owned(),
+        instructions: TRANSCRIBE_ONLY_INSTRUCTIONS.to_owned(),
+        voice: profile.voice.clone(),
+        eagerness: "low".to_owned(),
+        noise_reduction: profile.noise_reduction.clone(),
+        transcription_model: TRANSCRIPTION_MODEL.to_owned(),
+        keywords,
+        reasoning_effort: "low".to_owned(),
+        max_output_tokens: VOICE_MAX_OUTPUT_TOKENS,
+        create_response: false,
+        tools: Vec::new(),
+    }
+}
+
+/// Hash stored on conversation-mode sessions (recovery tells them apart).
+pub(crate) fn conversation_instructions_hash() -> String {
+    instructions_hash(TRANSCRIBE_ONLY_INSTRUCTIONS, &[])
+}
+
 fn validate_create(req: &CreateVoiceSessionRequest) -> Result<(), VoiceError> {
+    SessionMode::parse(req.mode.as_deref())?;
     if req.sdp_offer.len() > MAX_SDP_BYTES {
         return Err(VoiceError::BadRequest(format!(
             "sdp_offer exceeds {MAX_SDP_BYTES} bytes"
@@ -507,6 +667,7 @@ mod tests {
             device_id: None,
             focus_conversation_id: None,
             resume_of: None,
+            mode: None,
         }
     }
 
@@ -519,6 +680,9 @@ mod tests {
         let mut bad_device = req("v=0");
         bad_device.device_id = Some("x\u{0}".into());
         assert!(matches!(validate_create(&bad_device), Err(VoiceError::BadRequest(_))));
+        let mut bad_mode = req("v=0");
+        bad_mode.mode = Some("dictation".into());
+        assert!(matches!(validate_create(&bad_mode), Err(VoiceError::BadRequest(_))));
     }
 
     #[test]

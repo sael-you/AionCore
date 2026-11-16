@@ -47,7 +47,8 @@ pub(crate) fn capabilities_data() -> Value {
         "schema_version": 1,
         "contract": "agent-facing-voice-cli",
         "commands": {
-            "say": {"stdin": {"text": "string (≤ 500 chars, no confirmation words)"}},
+            "say": {"stdin": {"text": "string (≤ 500 chars, no confirmation words; in conversation voice mode ≤ 1200 chars, spoken in ≤ 300-char clips)"},
+                    "returns": {"status": "delivered | no_device"}},
             "ask": {"stdin": {"question": "string", "timeout_s": "integer, optional (≤ 50)"},
                     "returns": {"status": "answered | pending | timeout | no_device | cancelled", "id": "string",
                                 "answer": "string"}},
@@ -56,8 +57,11 @@ pub(crate) fn capabilities_data() -> Value {
         },
         "max_wait_s": 50,
         "say_per_minute": 6,
+        "voice_mode": "GET /api/runtime/voice/capabilities answers voice_mode on|off for the calling conversation; messages spoken in voice mode carry an [[AION_VOICE]] block (skill voice-mode)",
         "rules": [
             "Only conversations the user sent a voice request to (or opted in) may speak.",
+            "In conversation voice mode the conversation's own agent speaks without a name prefix and decides itself when it is worth it.",
+            "A spoken yes is never a typed approval for production data, payments, ads or email writes.",
             "A voice answer is never permission for a destructive action; ask for an approval instead.",
         ],
     })

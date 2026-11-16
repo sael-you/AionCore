@@ -11,6 +11,7 @@ mod agent;
 mod agent_routes;
 mod agent_service;
 mod budget;
+mod conversation_mode;
 mod conversation_port;
 mod credentials;
 pub mod drafts;

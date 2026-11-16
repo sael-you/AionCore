@@ -34,6 +34,8 @@ pub(crate) enum CallCommand {
     },
     /// A client frame for this call (evidence, taps) or a pending `ask`.
     Client(ClientEvent),
+    /// A clip was charged to the user's daily budget (already persisted).
+    ExternalCharge { session_id: String, micros: i64 },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -282,8 +284,9 @@ impl CallRunner {
                 }));
                 if let Some(text) = user_final
                     && !text.trim().is_empty()
+                    && let Some(reason) = self.on_user_final(&text).await
                 {
-                    self.on_user_final(&text).await;
+                    return Some(reason);
                 }
                 if let Some(text) = assistant_final
                     && !text.trim().is_empty()
@@ -409,6 +412,11 @@ impl CallRunner {
                 self.on_client(event).await;
                 None
             }
+            CallCommand::ExternalCharge { session_id, micros } => {
+                let this_session = session_id == self.call.session_id;
+                self.meter.on_external_charge(micros, this_session);
+                self.check_budget()
+            }
             CallCommand::CreateResponse { done } => {
                 if self.meter.reserve_own().is_err() {
                     let _ = done.send(Err(VoiceError::BudgetReached));
@@ -451,6 +459,21 @@ impl CallRunner {
             (Ok(l), None) => (std::time::Duration::ZERO, l.frozen),
             (Err(_), _) => (std::time::Duration::ZERO, false),
         };
+        // Conversation mode: a running turn of the bound conversation keeps
+        // the (muted, response-free) call open, so a barge-in needs no re-dial.
+        if self.call.mode.is_conversation()
+            && self.last_activity.elapsed() >= timings.idle_hangup
+            && let Some(conversation_id) = self.call.focus.as_deref()
+            && let Ok(Some(status)) = self
+                .inner
+                .drafts
+                .conversations
+                .status(&self.call.user_id, conversation_id)
+                .await
+            && (status.is_processing || status.pending_confirmations > 0)
+        {
+            self.last_activity = Instant::now();
+        }
         let inputs = TickInputs {
             since_start: self.started.elapsed(),
             since_activity: self.last_activity.elapsed(),
@@ -508,6 +531,9 @@ impl CallRunner {
         self.send(state_frame(Some(&session_id), state, Some(reason.as_str())));
         self.inner.live.remove(&session_id);
         self.inner.tasks.remove(&session_id);
+        if self.call.mode.is_conversation() {
+            self.inner.release_binding(&user_id, &session_id, reason);
+        }
         // Answer anything still queued, then release the waiters.
         self.cmd_rx.close();
         while let Ok(command) = self.cmd_rx.try_recv() {
@@ -531,6 +557,6 @@ fn reject_not_ready(command: CallCommand) {
         CallCommand::SetCreateResponse { done, .. } | CallCommand::CreateResponse { done } => {
             let _ = done.send(Err(err()));
         }
-        CallCommand::Client(_) => {}
+        CallCommand::Client(_) | CallCommand::ExternalCharge { .. } => {}
     }
 }
