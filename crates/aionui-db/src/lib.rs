@@ -5,6 +5,7 @@ mod agent_binding;
 mod database;
 mod error;
 mod instance_lock;
+pub mod kit_resolve;
 mod legacy_handoff;
 mod migrate_repair;
 pub mod models;
@@ -24,6 +25,7 @@ pub use error::{
     message_indicates_unique_violation,
 };
 pub use instance_lock::{DataDirInstanceGuard, instance_lock_path};
+pub use kit_resolve::{GLOBAL_MCP_IDS, KitDecision, KitLayers, KitResolution, KitScope};
 pub use models::{
     AgentMetadataRow, AssistantDefinitionRow, AssistantOverlayRow, AssistantOverrideRow, AssistantPreferenceRow,
     AssistantRow, BoardCardRow, BoardColumnRow, BoardDepRow, BoardDeployJobRow, BoardEventRow, BoardIdempotencyRow,
@@ -44,6 +46,7 @@ pub use repository::conversation::{
 pub use repository::cron::{
     ClaimCronRunParams, CronRunClaimResult, FinishCronRunParams, RecoverableCronRun, UpdateCronJobParams,
 };
+pub use repository::kit::{AttachParams, CreateKitParams, KitMembers, SeedKit, UpdateKitParams};
 pub use repository::mcp_market::{CreateAssignmentParams, MarketInstanceParams, UpdateMarketInstanceParams};
 pub use repository::mcp_server::{
     CreateMcpServerParams, GatedMcpRow, MarketDelivery, McpMarketScope, UpdateMcpServerParams,
@@ -67,18 +70,19 @@ pub use repository::{
     IAgentMetadataRepository, IAssistantDefinitionRepository, IAssistantOverlayRepository,
     IAssistantOverrideRepository, IAssistantPreferenceRepository, IAssistantRepository, IBoardStore, IBoardTx,
     IChannelRepository, IClientPreferenceRepository, IConversationRepository, ICronRepository,
-    IFeedbackDiagnosticsRepository, IMcpMarketRepository, IMcpServerRepository, IOAuthTokenRepository, IProjectStore,
-    IProviderRepository, IRemoteAgentRepository, ISettingsRepository, ISidebarStore, ISkillRepository, ITeamRepository,
-    IUserOrderStore, IUserRepository, IVoiceAuditRepository, IVoiceSessionRepository, IVoiceSettingsRepository,
-    MoveOutcome, NewBoardEvent, OrderItemRef, PageDirection, PersistedSessionState, PinOutcome, PinnedCursor,
-    SaveRuntimeStateParams, SidebarConversationThin, SidebarProjectMeta, SidebarTeamThin, SqliteAcpSessionRepository,
-    SqliteAgentMetadataRepository, SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository,
-    SqliteAssistantOverrideRepository, SqliteAssistantPreferenceRepository, SqliteAssistantRepository,
-    SqliteBoardStore, SqliteChannelRepository, SqliteClientPreferenceRepository, SqliteConversationRepository,
-    SqliteCronRepository, SqliteFeedbackDiagnosticsRepository, SqliteMcpMarketRepository, SqliteMcpServerRepository,
-    SqliteOAuthTokenRepository, SqliteProjectStore, SqliteProviderRepository, SqliteRemoteAgentRepository,
-    SqliteSettingsRepository, SqliteSidebarStore, SqliteSkillRepository, SqliteTeamRepository, SqliteUserOrderStore,
-    SqliteUserRepository, SqliteVoiceRepository, count_live_voice_calls_read_only,
+    IFeedbackDiagnosticsRepository, IKitRepository, IMcpMarketRepository, IMcpServerRepository, IOAuthTokenRepository,
+    IProjectStore, IProviderRepository, IRemoteAgentRepository, ISettingsRepository, ISidebarStore, ISkillRepository,
+    ITeamRepository, IUserOrderStore, IUserRepository, IVoiceAuditRepository, IVoiceSessionRepository,
+    IVoiceSettingsRepository, MoveOutcome, NewBoardEvent, OrderItemRef, PageDirection, PersistedSessionState,
+    PinOutcome, PinnedCursor, SaveRuntimeStateParams, SidebarConversationThin, SidebarProjectMeta, SidebarTeamThin,
+    SqliteAcpSessionRepository, SqliteAgentMetadataRepository, SqliteAssistantDefinitionRepository,
+    SqliteAssistantOverlayRepository, SqliteAssistantOverrideRepository, SqliteAssistantPreferenceRepository,
+    SqliteAssistantRepository, SqliteBoardStore, SqliteChannelRepository, SqliteClientPreferenceRepository,
+    SqliteConversationRepository, SqliteCronRepository, SqliteFeedbackDiagnosticsRepository, SqliteKitRepository,
+    SqliteMcpMarketRepository, SqliteMcpServerRepository, SqliteOAuthTokenRepository, SqliteProjectStore,
+    SqliteProviderRepository, SqliteRemoteAgentRepository, SqliteSettingsRepository, SqliteSidebarStore,
+    SqliteSkillRepository, SqliteTeamRepository, SqliteUserOrderStore, SqliteUserRepository, SqliteVoiceRepository,
+    count_live_voice_calls_read_only,
 };
 
 // Re-export sqlx pool type for downstream crates
