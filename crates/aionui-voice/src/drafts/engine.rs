@@ -566,13 +566,7 @@ impl DraftEngine {
                     {
                         spoken_confirm = self
                             .name_check
-                            .passes(
-                                kit.transcriber.as_deref(),
-                                &clip,
-                                name,
-                                &synth.voice_id(ClipVoice::Jarvis),
-                                DICTIONARY_VERSION,
-                            )
+                            .passes(kit.transcriber.as_deref(), &clip, name, DICTIONARY_VERSION)
                             .await;
                     }
                     readback_id = Some(self.clips.insert(user_id, session_id, clip));

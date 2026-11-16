@@ -162,6 +162,7 @@ impl Socket {
                 self.hello_done = true;
                 tracing::debug!(user_id = %self.user_id, device = %log_safe(&hello.device), "voice socket hello");
                 self.service.note_heartbeat(&self.user_id, session.as_deref());
+                self.service.note_hello_mode(&self.user_id, hello.mode.as_deref());
                 if let (Some(id), Some(token)) = (session.as_deref(), self.token.as_deref()) {
                     self.service.adopt_token(&self.user_id, id, token);
                 }

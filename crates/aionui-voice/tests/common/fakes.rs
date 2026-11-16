@@ -221,7 +221,7 @@ struct Refiner(FakeSpeech);
 
 #[async_trait::async_trait]
 impl SynthPort for Synth {
-    async fn synthesize(&self, text: &str, _voice: ClipVoice) -> Result<Clip, String> {
+    async fn synthesize(&self, text: &str, voice: ClipVoice) -> Result<Clip, String> {
         let slow = self.0.slow.lock().unwrap().clone();
         if let Some((marker, delay)) = slow
             && text.contains(&marker)
@@ -232,6 +232,7 @@ impl SynthPort for Synth {
         Ok(Clip {
             bytes: text.as_bytes().to_vec(),
             mime: "audio/mpeg",
+            voice: format!("fake/{}", self.voice_id(voice)),
         })
     }
 
