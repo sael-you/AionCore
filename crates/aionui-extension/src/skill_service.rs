@@ -1224,12 +1224,16 @@ pub async fn delete_skill_with_repo_for_user(
     skill_name: &str,
 ) -> Result<(), ExtensionError> {
     validate_filename(skill_name)?;
-    if builtin_skill_exists(paths, skill_name) {
-        return Err(ExtensionError::BuiltinSkillDeletion(skill_name.to_string()));
-    }
-
-    let Some(row) = repo.find_by_name_for_user(user_id, skill_name).await? else {
-        return Err(ExtensionError::SkillNotFound(skill_name.to_string()));
+    // `find_by_name_for_user` prefers the user's own active row over a global
+    // one, so a user skill that shadows a built-in is deletable; deleting it
+    // makes the built-in visible again (TASK-96). Global rows are never
+    // user-deletable.
+    let row = match repo.find_by_name_for_user(user_id, skill_name).await? {
+        Some(row) if row.user_id.is_some() => row,
+        _ if builtin_skill_exists(paths, skill_name) => {
+            return Err(ExtensionError::BuiltinSkillDeletion(skill_name.to_string()));
+        }
+        _ => return Err(ExtensionError::SkillNotFound(skill_name.to_string())),
     };
     if !PathBuf::from(&row.path).is_dir() {
         warn!(
@@ -1419,7 +1423,9 @@ async fn resolve_skill_source_path_with_repo_for_user(
     user_id: &str,
     name: &str,
 ) -> Result<Option<PathBuf>, ExtensionError> {
-    if let Some(row) = repo.find_by_name_any_for_user(user_id, name).await? {
+    // Active rows only: a soft-deleted user row must never shadow a
+    // built-in skill with the same name (TASK-96).
+    if let Some(row) = repo.find_by_name_for_user(user_id, name).await? {
         let path = PathBuf::from(&row.path);
         if path.is_dir() {
             return Ok(Some(path));
@@ -1427,7 +1433,6 @@ async fn resolve_skill_source_path_with_repo_for_user(
         warn!(
             skill = %name,
             path = %path.display(),
-            deleted = row.deleted_at.is_some(),
             "skill row points at a missing directory"
         );
         if row.user_id.is_some() {
@@ -1441,6 +1446,23 @@ async fn resolve_skill_source_path_with_repo_for_user(
     let auto = paths.builtin_skills_dir.join(BUILTIN_AUTO_SKILLS_SUBDIR).join(name);
     if auto.is_dir() {
         return Ok(Some(auto));
+    }
+    // Last resort: a soft-deleted skill the user owned still resolves for
+    // conversations that referenced it before deletion (its files are kept),
+    // but only when no active or built-in skill carries the name.
+    if let Some(row) = repo.find_by_name_any_for_user(user_id, name).await?
+        && row.user_id.is_some()
+        && row.deleted_at.is_some()
+    {
+        let path = PathBuf::from(&row.path);
+        if path.is_dir() {
+            return Ok(Some(path));
+        }
+        warn!(
+            skill = %name,
+            path = %path.display(),
+            "soft-deleted skill row points at a missing directory"
+        );
     }
     // Per-job cron skill dirs are intentionally NOT probed as a fallback:
     // they hold user content (job prompts) and must resolve only through
@@ -3015,6 +3037,65 @@ mod tests {
 
         let result = delete_skill(&paths, "protected").await;
         assert!(matches!(result, Err(ExtensionError::BuiltinSkillDeletion(_))));
+    }
+
+    /// Seed a built-in `shared` skill (on disk and in the catalog) plus a
+    /// user-imported skill with the same name that shadows it.
+    async fn seed_user_skill_shadowing_builtin(tmp: &Path, paths: &SkillPaths, repo: &SqliteSkillRepository) {
+        create_skill_in_dir(disk_builtin_dir(paths), "shared", "Built-in shared");
+        sync_skill_catalog_into_repo(paths, repo).await.unwrap();
+        let src = tmp.join("import-src");
+        create_skill_in_dir(&src, "shared", "User shared");
+        import_skill_with_repo(paths, repo, &src.join("shared")).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn soft_deleted_user_skill_does_not_shadow_builtin_on_resolve() {
+        let tmp = TempDir::new().unwrap();
+        let paths = make_disk_builtin_paths(tmp.path());
+        let repo = make_test_skill_repo().await;
+        seed_user_skill_shadowing_builtin(tmp.path(), &paths, &repo).await;
+
+        // Soft-delete leaves the user folder on disk.
+        repo.delete_by_name("shared").await.unwrap();
+        assert!(default_user_skill_root(&paths).join("shared").is_dir());
+
+        let resolved =
+            materialize_skills_for_agent_with_repo(&paths, &repo, "conv-after-delete", &["shared".to_owned()])
+                .await
+                .unwrap();
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(resolved[0].source_path, disk_builtin_dir(&paths).join("shared"));
+    }
+
+    #[tokio::test]
+    async fn deleting_user_skill_that_shadows_builtin_restores_builtin() {
+        let tmp = TempDir::new().unwrap();
+        let paths = make_disk_builtin_paths(tmp.path());
+        let repo = make_test_skill_repo().await;
+        seed_user_skill_shadowing_builtin(tmp.path(), &paths, &repo).await;
+
+        let before = list_available_skills_with_repo(&paths, &repo).await.unwrap();
+        let shared: Vec<_> = before.iter().filter(|s| s.name == "shared").collect();
+        assert_eq!(shared.len(), 1);
+        assert_eq!(shared[0].source, SkillSource::Custom);
+
+        delete_skill_with_repo(&paths, &repo, "shared").await.unwrap();
+
+        let after = list_available_skills_with_repo(&paths, &repo).await.unwrap();
+        let shared: Vec<_> = after.iter().filter(|s| s.name == "shared").collect();
+        assert_eq!(shared.len(), 1);
+        assert_eq!(shared[0].source, SkillSource::Builtin);
+
+        let resolved =
+            materialize_skills_for_agent_with_repo(&paths, &repo, "conv-after-delete", &["shared".to_owned()])
+                .await
+                .unwrap();
+        assert_eq!(resolved[0].source_path, disk_builtin_dir(&paths).join("shared"));
+
+        // With the user copy gone only the built-in is left, which stays protected.
+        let again = delete_skill_with_repo(&paths, &repo, "shared").await;
+        assert!(matches!(again, Err(ExtensionError::BuiltinSkillDeletion(_))));
     }
 
     #[tokio::test]
