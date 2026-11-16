@@ -238,7 +238,7 @@ async fn import_creates_template_instances_with_file_secrets_and_ignores_the_old
     assert_eq!(again.kit_id, result.kit_id);
     assert_eq!(
         f.kits
-            .list_kit_items(USER, Some(&[kit.id.clone()]))
+            .list_kit_items(USER, Some(std::slice::from_ref(&kit.id)))
             .await
             .unwrap()
             .len(),
