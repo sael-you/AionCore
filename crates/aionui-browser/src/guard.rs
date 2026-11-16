@@ -109,7 +109,7 @@ impl NavigationGuard {
     /// Whether `host` (any case, trailing dot, optional port) is an AionUi host.
     pub fn is_aionui_host(&self, host: &str) -> bool {
         let host = norm_host(host);
-        self.aionui_hosts().iter().any(|h| *h == host)
+        self.aionui_hosts().contains(&host)
     }
 
     fn aionui_hosts(&self) -> Vec<String> {
