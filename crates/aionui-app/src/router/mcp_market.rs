@@ -14,7 +14,9 @@ use crate::config::IdentityMode;
 use crate::services::AppServices;
 
 /// Templates = `contributes.mcpServers` of the `studio-mcp-catalog` extension
-/// only (an arbitrary extension cannot pin launch commands).
+/// only (an arbitrary extension cannot pin launch commands), over the
+/// built-in catalogue shipped in the binary (an installed extension
+/// overrides a built-in template of the same id).
 pub(crate) struct ExtensionTemplateCatalog {
     pub registry: ExtensionRegistry,
 }
@@ -22,13 +24,15 @@ pub(crate) struct ExtensionTemplateCatalog {
 #[async_trait::async_trait]
 impl IMcpTemplateCatalog for ExtensionTemplateCatalog {
     async fn entries(&self, user_id: &str) -> Result<Vec<serde_json::Value>, String> {
-        self.registry
+        let installed = self
+            .registry
             .get_mcp_servers_for_user(user_id)
             .await
             .into_iter()
             .filter(|s| s.extension_name == CATALOG_EXTENSION)
             .map(|s| serde_json::to_value(s).map_err(|e| e.to_string()))
-            .collect()
+            .collect::<Result<Vec<_>, _>>()?;
+        Ok(aionui_mcp::market::with_builtin(installed))
     }
 }
 

@@ -37,6 +37,11 @@ pub struct McpMarketEnvField {
     pub default: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub description: Option<String>,
+    /// Launch parameter (G1): an anchored regex every value of this plain key
+    /// must fully match. Only a plain key with a pattern may be referenced as
+    /// `${KEY}` in the pinned args or url; the launcher substitutes it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pattern: Option<String>,
 }
 
 /// A stdio command (the pinned server command, or the stdio bridge an HTTP
@@ -90,6 +95,28 @@ pub struct McpMarketTemplate {
     /// Tool name -> `read` | `write`.
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub tool_classes: BTreeMap<String, String>,
+    /// Pinned read allowlist (G3). With enforcement `proxy` a read instance
+    /// may only allow these tools; the launcher's proxy enforces it.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub read_tools: Vec<String>,
+    /// Library browse metadata (D49): category slug (e.g. `developer`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+    /// Who publishes the server (e.g. `Supabase`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub vendor: Option<String>,
+    /// Published by the vendor itself (vs a community server).
+    #[serde(default)]
+    pub official: bool,
+    /// Optional pick (D50): shown apart in the library browse.
+    #[serde(default)]
+    pub optional: bool,
+    /// One-line purpose for the library browse.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    /// `metered` when calls spend money (G7); shown as a cost badge.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub billing: Option<String>,
 }
 
 // ---------------------------------------------------------------------------

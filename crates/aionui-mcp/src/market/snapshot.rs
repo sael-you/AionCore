@@ -8,6 +8,7 @@ use aionui_api_types::{McpMarketEnvKind, McpMarketInstanceStatus, McpMarketStatu
 use serde_json::{Value, json};
 
 use super::error::{MarketError, invalid};
+use super::params::{substitute, substitute_command};
 use super::rules::{GLOBAL_IDS, instance_problems};
 use super::service::McpMarketService;
 use super::stored::StoredInstance;
@@ -129,11 +130,17 @@ fn lock_instance(inst: &StoredInstance, clis: Vec<String>) -> Value {
     }
     if t.transport == "stdio" {
         if let Some(cmd) = &t.command {
+            // G1: launch parameters resolved (a missing one stays a `${KEY}` ref).
+            let cmd = substitute_command(cmd, t, &inst.plain_env).unwrap_or_else(|_| cmd.clone());
             v["command"] = json!(cmd.command);
             v["args"] = json!(cmd.args);
         }
     } else {
-        v["url"] = json!(t.url);
+        let url = t
+            .url
+            .as_deref()
+            .map(|u| substitute(u, t, &inst.plain_env).unwrap_or_else(|_| u.to_owned()));
+        v["url"] = json!(url);
         let mut headers = BTreeMap::new();
         for (header, key) in &t.headers {
             let value = match t.env.get(key).map(|f| f.kind) {

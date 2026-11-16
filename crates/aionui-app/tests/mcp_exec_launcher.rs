@@ -83,12 +83,19 @@ async fn fx() -> Fx {
     .execute(db.pool())
     .await
     .unwrap();
-    let catalog = StaticTemplateCatalog::new(vec![json!({"id": "fakesrv", "name": "Fake", "market": {
-        "transport": "stdio",
-        "command": {"command": PYTHON, "args": ["-u", script.to_string_lossy()]},
-        "env": {"FAKE_API_KEY": {"kind": "secret", "required": true}, "FAKE_MODE": {"kind": "plain"}},
-        "tiers": ["read"], "enforcement": "server", "clis": ["claude", "codex"]
-    }})]);
+    let catalog = StaticTemplateCatalog::new(vec![
+        json!({"id": "fakesrv", "name": "Fake", "market": {
+            "transport": "stdio",
+            "command": {"command": PYTHON, "args": ["-u", script.to_string_lossy()]},
+            "env": {"FAKE_API_KEY": {"kind": "secret", "required": true}, "FAKE_MODE": {"kind": "plain"}},
+            "tiers": ["read"], "enforcement": "server", "clis": ["claude", "codex"]
+        }}),
+        json!({"id": "fakeuv", "name": "Fake uvx", "market": {
+            "transport": "stdio",
+            "command": {"command": "uvx", "args": ["fake-mcp@1.0.0"]},
+            "tiers": ["read"], "enforcement": "server", "clis": ["claude"]
+        }}),
+    ]);
     let repo: Arc<dyn IMcpMarketRepository> = Arc::new(SqliteMcpMarketRepository::new(db.pool().clone()));
     let servers: Arc<dyn IMcpServerRepository> = Arc::new(SqliteMcpServerRepository::new(db.pool().clone()));
     let market = McpMarketService::new(
@@ -355,4 +362,62 @@ async fn proxies_filtered_tools_with_an_isolated_env_and_stops_on_revoke() {
         !stderr.contains("LAUNCHERFIXTURE") && !stderr.contains("SENTINEL"),
         "{stderr}"
     );
+}
+
+/// G4: a template pinned to `uvx` runs the toolchain's uvx from
+/// `<data_dir>/toolchain/bin`, with that dir first on the child's PATH and
+/// uv's caches under the data dir (persisted), even though PATH has no uvx.
+#[tokio::test(flavor = "multi_thread")]
+async fn resolves_uvx_from_the_data_dir_toolchain() {
+    use std::os::unix::fs::PermissionsExt;
+    let f = fx().await;
+    let bin = f.data_dir.join("toolchain").join("bin");
+    std::fs::create_dir_all(&bin).unwrap();
+    let uvx = bin.join("uvx");
+    let script = f._dir.path().join("fake_mcp.py");
+    std::fs::write(&uvx, format!("#!/bin/sh\nexec {PYTHON} -u {}\n", script.display())).unwrap();
+    std::fs::set_permissions(&uvx, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+    let inst = f
+        .market
+        .create_instance(
+            USER,
+            CreateMcpMarketInstanceRequest {
+                name: "tb-uv".into(),
+                template_id: "fakeuv".into(),
+                description: None,
+                environment: "local".into(),
+                tier: "read".into(),
+                status: Some("active".into()),
+                clis: vec!["claude".into()],
+                plain_env: BTreeMap::new(),
+                tools_allow: Some(vec!["env".into()]),
+                tools_block: vec![],
+            },
+        )
+        .await
+        .unwrap();
+    f.assign(&inst.id, "claude").await;
+
+    let mut cmd = f.launcher("tb-uv", "proj-a", "claude");
+    cmd.env("PATH", "/usr/bin:/bin");
+    let mut s = Session::start(cmd);
+    let init = s.call(rpc(
+        1,
+        "initialize",
+        json!({"protocolVersion": "2025-06-18", "capabilities": {}, "clientInfo": {"name": "t", "version": "0"}}),
+    ));
+    assert_eq!(init["result"]["serverInfo"]["name"], "fake", "uvx resolved and started");
+    let env_call = s.call(rpc(2, "tools/call", json!({"name": "env", "arguments": {}})));
+    let env: serde_json::Map<String, Value> =
+        serde_json::from_str(env_call["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    let path = env["PATH"].as_str().unwrap();
+    assert!(path.starts_with(&bin.to_string_lossy().into_owned()), "{path}");
+    let cache = env["UV_CACHE_DIR"].as_str().unwrap();
+    assert!(
+        cache.starts_with(&f.data_dir.join("toolchain").to_string_lossy().into_owned()),
+        "{cache}"
+    );
+    drop(s.stdin);
+    let _ = s.child.wait();
 }
