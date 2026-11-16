@@ -195,6 +195,9 @@ pub fn prepare_dirs(
     ensure_owned_private_dir(&user_dir, uid, gid)?;
     let profile = layout.profile_dir(user_id, instance)?;
     ensure_owned_private_dir(&profile, uid, gid)?;
+    // Per-instance HOME (`.config`, NSS db, crashpad database): instances
+    // share nothing, and every helper's command line names its profile.
+    ensure_owned_private_dir(&instance_home(&profile), uid, gid)?;
     Ok(profile)
 }
 
@@ -249,8 +252,16 @@ pub(crate) async fn kill_pids_as(uid: u32, gid: u32, pids: &[u32], signal: &str)
     let _ = cmd.output().await;
 }
 
-/// `(real uid, pgid)` from `/proc/<pid>/status` and `/proc/<pid>/stat`.
-fn proc_identity(pid: u32) -> Option<(u32, u32)> {
+/// One process of the browser account.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ProcInfo {
+    pub pid: u32,
+    pub ppid: u32,
+    pub pgid: u32,
+}
+
+/// `(real uid, ppid, pgid)` from `/proc/<pid>/status` and `/proc/<pid>/stat`.
+fn proc_identity(pid: u32) -> Option<(u32, u32, u32)> {
     let status = std::fs::read_to_string(format!("/proc/{pid}/status")).ok()?;
     let uid = status
         .lines()
@@ -260,19 +271,21 @@ fn proc_identity(pid: u32) -> Option<(u32, u32)> {
         .parse()
         .ok()?;
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
-    Some((uid, parse_stat_pgid(&stat)?))
+    let (ppid, pgid) = parse_stat_ppid_pgid(&stat)?;
+    Some((uid, ppid, pgid))
 }
 
-/// The process group (field 5) of a `/proc/<pid>/stat` line; the command
+/// `(ppid, pgid)` (fields 4 and 5) of a `/proc/<pid>/stat` line; the command
 /// name in parentheses may itself contain spaces or `)`.
-pub(crate) fn parse_stat_pgid(stat: &str) -> Option<u32> {
+pub(crate) fn parse_stat_ppid_pgid(stat: &str) -> Option<(u32, u32)> {
     let after = &stat[stat.rfind(')')? + 1..];
     // state ppid pgrp …
-    after.split_whitespace().nth(2)?.parse().ok()
+    let mut f = after.split_whitespace().skip(1);
+    Some((f.next()?.parse().ok()?, f.next()?.parse().ok()?))
 }
 
-/// `(pid, pgid)` of every process running as `uid`.
-pub(crate) fn processes_of(uid: u32) -> Vec<(u32, u32)> {
+/// Every process running as `uid`.
+pub(crate) fn processes_of(uid: u32) -> Vec<ProcInfo> {
     let Ok(entries) = std::fs::read_dir("/proc") else {
         return Vec::new();
     };
@@ -280,27 +293,78 @@ pub(crate) fn processes_of(uid: u32) -> Vec<(u32, u32)> {
         .flatten()
         .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
         .filter_map(|pid| {
-            let (owner, pgid) = proc_identity(pid)?;
-            (owner == uid).then_some((pid, pgid))
+            let (owner, ppid, pgid) = proc_identity(pid)?;
+            (owner == uid).then_some(ProcInfo { pid, ppid, pgid })
         })
         .collect()
 }
 
-/// Stop every process of the browser account outside `keep_pgids` (orphans
-/// of an AionCore that restarted): TERM, wait up to 5 s, then KILL. Refuses
-/// uid 0. Returns how many were found.
-pub async fn reap_strays(uid: u32, gid: u32, keep_pgids: &[u32]) -> usize {
+/// Whether `p` belongs to a live instance: its group is a tracked group, an
+/// ancestor (through the account's processes) is a tracked process, or its
+/// command line names a live profile directory.
+pub(crate) fn belongs_to_live(
+    p: &ProcInfo,
+    all: &[ProcInfo],
+    keep_pids: &[u32],
+    cmdline: impl Fn(u32) -> Option<String>,
+    keep_profiles: &[std::path::PathBuf],
+) -> bool {
+    if keep_pids.contains(&p.pgid) || keep_pids.contains(&p.pid) {
+        return true;
+    }
+    let mut cur = p.ppid;
+    for _ in 0..64 {
+        if keep_pids.contains(&cur) {
+            return true;
+        }
+        match all.iter().find(|q| q.pid == cur) {
+            Some(parent) => cur = parent.ppid,
+            None => break,
+        }
+    }
+    cmdline(p.pid).is_some_and(|c| {
+        keep_profiles
+            .iter()
+            .any(|dir| names_profile(&c, &dir.to_string_lossy()))
+    })
+}
+
+/// HOME of the Chrome of `profile` (inside the profile, wiped with it).
+pub fn instance_home(profile: &Path) -> std::path::PathBuf {
+    profile.join(".home")
+}
+
+/// `cmdline` names `dir` as a whole path: `<dir>/…` or `=<dir>` at an
+/// argument end (never `<dir>2` or `<dir>-x`).
+pub(crate) fn names_profile(cmdline: &str, dir: &str) -> bool {
+    let dir = dir.trim_end_matches('/');
+    !dir.is_empty()
+        && (cmdline.contains(&format!("{dir}/"))
+            || cmdline.contains(&format!("={dir} "))
+            || cmdline.ends_with(&format!("={dir}")))
+}
+
+fn read_cmdline(pid: u32) -> Option<String> {
+    std::fs::read(format!("/proc/{pid}/cmdline"))
+        .ok()
+        .map(|b| String::from_utf8_lossy(&b).replace('\0', " "))
+}
+
+/// Stop every process of the browser account that belongs to no live
+/// instance (orphans of an AionCore that restarted): TERM, wait up to 5 s,
+/// then KILL. Refuses uid 0. Returns how many were found.
+pub async fn reap_strays(uid: u32, gid: u32, keep_pids: &[u32], keep_profiles: &[std::path::PathBuf]) -> usize {
     if uid == 0 {
         return 0;
     }
-    let strays = |procs: Vec<(u32, u32)>| -> Vec<u32> {
-        procs
-            .into_iter()
-            .filter(|(_, pgid)| !keep_pgids.contains(pgid))
-            .map(|(pid, _)| pid)
+    let strays = || -> Vec<u32> {
+        let all = processes_of(uid);
+        all.iter()
+            .filter(|p| !belongs_to_live(p, &all, keep_pids, read_cmdline, keep_profiles))
+            .map(|p| p.pid)
             .collect()
     };
-    let found = strays(processes_of(uid));
+    let found = strays();
     if found.is_empty() {
         return 0;
     }
@@ -310,12 +374,12 @@ pub async fn reap_strays(uid: u32, gid: u32, keep_pgids: &[u32]) -> usize {
     );
     kill_pids_as(uid, gid, &found, "TERM").await;
     for _ in 0..50 {
-        if strays(processes_of(uid)).is_empty() {
+        if strays().is_empty() {
             return found.len();
         }
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
     }
-    let left = strays(processes_of(uid));
+    let left = strays();
     kill_pids_as(uid, gid, &left, "KILL").await;
     found.len()
 }
@@ -324,6 +388,54 @@ pub async fn reap_strays(uid: u32, gid: u32, keep_pgids: &[u32]) -> usize {
 pub(crate) fn remove_profile_locks(profile: &Path) {
     for name in ["SingletonLock", "SingletonSocket", "SingletonCookie"] {
         let _ = std::fs::remove_file(profile.join(name));
+    }
+}
+
+/// Stop the `chrome_crashpad_handler`s of the Chrome using `profile` (as the
+/// account; they re-parent to init with their own group, and their database
+/// lives under the instance HOME inside the profile). Polls up to 3 s.
+pub(crate) async fn stop_crash_handlers(uid: u32, gid: u32, profile: &Path) {
+    if uid == 0 {
+        return;
+    }
+    let dir = profile.to_string_lossy().into_owned();
+    for _ in 0..30 {
+        let handlers: Vec<u32> = processes_of(uid)
+            .into_iter()
+            .filter(|p| {
+                std::fs::read_to_string(format!("/proc/{}/comm", p.pid))
+                    .is_ok_and(|c| c.trim().starts_with("chrome_crashpad"))
+                    && read_cmdline(p.pid).is_some_and(|c| names_profile(&c, &dir))
+            })
+            .map(|p| p.pid)
+            .collect();
+        if !handlers.is_empty() {
+            kill_pids_as(uid, gid, &handlers, "KILL").await;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        if handlers.is_empty()
+            && !processes_of(uid).iter().any(|p| {
+                std::fs::read_to_string(format!("/proc/{}/comm", p.pid))
+                    .is_ok_and(|c| c.trim().starts_with("chrome_crashpad"))
+            })
+        {
+            return;
+        }
+    }
+}
+
+/// `user_experience_metrics.reporting_enabled = false` in the profile's
+/// Local State (merged; the file stays the account's).
+pub(crate) fn disable_metrics_reporting(profile: &Path, uid: u32, gid: u32) {
+    let path = profile.join("Local State");
+    let mut state: serde_json::Value = std::fs::read(&path)
+        .ok()
+        .and_then(|b| serde_json::from_slice(&b).ok())
+        .filter(serde_json::Value::is_object)
+        .unwrap_or_else(|| serde_json::json!({}));
+    state["user_experience_metrics"]["reporting_enabled"] = serde_json::json!(false);
+    if std::fs::write(&path, state.to_string()).is_ok() {
+        let _ = std::os::unix::fs::lchown(&path, Some(uid), Some(gid));
     }
 }
 
@@ -399,22 +511,77 @@ mod tests {
     }
 
     #[test]
-    fn stat_pgid_survives_odd_command_names() {
-        assert_eq!(parse_stat_pgid("123 (chrome) S 1 456 456 0 -1"), Some(456));
-        assert_eq!(parse_stat_pgid("123 (we ird) name)) S 1 789 789 0"), Some(789));
-        assert_eq!(parse_stat_pgid("garbage"), None);
+    fn stat_fields_survive_odd_command_names() {
+        assert_eq!(parse_stat_ppid_pgid("123 (chrome) S 1 456 456 0 -1"), Some((1, 456)));
+        assert_eq!(
+            parse_stat_ppid_pgid("123 (we ird) name)) S 7 789 789 0"),
+            Some((7, 789))
+        );
+        assert_eq!(parse_stat_ppid_pgid("garbage"), None);
     }
 
     #[test]
-    fn this_process_is_found_by_its_uid_and_group() {
+    fn this_process_is_found_by_its_uid() {
         let me = std::process::id();
         let uid = unsafe { libc::getuid() };
-        assert!(processes_of(uid).iter().any(|(pid, _)| *pid == me));
+        assert!(processes_of(uid).iter().any(|p| p.pid == me));
+    }
+
+    /// Instance 1 = chrome 100 (group 100) with a renderer 101 and a helper
+    /// 102 that left the group but descends from 100, a crashpad 103 that
+    /// was re-parented to init but names the profile; 200 + 201 belong to a
+    /// dead instance. Only the dead ones are strays.
+    #[test]
+    fn live_instance_processes_are_kept_and_orphans_are_not() {
+        let p = |pid, ppid, pgid| ProcInfo { pid, ppid, pgid };
+        let all = vec![
+            p(100, 1, 100),
+            p(101, 100, 100),
+            p(102, 100, 102),
+            p(103, 1, 103),
+            p(200, 1, 200),
+            p(201, 200, 200),
+        ];
+        let live = [std::path::PathBuf::from("/b/u/1")];
+        let cmd = |pid: u32| match pid {
+            103 => Some("chrome_crashpad_handler --database=/b/u/1/Crashpad".to_owned()),
+            201 => Some("chrome --user-data-dir=/b/u/2".to_owned()),
+            _ => None,
+        };
+        let kept: Vec<u32> = all
+            .iter()
+            .filter(|x| belongs_to_live(x, &all, &[100], cmd, &live))
+            .map(|x| x.pid)
+            .collect();
+        assert_eq!(kept, vec![100, 101, 102, 103]);
+    }
+
+    #[test]
+    fn profile_names_match_whole_paths_only() {
+        let crashpad = "chrome_crashpad_handler --database=/b/u/1/.home/.config/google-chrome/Crash Reports --url=x";
+        assert!(names_profile(crashpad, "/b/u/1"));
+        assert!(!names_profile(crashpad, "/b/u/2"));
+        assert!(names_profile("chrome --user-data-dir=/b/u/1 --no-sandbox", "/b/u/1"));
+        assert!(names_profile("chrome --user-data-dir=/b/u/1", "/b/u/1"));
+        assert!(!names_profile("chrome --user-data-dir=/b/u/12", "/b/u/1"));
+        assert!(!names_profile("chrome --user-data-dir=/b/u/1-x", "/b/u/1"));
+    }
+
+    #[test]
+    fn metrics_reporting_is_turned_off_and_other_state_kept() {
+        let t = tempfile::tempdir().unwrap();
+        std::fs::write(t.path().join("Local State"), r#"{"browser":{"x":1}}"#).unwrap();
+        let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+        disable_metrics_reporting(t.path(), uid, gid);
+        let v: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(t.path().join("Local State")).unwrap()).unwrap();
+        assert_eq!(v["user_experience_metrics"]["reporting_enabled"], false);
+        assert_eq!(v["browser"]["x"], 1);
     }
 
     #[tokio::test]
     async fn reaping_never_touches_root() {
-        assert_eq!(reap_strays(0, 0, &[]).await, 0);
+        assert_eq!(reap_strays(0, 0, &[], &[]).await, 0);
     }
 
     #[test]

@@ -95,6 +95,8 @@ const COOKIE_KEYS: &[&str] = &[
     "cookies",
     "headersText",
     "requestHeadersText",
+    // Audits CookieIssueDetails carry the raw Set-Cookie line.
+    "rawCookieLine",
 ];
 
 fn is_cookie_header(name: &str) -> bool {

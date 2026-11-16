@@ -31,7 +31,6 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::get;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
-use tokio_tungstenite::tungstenite::Message as TMessage;
 
 use crate::error::BrowserError;
 use crate::filter::{FilterDecision, decide, tokens_match};
@@ -239,22 +238,24 @@ async fn upgrade(ctx: BridgeCtx, headers: &HeaderMap, ws: WebSocketUpgrade, page
         Ok(i) => i,
         Err(e) => return backend_error(e),
     };
-    let upstream_path = match &page {
-        Some(id) => format!("/devtools/page/{id}"),
-        None => inst.browser_path().to_owned(),
+    // The only CDP channel is Chrome's pipe: this connection becomes a link
+    // with its own default session (browser or page).
+    let target = match &page {
+        Some(id) => crate::mux::LinkTarget::Page(id.clone()),
+        None => crate::mux::LinkTarget::Browser,
     };
-    let upstream = match tokio_tungstenite::connect_async(inst.upstream_url(&upstream_path)).await {
-        Ok((s, _)) => s,
+    let link = match inst.open_agent_link(target).await {
+        Ok(l) => l,
         Err(_) => {
             return error_response(
                 StatusCode::BAD_GATEWAY,
-                BrowserErrorCode::BrowserNotRunning,
-                "the browser endpoint is not reachable",
+                BrowserErrorCode::BrowserTabNotFound,
+                "the browser target is not available",
             );
         }
     };
     ws.max_message_size(256 * 1024 * 1024)
-        .on_upgrade(move |client| pump(ctx, inst, page, client, upstream))
+        .on_upgrade(move |client| pump(ctx, inst, page, client, link))
 }
 
 /// What to do with one agent frame.
@@ -313,17 +314,13 @@ async fn pump(
     inst: Arc<ChromeInstance>,
     page: Option<String>,
     client: WebSocket,
-    upstream: tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    mut link: crate::mux::AgentLink,
 ) {
     let (mut c_tx, mut c_rx) = client.split();
-    let (mut u_tx, mut u_rx) = upstream.split();
-    let (reply_tx, mut reply_rx) = tokio::sync::mpsc::unbounded_channel::<String>();
-
-    let to_chrome = {
-        let ctx = ctx.clone();
-        let inst = inst.clone();
-        async move {
-            while let Some(Ok(msg)) = c_rx.next().await {
+    loop {
+        tokio::select! {
+            msg = c_rx.next() => {
+                let Some(Ok(msg)) = msg else { break };
                 let text = match msg {
                     AxMessage::Text(t) => t.to_string(),
                     AxMessage::Close(_) => break,
@@ -335,59 +332,55 @@ async fn pump(
                     inst.tab_count(),
                     inst.max_tabs(),
                 );
-                match verdict {
+                let reply = match verdict {
                     Verdict::Forward => {
                         inst.mark_agent(frame_tab(&text, page.as_deref()).as_deref());
-                        if u_tx.send(TMessage::Text(text.into())).await.is_err() {
-                            break;
+                        match link.send(&text) {
+                            Ok(()) => None,
+                            // A session this connection does not own.
+                            Err(_) => match judge_refusal(&text, "unknown session") {
+                                Verdict::Refuse(r) => Some(r.to_string()),
+                                Verdict::Forward => None,
+                            },
                         }
                     }
-                    Verdict::Refuse(reply) => {
-                        let _ = reply_tx.send(reply.to_string());
-                    }
+                    Verdict::Refuse(reply) => Some(reply.to_string()),
+                };
+                if let Some(reply) = reply
+                    && c_tx.send(AxMessage::Text(reply.into())).await.is_err()
+                {
+                    break;
                 }
             }
-            let _ = u_tx.close().await;
-        }
-    };
-
-    let to_agent = async move {
-        loop {
-            tokio::select! {
-                up = u_rx.next() => {
-                    let Some(Ok(msg)) = up else { break };
-                    // Every Chrome -> agent frame loses cookies and cookie
-                    // headers (Network.* events expose them, HttpOnly included).
-                    let text = match msg {
-                        TMessage::Text(t) => t.to_string(),
-                        TMessage::Binary(b) => String::from_utf8_lossy(&b).into_owned(),
-                        TMessage::Close(_) => break,
-                        _ => continue,
-                    };
-                    let clean = crate::filter::sanitize(&text);
-                    if clean.is_empty() {
-                        continue;
-                    }
-                    let out = AxMessage::Text(clean.into_owned().into());
-                    if c_tx.send(out).await.is_err() {
-                        break;
-                    }
+            frame = link.incoming.recv() => {
+                let Some(text) = frame else { break };
+                // Every Chrome -> agent frame loses cookies and cookie
+                // headers (Network.* events expose them, HttpOnly included).
+                let clean = crate::filter::sanitize(&text);
+                if clean.is_empty() {
+                    continue;
                 }
-                reply = reply_rx.recv() => {
-                    let Some(reply) = reply else { break };
-                    if c_tx.send(AxMessage::Text(reply.into())).await.is_err() {
-                        break;
-                    }
+                if c_tx.send(AxMessage::Text(clean.into_owned().into())).await.is_err() {
+                    break;
                 }
             }
         }
-        let _ = c_tx.close().await;
-    };
-
-    tokio::select! {
-        _ = to_chrome => {}
-        _ = to_agent => {}
     }
+    let _ = c_tx.close().await;
+    // Dropping the link detaches every session this connection opened.
+}
+
+/// The error reply for a frame refused after the filter (by the mux).
+fn judge_refusal(text: &str, detail: &str) -> Verdict {
+    let frame: Value = serde_json::from_str(text).unwrap_or(Value::Null);
+    let mut reply = json!({
+        "id": frame.get("id").cloned().unwrap_or(Value::Null),
+        "error": {"code": -32000, "message": format!("BROWSER_METHOD_BLOCKED: {detail}")},
+    });
+    if let Some(sid) = frame.get("sessionId") {
+        reply["sessionId"] = sid.clone();
+    }
+    Verdict::Refuse(reply)
 }
 
 #[cfg(test)]

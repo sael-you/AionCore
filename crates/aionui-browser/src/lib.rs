@@ -11,6 +11,7 @@ pub mod host;
 pub mod install;
 pub mod instance;
 pub mod layout;
+pub mod mux;
 pub mod panel;
 pub mod proxy;
 pub mod routes;

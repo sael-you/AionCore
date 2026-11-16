@@ -1,6 +1,7 @@
-//! Minimal Chrome DevTools Protocol client over one WebSocket (flat sessions):
-//! numbered requests with awaited replies, and a broadcast of every event.
-//! The endpoint URL (it carries Chrome's private port) is never logged.
+//! Minimal Chrome DevTools Protocol client (flat sessions): numbered requests
+//! with awaited replies, and a broadcast of every event. Transport-agnostic
+//! ([`CdpClient::from_channels`]): production runs it over Chrome's
+//! `--remote-debugging-pipe` through [`crate::mux`]; tests use a WebSocket.
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -37,16 +38,14 @@ pub struct CdpClient {
 const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 
 impl CdpClient {
+    /// Over a WebSocket endpoint (tests; production uses the pipe).
     pub async fn connect(ws_url: &str) -> Result<Self, BrowserError> {
         let (stream, _) = tokio_tungstenite::connect_async(ws_url)
             .await
             .map_err(|e| BrowserError::Cdp(format!("connect failed: {}", redact(&e.to_string()))))?;
         let (mut sink, mut source) = stream.split();
         let (out_tx, mut out_rx) = mpsc::unbounded_channel::<String>();
-        let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
-        let (events, _) = broadcast::channel(1024);
-        let (closed_tx, closed_rx) = tokio::sync::watch::channel(false);
-
+        let (in_tx, in_rx) = mpsc::unbounded_channel::<String>();
         tokio::spawn(async move {
             while let Some(text) = out_rx.recv().await {
                 if sink.send(Message::Text(text.into())).await.is_err() {
@@ -55,9 +54,6 @@ impl CdpClient {
             }
             let _ = sink.close().await;
         });
-
-        let reader_pending = pending.clone();
-        let reader_events = events.clone();
         tokio::spawn(async move {
             while let Some(Ok(msg)) = source.next().await {
                 let text = match msg {
@@ -66,6 +62,24 @@ impl CdpClient {
                     Message::Close(_) => break,
                     _ => continue,
                 };
+                if in_tx.send(text).is_err() {
+                    break;
+                }
+            }
+        });
+        Ok(Self::from_channels(out_tx, in_rx))
+    }
+
+    /// A client whose frames go out on `out` and come in on `incoming`;
+    /// closes when `incoming` ends.
+    pub fn from_channels(out: mpsc::UnboundedSender<String>, mut incoming: mpsc::UnboundedReceiver<String>) -> Self {
+        let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
+        let (events, _) = broadcast::channel(1024);
+        let (closed_tx, closed_rx) = tokio::sync::watch::channel(false);
+        let reader_pending = pending.clone();
+        let reader_events = events.clone();
+        tokio::spawn(async move {
+            while let Some(text) = incoming.recv().await {
                 let Ok(frame) = serde_json::from_str::<Value>(&text) else {
                     continue;
                 };
@@ -93,14 +107,13 @@ impl CdpClient {
             }
             let _ = closed_tx.send(true);
         });
-
-        Ok(Self {
+        Self {
             next_id: Arc::new(AtomicU64::new(1)),
-            out: out_tx,
+            out,
             pending,
             events,
             closed: Arc::new(closed_rx),
-        })
+        }
     }
 
     /// Send `method` (in `session_id` when given) and await the result.

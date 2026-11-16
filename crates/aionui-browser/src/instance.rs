@@ -19,6 +19,7 @@
 //! `kill` helper spawned AS the browser account as fallback.
 
 use std::collections::HashMap;
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU8, Ordering};
@@ -69,10 +70,11 @@ pub struct ChromeInstance {
     pub instance: u8,
     pub hide_automation: bool,
     pub version: String,
-    cdp: CdpClient,
+    /// The only CDP channel (Chrome's pipe), shared by AionCore and agent links.
+    mux: crate::mux::CdpMux,
+    /// The profile directory (the reaper keeps processes that use it).
+    pub profile: PathBuf,
     /// Chrome's private endpoint pieces (never logged or sent out).
-    port: u16,
-    browser_path: String,
     uid: u32,
     gid: u32,
     chrome_child: Mutex<Option<Child>>,
@@ -128,8 +130,7 @@ fn release_display(n: u16) {
     DISPLAYS.lock().unwrap_or_else(|e| e.into_inner()).retain(|d| *d != n);
 }
 
-/// Chrome's launch arguments. No CDP port, no token: the port is chosen by
-/// Chrome (`--remote-debugging-port=0`) and read from `DevToolsActivePort`.
+/// Chrome's launch arguments. No CDP port at all (`--remote-debugging-pipe`).
 /// All traffic goes through the egress proxy (only the browser account may
 /// use it, so its port in argv opens nothing).
 pub fn chrome_args(profile: &Path, hide_automation: bool, proxy_port: u16) -> Vec<String> {
@@ -138,13 +139,21 @@ pub fn chrome_args(profile: &Path, hide_automation: bool, proxy_port: u16) -> Ve
         // user namespaces); isolation = the separate account (decision d).
         "--no-sandbox".to_owned(),
         format!("--user-data-dir={}", profile.display()),
-        "--remote-debugging-address=127.0.0.1".to_owned(),
-        "--remote-debugging-port=0".to_owned(),
+        // CDP over fds 3/4 only: no debugging TCP port that a local process
+        // could reach around the bridge (train-8 review).
+        "--remote-debugging-pipe".to_owned(),
         // /dev/shm is 64 MB here: without this Chrome crashes or renders blank.
         "--disable-dev-shm-usage".to_owned(),
         "--no-first-run".to_owned(),
         "--password-store=basic".to_owned(),
+        // No crash uploads (dumps can hold page memory: cookies, tokens).
+        // These two flags do not stop chrome_crashpad_handler for a non-root
+        // user (probed 2026-11-16; --disable-crashpad-for-testing does, but
+        // then every navigation fails with ERR_ABORTED), so the launch also
+        // stops the handlers (`stop_crash_handlers`) and turns metrics
+        // reporting off in Local State.
         "--disable-breakpad".to_owned(),
+        "--disable-crash-reporter".to_owned(),
         "--window-position=0,0".to_owned(),
         "--window-size=1280,800".to_owned(),
         // Network-level egress guard (train-7 review): every request, WebSocket
@@ -161,14 +170,6 @@ pub fn chrome_args(profile: &Path, hide_automation: bool, proxy_port: u16) -> Ve
     args
 }
 
-/// `DevToolsActivePort`: line 1 = port, line 2 = browser ws path.
-pub fn parse_devtools_active_port(text: &str) -> Option<(u16, String)> {
-    let mut lines = text.lines();
-    let port = lines.next()?.trim().parse::<u16>().ok().filter(|p| *p > 0)?;
-    let path = lines.next()?.trim().to_owned();
-    path.starts_with("/devtools/browser/").then_some((port, path))
-}
-
 async fn wait_for(path: &Path, timeout: Duration) -> bool {
     let deadline = tokio::time::Instant::now() + timeout;
     while tokio::time::Instant::now() < deadline {
@@ -178,6 +179,57 @@ async fn wait_for(path: &Path, timeout: Duration) -> bool {
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
     false
+}
+
+/// Chrome's `--remote-debugging-pipe` descriptors: Chrome reads commands on
+/// fd 3 and writes replies/events on fd 4. Every end is close-on-exec and
+/// >= 10 in AionCore; only the two child ends are mapped into Chrome.
+struct CdpPipes {
+    to_chrome: OwnedFd,
+    chrome_reads: OwnedFd,
+    chrome_writes: OwnedFd,
+    from_chrome: OwnedFd,
+}
+
+fn pipe_high() -> std::io::Result<(OwnedFd, OwnedFd)> {
+    let mut fds = [0i32; 2];
+    // SAFETY: plain syscalls on descriptors this function owns.
+    unsafe {
+        if libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        let raise = |fd: i32| -> std::io::Result<OwnedFd> {
+            let high = libc::fcntl(fd, libc::F_DUPFD_CLOEXEC, 10);
+            libc::close(fd);
+            if high < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(OwnedFd::from_raw_fd(high))
+        };
+        Ok((raise(fds[0])?, raise(fds[1])?))
+    }
+}
+
+impl CdpPipes {
+    fn new() -> std::io::Result<Self> {
+        let (chrome_reads, to_chrome) = pipe_high()?;
+        let (from_chrome, chrome_writes) = pipe_high()?;
+        Ok(Self {
+            to_chrome,
+            chrome_reads,
+            chrome_writes,
+            from_chrome,
+        })
+    }
+
+    fn child_map(&self) -> Vec<(i32, i32)> {
+        vec![(self.chrome_reads.as_raw_fd(), 3), (self.chrome_writes.as_raw_fd(), 4)]
+    }
+
+    /// Our two ends; the child ends close here (Chrome has its copies).
+    fn into_parent_ends(self) -> (OwnedFd, OwnedFd) {
+        (self.to_chrome, self.from_chrome)
+    }
 }
 
 impl ChromeInstance {
@@ -237,10 +289,18 @@ impl ChromeInstance {
                 return Err(failed("the egress proxy did not start"));
             }
         };
-        let port_file = spec.profile.join("DevToolsActivePort");
-        let _ = std::fs::remove_file(&port_file);
         // A Chrome that died with AionCore leaves its profile lock behind.
         crate::host::remove_profile_locks(&spec.profile);
+        crate::host::disable_metrics_reporting(&spec.profile, spec.uid, spec.gid);
+        let pipes = match CdpPipes::new() {
+            Ok(p) => p,
+            Err(_) => {
+                if let Some(pid) = xvfb_pid {
+                    kill_as(spec.uid, spec.gid, pid, "KILL").await;
+                }
+                return Err(failed("could not create the CDP pipe"));
+            }
+        };
         let mut chrome = aionui_runtime::Builder::new(&spec.chrome);
         base_env(&mut chrome);
         chrome
@@ -248,10 +308,13 @@ impl ChromeInstance {
             .current_dir(&spec.home)
             .uid(spec.uid)
             .gid(spec.gid)
+            .map_fds(pipes.child_map())
             .stdin(std::process::Stdio::null())
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null());
-        let chrome_child = match chrome.spawn() {
+        let spawned = chrome.spawn();
+        let (to_chrome, from_chrome) = pipes.into_parent_ends();
+        let chrome_child = match spawned {
             Ok(c) => c,
             Err(_) => {
                 if let Some(pid) = xvfb_pid {
@@ -261,38 +324,30 @@ impl ChromeInstance {
             }
         };
         let chrome_pid = chrome_child.id();
-
-        let deadline = tokio::time::Instant::now() + START_TIMEOUT;
-        let (port, browser_path) = loop {
-            if let Some(parsed) = std::fs::read_to_string(&port_file)
-                .ok()
-                .and_then(|t| parse_devtools_active_port(&t))
-            {
-                break parsed;
+        let kill_all = || async {
+            for pid in [chrome_pid, xvfb_pid].into_iter().flatten() {
+                kill_as(spec.uid, spec.gid, pid, "KILL").await;
             }
-            if tokio::time::Instant::now() >= deadline {
-                for pid in [chrome_pid, xvfb_pid].into_iter().flatten() {
-                    kill_as(spec.uid, spec.gid, pid, "KILL").await;
-                }
-                return Err(failed("Chrome did not open its debugging port"));
-            }
-            tokio::time::sleep(Duration::from_millis(150)).await;
         };
-        let cdp = match CdpClient::connect(&format!("ws://127.0.0.1:{port}{browser_path}")).await {
-            Ok(c) => c,
+        let mux = match crate::mux::CdpMux::over_pipe(to_chrome, from_chrome) {
+            Ok(m) => m,
             Err(_) => {
-                for pid in [chrome_pid, xvfb_pid].into_iter().flatten() {
-                    kill_as(spec.uid, spec.gid, pid, "KILL").await;
-                }
-                return Err(failed("could not connect to Chrome"));
+                kill_all().await;
+                return Err(failed("could not open the CDP pipe"));
             }
         };
-        let version = cdp
-            .call("Browser.getVersion", json!({}), None)
-            .await
-            .ok()
-            .and_then(|v| v.get("product").and_then(Value::as_str).map(str::to_owned))
-            .unwrap_or_default();
+        // Readiness: Chrome answers on the pipe once the browser is up.
+        let version =
+            match tokio::time::timeout(START_TIMEOUT, mux.root().call("Browser.getVersion", json!({}), None)).await {
+                Ok(Ok(v)) => v.get("product").and_then(Value::as_str).unwrap_or_default().to_owned(),
+                _ => {
+                    kill_all().await;
+                    return Err(failed("Chrome did not answer on the CDP pipe"));
+                }
+            };
+
+        // The browser is up: no crash handler may run (no dumps, no uploads).
+        crate::host::stop_crash_handlers(spec.uid, spec.gid, &spec.profile).await;
 
         let (exited_tx, exited_rx) = watch::channel(false);
         let (tabs_tx, _) = watch::channel(Vec::new());
@@ -302,9 +357,8 @@ impl ChromeInstance {
             instance: spec.instance,
             hide_automation: spec.hide_automation,
             version: version.trim_start_matches("Chrome/").to_owned(),
-            cdp,
-            port,
-            browser_path,
+            mux,
+            profile: spec.profile.clone(),
             uid: spec.uid,
             gid: spec.gid,
             chrome_child: Mutex::new(Some(chrome_child)),
@@ -347,17 +401,17 @@ impl ChromeInstance {
             .into_iter()
             .map(|p| json!({"urlPattern": p, "requestStage": "Request"}))
             .collect();
-        self.cdp
+        self.cdp()
             .call("Fetch.enable", json!({"patterns": patterns}), None)
             .await?;
-        self.cdp
+        self.cdp()
             .call(
                 "Target.setAutoAttach",
                 json!({"autoAttach": true, "waitForDebuggerOnStart": false, "flatten": true}),
                 None,
             )
             .await?;
-        self.cdp
+        self.cdp()
             .call("Target.setDiscoverTargets", json!({"discover": true}), None)
             .await?;
         Ok(())
@@ -387,7 +441,7 @@ impl ChromeInstance {
     }
 
     fn spawn_event_loop(self: Arc<Self>, guard: Arc<NavigationGuard>) {
-        let mut events = self.cdp.subscribe();
+        let mut events = self.cdp().subscribe();
         let weak = Arc::downgrade(&self);
         drop(self);
         tokio::spawn(async move {
@@ -452,13 +506,13 @@ impl ChromeInstance {
                         code: BrowserErrorCode::BrowserUrlBlocked,
                         message: host,
                     });
-                    self.cdp.notify(
+                    self.cdp().notify(
                         "Fetch.failRequest",
                         json!({"requestId": request_id, "errorReason": "BlockedByClient"}),
                         session.as_deref(),
                     );
                 } else {
-                    self.cdp.notify(
+                    self.cdp().notify(
                         "Fetch.continueRequest",
                         json!({"requestId": request_id}),
                         session.as_deref(),
@@ -484,7 +538,7 @@ impl ChromeInstance {
                         code: BrowserErrorCode::BrowserUrlBlocked,
                         message: record.url.split(':').next().unwrap_or("").to_owned(),
                     });
-                    self.cdp
+                    self.cdp()
                         .notify("Page.navigate", json!({"url": "about:blank"}), Some(session));
                 }
                 match pages.iter_mut().find(|p| p.id == record.id) {
@@ -497,7 +551,7 @@ impl ChromeInstance {
                                 code: BrowserErrorCode::BrowserTabLimit,
                                 message: format!("max {limit} tabs"),
                             });
-                            self.cdp
+                            self.cdp()
                                 .notify("Target.closeTarget", json!({"targetId": record.id}), None);
                             return;
                         }
@@ -518,16 +572,12 @@ impl ChromeInstance {
     }
 
     pub fn cdp(&self) -> &CdpClient {
-        &self.cdp
+        self.mux.root()
     }
 
-    /// `ws://127.0.0.1:<port><path>` for the bridge's upstream (private).
-    pub(crate) fn upstream_url(&self, path: &str) -> String {
-        format!("ws://127.0.0.1:{}{}", self.port, path)
-    }
-
-    pub(crate) fn browser_path(&self) -> &str {
-        &self.browser_path
+    /// A CDP link for one agent connection (its own default session).
+    pub async fn open_agent_link(&self, target: crate::mux::LinkTarget) -> Result<crate::mux::AgentLink, BrowserError> {
+        self.mux.open_link(target).await
     }
 
     pub fn tabs(&self) -> watch::Receiver<Vec<TabRecord>> {
@@ -547,7 +597,7 @@ impl ChromeInstance {
     }
 
     pub fn is_running(&self) -> bool {
-        !*self.exited.borrow() && !self.cdp.is_closed()
+        !*self.exited.borrow() && !self.cdp().is_closed()
     }
 
     pub fn touch(&self) {
@@ -587,7 +637,11 @@ impl ChromeInstance {
 
     /// Close Chrome over CDP; fall back to a kill run as the browser account.
     pub async fn stop(&self) {
-        let _ = tokio::time::timeout(Duration::from_secs(5), self.cdp.call("Browser.close", json!({}), None)).await;
+        let _ = tokio::time::timeout(
+            Duration::from_secs(5),
+            self.cdp().call("Browser.close", json!({}), None),
+        )
+        .await;
         if tokio::time::timeout(Duration::from_secs(8), self.exited())
             .await
             .is_err()
@@ -607,8 +661,16 @@ mod tests {
     #[test]
     fn launch_args_carry_no_port_or_token_and_honour_hide_automation() {
         let args = chrome_args(Path::new("/b/u/1"), false, 41000);
-        assert!(args.contains(&"--remote-debugging-port=0".to_owned()));
-        assert!(args.contains(&"--remote-debugging-address=127.0.0.1".to_owned()));
+        assert!(args.contains(&"--remote-debugging-pipe".to_owned()));
+        assert!(
+            !args.contains(&"--disable-crashpad-for-testing".to_owned()),
+            "breaks every navigation (ERR_ABORTED)"
+        );
+        assert!(args.contains(&"--disable-crash-reporter".to_owned()));
+        assert!(
+            !args.iter().any(|a| a.starts_with("--remote-debugging-port")),
+            "no TCP debugging port"
+        );
         assert!(args.contains(&"--user-data-dir=/b/u/1".to_owned()));
         assert!(args.contains(&"--disable-dev-shm-usage".to_owned()));
         assert!(!args.iter().any(|a| a.contains("AutomationControlled")));
@@ -619,16 +681,5 @@ mod tests {
         let hidden = chrome_args(Path::new("/b/u/1"), true, 41000);
         assert!(hidden.contains(&"--disable-blink-features=AutomationControlled".to_owned()));
         assert_eq!(hidden.len(), args.len() + 1, "no other flag changes");
-    }
-
-    #[test]
-    fn devtools_active_port_file() {
-        assert_eq!(
-            parse_devtools_active_port("41234\n/devtools/browser/abc-def\n"),
-            Some((41234, "/devtools/browser/abc-def".to_owned()))
-        );
-        assert_eq!(parse_devtools_active_port("0\n/devtools/browser/x"), None);
-        assert_eq!(parse_devtools_active_port("41234\n"), None);
-        assert_eq!(parse_devtools_active_port("41234\n/evil"), None);
     }
 }

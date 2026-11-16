@@ -261,7 +261,8 @@ impl BrowserService {
             return 0;
         };
         let keep: Vec<u32> = self.instances.iter().flat_map(|e| e.value().process_groups()).collect();
-        reap_strays(uid, gid, &keep).await
+        let profiles: Vec<PathBuf> = self.instances.iter().map(|e| e.value().profile.clone()).collect();
+        reap_strays(uid, gid, &keep, &profiles).await
     }
 
     pub fn running(&self, user_id: &str, n: u8) -> Option<Arc<ChromeInstance>> {
@@ -314,8 +315,8 @@ impl BrowserService {
             user_id: user_id.to_owned(),
             instance: n,
             chrome,
+            home: crate::host::instance_home(&profile),
             profile,
-            home: self.cfg.layout.home_dir(),
             uid,
             gid,
             hide_automation: self.settings.hide_automation(user_id, n)?,

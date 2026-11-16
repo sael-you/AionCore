@@ -374,6 +374,44 @@
         "id": 7,
         "result": {}
       }
+    },
+    {
+      "name": "Audits cookie issue raw Set-Cookie line",
+      "frame": {
+        "method": "Audits.issueAdded",
+        "sessionId": "S",
+        "params": {
+          "issue": {
+            "code": "CookieIssue",
+            "details": {
+              "cookieIssueDetails": {
+                "rawCookieLine": "sid=secret-session; SameSite=None",
+                "cookieWarningReasons": [
+                  "WarnSameSiteNoneInsecure"
+                ],
+                "operation": "SetCookie"
+              }
+            }
+          }
+        }
+      },
+      "expect": {
+        "method": "Audits.issueAdded",
+        "sessionId": "S",
+        "params": {
+          "issue": {
+            "code": "CookieIssue",
+            "details": {
+              "cookieIssueDetails": {
+                "cookieWarningReasons": [
+                  "WarnSameSiteNoneInsecure"
+                ],
+                "operation": "SetCookie"
+              }
+            }
+          }
+        }
+      }
     }
   ]
 }

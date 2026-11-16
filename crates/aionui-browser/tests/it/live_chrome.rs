@@ -448,6 +448,57 @@ async fn live_server_browser_end_to_end() {
     assert_eq!(webdriver(inst.clone()).await, json!(true));
     assert_eq!(webdriver(i2.clone()).await, json!(false));
 
+    // 8b. No debugging TCP port (train-8 review): nothing owned by the browser
+    //     account listens on any TCP socket; CDP runs over the pipe only.
+    let uid_out = std::process::Command::new("id")
+        .args(["-u", "aionui-browser"])
+        .output()
+        .unwrap();
+    let browser_uid = String::from_utf8_lossy(&uid_out.stdout).trim().to_owned();
+    for table in ["/proc/net/tcp", "/proc/net/tcp6"] {
+        let text = std::fs::read_to_string(table).unwrap_or_default();
+        let listening: Vec<&str> = text
+            .lines()
+            .skip(1)
+            .filter(|l| {
+                let f: Vec<&str> = l.split_whitespace().collect();
+                f.len() > 7 && f[3] == "0A" && f[7] == browser_uid
+            })
+            .collect();
+        assert!(
+            listening.is_empty(),
+            "{table}: browser account listens on {listening:?}"
+        );
+    }
+    // Process groups of both instances (evidence for the reaper), then a reap
+    // with both instances live must touch neither.
+    let ps = std::process::Command::new("ps")
+        .args(["-u", "aionui-browser", "-o", "pid=,ppid=,pgid=,comm="])
+        .output()
+        .unwrap();
+    eprintln!(
+        "instance groups: 1 = {:?}, 2 = {:?}\naccount processes (pid ppid pgid comm):\n{}",
+        inst.process_groups(),
+        i2.process_groups(),
+        String::from_utf8_lossy(&ps.stdout)
+    );
+    let crashpad = std::process::Command::new("pgrep")
+        .args(["-u", "aionui-browser", "chrome_crashpad"])
+        .output()
+        .unwrap();
+    assert!(
+        String::from_utf8_lossy(&crashpad.stdout).trim().is_empty(),
+        "no crash handler (no crash uploads) runs for the browser account"
+    );
+    assert_eq!(svc.reap_orphans().await, 0, "live instances are never reaped");
+    for i in [&inst, &i2] {
+        assert!(i.is_running());
+        i.cdp()
+            .call("Browser.getVersion", json!({}), None)
+            .await
+            .expect("still answers over its pipe");
+    }
+
     // 9. Idle footprint, then stop over CDP (root cannot signal the account).
     tokio::time::sleep(Duration::from_secs(5)).await;
     let rss = std::process::Command::new("ps")
