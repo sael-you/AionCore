@@ -72,6 +72,7 @@ impl BoardService {
 
     /// `status`: always answers for an authenticated caller — no project or
     /// no board is `{enabled: false, project_id: null|…, template: null}`.
+    /// `keeper_conversation_id` is set only while the board is enabled.
     pub async fn agent_status(&self, user_id: &str, conversation_id: &str) -> BoardResult<BoardStatusResponse> {
         let caller = match self.resolve_agent(user_id, conversation_id).await {
             Ok(caller) => caller,
@@ -81,14 +82,17 @@ impl BoardService {
                     project_id: None,
                     template: None,
                     keeper: false,
+                    keeper_conversation_id: None,
                 });
             }
             Err(error) => return Err(error),
         };
         let settings = self.store().settings(user_id, &caller.project_id).await?;
+        let enabled = settings.as_ref().is_some_and(|s| s.enabled && s.archived_at.is_none());
         Ok(BoardStatusResponse {
-            enabled: settings.as_ref().is_some_and(|s| s.enabled && s.archived_at.is_none()),
+            enabled,
             template: settings.as_ref().and_then(|s| BoardTemplate::parse(&s.template)),
+            keeper_conversation_id: settings.and_then(|s| s.keeper_conversation_id).filter(|_| enabled),
             project_id: Some(caller.project_id),
             keeper: caller.keeper,
         })

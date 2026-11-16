@@ -66,7 +66,7 @@ fn specs() -> Vec<Spec> {
     vec![
         Spec {
             name: "board_status",
-            description: "Whether this conversation's project has a board, and its template. Always answers.",
+            description: "Whether this conversation's project has a board, its template and its Board Keeper (Butler) conversation id. Always answers.",
             input_schema: empty.clone(),
             cli_command: &["status"],
             selectors: &[],

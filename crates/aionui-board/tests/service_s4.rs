@@ -923,6 +923,46 @@ async fn re_enabling_a_board_recreates_a_missing_keeper() {
 }
 
 #[tokio::test]
+async fn status_names_the_keeper_conversation_only_while_the_board_is_enabled() {
+    let env = env_with_host(true).await;
+    let settings = enable(&env.service, PROJECT).await;
+    let keeper = settings.keeper_conversation_id.expect("keeper created on enable");
+    // Any project conversation (not only the keeper) learns where to report.
+    let status = env.service.agent_status(USER, CONV).await.unwrap();
+    assert!(!status.keeper);
+    assert_eq!(status.keeper_conversation_id.as_deref(), Some(keeper.as_str()));
+    let wire = serde_json::to_value(&status).unwrap();
+    assert_eq!(wire["keeper_conversation_id"], json!(keeper));
+
+    env.service
+        .update_settings(
+            &owner(),
+            PROJECT,
+            UpdateBoardSettingsRequest {
+                version: settings.version,
+                enabled: Some(false),
+                template: None,
+                settings: None,
+            },
+        )
+        .await
+        .unwrap();
+    let status = env.service.agent_status(USER, CONV).await.unwrap();
+    assert!(!status.enabled);
+    assert_eq!(status.keeper_conversation_id, None);
+    let wire = serde_json::to_value(&status).unwrap();
+    assert_eq!(wire["keeper_conversation_id"], serde_json::Value::Null);
+    assert!(wire.as_object().unwrap().contains_key("keeper_conversation_id"));
+}
+
+#[tokio::test]
+async fn status_has_no_keeper_conversation_without_a_board() {
+    let env = env().await;
+    let status = env.service.agent_status(USER, CONV).await.unwrap();
+    assert_eq!((status.enabled, status.keeper_conversation_id), (false, None));
+}
+
+#[tokio::test]
 async fn non_owner_actors_never_jump_over_a_gate() {
     let env = env_with_host(true).await;
     let settings = enable(&env.service, PROJECT).await;
