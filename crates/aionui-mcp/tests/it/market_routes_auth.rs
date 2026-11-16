@@ -40,6 +40,7 @@ impl IRuntimeTokenVerifier for AlwaysValid {
 }
 
 struct Fx {
+    db: aionui_db::Database,
     jwt: Arc<JwtService>,
     users: Arc<dyn IUserRepository>,
     state: McpMarketRouterState,
@@ -57,6 +58,7 @@ async fn fx() -> Fx {
     let market = McpMarketService::new(repo, servers, Arc::new(catalog), [9u8; 32])
         .with_kits(Arc::new(aionui_db::SqliteKitRepository::new(db.pool().clone())));
     Fx {
+        db: db.clone(),
         jwt: Arc::new(JwtService::new("route-test-signing-secret".into())),
         users: Arc::new(SqliteUserRepository::new(db.pool().clone())),
         state: McpMarketRouterState { market },
@@ -380,7 +382,7 @@ async fn kit_routes_use_the_market_auth_stacks() {
     let app = app(&f);
     let (status, body) = send(&app, Request::get("/api/kits").body(Body::empty()).unwrap()).await;
     assert_eq!(status, StatusCode::OK, "{body}");
-    assert_eq!(body["data"].as_array().unwrap().len(), 12);
+    assert_eq!(body["data"].as_array().unwrap().len(), 13);
 
     let kit = json!({"name": "Mine", "skills": ["pdf"]});
     // no session (local loopback caller)
@@ -469,6 +471,145 @@ async fn kit_routes_use_the_market_auth_stacks() {
     assert_eq!(attached["data"]["item_name"], "Mine");
     let (status, eff) = send(&app, Request::get("/api/kits/effective").body(Body::empty()).unwrap()).await;
     assert_eq!(status, StatusCode::OK, "{eff}");
-    assert_eq!(eff["data"]["skills"][0]["item_ref"], "pdf");
-    assert_eq!(eff["data"]["skills"][0]["provenance"]["level"], "global");
+    // K0 (seeded by the first GET) contributes cs-delegate/cs-verify at global too.
+    let pdf = eff["data"]["skills"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["item_ref"] == "pdf")
+        .unwrap();
+    assert_eq!(pdf["provenance"]["level"], "global");
+}
+
+/// C28: project kit codes over HTTP and the project-kit read route.
+#[tokio::test]
+async fn project_kit_routes_return_their_codes() {
+    let f = fx().await;
+    sqlx::query(
+        "INSERT INTO projects (project_id, user_id, name, kind, created_at, updated_at) VALUES ('proj-a', ?, 'A', 'standard', 1, 1)",
+    )
+    .bind(USER)
+    .execute(f.db.pool())
+    .await
+    .unwrap();
+    let app = app(&f);
+    let token = f.jwt.sign(USER, USER).unwrap();
+    let create = |body: Value| {
+        post("/api/kits", &body)
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    };
+    let (status, resp) = send(&app, create(json!({"name": "x", "project_id": "nope"}))).await;
+    assert_eq!(
+        (status, resp["code"].as_str()),
+        (StatusCode::NOT_FOUND, Some("KIT_UNKNOWN_TARGET"))
+    );
+    let (status, resp) = send(
+        &app,
+        Request::get("/api/projects/proj-a/kit").body(Body::empty()).unwrap(),
+    )
+    .await;
+    assert_eq!(
+        (status, resp["code"].as_str()),
+        (StatusCode::NOT_FOUND, Some("KIT_NOT_FOUND"))
+    );
+
+    let (status, created) = send(
+        &app,
+        create(json!({"name": "A kit", "project_id": "proj-a", "skills": ["tb-protocol"]})),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    assert_eq!(created["data"]["project_id"], "proj-a");
+    let (status, resp) = send(&app, create(json!({"name": "A kit 2", "project_id": "proj-a"}))).await;
+    assert_eq!(
+        (status, resp["code"].as_str()),
+        (StatusCode::CONFLICT, Some("KIT_PROJECT_HAS_KIT"))
+    );
+
+    let (status, got) = send(
+        &app,
+        Request::get("/api/projects/proj-a/kit").body(Body::empty()).unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{got}");
+    assert_eq!(got["data"]["id"], created["data"]["id"]);
+    let (status, list) = send(
+        &app,
+        Request::get("/api/kits?project_id=proj-a").body(Body::empty()).unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(list["data"].as_array().unwrap().len(), 1);
+
+    // Global attach of the project kit: 400 KIT_INVALID_TARGET.
+    let attach = json!({"level": "global", "item_kind": "kit", "item_ref": created["data"]["id"], "op": "add"});
+    let (status, resp) = send(
+        &app,
+        post("/api/kits/attachments", &attach)
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::from(attach.to_string()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        (status, resp["code"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("KIT_INVALID_TARGET"))
+    );
+
+    // The agent runtime-token channel cannot create a project kit.
+    let runtime = mcp_market_write_routes(f.state.clone()).route_layer(from_fn_with_state(
+        auth(&f, AuthIdentityMode::UserSession, Some(Arc::new(AlwaysValid))),
+        auth_middleware,
+    ));
+    let body = json!({"name": "agent kit", "project_id": "proj-a"});
+    let (status, resp) = send(
+        &runtime,
+        post("/api/kits", &body)
+            .header(aionui_auth::RUNTIME_TOKEN_HEADER, "tok")
+            .header(aionui_auth::RUNTIME_USER_ID_HEADER, USER)
+            .header(aionui_auth::RUNTIME_CONVERSATION_ID_HEADER, "conv-1")
+            .body(Body::from(body.to_string()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        (status, resp["code"].as_str()),
+        (StatusCode::FORBIDDEN, Some("MCP_MARKET_SESSION_REQUIRED"))
+    );
+
+    // C28 §5: the .mcp.json preview/import are session-only too.
+    let (status, resp) = send(
+        &runtime,
+        Request::get("/api/projects/proj-a/kit/import-preview")
+            .header(aionui_auth::RUNTIME_TOKEN_HEADER, "tok")
+            .header(aionui_auth::RUNTIME_USER_ID_HEADER, USER)
+            .header(aionui_auth::RUNTIME_CONVERSATION_ID_HEADER, "conv-1")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        (status, resp["code"].as_str()),
+        (StatusCode::FORBIDDEN, Some("MCP_MARKET_SESSION_REQUIRED"))
+    );
+    let (status, _) = send(
+        &app,
+        Request::get("/api/projects/proj-a/kit/import-preview")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "no session on the app stack");
+    let (status, preview) = send(
+        &app,
+        Request::get("/api/projects/proj-a/kit/import-preview")
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{preview}");
+    assert_eq!(preview["data"]["file_found"], false);
 }

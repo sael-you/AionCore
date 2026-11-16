@@ -114,13 +114,14 @@ impl KitOp {
 /// | code | status | when |
 /// |---|---|---|
 /// | `KIT_NAME_TAKEN` | 409 | create/rename: a live kit of the user already has this name (trimmed) |
+/// | `KIT_PROJECT_HAS_KIT` | 409 | create with `project_id`: that project already has a live project kit (C28) |
 /// | `KIT_STALE` | 409 | update: `expected_updated_at` no longer matches (re-read, retry) |
 /// | `KIT_NOT_FOUND` | 404 | kit id unknown or deleted (GET/PUT/DELETE, or `item_kind: kit` attach) |
 /// | `KIT_ATTACHMENT_NOT_FOUND` | 404 | DELETE of an unknown attachment id |
 /// | `KIT_UNKNOWN_TARGET` | 404 | project/conversation `target_id` (or effective `conversation_id`) not found |
 /// | `KIT_INVALID_NAME` | 400 | name empty or > 80 chars, description > 500 chars |
 /// | `KIT_INVALID_ITEM` | 400 | bad skill name (`[A-Za-z0-9._-]{1,128}`), MCP instance not a live market instance of the user, template not in the catalogue, empty `item_ref`, > 200 members per kind |
-/// | `KIT_INVALID_TARGET` | 400 | `target_id` missing for project/assistant/conversation, or present for global |
+/// | `KIT_INVALID_TARGET` | 400 | `target_id` missing for project/assistant/conversation, or present for global; a project kit attached at global, at another project, or at a conversation of another project (C28) |
 /// | `KIT_GLOBAL_NOT_ALLOWED` | 400 | R2/R3: a global add of a non-global (not context7/studio-memory) or write MCP instance, directly or inside the kit; also a member update of a globally attached kit |
 ///
 /// There is no duplicate-item error: member lists are trimmed and
@@ -131,6 +132,7 @@ impl KitOp {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KitErrorCode {
     NameTaken,
+    ProjectHasKit,
     Stale,
     NotFound,
     AttachmentNotFound,
@@ -145,6 +147,7 @@ impl KitErrorCode {
     pub fn as_str(self) -> &'static str {
         match self {
             KitErrorCode::NameTaken => "KIT_NAME_TAKEN",
+            KitErrorCode::ProjectHasKit => "KIT_PROJECT_HAS_KIT",
             KitErrorCode::Stale => "KIT_STALE",
             KitErrorCode::NotFound => "KIT_NOT_FOUND",
             KitErrorCode::AttachmentNotFound => "KIT_ATTACHMENT_NOT_FOUND",
@@ -158,7 +161,7 @@ impl KitErrorCode {
 
     pub fn http_status(self) -> u16 {
         match self {
-            KitErrorCode::NameTaken | KitErrorCode::Stale => 409,
+            KitErrorCode::NameTaken | KitErrorCode::ProjectHasKit | KitErrorCode::Stale => 409,
             KitErrorCode::NotFound | KitErrorCode::AttachmentNotFound | KitErrorCode::UnknownTarget => 404,
             KitErrorCode::InvalidName
             | KitErrorCode::InvalidItem
@@ -187,9 +190,13 @@ pub struct KitResponse {
     pub id: String,
     pub name: String,
     pub description: String,
-    /// `K1`…`K12` for the kits seeded from KITS.md; `None` for owner kits.
+    /// `K0` (Global) and `K1`…`K12` for the seeded kits; `None` for owner kits.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub builtin_key: Option<String>,
+    /// `Some` = the project kit of that project (`projects.project_id`, C28):
+    /// implicitly attached at its project; `None` = a shared kit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub project_id: Option<String>,
     /// Library skill names, sorted.
     pub skills: Vec<String>,
     /// MCP market instances, sorted by id.
@@ -214,6 +221,19 @@ pub struct CreateKitRequest {
     pub mcp_instance_ids: Vec<String>,
     #[serde(default)]
     pub mcp_templates: Vec<String>,
+    /// C28: create the project kit of this project (one per project:
+    /// `KIT_PROJECT_HAS_KIT` 409; unknown project: `KIT_UNKNOWN_TARGET` 404).
+    /// Fixed once created (not in [`UpdateKitRequest`]).
+    #[serde(default)]
+    pub project_id: Option<String>,
+}
+
+/// Query of `GET /api/kits` (C28): `project_id` = only that project's kit;
+/// omitted = every live kit.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ListKitsQuery {
+    #[serde(default)]
+    pub project_id: Option<String>,
 }
 
 /// `PUT /api/kits/{id}`. Every field optional; a list present REPLACES that
@@ -329,6 +349,12 @@ pub struct KitEffectiveMcp {
     pub delivered: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
+    /// C28: the conversation's workspace `.mcp.json` defines a server with the
+    /// same name, so a CLI that also reads that file loads it twice. Only the
+    /// file's server names are read, never its content. Always `false` for a
+    /// project/assistant preview (no workspace).
+    #[serde(default)]
+    pub shadowed_by_project_file: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -370,6 +396,106 @@ pub struct KitEffectiveSetResponse {
     pub missing_templates: Vec<KitMissingTemplate>,
 }
 
+// ---------------------------------------------------------------------------
+// Import keys from a project's .mcp.json (C28 §5)
+// ---------------------------------------------------------------------------
+
+/// How a `.mcp.json` server maps onto the AionUi catalogue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum KitImportMatch {
+    /// A catalogue template (by package/command identity or URL host, then by name).
+    Catalogue,
+    /// No template: a custom server (not importable here; see the custom-template path).
+    Custom,
+    /// A server the market does not offer (R11 / dropped by D50).
+    None,
+}
+
+/// One secret field of the matched template and whether the file holds a
+/// usable value for it (never the value, never a masked value).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KitImportSecret {
+    /// Template env key (e.g. `SUPABASE_ACCESS_TOKEN`).
+    pub field: String,
+    pub found: bool,
+}
+
+/// One server of `<workspace>/.mcp.json`. Never carries a value, a masked
+/// value, the command, args or URL.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KitImportPreviewServer {
+    /// The server's key in `mcpServers`.
+    pub name: String,
+    pub template_id: Option<String>,
+    #[serde(rename = "match")]
+    pub match_kind: KitImportMatch,
+    /// The template's secret fields (empty without a template).
+    pub secrets: Vec<KitImportSecret>,
+    /// A remote server configured without any credential in the file (its
+    /// CLI used OAuth): connect it in the UI instead.
+    pub oauth_only: bool,
+}
+
+/// `GET /api/projects/{project_id}/kit/import-preview`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KitImportPreviewResponse {
+    pub project_id: String,
+    /// `false` when the project has no workspace or the workspace no readable
+    /// `.mcp.json` (then `servers` is empty).
+    pub file_found: bool,
+    pub servers: Vec<KitImportPreviewServer>,
+}
+
+/// One server to import.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KitImportServerRequest {
+    /// The server's key in `.mcp.json`.
+    pub name: String,
+    /// Catalogue template the instance is created from (its pinned command).
+    pub template_id: String,
+    /// New market instance id (R1 #14; must differ from the template id, R1).
+    pub instance_name: String,
+    /// `production | staging | sandbox | local`.
+    pub environment: String,
+    /// `read | write`.
+    pub tier: String,
+}
+
+/// `POST /api/projects/{project_id}/kit/import`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct KitImportRequest {
+    pub servers: Vec<KitImportServerRequest>,
+}
+
+/// Per-server import result.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KitImportServerResult {
+    pub name: String,
+    /// The created (dormant) instance, added to the project kit; `None` on error.
+    pub instance_id: Option<String>,
+    /// `None` on success; else a market or kit code (`MCP_MARKET_INVALID`,
+    /// `MCP_MARKET_CONFLICT`, `KIT_IMPORT_NOT_IN_FILE`, `KIT_IMPORT_UNKNOWN_TEMPLATE`, ...).
+    pub error_code: Option<String>,
+    /// Human-readable reason for `error_code` (names keys and rules, never a value).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    /// Required secret fields the file did not provide: the instance stays
+    /// dormant until the owner sets them (`needs_secret`).
+    #[serde(default)]
+    pub missing_secrets: Vec<String>,
+}
+
+/// Response of `POST /api/projects/{project_id}/kit/import`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KitImportResponse {
+    /// The project kit the instances were added to (created when missing).
+    pub kit_id: String,
+    pub servers: Vec<KitImportServerResult>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -381,6 +507,40 @@ mod tests {
         assert_eq!(KitItemKind::parse("mcp"), Some(KitItemKind::Mcp));
         assert_eq!(KitOp::parse("remove"), Some(KitOp::Remove));
         assert_eq!(KitOp::parse("drop"), None);
+    }
+
+    #[test]
+    fn import_wire_shapes() {
+        let server = KitImportPreviewServer {
+            name: "supabase".into(),
+            template_id: Some("supabase".into()),
+            match_kind: KitImportMatch::Catalogue,
+            secrets: vec![KitImportSecret {
+                field: "SUPABASE_ACCESS_TOKEN".into(),
+                found: true,
+            }],
+            oauth_only: false,
+        };
+        let v = serde_json::to_value(&server).unwrap();
+        assert_eq!(v["match"], "catalogue");
+        assert!(v.get("match_kind").is_none());
+        let bad = serde_json::from_str::<KitImportRequest>(
+            r#"{"servers":[{"name":"a","template_id":"b","instance_name":"c","environment":"production","tier":"read","command":"x"}]}"#,
+        );
+        assert!(bad.is_err(), "a client command is never accepted");
+    }
+
+    #[test]
+    fn project_kit_wire_fields() {
+        let req: CreateKitRequest = serde_json::from_str(r#"{"name":"tb","project_id":"p1"}"#).unwrap();
+        assert_eq!(req.project_id.as_deref(), Some("p1"));
+        let shared: CreateKitRequest = serde_json::from_str(r#"{"name":"x"}"#).unwrap();
+        assert!(shared.project_id.is_none());
+        assert_eq!(KitErrorCode::ProjectHasKit.as_str(), "KIT_PROJECT_HAS_KIT");
+        assert_eq!(KitErrorCode::ProjectHasKit.http_status(), 409);
+        let mcp: KitEffectiveMcp =
+            serde_json::from_str(r#"{"instance_name":"a","status":"active","clis":[],"delivered":true}"#).unwrap();
+        assert!(!mcp.shadowed_by_project_file);
     }
 
     #[test]

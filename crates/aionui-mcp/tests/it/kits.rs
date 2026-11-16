@@ -58,6 +58,10 @@ async fn fx() -> Fx {
     let market = McpMarketService::new(repo.clone(), servers.clone(), Arc::new(catalog()), KEY).with_kits(kits.clone());
     for sql in [
         "INSERT INTO projects (project_id, user_id, name, kind, created_at, updated_at) VALUES ('proj-a', 'system_default_user', 'A', 'standard', 1, 1)",
+        "INSERT INTO projects (project_id, user_id, name, kind, created_at, updated_at) VALUES ('proj-b', 'system_default_user', 'B', 'standard', 1, 1)",
+        "INSERT INTO projects (project_id, user_id, name, kind, created_at, updated_at) VALUES ('proj-aionui', 'system_default_user', 'aionui', 'standard', 1, 1)",
+        "INSERT INTO conversations (id, user_id, name, type, status, created_at, updated_at, project_id, extra) \
+         VALUES ('conv-b', 'system_default_user', 'c', 'acp', 'pending', 1, 1, 'proj-b', '{}')",
         "INSERT INTO conversations (id, user_id, name, type, status, created_at, updated_at, project_id, extra) \
          VALUES ('conv-a', 'system_default_user', 'c', 'acp', 'pending', 1, 1, 'proj-a', '{\"preset_assistant_id\":\"asst-1\",\"skills\":[\"cron\"]}')",
     ] {
@@ -118,6 +122,7 @@ async fn kit(f: &Fx, name: &str, skills: &[&str], mcps: &[&str]) -> String {
                 skills: skills.iter().map(|s| s.to_string()).collect(),
                 mcp_instance_ids: mcps.iter().map(|s| s.to_string()).collect(),
                 mcp_templates: vec![],
+                project_id: None,
             },
         )
         .await
@@ -144,16 +149,21 @@ fn coded(err: MarketError, want: KitErrorCode) -> String {
 }
 
 #[tokio::test]
-async fn list_seeds_the_twelve_default_kits_once_without_instances() {
+async fn list_seeds_the_default_kits_once_without_instances() {
     let f = fx().await;
-    let kits = f.market.list_kits(USER).await.unwrap();
-    assert_eq!(kits.len(), 12);
-    assert_eq!(kits[0].builtin_key.as_deref(), Some("K1"));
-    assert_eq!(kits[0].name, "Platform Dev");
-    assert!(kits[0].skills.contains(&"pf-core".to_owned()));
-    assert_eq!(kits[0].mcp_templates, vec!["context7", "deepwiki", "github"]);
+    let kits = f.market.list_kits(USER, Default::default()).await.unwrap();
+    assert_eq!(kits.len(), 13);
+    assert_eq!(kits[0].builtin_key.as_deref(), Some("K0"));
+    assert_eq!(kits[0].name, "Global");
+    assert_eq!(kits[0].skills, vec!["cs-delegate", "cs-verify"]);
+    assert_eq!(kits[0].mcp_templates, vec!["context7"]);
+    assert_eq!(kits[1].builtin_key.as_deref(), Some("K1"));
+    assert_eq!(kits[1].name, "Platform Dev");
+    assert!(kits[1].skills.contains(&"pf-core".to_owned()));
+    assert_eq!(kits[1].mcp_templates, vec!["context7", "deepwiki", "github"]);
     assert!(kits.iter().all(|k| k.mcps.is_empty()), "seeding creates no instance");
-    assert_eq!(f.market.list_kits(USER).await.unwrap().len(), 12);
+    assert!(kits.iter().all(|k| k.project_id.is_none()));
+    assert_eq!(f.market.list_kits(USER, Default::default()).await.unwrap().len(), 13);
     assert!(f.repo.list_instances(USER).await.unwrap().is_empty());
 }
 
@@ -699,4 +709,355 @@ async fn deleting_a_kit_detaches_it_everywhere() {
     );
     coded(f.market.delete_kit(USER, &k).await.unwrap_err(), KitErrorCode::NotFound);
     coded(f.market.get_kit(USER, &k).await.unwrap_err(), KitErrorCode::NotFound);
+}
+
+// -- C28 project kits (TASK-108) -------------------------------------------------
+
+async fn create_project_kit(f: &Fx, project: &str, skills: &[&str], mcps: &[&str]) -> Result<String, MarketError> {
+    f.market
+        .create_kit(
+            USER,
+            CreateKitRequest {
+                name: format!("{project} kit"),
+                skills: skills.iter().map(|s| s.to_string()).collect(),
+                mcp_instance_ids: mcps.iter().map(|s| s.to_string()).collect(),
+                project_id: Some(project.to_owned()),
+                ..Default::default()
+            },
+        )
+        .await
+        .map(|k| k.id)
+}
+
+async fn effective(f: &Fx, conversation: &str) -> aionui_api_types::KitEffectiveSetResponse {
+    f.market
+        .kit_effective_set(
+            USER,
+            KitEffectiveQuery {
+                conversation_id: Some(conversation.into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap()
+}
+
+#[tokio::test]
+async fn project_kit_create_is_one_per_existing_project() {
+    let f = fx().await;
+    let err = create_project_kit(&f, "nope", &[], &[]).await.unwrap_err();
+    coded(err, KitErrorCode::UnknownTarget);
+    let pk = create_project_kit(&f, "proj-a", &["tb-protocol"], &[]).await.unwrap();
+    let err = f
+        .market
+        .create_kit(
+            USER,
+            CreateKitRequest {
+                name: "another".into(),
+                project_id: Some("proj-a".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_err();
+    coded(err, KitErrorCode::ProjectHasKit);
+
+    let got = f.market.get_project_kit(USER, "proj-a").await.unwrap();
+    assert_eq!(
+        (got.id.as_str(), got.project_id.as_deref()),
+        (pk.as_str(), Some("proj-a"))
+    );
+    coded(
+        f.market.get_project_kit(USER, "proj-b").await.unwrap_err(),
+        KitErrorCode::NotFound,
+    );
+    let only = f
+        .market
+        .list_kits(
+            USER,
+            aionui_api_types::ListKitsQuery {
+                project_id: Some("proj-a".into()),
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(only.len(), 1);
+    assert_eq!(only[0].id, pk);
+    assert_eq!(f.market.list_kits(USER, Default::default()).await.unwrap().len(), 14);
+}
+
+#[tokio::test]
+async fn project_kit_applies_in_its_project_and_is_refused_elsewhere() {
+    let f = fx().await;
+    let pdl = active_paddle(&f, "tb-pdl-read").await;
+    let pk = create_project_kit(&f, "proj-a", &["tb-protocol", "paddle-rules"], &[&pdl])
+        .await
+        .unwrap();
+    let m = &f.market;
+
+    // Implicitly attached at proj-a (no attachment row).
+    assert!(
+        m.list_kit_attachments(USER, Default::default())
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    let set = effective(&f, "conv-a").await;
+    let tb = set.skills.iter().find(|i| i.item_ref == "tb-protocol").unwrap();
+    assert!(tb.included);
+    assert_eq!(tb.provenance.level, KitLevel::Project);
+    assert_eq!(tb.provenance.kit_name.as_deref(), Some("proj-a kit"));
+    assert!(set.mcps[0].included && set.mcps[0].mcp.as_ref().unwrap().delivered);
+    // ...and nowhere else.
+    assert!(effective(&f, "conv-b").await.skills.is_empty());
+    // The market gate follows: granted in conv-a only.
+    assert_eq!(f.servers.kit_mcp_ids(USER, "conv-a").await.unwrap(), vec![pdl.clone()]);
+    assert!(f.servers.kit_mcp_ids(USER, "conv-b").await.unwrap().is_empty());
+
+    for (level, target) in [
+        (KitLevel::Global, ""),
+        (KitLevel::Project, "proj-b"),
+        (KitLevel::Conversation, "conv-b"),
+    ] {
+        let err = m
+            .attach_kit_item(USER, attach(level, target, KitItemKind::Kit, &pk, KitOp::Add))
+            .await
+            .unwrap_err();
+        assert!(
+            coded(err, KitErrorCode::InvalidTarget).contains("project kit"),
+            "{level:?}"
+        );
+    }
+
+    // Removable below its project: one skill at assistant level, the kit at conversation level.
+    m.attach_kit_item(
+        USER,
+        attach(
+            KitLevel::Assistant,
+            "asst-1",
+            KitItemKind::Skill,
+            "paddle-rules",
+            KitOp::Remove,
+        ),
+    )
+    .await
+    .unwrap();
+    let set = effective(&f, "conv-a").await;
+    assert!(
+        !set.skills
+            .iter()
+            .find(|i| i.item_ref == "paddle-rules")
+            .unwrap()
+            .included
+    );
+    m.attach_kit_item(
+        USER,
+        attach(KitLevel::Conversation, "conv-a", KitItemKind::Kit, &pk, KitOp::Remove),
+    )
+    .await
+    .unwrap();
+    let set = effective(&f, "conv-a").await;
+    assert!(set.skills.iter().all(|i| !i.included));
+    assert!(!set.mcps[0].included);
+    assert!(f.servers.kit_mcp_ids(USER, "conv-a").await.unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn seed_attaches_k0_globally_and_moves_builtins_off_global_once() {
+    let f = fx().await;
+    // State before C28: K1-K12 seeded by C27 and Platform Dev attached globally.
+    let c27: Vec<aionui_db::SeedKit<'static>> = aionui_mcp::market::kit_seed::DEFAULT_KITS
+        .iter()
+        .filter(|k| k.builtin_key != "K0")
+        .copied()
+        .collect();
+    f.kits.seed_kits(USER, &c27).await.unwrap();
+    let k1 = f
+        .kits
+        .list_kits(USER)
+        .await
+        .unwrap()
+        .into_iter()
+        .find(|k| k.builtin_key.as_deref() == Some("K1"))
+        .unwrap()
+        .id;
+    f.market
+        .attach_kit_item(USER, attach(KitLevel::Global, "", KitItemKind::Kit, &k1, KitOp::Add))
+        .await
+        .unwrap();
+
+    let kits = f.market.list_kits(USER, Default::default()).await.unwrap();
+    let k0 = kits
+        .iter()
+        .find(|k| k.builtin_key.as_deref() == Some("K0"))
+        .unwrap()
+        .id
+        .clone();
+    let global = f
+        .market
+        .list_kit_attachments(
+            USER,
+            aionui_api_types::ListKitAttachmentsQuery {
+                level: Some(KitLevel::Global),
+                target_id: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        global.iter().map(|a| a.item_ref.as_str()).collect::<Vec<_>>(),
+        vec![k0.as_str()]
+    );
+    let platform = f
+        .market
+        .list_kit_attachments(
+            USER,
+            aionui_api_types::ListKitAttachmentsQuery {
+                level: Some(KitLevel::Project),
+                target_id: Some("proj-aionui".into()),
+            },
+        )
+        .await
+        .unwrap();
+    let names: Vec<&str> = platform.iter().map(|a| a.item_name.as_str()).collect();
+    assert!(
+        names.contains(&"Platform Dev") && names.contains(&"Ship & Ops"),
+        "{names:?}"
+    );
+
+    // Re-run: nothing moves again; a user detach of K0 is not undone.
+    f.market.detach_kit_item(USER, &global[0].id).await.unwrap();
+    f.market
+        .attach_kit_item(USER, attach(KitLevel::Global, "", KitItemKind::Kit, &k1, KitOp::Add))
+        .await
+        .unwrap();
+    f.market.list_kits(USER, Default::default()).await.unwrap();
+    let global = f
+        .market
+        .list_kit_attachments(
+            USER,
+            aionui_api_types::ListKitAttachmentsQuery {
+                level: Some(KitLevel::Global),
+                target_id: None,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        global.iter().map(|a| a.item_ref.as_str()).collect::<Vec<_>>(),
+        vec![k1.as_str()]
+    );
+}
+
+#[tokio::test]
+async fn effective_view_flags_servers_shadowed_by_the_workspace_mcp_json() {
+    let f = fx().await;
+    let pdl = active_paddle(&f, "tb-pdl-read").await;
+    let ws = tempfile::tempdir().unwrap();
+    std::fs::write(
+        ws.path().join(".mcp.json"),
+        r#"{"mcpServers":{"tb-pdl-read":{"command":"npx","env":{"PADDLE_API_KEY":"pdl_live_SHOULDNEVERLEAVE"}}}}"#,
+    )
+    .unwrap();
+    let extra = json!({"preset_assistant_id": "asst-1", "workspace": ws.path().to_string_lossy()}).to_string();
+    sqlx::query(
+        "INSERT INTO conversations (id, user_id, name, type, status, created_at, updated_at, project_id, extra) \
+         VALUES ('conv-ws', ?, 'c', 'acp', 'pending', 1, 1, 'proj-a', ?)",
+    )
+    .bind(USER)
+    .bind(&extra)
+    .execute(f.db.pool())
+    .await
+    .unwrap();
+    create_project_kit(&f, "proj-a", &[], &[&pdl]).await.unwrap();
+
+    let set = effective(&f, "conv-ws").await;
+    assert!(set.mcps[0].mcp.as_ref().unwrap().shadowed_by_project_file);
+    let wire = serde_json::to_string(&set).unwrap();
+    assert!(
+        !wire.contains("SHOULDNEVERLEAVE") && !wire.contains("PADDLE_API_KEY"),
+        "{wire}"
+    );
+    // conv-a has no workspace: not shadowed.
+    assert!(
+        !effective(&f, "conv-a").await.mcps[0]
+            .mcp
+            .as_ref()
+            .unwrap()
+            .shadowed_by_project_file
+    );
+    // A malformed file is ignored.
+    std::fs::write(ws.path().join(".mcp.json"), "{not json").unwrap();
+    assert!(
+        !effective(&f, "conv-ws").await.mcps[0]
+            .mcp
+            .as_ref()
+            .unwrap()
+            .shadowed_by_project_file
+    );
+}
+
+/// Spec §2 "custom MCPs": a custom stdio server becomes a market instance
+/// through a template of the installed `studio-mcp-catalog` extension (kept
+/// next to the built-ins by `with_builtin`); the create route itself keeps
+/// refusing client-supplied commands (C15 R1 #1). A project kit can hold it.
+#[tokio::test]
+async fn custom_catalogue_template_instance_can_join_a_project_kit() {
+    let db = init_database_memory().await.unwrap();
+    let repo: Arc<dyn IMcpMarketRepository> = Arc::new(SqliteMcpMarketRepository::new(db.pool().clone()));
+    let servers: Arc<dyn IMcpServerRepository> = Arc::new(SqliteMcpServerRepository::new(db.pool().clone()));
+    let kits: Arc<dyn IKitRepository> = Arc::new(SqliteKitRepository::new(db.pool().clone()));
+    let custom = json!({"id": "tb-protocol", "name": "TB protocol", "market": {
+        "transport": "stdio",
+        "command": {"command": "node", "args": ["/srv/tb/protocol-mcp.js"]},
+        "tiers": ["read", "write"], "enforcement": "server", "clis": ["claude", "codex"]
+    }});
+    let catalog = StaticTemplateCatalog::new(aionui_mcp::market::with_builtin(vec![custom]));
+    let market = McpMarketService::new(repo, servers, Arc::new(catalog), KEY).with_kits(kits);
+    sqlx::query(
+        "INSERT INTO projects (project_id, user_id, name, kind, created_at, updated_at) VALUES ('proj-tb', ?, 'TB-test', 'standard', 1, 1)",
+    )
+    .bind(USER)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    let inst = market
+        .create_instance(
+            USER,
+            CreateMcpMarketInstanceRequest {
+                name: "tb-proto".into(),
+                template_id: "tb-protocol".into(),
+                description: None,
+                environment: "local".into(),
+                tier: "write".into(),
+                status: None,
+                clis: vec!["claude".into()],
+                plain_env: BTreeMap::new(),
+                tools_allow: None,
+                tools_block: vec![],
+            },
+        )
+        .await
+        .unwrap();
+    let kit = market
+        .create_kit(
+            USER,
+            CreateKitRequest {
+                name: "TB-test".into(),
+                mcp_instance_ids: vec![inst.id.clone()],
+                project_id: Some("proj-tb".into()),
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(kit.mcps[0].instance_name, "tb-proto");
+    assert!(
+        market
+            .list_templates(USER)
+            .await
+            .unwrap()
+            .iter()
+            .any(|t| t.id == "paddle")
+    );
 }

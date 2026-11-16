@@ -6,6 +6,7 @@
 
 mod assignments;
 pub mod error;
+mod kit_import;
 pub mod kit_seed;
 mod kits;
 pub mod launch;

@@ -1,4 +1,4 @@
-//! The default kits K1–K12 of `clauterm-studio/design/mcp-catalogue/KITS.md`
+//! The default kits K0 (Global, C28) and K1–K12 of `clauterm-studio/design/mcp-catalogue/KITS.md`
 //! (v1, 2026-11-15, amended by D50) as data. Skills are library skill names;
 //! MCPs are catalogue template ids ("wanted"), never instances: no instance
 //! is created by seeding (owner rule), the owner adds instances to a kit once
@@ -7,6 +7,17 @@
 use aionui_db::SeedKit;
 
 pub const DEFAULT_KITS: &[SeedKit<'static>] = &[
+    // C28 (TASK-108): the Global kit, attached at the global level when first
+    // seeded. Built-in auto-inject skills (cs-board-report, voice-mode, ...)
+    // are delivered anyway and are not listed.
+    SeedKit {
+        builtin_key: "K0",
+        name: "Global",
+        description: "Skills and MCPs every conversation gets.",
+        skills: &["cs-verify", "cs-delegate"],
+        attach_globally: true,
+        mcp_templates: &["context7"],
+    },
     SeedKit {
         builtin_key: "K1",
         name: "Platform Dev",
@@ -19,6 +30,7 @@ pub const DEFAULT_KITS: &[SeedKit<'static>] = &[
             "cs-review-code",
             "cs-delegate",
         ],
+        attach_globally: false,
         mcp_templates: &["context7", "github", "deepwiki"],
     },
     SeedKit {
@@ -26,6 +38,7 @@ pub const DEFAULT_KITS: &[SeedKit<'static>] = &[
         name: "Ship & Ops",
         description: "Release trains, staging checks, live verification, incident triage.",
         skills: &["pf-youssef-ship", "pf-staging", "cs-verify", "cs-board-butler"],
+        attach_globally: false,
         mcp_templates: &["sentry", "cloudflare", "chrome-devtools", "github"],
     },
     SeedKit {
@@ -33,6 +46,7 @@ pub const DEFAULT_KITS: &[SeedKit<'static>] = &[
         name: "Web App Backend",
         description: "Schema, migrations, SQL, auth and storage on Supabase.",
         skills: &[],
+        attach_globally: false,
         mcp_templates: &["supabase", "sentry"],
     },
     SeedKit {
@@ -40,6 +54,7 @@ pub const DEFAULT_KITS: &[SeedKit<'static>] = &[
         name: "Payments",
         description: "Subscriptions, prices, invoices, refunds analysis, MRR.",
         skills: &["pricing-strategy", "churn-prevention", "paywall-upgrade-cro"],
+        attach_globally: false,
         mcp_templates: &["paddle", "paddle-sandbox", "stripe"],
     },
     SeedKit {
@@ -47,6 +62,7 @@ pub const DEFAULT_KITS: &[SeedKit<'static>] = &[
         name: "Analytics",
         description: "Product and traffic analytics, funnels, experiments readout.",
         skills: &["analytics-tracking", "ab-test-setup"],
+        attach_globally: false,
         mcp_templates: &["posthog"],
     },
     SeedKit {
@@ -61,6 +77,7 @@ pub const DEFAULT_KITS: &[SeedKit<'static>] = &[
             "competitor-alternatives",
             "content-strategy",
         ],
+        attach_globally: false,
         mcp_templates: &["gsc", "keyword-planner", "chrome-devtools", "firecrawl"],
     },
     SeedKit {
@@ -77,6 +94,7 @@ pub const DEFAULT_KITS: &[SeedKit<'static>] = &[
             "ab-test-setup",
             "marketing-psychology",
         ],
+        attach_globally: false,
         mcp_templates: &["posthog", "chrome-devtools"],
     },
     SeedKit {
@@ -93,6 +111,7 @@ pub const DEFAULT_KITS: &[SeedKit<'static>] = &[
             "voice-extractor",
             "product-marketing-context",
         ],
+        attach_globally: false,
         mcp_templates: &["resend", "brevo"],
     },
     SeedKit {
@@ -100,6 +119,7 @@ pub const DEFAULT_KITS: &[SeedKit<'static>] = &[
         name: "Ads",
         description: "Google and Meta campaign analysis, creative production, budget recommendations.",
         skills: &["paid-ads", "ad-creative"],
+        attach_globally: false,
         mcp_templates: &["google-ads", "meta-ads", "keyword-planner", "ga4", "minimax"],
     },
     SeedKit {
@@ -113,6 +133,7 @@ pub const DEFAULT_KITS: &[SeedKit<'static>] = &[
             "free-tool-strategy",
             "referral-program",
         ],
+        attach_globally: false,
         mcp_templates: &["exa", "brave-search", "perplexity", "firecrawl", "reddit", "deepwiki"],
     },
     SeedKit {
@@ -120,6 +141,7 @@ pub const DEFAULT_KITS: &[SeedKit<'static>] = &[
         name: "Design",
         description: "Design handoff, UI review, visual assets.",
         skills: &["ad-creative", "social-content"],
+        attach_globally: false,
         mcp_templates: &["minimax", "chrome-devtools"],
     },
     SeedKit {
@@ -127,6 +149,7 @@ pub const DEFAULT_KITS: &[SeedKit<'static>] = &[
         name: "Docs & Knowledge",
         description: "Bases, sheets, docs and wikis as the source of truth for clients and operations.",
         skills: &["product-marketing-context"],
+        attach_globally: false,
         mcp_templates: &["airtable", "google-workspace"],
     },
 ];
@@ -136,15 +159,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn twelve_kits_with_unique_keys_names_and_known_templates() {
-        assert_eq!(DEFAULT_KITS.len(), 12);
+    fn thirteen_kits_with_unique_keys_names_and_known_templates() {
+        assert_eq!(DEFAULT_KITS.len(), 13);
+        // Only K0 is attached globally by the seed (C28).
+        let global: Vec<&str> = DEFAULT_KITS
+            .iter()
+            .filter(|k| k.attach_globally)
+            .map(|k| k.builtin_key)
+            .collect();
+        assert_eq!(global, vec!["K0"]);
         let mut keys: Vec<&str> = DEFAULT_KITS.iter().map(|k| k.builtin_key).collect();
         keys.dedup();
-        assert_eq!(keys.len(), 12);
+        assert_eq!(keys.len(), 13);
         let mut names: Vec<&str> = DEFAULT_KITS.iter().map(|k| k.name).collect();
         names.sort_unstable();
         names.dedup();
-        assert_eq!(names.len(), 12);
+        assert_eq!(names.len(), 13);
         // every wanted template exists in the built-in catalogue
         let builtin: Vec<String> = crate::market::builtin_entries()
             .iter()

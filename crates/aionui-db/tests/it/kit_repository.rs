@@ -2,6 +2,7 @@
 //! sets, the idempotent builtin seed, attachment upsert/flip, delete
 //! cascades, and scope loading + resolution for a conversation.
 
+use aionui_db::models::KitRow;
 use aionui_db::{
     AttachParams, CreateKitParams, DbError, IKitRepository, KitMembers, KitScope, SeedKit, SqliteKitRepository,
     UpdateKitParams, init_database_memory, kit_resolve,
@@ -26,6 +27,7 @@ async fn create(repo: &SqliteKitRepository, name: &str, skills: &[&str], mcps: &
         user_id: USER,
         name,
         description: "",
+        project_id: None,
         members: KitMembers {
             skills: &skills,
             mcp_instance_ids: &mcps,
@@ -75,6 +77,7 @@ async fn kit_crud_replaces_member_sets_and_rejects_duplicates_and_stale_writes()
             user_id: USER,
             name: "Platform",
             description: "",
+            project_id: None,
             members: KitMembers::default(),
         })
         .await;
@@ -153,6 +156,7 @@ async fn seed_is_idempotent_and_never_resurrects_a_deleted_builtin() {
             description: "build",
             skills: &["pf-core"],
             mcp_templates: &["context7", "github"],
+            attach_globally: false,
         },
         SeedKit {
             builtin_key: "K2",
@@ -160,6 +164,7 @@ async fn seed_is_idempotent_and_never_resurrects_a_deleted_builtin() {
             description: "ship",
             skills: &["pf-staging"],
             mcp_templates: &["sentry"],
+            attach_globally: false,
         },
     ];
     assert_eq!(repo.seed_kits(USER, &seeds).await.unwrap(), 2);
@@ -256,5 +261,221 @@ async fn conversation_scope_and_layers_resolve_all_four_levels() {
     assert_eq!(
         r.apply_skills(&s(&["cron"])),
         vec!["cron", "context-skill", "seo-audit"]
+    );
+}
+
+// -- C28 project kits ---------------------------------------------------------
+
+async fn project_kit(
+    repo: &SqliteKitRepository,
+    name: &str,
+    project: &str,
+    skills: &[&str],
+) -> Result<KitRow, DbError> {
+    let skills = s(skills);
+    repo.create_kit(&CreateKitParams {
+        user_id: USER,
+        name,
+        description: "",
+        project_id: Some(project),
+        members: KitMembers {
+            skills: &skills,
+            mcp_instance_ids: &[],
+            mcp_templates: &[],
+        },
+    })
+    .await
+}
+
+#[tokio::test]
+async fn one_live_project_kit_per_project_and_it_is_implicitly_attached() {
+    let (db, repo) = setup().await;
+    let pk = project_kit(&repo, "TB-test", "proj-a", &["tb-protocol"]).await.unwrap();
+    assert_eq!(pk.project_id.as_deref(), Some("proj-a"));
+    let second = project_kit(&repo, "TB-test 2", "proj-a", &[]).await;
+    assert!(
+        matches!(&second, Err(DbError::Conflict(m)) if m == aionui_db::KIT_PROJECT_HAS_KIT_MSG),
+        "{second:?}"
+    );
+    // A name clash is still the name conflict, not the project one.
+    let same_name = project_kit(&repo, "TB-test", "proj-b", &[]).await;
+    assert!(
+        matches!(&same_name, Err(DbError::Conflict(m)) if m == aionui_db::KIT_NAME_TAKEN_MSG),
+        "{same_name:?}"
+    );
+    assert_eq!(repo.find_project_kit(USER, "proj-a").await.unwrap().unwrap().id, pk.id);
+    assert!(repo.find_project_kit(USER, "proj-b").await.unwrap().is_none());
+
+    sqlx::query(
+        "INSERT INTO conversations (id, user_id, name, type, status, created_at, updated_at, project_id, extra) \
+         VALUES ('conv-a', ?, 'c', 'acp', 'pending', 1, 1, 'proj-a', '{\"workspace\":\"/ws/a\"}'), \
+                ('conv-b', ?, 'c', 'acp', 'pending', 1, 1, 'proj-b', '{}')",
+    )
+    .bind(USER)
+    .bind(USER)
+    .execute(db.pool())
+    .await
+    .unwrap();
+    assert_eq!(
+        repo.conversation_workspace(USER, "conv-a").await.unwrap().as_deref(),
+        Some("/ws/a")
+    );
+    assert!(repo.conversation_workspace(USER, "conv-b").await.unwrap().is_none());
+
+    let scope_a = repo.conversation_scope(USER, "conv-a").await.unwrap().unwrap();
+    let layers = repo.load_layers(USER, &scope_a).await.unwrap();
+    assert_eq!(layers.attachments.len(), 1, "implicit project attachment, no row");
+    assert!(repo.list_attachments(USER, None, None).await.unwrap().is_empty());
+    assert!(kit_resolve::resolve(&scope_a, &layers).skills["tb-protocol"].included);
+
+    let scope_b = repo.conversation_scope(USER, "conv-b").await.unwrap().unwrap();
+    let layers = repo.load_layers(USER, &scope_b).await.unwrap();
+    assert!(kit_resolve::resolve(&scope_b, &layers).skills.is_empty());
+
+    // Deleted: the project may get a new project kit.
+    assert!(repo.delete_kit(USER, &pk.id).await.unwrap());
+    project_kit(&repo, "TB-test", "proj-a", &[]).await.unwrap();
+}
+
+#[tokio::test]
+async fn seed_attaches_k0_globally_once_and_a_detach_is_not_undone() {
+    let (_db, repo) = setup().await;
+    let seeds = [SeedKit {
+        builtin_key: "K0",
+        name: "Global",
+        description: "",
+        skills: &["cs-verify"],
+        mcp_templates: &[],
+        attach_globally: true,
+    }];
+    assert_eq!(repo.seed_kits(USER, &seeds).await.unwrap(), 1);
+    let global = repo.list_attachments(USER, Some("global"), Some("")).await.unwrap();
+    assert_eq!(global.len(), 1);
+    assert!(repo.delete_attachment(USER, &global[0].id).await.unwrap());
+    assert_eq!(repo.seed_kits(USER, &seeds).await.unwrap(), 0);
+    assert!(
+        repo.list_attachments(USER, Some("global"), None)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn global_kit_step_moves_builtins_off_global_exactly_once() {
+    let (db, repo) = setup().await;
+    for (pid, name) in [
+        ("p-aionui", "aionui"),
+        ("p-studio", "clauterm-studio"),
+        ("p-tb", "TB-test"),
+    ] {
+        sqlx::query(
+            "INSERT INTO projects (project_id, user_id, name, kind, created_at, updated_at) VALUES (?, ?, ?, 'standard', 1, 1)",
+        )
+        .bind(pid)
+        .bind(USER)
+        .bind(name)
+        .execute(db.pool())
+        .await
+        .unwrap();
+    }
+    let seeds = [
+        SeedKit {
+            builtin_key: "K0",
+            name: "Global",
+            description: "",
+            skills: &[],
+            mcp_templates: &[],
+            attach_globally: true,
+        },
+        SeedKit {
+            builtin_key: "K1",
+            name: "Platform Dev",
+            description: "",
+            skills: &[],
+            mcp_templates: &[],
+            attach_globally: false,
+        },
+        SeedKit {
+            builtin_key: "K2",
+            name: "Ship & Ops",
+            description: "",
+            skills: &[],
+            mcp_templates: &[],
+            attach_globally: false,
+        },
+    ];
+    repo.seed_kits(USER, &seeds).await.unwrap();
+    let kits = repo.list_kits(USER).await.unwrap();
+    let id = |key: &str| {
+        kits.iter()
+            .find(|k| k.builtin_key.as_deref() == Some(key))
+            .unwrap()
+            .id
+            .clone()
+    };
+    let (k0, k1, k2) = (id("K0"), id("K1"), id("K2"));
+    // Today's state: Platform Dev attached globally (plus an owner single skill).
+    repo.upsert_attachment(&attach("global", "", "kit", &k1, "add"))
+        .await
+        .unwrap();
+    repo.upsert_attachment(&attach("global", "", "skill", "pdf", "add"))
+        .await
+        .unwrap();
+
+    let off: Vec<String> = (1..=12).map(|n| format!("K{n}")).collect();
+    let off: Vec<&str> = off.iter().map(String::as_str).collect();
+    let step = repo
+        .run_global_kit_step_once(
+            USER,
+            "kits.c28",
+            &off,
+            &["K1", "K2"],
+            &["aionui", "clauterm-studio", "missing"],
+        )
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(step.removed_global, 1);
+    assert_eq!(step.attached_project, 4);
+    let global: Vec<String> = repo
+        .list_attachments(USER, Some("global"), None)
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|a| a.item_ref)
+        .collect();
+    assert_eq!(global.len(), 2);
+    assert!(global.contains(&k0) && global.contains(&"pdf".to_owned()));
+    for project in ["p-aionui", "p-studio"] {
+        let refs: Vec<String> = repo
+            .list_attachments(USER, Some("project"), Some(project))
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|a| a.item_ref)
+            .collect();
+        assert!(refs.contains(&k1) && refs.contains(&k2), "{project}: {refs:?}");
+    }
+    assert!(
+        repo.list_attachments(USER, Some("project"), Some("p-tb"))
+            .await
+            .unwrap()
+            .is_empty()
+    );
+
+    // Re-run is a no-op, even after the owner re-attaches K1 globally.
+    repo.upsert_attachment(&attach("global", "", "kit", &k1, "add"))
+        .await
+        .unwrap();
+    assert!(
+        repo.run_global_kit_step_once(USER, "kits.c28", &off, &["K1", "K2"], &["aionui"])
+            .await
+            .unwrap()
+            .is_none()
+    );
+    assert_eq!(
+        repo.list_attachments(USER, Some("global"), None).await.unwrap().len(),
+        3
     );
 }

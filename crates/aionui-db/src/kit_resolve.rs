@@ -146,7 +146,11 @@ pub fn resolve(scope: &KitScope, layers: &KitLayers) -> KitResolution {
                 "skill" => put("skill", &a.item_ref, None),
                 "mcp" => put("mcp", &a.item_ref, None),
                 "kit" => {
-                    if !layers.kits.contains_key(&a.item_ref) {
+                    let Some(kit) = layers.kits.get(&a.item_ref) else {
+                        continue;
+                    };
+                    // C28: a project kit applies only inside its own project.
+                    if kit.project_id.is_some() && kit.project_id.as_deref() != scope.target("project") {
                         continue;
                     }
                     for m in members.get(a.item_ref.as_str()).into_iter().flatten() {
@@ -227,6 +231,7 @@ mod tests {
                 name: id.into(),
                 description: String::new(),
                 builtin_key: None,
+                project_id: None,
                 created_at: 0,
                 updated_at: 0,
                 deleted_at: None,
@@ -374,6 +379,64 @@ mod tests {
         let only_global = KitScope::default();
         let l = layers(vec![], vec![att("project", "", "skill", "pdf", "add")]);
         assert!(resolve(&only_global, &l).skills.is_empty());
+    }
+
+    fn project_kit(id: &str, project: &str, members: &[(&str, &str)]) -> (KitRow, Vec<KitItemRow>) {
+        let (mut row, items) = kit(id, members);
+        row.project_id = Some(project.into());
+        (row, items)
+    }
+
+    #[test]
+    fn project_kit_applies_only_in_its_project_and_is_removable_below() {
+        // The repository injects the implicit project-level add; the resolver
+        // must still refuse the kit outside its project.
+        let l = layers(
+            vec![project_kit("pk", "p1", &[("skill", "tb-protocol"), ("mcp", "sb-1")])],
+            vec![att("project", "p1", "kit", "pk", "add")],
+        );
+        let r = resolve(&scope(), &l);
+        assert!(r.skills["tb-protocol"].included);
+        assert_eq!(r.skills["tb-protocol"].level, "project");
+        assert!(r.mcp_granted("sb-1"));
+
+        // Another project's scope: an assistant/conversation add of p1's kit has no effect.
+        let other = KitScope {
+            project_id: Some("p2".into()),
+            ..scope()
+        };
+        let l2 = layers(
+            vec![project_kit("pk", "p1", &[("skill", "tb-protocol")])],
+            vec![
+                att("assistant", "a1", "kit", "pk", "add"),
+                att("conversation", "c1", "kit", "pk", "add"),
+            ],
+        );
+        assert!(resolve(&other, &l2).skills.is_empty());
+        // No project at all: same.
+        let none = KitScope {
+            project_id: None,
+            ..scope()
+        };
+        assert!(resolve(&none, &l2).skills.is_empty());
+
+        // Removable at assistant and conversation level inside its project.
+        let l3 = layers(
+            vec![project_kit(
+                "pk",
+                "p1",
+                &[("skill", "tb-protocol"), ("skill", "paddle")],
+            )],
+            vec![
+                att("project", "p1", "kit", "pk", "add"),
+                att("assistant", "a1", "skill", "paddle", "remove"),
+                att("conversation", "c1", "kit", "pk", "remove"),
+            ],
+        );
+        let r3 = resolve(&scope(), &l3);
+        assert!(!r3.skills["tb-protocol"].included);
+        assert_eq!(r3.skills["tb-protocol"].level, "conversation");
+        assert!(!r3.skills["paddle"].included);
     }
 
     #[test]
