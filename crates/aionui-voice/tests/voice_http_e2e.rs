@@ -269,7 +269,8 @@ async fn settings_update_validates_input() {
     for bad in [
         json!({"model": "gpt-4o"}),
         json!({"daily_budget_usd": -1}),
-        json!({"engine": "minimax-cascade"}),
+        json!({"engine": "openai-relay"}),
+        json!({"model": "MiniMax-M3.1-Flash"}),
         json!({"api_key": "sk-should-not-be-accepted"}),
     ] {
         let (status, body) = h
@@ -282,6 +283,18 @@ async fn settings_update_validates_input() {
         assert_eq!(status, 400, "{bad}: {body}");
         assert_eq!(body["code"], "BAD_REQUEST");
     }
+
+    // TASK-91: the MiniMax cascade is selectable, with its brain model.
+    let (status, body) = h
+        .send(
+            Req::browser("PUT", "/api/voice/settings", &user)
+                .json(json!({"engine": "minimax-cascade", "model": "MiniMax-M3"}))
+                .build(),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["data"]["engine"], "minimax-cascade");
+    assert_eq!(body["data"]["model"], "MiniMax-M3");
 }
 
 // --------------------------------------------------------------- sockets

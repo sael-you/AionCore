@@ -36,6 +36,7 @@ use crate::cli::{McpArgs, McpCommand, McpExecArgs};
 const PREFIX: &str = "aioncore mcp exec";
 /// Migrations the launcher's queries need.
 const REQUIRED_MIGRATIONS: &[i64] = &[904, 905];
+const KIT_REQUIRED_MIGRATIONS: &[i64] = &[904, 905, 907];
 const RECHECK_EVERY: Duration = Duration::from_secs(30);
 const SYSTEM_USER: &str = "system_default_user";
 
@@ -88,6 +89,7 @@ struct OwnedRequest {
     instance: String,
     project: Option<String>,
     assistant: Option<String>,
+    conversation: Option<String>,
     cli: String,
 }
 
@@ -96,12 +98,13 @@ impl OwnedRequest {
         LaunchRequest {
             user_id: &self.user_id,
             instance: &self.instance,
-            scope: match self.project.as_deref() {
-                Some(project_id) => LaunchScope::Project {
+            scope: match (self.conversation.as_deref(), self.project.as_deref()) {
+                (Some(conversation_id), _) => LaunchScope::Conversation { conversation_id },
+                (None, Some(project_id)) => LaunchScope::Project {
                     project_id,
                     assistant_id: self.assistant.as_deref(),
                 },
-                None => LaunchScope::Global,
+                (None, None) => LaunchScope::Global,
             },
             cli: &self.cli,
         }
@@ -126,7 +129,13 @@ async fn run_exec(args: McpExecArgs) -> ExitCode {
         );
     };
     let db_path = data_dir.join("aionui-backend.db");
-    let db = match open_database_read_only(&db_path, REQUIRED_MIGRATIONS).await {
+    // A kit grant (C27) needs the kit tables too.
+    let required: &[i64] = if args.conversation.is_some() {
+        KIT_REQUIRED_MIGRATIONS
+    } else {
+        REQUIRED_MIGRATIONS
+    };
+    let db = match open_database_read_only(&db_path, required).await {
         Ok(db) => db,
         Err(e) => return fail(EXIT_REFUSED, &format!("cannot open the AionUi database read-only: {e}")),
     };
@@ -142,6 +151,7 @@ async fn run_exec(args: McpExecArgs) -> ExitCode {
         instance: args.instance.clone(),
         project: args.project.clone(),
         assistant: args.assistant.clone(),
+        conversation: args.conversation.clone(),
         cli: args.cli.clone(),
     });
     let repo = Arc::new(SqliteMcpMarketRepository::new(db.pool().clone()));
@@ -249,9 +259,49 @@ mod tests {
             project: Some("p".into()),
             global: false,
             assistant: None,
+            conversation: None,
             cli: "claude".into(),
             data_dir: data_dir.map(PathBuf::from),
         }
+    }
+
+    fn parse(argv: &[&str]) -> Result<McpExecArgs, clap::Error> {
+        use clap::Parser;
+        let mut full = vec!["aioncore", "mcp", "exec"];
+        full.extend_from_slice(argv);
+        match crate::cli::Cli::try_parse_from(full)?.command {
+            Some(crate::cli::Command::Mcp(crate::cli::McpArgs {
+                command: McpCommand::Exec(args),
+            })) => Ok(args),
+            other => panic!("not mcp exec: {other:?}"),
+        }
+    }
+
+    /// C27: a kit grant launches with `--conversation` alone; it cannot be
+    /// combined with a project or the global scope, and the scope maps to
+    /// `LaunchScope::Conversation`.
+    #[test]
+    fn conversation_scope_parses_and_excludes_project_and_global() {
+        let a = parse(&["tb-pdl", "--conversation", "conv-1", "--cli", "claude"]).unwrap();
+        assert_eq!(a.conversation.as_deref(), Some("conv-1"));
+        assert!(a.project.is_none());
+        assert!(parse(&["tb-pdl", "--conversation", "c", "--project", "p", "--cli", "claude"]).is_err());
+        assert!(parse(&["tb-pdl", "--conversation", "c", "--global", "--cli", "claude"]).is_err());
+        assert!(parse(&["tb-pdl", "--cli", "claude"]).is_err(), "a scope is required");
+        let owned = OwnedRequest {
+            user_id: "u".into(),
+            instance: "tb-pdl".into(),
+            project: None,
+            assistant: None,
+            conversation: Some("conv-1".into()),
+            cli: "claude".into(),
+        };
+        assert_eq!(
+            owned.borrow().scope,
+            LaunchScope::Conversation {
+                conversation_id: "conv-1"
+            }
+        );
     }
 
     #[test]

@@ -663,3 +663,60 @@ async fn the_binding_holds_while_the_armed_device_is_connected() {
     .await;
     assert!(unbound.is_some(), "device gone: the grace runs out");
 }
+
+fn hello_in(mode: &str) -> Value {
+    let mut frame = hello(None);
+    frame["data"]["mode"] = json!(mode);
+    frame
+}
+
+#[tokio::test]
+async fn switching_the_armed_device_to_jarvis_ends_the_binding() {
+    let timings = aionui_voice::VoiceTimings {
+        idle_hangup: Duration::from_millis(400),
+        heartbeat_stale: Duration::from_secs(60),
+        // Long grace: only the switch can end the binding inside this test.
+        binding_grace: Duration::from_secs(600),
+        ..fast_timings()
+    };
+    let (h, user, session) = conversation_harness_with(Options { timings }).await;
+    let addr = h.serve().await;
+    let mut ws = ws_connect(&addr, &user, Some(ORIGIN)).await.unwrap();
+    ws_send(&mut ws, hello_in("conversation")).await;
+    ws_expect(&mut ws, "voice.state").await;
+    let row = h.wait_ended(&user, &session).await;
+    assert_eq!(row.end_reason.as_deref(), Some("idle"));
+    assert!(h.service.is_bound(&user.id, "c-build"), "conversation mode stays armed");
+
+    // The device re-arms in Jarvis mode: its new socket must not renew the binding.
+    drop(ws);
+    let mut jarvis = ws_connect(&addr, &user, Some(ORIGIN)).await.unwrap();
+    ws_send(&mut jarvis, hello_in("jarvis")).await;
+    ws_expect(&mut jarvis, "voice.state").await;
+    assert!(
+        !h.service.is_bound(&user.id, "c-build"),
+        "Jarvis mode: the old binding is gone while the socket stays connected"
+    );
+    let said = h.service.agent_say(&user.id, "c-build", "Done.").await;
+    assert!(
+        said.as_ref().map_or(true, |s| s.status != "delivered"),
+        "the old conversation no longer speaks as bound: {said:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_jarvis_hello_never_unbinds_a_live_conversation_call() {
+    let c = call().await;
+    let addr = c.h.serve().await;
+    // Another device armed in Jarvis mode, or an old client without a mode.
+    for frame in [hello_in("jarvis"), hello(None)] {
+        let mut other = ws_connect(&addr, &c.user, Some(ORIGIN)).await.unwrap();
+        ws_send(&mut other, frame).await;
+        ws_expect(&mut other, "voice.state").await;
+        assert!(
+            c.h.service.is_bound(&c.user.id, "c-build"),
+            "the live call keeps its binding"
+        );
+    }
+    assert_eq!(c.h.session_row(&c.user, &c.session).await.state, "live");
+}

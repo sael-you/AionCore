@@ -32,6 +32,11 @@ impl IRuntimeTokenVerifier for AlwaysValid {
     fn verify_conversation_helper(&self, _: &str, _: &str, _: &str) -> bool {
         true
     }
+    /// Unscoped on purpose: these tests prove the market write router
+    /// refuses the runtime-token channel by itself, not via the C13 scope.
+    fn allows_route(&self, _: &axum::http::Method, _: &str) -> bool {
+        true
+    }
 }
 
 struct Fx {
@@ -49,7 +54,8 @@ async fn fx() -> Fx {
         "env": {"PADDLE_API_KEY": {"kind": "secret", "required": true}},
         "tiers": ["read"], "enforcement": "server", "clis": ["claude"]
     }})]);
-    let market = McpMarketService::new(repo, servers, Arc::new(catalog), [9u8; 32]);
+    let market = McpMarketService::new(repo, servers, Arc::new(catalog), [9u8; 32])
+        .with_kits(Arc::new(aionui_db::SqliteKitRepository::new(db.pool().clone())));
     Fx {
         jwt: Arc::new(JwtService::new("route-test-signing-secret".into())),
         users: Arc::new(SqliteUserRepository::new(db.pool().clone())),
@@ -364,4 +370,105 @@ async fn writes_need_a_trusted_origin_and_read_the_configured_session_cookie() {
 
     let (status, created) = send_raw(&app, write(session, Some(ORIGIN))).await;
     assert_eq!(status, StatusCode::CREATED, "{created}");
+}
+
+/// Kits (C27) ride the market routers: reads with the ordinary state, writes
+/// need a verified session + a trusted Origin; agents are refused.
+#[tokio::test]
+async fn kit_routes_use_the_market_auth_stacks() {
+    let f = fx().await;
+    let app = app(&f);
+    let (status, body) = send(&app, Request::get("/api/kits").body(Body::empty()).unwrap()).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["data"].as_array().unwrap().len(), 12);
+
+    let kit = json!({"name": "Mine", "skills": ["pdf"]});
+    // no session (local loopback caller)
+    let (status, _) = send(&app, post("/api/kits", &kit).body(Body::from(kit.to_string())).unwrap()).await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    // agent runtime-token channel, mis-mounted: the handler refuses
+    let runtime = mcp_market_write_routes(f.state.clone()).route_layer(from_fn_with_state(
+        auth(&f, AuthIdentityMode::UserSession, Some(Arc::new(AlwaysValid))),
+        auth_middleware,
+    ));
+    let (status, resp) = send(
+        &runtime,
+        post("/api/kits/attachments", &kit)
+            .header(aionui_auth::RUNTIME_TOKEN_HEADER, "tok")
+            .header(aionui_auth::RUNTIME_USER_ID_HEADER, USER)
+            .header(aionui_auth::RUNTIME_CONVERSATION_ID_HEADER, "conv-1")
+            .body(Body::from(
+                json!({"level": "global", "item_kind": "skill", "item_ref": "pdf", "op": "add"}).to_string(),
+            ))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        (status, resp["code"].as_str()),
+        (StatusCode::FORBIDDEN, Some("MCP_MARKET_SESSION_REQUIRED"))
+    );
+
+    let token = f.jwt.sign(USER, USER).unwrap();
+    // session but no Origin
+    let (status, resp) = send_raw(
+        &app,
+        post("/api/kits", &kit)
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::from(kit.to_string()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        (status, resp["code"].as_str()),
+        (StatusCode::FORBIDDEN, Some("ORIGIN_REQUIRED"))
+    );
+    // unknown field (wire contract)
+    let wrong = json!({"name": "Mine", "skill_names": ["pdf"]});
+    let (status, _) = send(
+        &app,
+        post("/api/kits", &wrong)
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::from(wrong.to_string()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST);
+    // session + same origin
+    let (status, created) = send(
+        &app,
+        post("/api/kits", &kit)
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::from(kit.to_string()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let id = created["data"]["id"].as_str().unwrap().to_owned();
+    let (status, dup) = send(
+        &app,
+        post("/api/kits", &kit)
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::from(kit.to_string()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        (status, dup["code"].as_str()),
+        (StatusCode::CONFLICT, Some("KIT_NAME_TAKEN"))
+    );
+    let attach = json!({"level": "global", "item_kind": "kit", "item_ref": id, "op": "add"});
+    let (status, attached) = send(
+        &app,
+        post("/api/kits/attachments", &attach)
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::from(attach.to_string()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{attached}");
+    assert_eq!(attached["data"]["item_name"], "Mine");
+    let (status, eff) = send(&app, Request::get("/api/kits/effective").body(Body::empty()).unwrap()).await;
+    assert_eq!(status, StatusCode::OK, "{eff}");
+    assert_eq!(eff["data"]["skills"][0]["item_ref"], "pdf");
+    assert_eq!(eff["data"]["skills"][0]["provenance"]["level"], "global");
 }

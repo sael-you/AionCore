@@ -61,8 +61,7 @@ fn card_fields(required_version: bool) -> Value {
 fn specs() -> Vec<Spec> {
     let empty = json!({ "type": "object", "properties": {}, "additionalProperties": false });
     let mut create_props = card_fields(false);
-    create_props["column"] =
-        json!({ "type": "string", "description": "Column key; default = the first column (backlog)." });
+    create_props["column"] = json!({ "type": "string", "description": "Column key; default = the first column (backlog). Agents may use only the first column: leave it out (the Board Keeper may name a non-gate column)." });
     vec![
         Spec {
             name: "board_status",
@@ -108,7 +107,7 @@ fn specs() -> Vec<Spec> {
         },
         Spec {
             name: "board_create",
-            description: "Create a card; you are recorded as its creator.",
+            description: "Create a card in the board's first column; you are recorded as its creator.",
             input_schema: json!({
                 "type": "object",
                 "properties": create_props,

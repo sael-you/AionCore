@@ -794,6 +794,16 @@ pub fn build_mcp_state(
     if let Some(assistant) = assistant {
         market = market.with_assistant_binder(Arc::new(super::mcp_market::AssistantMcpBinder { assistant }));
     }
+    // Kits (C27): stored next to the market; a conversation-level attach
+    // re-applies that conversation's skill snapshot through the app's
+    // conversation service.
+    market = market
+        .with_kits(Arc::new(aionui_db::SqliteKitRepository::new(
+            services.database.pool().clone(),
+        )))
+        .with_kit_applier(Arc::new(super::mcp_market::ConversationKitApplier {
+            conversation: services.conversation_service.clone(),
+        }));
 
     let adapters: Vec<Arc<dyn McpAgentAdapter>> = vec![
         Arc::new(ClaudeAdapter),

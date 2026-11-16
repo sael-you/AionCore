@@ -206,7 +206,7 @@ pub(crate) struct McpArgs {
 pub(crate) enum McpCommand {
     /// Start market instance <ID> as a filtering stdio MCP proxy. Refuses
     /// (exit 3) unless the instance is active and assigned to exactly this
-    /// scope and CLI now.
+    /// scope (or granted by the conversation's kits) and CLI now.
     Exec(McpExecArgs),
 }
 
@@ -215,11 +215,15 @@ pub(crate) struct McpExecArgs {
     /// Instance id (= tool prefix, `mcp__<id>__*`).
     pub instance: String,
     /// Project id (`projects.project_id`) the instance is assigned to.
-    #[arg(long, conflicts_with = "global", required_unless_present = "global")]
+    #[arg(long, conflicts_with_all = ["global", "conversation"], required_unless_present_any = ["global", "conversation"])]
     pub project: Option<String>,
     /// A global assignment (context7 / studio-memory only).
-    #[arg(long)]
+    #[arg(long, conflicts_with = "conversation")]
     pub global: bool,
+    /// Conversation id whose kits grant the instance (C27); the grant is
+    /// recomputed from the database at launch and on every re-check.
+    #[arg(long)]
+    pub conversation: Option<String>,
     /// Assistant id, for the AionUi assistant-binding channel.
     #[arg(long, requires = "project")]
     pub assistant: Option<String>,

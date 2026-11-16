@@ -8,6 +8,7 @@ mod health;
 mod item_revealer;
 mod mcp_market;
 mod routes;
+mod runtime_scope;
 mod runtime_team_tools;
 mod scm_monitor;
 mod state;

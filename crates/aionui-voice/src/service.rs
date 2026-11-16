@@ -121,6 +121,8 @@ pub(crate) struct ServiceInner {
     pub credentials: Arc<dyn CredentialPort>,
     pub credential_policy: CredentialPolicy,
     pub engine: Arc<dyn VoiceEngine>,
+    /// `minimax-cascade`, built over [`Self::engine`] as its ear.
+    pub cascade: Arc<dyn VoiceEngine>,
     pub verifier: Arc<dyn AuthVerifier>,
     pub sockets: VoiceSockets,
     pub timings: VoiceTimings,
@@ -212,6 +214,22 @@ impl ServiceInner {
         }
     }
 
+    /// The device was re-armed in Jarvis mode: the user left conversation
+    /// voice mode, so a binding kept for an idle/hung-up call ends now
+    /// instead of being renewed by the Jarvis socket. A live
+    /// conversation-mode call (another device) keeps its binding; it ends
+    /// with that call or when a Jarvis call is admitted.
+    pub(crate) fn leave_conversation_mode(&self, user_id: &str) -> bool {
+        let removed = self
+            .bindings
+            .remove_if(user_id, |_, binding| binding.until.is_some())
+            .is_some();
+        if removed {
+            tracing::info!(user_id, "voice conversation binding cleared: device switched to Jarvis");
+        }
+        removed
+    }
+
     pub(crate) fn mark_listening(&self) {
         if let Ok(mut since) = self.listening_since.lock()
             && since.is_none()
@@ -282,6 +300,7 @@ impl VoiceService {
                 audit: deps.audit,
                 credentials: deps.credentials,
                 credential_policy: deps.credential_policy,
+                cascade: Arc::new(crate::engine::MiniMaxCascadeEngine::new(deps.engine.clone())),
                 engine: deps.engine,
                 verifier: deps.verifier,
                 sockets: deps.sockets,
@@ -600,6 +619,16 @@ impl VoiceService {
                 }
             }
             _ => {}
+        }
+    }
+
+    /// A device said hello armed in `mode`: Jarvis mode ends a conversation
+    /// binding whose call is gone (C26 mode switch). Unknown or absent
+    /// modes change nothing.
+    pub fn note_hello_mode(&self, user_id: &str, mode: Option<&str>) {
+        let mode = mode.map(str::trim).filter(|m| !m.is_empty());
+        if matches!(mode.map(|m| SessionMode::parse(Some(m))), Some(Ok(SessionMode::Jarvis))) {
+            self.inner.leave_conversation_mode(user_id);
         }
     }
 

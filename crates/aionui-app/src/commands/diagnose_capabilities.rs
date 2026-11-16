@@ -50,6 +50,7 @@ pub(crate) fn data() -> Value {
                 "command": "diagnose http get",
                 "method": "GET only",
                 "allowed_paths": ["/health", "/api/..."],
+                "runtime_token_scope": "outside --local identity the runtime token only reaches the routes the named diagnose and config commands use; other /api paths answer 403 RUNTIME_SCOPE",
                 "prefer_named_commands": true
             }
         },

@@ -28,7 +28,7 @@ use crate::lifecycle::EndReason;
 use crate::pricing::pricing_for;
 use crate::runner::{CallRunner, RunMode};
 use crate::service::{LiveCall, Liveness, VoiceService};
-use crate::settings::{CallProfile, VoiceSettings};
+use crate::settings::{CallProfile, ENGINE_MINIMAX_CASCADE, MODEL_MINI, VoiceSettings};
 
 /// Largest SDP offer accepted (a browser audio-only offer is ≈ 2–6 KB).
 pub const MAX_SDP_BYTES: usize = 32 * 1024;
@@ -53,6 +53,8 @@ pub(crate) struct RunnerStart {
     pub carry: Option<String>,
     pub session_mode: SessionMode,
     pub car: bool,
+    /// Engine kind of the call (`openai-realtime`, `minimax-cascade`).
+    pub engine: &'static str,
 }
 
 impl VoiceService {
@@ -106,7 +108,7 @@ impl VoiceService {
             }
         }
         if let Some(engine) = req.engine.as_deref()
-            && engine != settings.engine
+            && !client_engine_matches(engine, &settings.engine)
         {
             return Err(VoiceError::BadRequest(format!(
                 "engine '{engine}' is not the configured voice engine"
@@ -122,7 +124,18 @@ impl VoiceService {
             None => None,
         };
 
-        let profile = settings.call_profile();
+        let mut profile = settings.call_profile();
+        // Conversation mode is an ear only: no brain, so always the realtime
+        // engine on a realtime model (a cascade setting picks the ear's model).
+        let cascade = !mode.is_conversation() && profile.engine == ENGINE_MINIMAX_CASCADE;
+        if mode.is_conversation() && profile.engine == ENGINE_MINIMAX_CASCADE {
+            profile.model = MODEL_MINI.to_owned();
+        }
+        let engine = if cascade {
+            self.inner.cascade.clone()
+        } else {
+            self.inner.engine.clone()
+        };
         let tools: Vec<Value> = if mode.is_conversation() {
             Vec::new()
         } else {
@@ -152,6 +165,11 @@ impl VoiceService {
         }
 
         let credential = self.resolve_credential(user_id, &settings).await?;
+        let brain = if cascade {
+            Some(self.resolve_minimax(user_id).await?)
+        } else {
+            None
+        };
         let config = if mode.is_conversation() {
             conversation_session_config(&profile, &profile.model, self.transcription_keywords(user_id).await)
         } else {
@@ -159,7 +177,7 @@ impl VoiceService {
         };
         let hash = instructions_hash(&config.instructions, &tools);
         let session_id = aionui_common::generate_prefixed_id("vs");
-        let engine_kind = self.inner.engine.kind();
+        let engine_kind = engine.kind();
 
         self.inner
             .sessions
@@ -178,13 +196,12 @@ impl VoiceService {
                 other => other.into(),
             })?;
 
-        let opened = self
-            .inner
-            .engine
+        let opened = engine
             .open(OpenCallRequest {
                 credential,
                 sdp_offer: req.sdp_offer,
                 config,
+                brain,
             })
             .await;
         let (answer, mut engine_call) = match opened {
@@ -241,6 +258,7 @@ impl VoiceService {
             carry,
             session_mode: mode,
             car: settings.car_mode,
+            engine: engine_kind,
         });
         Ok(CreateVoiceSessionResponse {
             voice_session_id: session_id,
@@ -338,6 +356,20 @@ impl VoiceService {
             .resolve_openai(credentials, settings.provider_id.as_deref())
     }
 
+    /// The MiniMax key of the cascade brain (official MiniMax hosts only).
+    async fn resolve_minimax(&self, user_id: &str) -> Result<ResolvedCredential, VoiceError> {
+        let credentials = self
+            .inner
+            .credentials
+            .provider_credentials(user_id)
+            .await
+            .map_err(VoiceError::Internal)?;
+        self.inner
+            .credential_policy
+            .resolve_minimax(&credentials)
+            .ok_or(VoiceError::NoMiniMaxProvider)
+    }
+
     /// Register the call, then start its runner. The runner waits until it is
     /// registered, so a runner that ends at once cannot leave a stale entry.
     pub(crate) fn spawn_runner(&self, start: RunnerStart) {
@@ -345,7 +377,7 @@ impl VoiceService {
         let call = Arc::new(LiveCall {
             session_id: start.session_id.clone(),
             user_id: start.user_id,
-            engine: self.inner.engine.kind().to_owned(),
+            engine: start.engine.to_owned(),
             model: start.model,
             cmd_tx,
             ready: AtomicBool::new(false),
@@ -505,6 +537,12 @@ impl VoiceService {
         if row.instructions_hash.as_deref() == Some(conversation_instructions_hash().as_str()) {
             return Err(EndReason::Restart);
         }
+        // The cascade brain's context lived in the dead process: end it like a
+        // conversation-mode call; the client drops its WebRTC ear on
+        // `voice.callEnded` and re-dials on the next wake.
+        if row.engine == ENGINE_MINIMAX_CASCADE {
+            return Err(EndReason::Restart);
+        }
         let lock = self.inner.user_lock(&row.user_id);
         let _guard = lock.lock().await;
         let settings = self.settings(&row.user_id).await.map_err(|_| EndReason::Restart)?;
@@ -545,6 +583,7 @@ impl VoiceService {
             carry: None,
             session_mode: SessionMode::Jarvis,
             car: settings.car_mode,
+            engine: self.inner.engine.kind(),
         });
         Ok(())
     }
@@ -623,6 +662,13 @@ fn conversation_session_config(profile: &CallProfile, model: &str, keywords: Vec
 /// Hash stored on conversation-mode sessions (recovery tells them apart).
 pub(crate) fn conversation_instructions_hash() -> String {
     instructions_hash(TRANSCRIBE_ONLY_INSTRUCTIONS, &[])
+}
+
+/// The engine a client asks for matches the setting. Every browser build sends
+/// `openai-realtime` (its WebRTC transport); the cascade's ear is that same
+/// call, so a cascade setting accepts it and the client needs no change.
+fn client_engine_matches(requested: &str, configured: &str) -> bool {
+    requested == configured || (configured == ENGINE_MINIMAX_CASCADE && requested == crate::engine::openai::ENGINE_KIND)
 }
 
 fn validate_create(req: &CreateVoiceSessionRequest) -> Result<(), VoiceError> {

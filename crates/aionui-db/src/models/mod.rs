@@ -8,6 +8,7 @@ mod conversation;
 mod conversation_artifact;
 mod cron_job;
 mod idempotent_send;
+mod kit;
 mod mcp_market;
 mod mcp_server;
 mod message;
@@ -42,6 +43,7 @@ pub use conversation::{ConversationAssistantSnapshotRow, ConversationRow, Upsert
 pub use conversation_artifact::ConversationArtifactRow;
 pub use cron_job::CronJobRow;
 pub use idempotent_send::IdempotentSendRow;
+pub use kit::{KitAttachmentRow, KitItemRow, KitRow};
 pub use mcp_market::{McpAssignmentRow, McpMarketRow, McpSecretRow};
 pub use mcp_server::McpServerRow;
 pub use message::MessageRow;

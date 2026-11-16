@@ -23,6 +23,12 @@ pub enum LaunchScope<'a> {
         /// `Some` = the AionUi assistant channel; `None` = the native project files.
         assistant_id: Option<&'a str>,
     },
+    /// A kit grant of this conversation's effective set (C27): recomputed
+    /// from the DB now, so a detach or a kit `remove` refuses the next launch
+    /// and the proxy's periodic re-check.
+    Conversation {
+        conversation_id: &'a str,
+    },
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -95,6 +101,9 @@ async fn allowed_instance(
             project_id,
             assistant_id,
         } => (Some(project_id), assistant_id),
+        LaunchScope::Conversation { conversation_id } => {
+            return kit_granted(repo, req, inst, conversation_id).await;
+        }
     };
     if !repo
         .has_assignment(req.user_id, &inst.row.id, project, assistant, req.cli)
@@ -109,6 +118,31 @@ async fn allowed_instance(
             "{} is not assigned {where_} for {}",
             req.instance, req.cli
         )));
+    }
+    Ok(inst)
+}
+
+/// `LaunchScope::Conversation`: the instance must be `included` in the
+/// conversation's kit effective set now; a grant decided at the global level
+/// keeps R2/R3 (global ids only, never write).
+async fn kit_granted(
+    repo: &dyn IMcpMarketRepository,
+    req: &LaunchRequest<'_>,
+    inst: StoredInstance,
+    conversation_id: &str,
+) -> Result<StoredInstance, MarketError> {
+    let granted = repo
+        .kit_mcp_decision(req.user_id, conversation_id, &inst.row.id)
+        .await?
+        .filter(|d| d.included);
+    let Some(decision) = granted else {
+        return Err(refuse(format!(
+            "{} is not granted by the kits of conversation {conversation_id}",
+            req.instance
+        )));
+    };
+    if decision.level == "global" && (!GLOBAL_IDS.contains(&req.instance) || inst.tier == "write") {
+        return Err(refuse(format!("{} may not run globally (R2)", req.instance)));
     }
     Ok(inst)
 }

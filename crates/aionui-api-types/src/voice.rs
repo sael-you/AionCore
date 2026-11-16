@@ -174,6 +174,12 @@ pub struct VoiceHello {
     pub device: String,
     #[serde(default)]
     pub capabilities: Value,
+    /// The mode the device is armed in: `jarvis` or `conversation` (C26).
+    /// `jarvis` ends a conversation binding whose call is gone (a mode
+    /// switch with no live call never reaches core otherwise). Absent from
+    /// older clients: no effect.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

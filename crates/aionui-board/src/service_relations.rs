@@ -17,7 +17,10 @@ use serde_json::json;
 use tracing::Instrument;
 
 use crate::actor::BoardActor;
-use crate::convert::{card_dto, dependency_dto, event_dto, link_dto, question_dto, reference, review_dto};
+use crate::convert::{
+    agent_card_ids, card_creators, card_dto, dependency_dto, event_dto, link_dto, question_dto, reference, review_dto,
+    set_creator,
+};
 use crate::error::{BoardError, BoardErrorCode, BoardResult};
 use crate::events::{COMMENTED, DEP_ADDED, DEP_REMOVED};
 use crate::packet::build_packet;
@@ -134,13 +137,23 @@ impl BoardService {
                 .iter()
                 .map(event_dto)
                 .collect(),
-            card: card_dto(
-                &card,
-                depends_on
-                    .iter()
-                    .filter_map(|dep| resolve(&dep.depends_on_card_id))
-                    .collect(),
-            ),
+            card: {
+                let mut dto = card_dto(
+                    &card,
+                    depends_on
+                        .iter()
+                        .filter_map(|dep| resolve(&dep.depends_on_card_id))
+                        .collect(),
+                );
+                let creators = card_creators(store.card_creators(user_id, &agent_card_ids([&card])).await?);
+                set_creator(
+                    &card.id,
+                    &mut dto.creator_conversation_id,
+                    &mut dto.creator_name,
+                    &creators,
+                );
+                dto
+            },
         })
     }
 

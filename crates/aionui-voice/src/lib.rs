@@ -22,6 +22,7 @@ mod frames;
 mod guard;
 mod instructions;
 mod lifecycle;
+mod mouth;
 mod ports;
 mod pricing;
 mod readback;
@@ -47,8 +48,8 @@ pub use conversation_port::{
 };
 pub use credentials::{CredentialPolicy, FAKE_PROVIDER_URL_ENV, OPENAI_OFFICIAL_BASE_URL, ResolvedCredential};
 pub use engine::{
-    EngineCall, EngineError, EngineEvent, EngineSessionConfig, EngineTimings, OpenAiRealtimeEngine, OpenCallRequest,
-    SpeakMode, TranscriptRole, VoiceEngine,
+    EngineCall, EngineError, EngineEvent, EngineSessionConfig, EngineTimings, MiniMaxCascadeEngine,
+    OpenAiRealtimeEngine, OpenCallRequest, SpeakMode, TranscriptRole, VoiceEngine,
 };
 pub use error::VoiceError;
 pub use frames::VoiceSockets;

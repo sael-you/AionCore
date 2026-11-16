@@ -641,6 +641,10 @@ impl IRuntimeTokenVerifier for ConversationHelperTokenVerifier {
             )
             .is_ok()
     }
+
+    fn allows_route(&self, method: &Method, path: &str) -> bool {
+        super::runtime_scope::runtime_token_allows_route(method, path)
+    }
 }
 
 fn auth_identity_mode(identity_mode: crate::config::IdentityMode) -> AuthIdentityMode {

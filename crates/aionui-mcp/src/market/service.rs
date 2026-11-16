@@ -39,6 +39,9 @@ pub struct McpMarketService {
     pub(crate) catalog: Arc<dyn IMcpTemplateCatalog>,
     pub(crate) encryption_key: [u8; 32],
     pub(crate) binder: Option<Arc<dyn IMcpAssistantBinder>>,
+    /// Kits + attach levels (C27); `None` = kit routes answer 503.
+    pub(crate) kits: Option<Arc<dyn aionui_db::IKitRepository>>,
+    pub(crate) kit_applier: Option<Arc<dyn super::kits::IKitConversationApplier>>,
 }
 
 impl McpMarketService {
@@ -54,7 +57,20 @@ impl McpMarketService {
             catalog,
             encryption_key,
             binder: None,
+            kits: None,
+            kit_applier: None,
         }
+    }
+
+    pub fn with_kits(mut self, kits: Arc<dyn aionui_db::IKitRepository>) -> Self {
+        self.kits = Some(kits);
+        self
+    }
+
+    /// Late-bound (the conversation service is built after the market service).
+    pub fn with_kit_applier(mut self, applier: Arc<dyn super::kits::IKitConversationApplier>) -> Self {
+        self.kit_applier = Some(applier);
+        self
     }
 
     pub fn with_assistant_binder(mut self, binder: Arc<dyn IMcpAssistantBinder>) -> Self {

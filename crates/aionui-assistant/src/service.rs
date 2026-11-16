@@ -419,7 +419,7 @@ impl AssistantService {
         {
             return Ok(());
         }
-        self.upsert_definition_from_legacy_user_row_for_user(user_id, row, None)
+        self.upsert_definition_from_legacy_user_row_for_user(user_id, row, None, LegacyRowChanges::ALL)
             .await?;
         Ok(())
     }
@@ -723,6 +723,7 @@ impl AssistantService {
         user_id: &str,
         row: &AssistantRow,
         requested_agent_id: Option<&str>,
+        changes: LegacyRowChanges,
     ) -> Result<(), AssistantError> {
         // User-defined assistants do not expose locale-aware editing in the
         // current product. Keep the unified definition canonical fields as the
@@ -746,12 +747,35 @@ impl AssistantService {
             .await?;
         let agent_id = match requested_agent_id {
             Some(agent_id) => agent_id.to_string(),
-            None => match existing_definition {
-                Some(definition) => definition.agent_id,
+            None => match existing_definition.as_ref() {
+                Some(definition) => definition.agent_id.clone(),
                 None => self.resolve_default_agent_id_for_user(user_id).await?,
             },
         };
         self.resolve_runtime_backend_for_agent_id(user_id, &agent_id).await?;
+
+        // PATCH semantics (TASK-42): definition-only fields (model, permission,
+        // thought level, MCP defaults) and fields the request left out keep
+        // their stored value; only a fresh definition starts from the
+        // legacy-row defaults. Callers apply explicit `defaults` and the
+        // agent-change reset on top of this.
+        let existing = existing_definition.as_ref();
+        let default_model_mode = existing.map_or("auto", |d| d.default_model_mode.as_str());
+        let default_model_value = existing.and_then(|d| d.default_model_value.as_deref());
+        let default_permission_mode = existing.map_or("auto", |d| d.default_permission_mode.as_str());
+        let default_permission_value = existing.and_then(|d| d.default_permission_value.as_deref());
+        let default_thought_level_mode = existing.map_or("auto", |d| d.default_thought_level_mode.as_str());
+        let default_thought_level_value = existing.and_then(|d| d.default_thought_level_value.as_deref());
+        let default_mcps_mode = existing.map_or("auto", |d| d.default_mcps_mode.as_str());
+        let default_mcp_ids = existing.map_or("[]", |d| d.default_mcp_ids.as_str());
+        let (default_skills_mode, default_skill_ids) = match existing {
+            Some(d) if !changes.enabled_skills => (d.default_skills_mode.as_str(), d.default_skill_ids.clone()),
+            _ => ("fixed", default_skill_ids),
+        };
+        let recommended_prompts = match existing {
+            Some(d) if !changes.prompts => d.recommended_prompts.clone(),
+            _ => recommended_prompts,
+        };
 
         self.definition_repo
             .upsert_for_user(
@@ -773,18 +797,18 @@ impl AssistantService {
                     rule_resource_ref: Some(&row.id),
                     recommended_prompts: &recommended_prompts,
                     recommended_prompts_i18n: &recommended_prompts_i18n,
-                    default_model_mode: "auto",
-                    default_model_value: None,
-                    default_permission_mode: "auto",
-                    default_permission_value: None,
-                    default_thought_level_mode: "auto",
-                    default_thought_level_value: None,
-                    default_skills_mode: "fixed",
+                    default_model_mode,
+                    default_model_value,
+                    default_permission_mode,
+                    default_permission_value,
+                    default_thought_level_mode,
+                    default_thought_level_value,
+                    default_skills_mode,
                     default_skill_ids: &default_skill_ids,
                     custom_skill_names: &custom_skill_names,
                     default_disabled_builtin_skill_ids: &default_disabled_builtin_skill_ids,
-                    default_mcps_mode: "auto",
-                    default_mcp_ids: "[]",
+                    default_mcps_mode,
+                    default_mcp_ids,
                 },
             )
             .await
@@ -1175,8 +1199,13 @@ impl AssistantService {
         };
 
         let row = self.repo.create_for_user(user_id, &params).await?;
-        self.upsert_definition_from_legacy_user_row_for_user(user_id, &row, Some(&resolved_agent_id))
-            .await?;
+        self.upsert_definition_from_legacy_user_row_for_user(
+            user_id,
+            &row,
+            Some(&resolved_agent_id),
+            LegacyRowChanges::ALL,
+        )
+        .await?;
         self.apply_detail_overrides_for_user(user_id, &row.id, detail_overrides, false)
             .await?;
         if let Some(definition) = self
@@ -1396,8 +1425,13 @@ impl AssistantService {
             .update_for_user(user_id, id, &params)
             .await?
             .ok_or_else(|| AssistantError::NotFound(format!("assistant '{id}' not found")))?;
-        self.upsert_definition_from_legacy_user_row_for_user(user_id, &row, requested_agent_id.as_deref())
-            .await?;
+        self.upsert_definition_from_legacy_user_row_for_user(
+            user_id,
+            &row,
+            requested_agent_id.as_deref(),
+            LegacyRowChanges::from_update(&req),
+        )
+        .await?;
         self.apply_detail_overrides_for_user(user_id, id, detail_overrides, reset_model_and_permission)
             .await?;
         if let Some(definition) = self.definition_repo.get_by_assistant_id_for_user(user_id, id).await? {
@@ -1838,8 +1872,13 @@ impl AssistantService {
 
             match self.repo.create_for_user(user_id, &params).await {
                 Ok(row) => {
-                    self.upsert_definition_from_legacy_user_row_for_user(user_id, &row, Some(&resolved_agent_id))
-                        .await?;
+                    self.upsert_definition_from_legacy_user_row_for_user(
+                        user_id,
+                        &row,
+                        Some(&resolved_agent_id),
+                        LegacyRowChanges::ALL,
+                    )
+                    .await?;
                     result.imported += 1;
                 }
                 Err(aionui_db::DbError::Conflict(_)) => {
@@ -2973,6 +3012,32 @@ impl SerializedFields {
             description_i18n: encode_str_map(req.description_i18n.as_ref())?,
             prompts_i18n: encode_list_map(req.prompts_i18n.as_ref())?,
         })
+    }
+}
+
+/// Which legacy-row columns that feed a definition field a request set.
+/// An existing definition keeps its stored value for every field the request
+/// left out, so a partial update never resets it (TASK-42).
+#[derive(Clone, Copy)]
+struct LegacyRowChanges {
+    /// `enabled_skills` → `default_skills_mode` + `default_skill_ids`.
+    enabled_skills: bool,
+    /// `prompts` → `recommended_prompts`.
+    prompts: bool,
+}
+
+impl LegacyRowChanges {
+    /// Create, import and backfill: the legacy row is the whole truth.
+    const ALL: Self = Self {
+        enabled_skills: true,
+        prompts: true,
+    };
+
+    fn from_update(req: &UpdateAssistantRequest) -> Self {
+        Self {
+            enabled_skills: req.enabled_skills.is_some(),
+            prompts: req.prompts.is_some(),
+        }
     }
 }
 
@@ -5907,6 +5972,113 @@ mod tests {
             .unwrap();
         assert_eq!(updated.name, "renamed");
         assert_eq!(updated.description.as_deref(), Some("desc"));
+    }
+
+    /// TASK-42: the skills hub saves `{ enabled_skills }` only
+    /// (SkillDetailPage `setAttachment`); that must not reset the model,
+    /// permission, thought-level, MCP defaults or recommended prompts.
+    #[tokio::test]
+    async fn update_user_skills_only_keeps_model_permission_and_other_defaults() {
+        let fx = fixture().await;
+        fx.service
+            .create(CreateAssistantRequest {
+                id: Some("u1".into()),
+                name: "Planner".into(),
+                recommended_prompts: Some(vec!["Write a plan".into()]),
+                defaults: Some(AssistantDefaultsRequest {
+                    model: Some(AssistantDefaultScalarRequest {
+                        mode: "fixed".into(),
+                        value: Some("openai/gpt-5".into()),
+                    }),
+                    permission: Some(AssistantDefaultScalarRequest {
+                        mode: "fixed".into(),
+                        value: Some("default".into()),
+                    }),
+                    thought_level: Some(AssistantDefaultScalarRequest {
+                        mode: "fixed".into(),
+                        value: Some("high".into()),
+                    }),
+                    skills: None,
+                    mcps: Some(AssistantDefaultListRequest {
+                        mode: "fixed".into(),
+                        value: vec!["mcp-a".into()],
+                    }),
+                }),
+                ..req_default()
+            })
+            .await
+            .unwrap();
+
+        fx.service
+            .update(
+                "u1",
+                UpdateAssistantRequest {
+                    enabled_skills: Some(vec!["skill-a".into()]),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let detail = fx.service.get_detail("u1", Some("en-US")).await.unwrap();
+        assert_eq!(detail.defaults.skills.mode, "fixed");
+        assert_eq!(detail.defaults.skills.value, vec!["skill-a"]);
+        assert_eq!(detail.defaults.model.mode, "fixed");
+        assert_eq!(detail.defaults.model.value.as_deref(), Some("openai/gpt-5"));
+        assert_eq!(detail.defaults.permission.mode, "fixed");
+        assert_eq!(detail.defaults.permission.value.as_deref(), Some("default"));
+        assert_eq!(detail.defaults.thought_level.mode, "fixed");
+        assert_eq!(detail.defaults.thought_level.value.as_deref(), Some("high"));
+        assert_eq!(detail.defaults.mcps.mode, "fixed");
+        assert_eq!(detail.defaults.mcps.value, vec!["mcp-a"]);
+        assert_eq!(detail.prompts.recommended, vec!["Write a plan"]);
+    }
+
+    /// TASK-42, the other direction: a save without skill fields keeps the
+    /// skill defaults set through `defaults.skills`.
+    #[tokio::test]
+    async fn update_user_name_only_keeps_skill_defaults() {
+        let fx = fixture().await;
+        fx.service
+            .create(CreateAssistantRequest {
+                id: Some("u1".into()),
+                name: "Planner".into(),
+                defaults: Some(AssistantDefaultsRequest {
+                    skills: Some(AssistantDefaultListRequest {
+                        mode: "auto".into(),
+                        value: vec![],
+                    }),
+                    ..Default::default()
+                }),
+                ..req_default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            fx.service
+                .get_detail("u1", Some("en-US"))
+                .await
+                .unwrap()
+                .defaults
+                .skills
+                .mode,
+            "auto"
+        );
+
+        fx.service
+            .update(
+                "u1",
+                UpdateAssistantRequest {
+                    name: Some("Renamed".into()),
+                    ..Default::default()
+                },
+            )
+            .await
+            .unwrap();
+
+        let detail = fx.service.get_detail("u1", Some("en-US")).await.unwrap();
+        assert_eq!(detail.profile.name, "Renamed");
+        assert_eq!(detail.defaults.skills.mode, "auto");
     }
 
     #[tokio::test]

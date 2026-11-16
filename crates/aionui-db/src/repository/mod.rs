@@ -8,6 +8,7 @@ pub mod conversation;
 pub mod cron;
 pub mod diagnostics;
 mod diagnostics_sanitizer;
+pub mod kit;
 pub mod mcp_market;
 pub mod mcp_server;
 pub mod oauth_token;
@@ -28,8 +29,9 @@ mod sqlite_client_preference;
 mod sqlite_conversation;
 mod sqlite_cron;
 mod sqlite_diagnostics;
+pub(crate) mod sqlite_kit;
 mod sqlite_mcp_market;
-mod sqlite_mcp_server;
+pub(crate) mod sqlite_mcp_server;
 mod sqlite_oauth_token;
 mod sqlite_project;
 mod sqlite_provider;
@@ -55,9 +57,9 @@ pub use assistant::{
     IAssistantPreferenceRepository, IAssistantRepository,
 };
 pub use board::{
-    BOARD_POSITION_GAP, BoardCallerRow, BoardCardCursor, BoardCardFilter, BoardConversationInfo, BoardEventQuery,
-    BoardEventScope, BoardEventSeq, BoardPlacement, BoardPlacementOutcome, BoardProjectRow, IBoardStore, IBoardTx,
-    NewBoardEvent,
+    BOARD_POSITION_GAP, BoardCallerRow, BoardCardCreator, BoardCardCursor, BoardCardFilter, BoardConversationInfo,
+    BoardEventQuery, BoardEventScope, BoardEventSeq, BoardPlacement, BoardPlacementOutcome, BoardProjectRow,
+    IBoardStore, IBoardTx, NewBoardEvent,
 };
 pub use channel::IChannelRepository;
 pub use client_preference::IClientPreferenceRepository;
@@ -67,6 +69,7 @@ pub use diagnostics::{
     FeedbackDiagnosticsDbContext, FeedbackDiagnosticsProfile, FeedbackDiagnosticsProfileResult,
     FeedbackDiagnosticsRequest, FeedbackDiagnosticsResult, IFeedbackDiagnosticsRepository,
 };
+pub use kit::IKitRepository;
 pub use mcp_market::IMcpMarketRepository;
 pub use mcp_server::IMcpServerRepository;
 pub use oauth_token::IOAuthTokenRepository;
@@ -88,6 +91,7 @@ pub use sqlite_client_preference::SqliteClientPreferenceRepository;
 pub use sqlite_conversation::SqliteConversationRepository;
 pub use sqlite_cron::SqliteCronRepository;
 pub use sqlite_diagnostics::SqliteFeedbackDiagnosticsRepository;
+pub use sqlite_kit::SqliteKitRepository;
 pub use sqlite_mcp_market::SqliteMcpMarketRepository;
 pub use sqlite_mcp_server::SqliteMcpServerRepository;
 pub use sqlite_oauth_token::SqliteOAuthTokenRepository;
