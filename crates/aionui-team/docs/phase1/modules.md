@@ -339,7 +339,7 @@ Wave 5（3 人关键路径 + 可并行点）
 
 | 项 | 内容 |
 |---|---|
-| 目标文件 | `crates/aionui-app/src/state_builders.rs`（修改 `build_team_state` 签名）+ `lib.rs`（传 `backend_binary_path`）+ `crates/aionui-app/tests/team_phase1_smoke.rs`（新增） |
+| 目标文件 | `crates/aionui-app/src/state_builders.rs`（修改 `build_team_state` 签名）+ `lib.rs`（传 `backend_binary_path`）+ `crates/aionui-app/tests/it/team_phase1_smoke.rs`（新增） |
 | 职责 | 1) `build_team_state` 按 [interface-contracts.md §10](./interface-contracts.md#10-aionui-appstate_buildersbuild_team_state-扩展wave-2--模块-d11) 加参数<br>2) `lib.rs::build_router` 一次性 `current_exe()` 缓存到 `Arc<PathBuf>`<br>3) e2e smoke：按 [README.md §3](./README.md) 的 8 步脚本实跑，校验 agent 能调 `team_send_message` |
 | 输入 | D7 / D9 / D10 |
 | 输出 | 装配完整 + 可通过的 smoke test |

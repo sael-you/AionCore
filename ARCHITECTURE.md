@@ -526,8 +526,8 @@ Enabled via the `--local` startup flag, designed for Electron embedded scenarios
 | Layer | Location | Database Strategy | Purpose |
 |-------|----------|-------------------|---------|
 | Unit tests | `#[cfg(test)]` inline in each `.rs` file | None or Mock | Function-level logic verification |
-| Integration tests | `crates/<crate>/tests/` | In-memory SQLite | Service and Repository behavior verification |
-| E2E tests | `crates/aionui-app/tests/` | In-memory SQLite | Full HTTP request chain verification |
+| Integration tests | `crates/<crate>/tests/it/` (one binary per crate) | In-memory SQLite | Service and Repository behavior verification |
+| E2E tests | `crates/aionui-app/tests/it/` | In-memory SQLite | Full HTTP request chain verification |
 
 ### In-Memory Database
 
@@ -636,7 +636,9 @@ crates/aionui-my-feature/
 │   ├── service.rs    # Business logic
 │   └── state.rs      # #[derive(Clone)] pub struct MyFeatureRouterState { ... }
 └── tests/
-    └── my_feature_test.rs
+    └── it/
+        ├── main.rs          # mod my_feature_test;
+        └── my_feature_test.rs
 ```
 
 **Step 3: If database access is needed, add to aionui-db**
