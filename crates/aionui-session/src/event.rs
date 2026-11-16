@@ -1543,14 +1543,15 @@ mod additive_tests {
             ),
         ];
 
-        // Tripwire: every SessionEvent variant must appear. 34 variants today
-        // (7 orchestration-lowered + 27 backend-produced, incl. Notice +
+        // Tripwire: every SessionEvent variant must appear. 36 variants today
+        // (7 orchestration-lowered + 29 backend-produced, incl. Notice +
         // ToolOutputDelta + TurnDiffUpdated + SessionInfo + SessionTitle +
-        // MessageLifecycle); AdapterSpecific appears twice for its raw-timing
-        // vs structured split → 35 rows. A new variant trips.
+        // MessageLifecycle + TASK-8's ToolBackgrounded / ToolBackgroundRefused);
+        // AdapterSpecific appears twice for its raw-timing vs structured split →
+        // 37 rows. A new variant trips.
         assert_eq!(
             table.len(),
-            35,
+            37,
             "every SessionEvent variant (+ the AdapterSpecific timing split) must be routed here"
         );
 
