@@ -133,6 +133,14 @@ impl IMcpMarketRepository for RevokeBeforeWrite {
             .has_assignment(user_id, instance_id, project_id, assistant_id, cli)
             .await
     }
+    async fn kit_mcp_decision(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        instance_id: &str,
+    ) -> Result<Option<aionui_db::KitDecision>, DbError> {
+        self.inner.kit_mcp_decision(user_id, conversation_id, instance_id).await
+    }
     async fn conversation_project_id(&self, user_id: &str, conversation_id: &str) -> Result<Option<String>, DbError> {
         self.inner.conversation_project_id(user_id, conversation_id).await
     }

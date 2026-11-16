@@ -487,6 +487,17 @@ impl IMcpMarketRepository for SqliteMcpMarketRepository {
         Ok(found.is_some())
     }
 
+    async fn kit_mcp_decision(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        instance_id: &str,
+    ) -> Result<Option<crate::kit_resolve::KitDecision>, DbError> {
+        let mut kits =
+            crate::repository::sqlite_mcp_server::conversation_kits(&self.pool, user_id, conversation_id).await?;
+        Ok(kits.mcps.remove(instance_id))
+    }
+
     async fn conversation_project_id(&self, user_id: &str, conversation_id: &str) -> Result<Option<String>, DbError> {
         let row: Option<Option<String>> =
             sqlx::query_scalar("SELECT project_id FROM conversations WHERE user_id = ? AND id = ?")

@@ -31,7 +31,7 @@ mod sqlite_cron;
 mod sqlite_diagnostics;
 pub(crate) mod sqlite_kit;
 mod sqlite_mcp_market;
-mod sqlite_mcp_server;
+pub(crate) mod sqlite_mcp_server;
 mod sqlite_oauth_token;
 mod sqlite_project;
 mod sqlite_provider;

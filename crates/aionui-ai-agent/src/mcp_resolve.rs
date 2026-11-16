@@ -51,9 +51,7 @@ pub async fn resolve_session_mcp_servers(
 
     let mut servers = Vec::with_capacity(rows.len());
     for GatedMcpRow { row, market: delivery } in rows {
-        let selected = selected_ids
-            .map(|ids| ids.iter().any(|id| id == &row.id))
-            .unwrap_or(row.enabled);
+        let selected = is_selected(selected_ids, &row, delivery.as_ref());
         // `aionui-team` is a reserved wire-level name: the team coordination MCP
         // must win, so a user row that collides with it is skipped (never
         // injected), regardless of selection state.
@@ -91,6 +89,15 @@ pub async fn resolve_session_mcp_servers(
         );
     }
     servers
+}
+
+/// Whether a gated row belongs to the session: in the frozen selection (or
+/// enabled when there is none), or granted by the conversation's kits (C27).
+pub fn is_selected(selected_ids: Option<&[String]>, row: &McpServerRow, delivery: Option<&MarketDelivery>) -> bool {
+    delivery.is_some_and(|d| d.conversation_id.is_some())
+        || selected_ids
+            .map(|ids| ids.iter().any(|id| id == &row.id))
+            .unwrap_or(row.enabled)
 }
 
 /// What the market gate and the launcher rewrite need for one session
@@ -133,10 +140,23 @@ pub async fn load_gated_rows(
     conversation_id: &str,
     market: Option<&McpMarketLaunch>,
 ) -> Result<Vec<GatedMcpRow>, DbError> {
-    let rows = match selected_ids {
+    let mut rows = match selected_ids {
         Some(ids) => repo.list_by_ids_any(user_id, ids).await?,
         None => repo.list(user_id).await?,
     };
+    // C27: market instances the conversation's kits grant join the candidates
+    // (only when the market launcher is available; the gate decides again).
+    if market.is_some() {
+        let missing: Vec<String> = repo
+            .kit_mcp_ids(user_id, conversation_id)
+            .await?
+            .into_iter()
+            .filter(|id| !rows.iter().any(|r| &r.id == id))
+            .collect();
+        if !missing.is_empty() {
+            rows.extend(repo.list_by_ids_any(user_id, &missing).await?);
+        }
+    }
     let scope = McpMarketScope {
         conversation_id: Some(conversation_id),
         assistant_id: market.and_then(|m| m.assistant_id.as_deref()),
@@ -151,18 +171,24 @@ fn json_list(value: Option<&str>) -> Option<Vec<String>> {
 
 /// The launcher entry for a gated market row (R9): never the row's own
 /// transport, always `aioncore mcp exec <id> --project <pid> --assistant <aid>
-/// --cli <cli> --data-dir <dir>` with no env; the launcher decides again from
+/// --cli <cli> --data-dir <dir>` (or `--conversation <cid>` instead of
+/// project/assistant for a kit grant, C27) with no env; the launcher decides again from
 /// the DB. Tool filters ride along for backends that apply them natively.
 pub fn market_session_server(
     row: &McpServerRow,
     delivery: &MarketDelivery,
     launch: &McpMarketLaunch,
 ) -> Option<SessionMcpServer> {
-    let project = delivery.project_id.as_deref()?;
-    let assistant = delivery.assistant_id.as_deref()?;
     let mut args = vec!["mcp".to_owned(), "exec".to_owned(), row.name.clone()];
-    args.extend(["--project".to_owned(), project.to_owned()]);
-    args.extend(["--assistant".to_owned(), assistant.to_owned()]);
+    if let Some(conversation) = delivery.conversation_id.as_deref() {
+        // C27 kit grant: the launcher recomputes the conversation's effective set.
+        args.extend(["--conversation".to_owned(), conversation.to_owned()]);
+    } else {
+        let project = delivery.project_id.as_deref()?;
+        let assistant = delivery.assistant_id.as_deref()?;
+        args.extend(["--project".to_owned(), project.to_owned()]);
+        args.extend(["--assistant".to_owned(), assistant.to_owned()]);
+    }
     args.extend(["--cli".to_owned(), launch.cli.clone()]);
     args.extend(["--data-dir".to_owned(), launch.data_dir.clone()]);
     let enabled_tools = if delivery.tier == "write" {

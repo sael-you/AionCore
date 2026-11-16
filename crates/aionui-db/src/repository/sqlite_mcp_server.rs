@@ -5,10 +5,12 @@ use sqlx::QueryBuilder;
 use sqlx::SqlitePool;
 
 use crate::error::DbError;
+use crate::kit_resolve::{self, GLOBAL_MCP_IDS, KitDecision, KitResolution};
 use crate::models::McpServerRow;
 use crate::repository::mcp_server::{
     CreateMcpServerParams, GatedMcpRow, IMcpServerRepository, MarketDelivery, McpMarketScope, UpdateMcpServerParams,
 };
+use crate::repository::sqlite_kit;
 
 /// SQLite-backed implementation of [`IMcpServerRepository`].
 #[derive(Clone, Debug)]
@@ -308,8 +310,8 @@ impl IMcpServerRepository for SqliteMcpServerRepository {
             return Ok(Vec::new());
         }
         let mut query = QueryBuilder::new(
-            "SELECT id, market_status, market_tier, market_tools_allow, market_tools_block FROM mcp_servers \
-             WHERE market_status IS NOT NULL AND user_id = ",
+            "SELECT id, market_status, market_tier, market_tools_allow, market_tools_block, market_clis \
+             FROM mcp_servers WHERE market_status IS NOT NULL AND user_id = ",
         );
         query.push_bind(user_id);
         query.push(" AND id IN (");
@@ -329,8 +331,9 @@ impl IMcpServerRepository for SqliteMcpServerRepository {
             return Ok(rows.into_iter().map(|row| GatedMcpRow { row, market: None }).collect());
         }
 
-        // Conversation scope: the project the conversation is bound to.
-        let project_id = match scope.conversation_id {
+        // Conversation scope: the project the conversation is bound to, and
+        // its kits' effective set (C27).
+        let (project_id, kits) = match scope.conversation_id {
             Some(conversation_id) => {
                 let project: Option<Option<String>> =
                     sqlx::query_scalar("SELECT project_id FROM conversations WHERE user_id = ? AND id = ?")
@@ -338,9 +341,10 @@ impl IMcpServerRepository for SqliteMcpServerRepository {
                         .bind(conversation_id)
                         .fetch_optional(&self.pool)
                         .await?;
-                project.flatten().filter(|p| !p.is_empty())
+                let kits = conversation_kits(&self.pool, user_id, conversation_id).await?;
+                (project.flatten().filter(|p| !p.is_empty()), kits)
             }
-            None => None,
+            None => (None, KitResolution::default()),
         };
 
         let mut out = Vec::with_capacity(rows.len());
@@ -352,49 +356,95 @@ impl IMcpServerRepository for SqliteMcpServerRepository {
             if m.market_status.as_deref() != Some("active") || row.deleted_at.is_some() {
                 continue;
             }
-            let delivery = if scope.conversation_id.is_some() {
-                let (Some(project), Some(assistant), Some(cli)) =
-                    (project_id.as_deref(), scope.assistant_id, scope.cli)
-                else {
-                    continue;
+            let tier = m.market_tier.clone().unwrap_or_default();
+            let delivery =
+                |project_id: Option<&str>, assistant_id: Option<&str>, conversation_id: Option<&str>| MarketDelivery {
+                    project_id: project_id.map(str::to_owned),
+                    assistant_id: assistant_id.map(str::to_owned),
+                    conversation_id: conversation_id.map(str::to_owned),
+                    tier: tier.clone(),
+                    tools_allow: m.market_tools_allow.clone(),
+                    tools_block: m.market_tools_block.clone(),
                 };
-                let assigned: Option<i64> = sqlx::query_scalar(
-                    "SELECT 1 FROM mcp_assignments WHERE user_id = ? AND mcp_server_id = ? AND project_id = ? \
-                     AND assistant_id = ? AND cli = ? LIMIT 1",
-                )
-                .bind(user_id)
-                .bind(&row.id)
-                .bind(project)
-                .bind(assistant)
-                .bind(cli)
-                .fetch_optional(&self.pool)
-                .await?;
-                if assigned.is_none() {
+            let Some(conversation_id) = scope.conversation_id else {
+                out.push(GatedMcpRow {
+                    market: Some(delivery(None, None, None)),
+                    row,
+                });
+                continue;
+            };
+            if kits.mcp_removed(&row.id) {
+                continue;
+            }
+            if let Some(decision) = kits.mcps.get(&row.id).filter(|d| d.included) {
+                let cli_ok = scope.cli.is_some_and(|cli| {
+                    m.market_clis
+                        .as_deref()
+                        .and_then(|c| serde_json::from_str::<Vec<String>>(c).ok())
+                        .is_some_and(|clis| clis.iter().any(|c| c == cli))
+                });
+                if cli_ok && kit_grant_allowed(decision, &row.name, &tier) {
+                    out.push(GatedMcpRow {
+                        market: Some(delivery(None, None, Some(conversation_id))),
+                        row,
+                    });
                     continue;
                 }
-                MarketDelivery {
-                    project_id: Some(project.to_owned()),
-                    assistant_id: Some(assistant.to_owned()),
-                    tier: m.market_tier.clone().unwrap_or_default(),
-                    tools_allow: m.market_tools_allow.clone(),
-                    tools_block: m.market_tools_block.clone(),
-                }
-            } else {
-                MarketDelivery {
-                    project_id: None,
-                    assistant_id: None,
-                    tier: m.market_tier.clone().unwrap_or_default(),
-                    tools_allow: m.market_tools_allow.clone(),
-                    tools_block: m.market_tools_block.clone(),
-                }
+            }
+            let (Some(project), Some(assistant), Some(cli)) = (project_id.as_deref(), scope.assistant_id, scope.cli)
+            else {
+                continue;
             };
+            let assigned: Option<i64> = sqlx::query_scalar(
+                "SELECT 1 FROM mcp_assignments WHERE user_id = ? AND mcp_server_id = ? AND project_id = ? \
+                 AND assistant_id = ? AND cli = ? LIMIT 1",
+            )
+            .bind(user_id)
+            .bind(&row.id)
+            .bind(project)
+            .bind(assistant)
+            .bind(cli)
+            .fetch_optional(&self.pool)
+            .await?;
+            if assigned.is_none() {
+                continue;
+            }
             out.push(GatedMcpRow {
+                market: Some(delivery(Some(project), Some(assistant), None)),
                 row,
-                market: Some(delivery),
             });
         }
         Ok(out)
     }
+
+    async fn kit_mcp_ids(&self, user_id: &str, conversation_id: &str) -> Result<Vec<String>, DbError> {
+        let kits = conversation_kits(&self.pool, user_id, conversation_id).await?;
+        Ok(kits
+            .mcps
+            .into_iter()
+            .filter(|(_, d)| d.included)
+            .map(|(id, _)| id)
+            .collect())
+    }
+}
+
+/// The kit resolution of a conversation (empty when it does not exist).
+pub(crate) async fn conversation_kits(
+    pool: &SqlitePool,
+    user_id: &str,
+    conversation_id: &str,
+) -> Result<KitResolution, DbError> {
+    let Some(scope) = sqlite_kit::conversation_scope(pool, user_id, conversation_id).await? else {
+        return Ok(KitResolution::default());
+    };
+    let layers = sqlite_kit::load_layers(pool, user_id, &scope).await?;
+    Ok(kit_resolve::resolve(&scope, &layers))
+}
+
+/// R2/R3 backstop for a kit grant: one decided at the global level only for
+/// the global ids, never a write instance.
+pub(crate) fn kit_grant_allowed(decision: &KitDecision, instance_name: &str, tier: &str) -> bool {
+    decision.level != "global" || (GLOBAL_MCP_IDS.contains(&instance_name) && tier != "write")
 }
 
 #[derive(sqlx::FromRow)]
@@ -404,6 +454,7 @@ struct MarketColumns {
     market_tier: Option<String>,
     market_tools_allow: Option<String>,
     market_tools_block: Option<String>,
+    market_clis: Option<String>,
 }
 
 /// Merge partial update params into an existing row, returning a new instance.

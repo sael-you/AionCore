@@ -57,7 +57,28 @@ pub trait IKitRepository: Send + Sync {
     /// A conversation's scope: its project (`conversations.project_id`) and
     /// assistant (`extra.preset_assistant_id`). `None` when not found.
     async fn conversation_scope(&self, user_id: &str, conversation_id: &str) -> Result<Option<KitScope>, DbError>;
+
+    /// A conversation's frozen skill snapshot (`extra.skills`) and the
+    /// pre-kit base (`extra.kit_base_skills`, absent until kits changed it).
+    /// `None` when the conversation does not exist.
+    async fn conversation_skills(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<Option<ConversationSkills>, DbError>;
 }
+
+/// See [`IKitRepository::conversation_skills`].
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ConversationSkills {
+    pub skills: Vec<String>,
+    pub kit_base_skills: Option<Vec<String>>,
+}
+
+/// `DbError::Conflict` message of a kit name already taken by a live kit.
+pub const KIT_NAME_TAKEN_MSG: &str = "a kit with this name already exists";
+/// `DbError::Conflict` message of an `expected_updated_at` mismatch.
+pub const KIT_STALE_MSG: &str = "kit changed since it was read";
 
 /// Members of a kit by kind.
 #[derive(Debug, Clone, Copy, Default)]

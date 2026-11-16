@@ -5,7 +5,10 @@ use sqlx::{QueryBuilder, Sqlite, SqlitePool, Transaction};
 use crate::error::DbError;
 use crate::kit_resolve::{KIT_LEVELS, KitLayers, KitScope};
 use crate::models::{KitAttachmentRow, KitItemRow, KitRow};
-use crate::repository::kit::{AttachParams, CreateKitParams, IKitRepository, SeedKit, UpdateKitParams};
+use crate::repository::kit::{
+    AttachParams, ConversationSkills, CreateKitParams, IKitRepository, KIT_NAME_TAKEN_MSG, KIT_STALE_MSG, SeedKit,
+    UpdateKitParams,
+};
 
 /// SQLite implementation of [`IKitRepository`].
 #[derive(Clone, Debug)]
@@ -224,7 +227,7 @@ impl IKitRepository for SqliteKitRepository {
         .bind(now)
         .execute(&mut *tx)
         .await
-        .map_err(|e| map_conflict(e, "a kit with this name already exists"))?;
+        .map_err(|e| map_conflict(e, KIT_NAME_TAKEN_MSG))?;
         let m = p.members;
         for (kind, refs) in [
             ("skill", m.skills),
@@ -257,12 +260,12 @@ impl IKitRepository for SqliteKitRepository {
         .bind(p.expected_updated_at)
         .execute(&mut *tx)
         .await
-        .map_err(|e| map_conflict(e, "a kit with this name already exists"))?
+        .map_err(|e| map_conflict(e, KIT_NAME_TAKEN_MSG))?
         .rows_affected();
         if affected == 0 {
             drop(tx);
             return match self.find_kit(user_id, id).await? {
-                Some(_) => Err(DbError::Conflict("kit changed since it was read".into())),
+                Some(_) => Err(DbError::Conflict(KIT_STALE_MSG.into())),
                 None => Err(DbError::NotFound(format!("kit {id}"))),
             };
         }
@@ -420,5 +423,26 @@ impl IKitRepository for SqliteKitRepository {
 
     async fn conversation_scope(&self, user_id: &str, conversation_id: &str) -> Result<Option<KitScope>, DbError> {
         conversation_scope(&self.pool, user_id, conversation_id).await
+    }
+
+    async fn conversation_skills(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+    ) -> Result<Option<ConversationSkills>, DbError> {
+        let row: Option<(Option<String>, Option<String>)> = sqlx::query_as(
+            "SELECT CASE WHEN json_valid(extra) THEN json_extract(extra, '$.skills') END, \
+             CASE WHEN json_valid(extra) THEN json_extract(extra, '$.kit_base_skills') END \
+             FROM conversations WHERE user_id = ? AND id = ?",
+        )
+        .bind(user_id)
+        .bind(conversation_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        let list = |v: Option<String>| v.and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok());
+        Ok(row.map(|(skills, base)| ConversationSkills {
+            skills: list(skills).unwrap_or_default(),
+            kit_base_skills: list(base),
+        }))
     }
 }
