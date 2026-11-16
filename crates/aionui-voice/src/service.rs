@@ -643,6 +643,33 @@ impl VoiceService {
     /// A client frame about drafts / clips. With a live call it goes to the
     /// call's runner (evidence, hold); taps on a card without a live call act
     /// on the draft directly (a confirmed hold is then sent by the worker).
+    /// `voice.attachQuotes` (TASK-118): only for this user's own live call in
+    /// conversation mode. `Err(reason)` is acked to the client at once.
+    pub(crate) async fn attach_quotes(
+        &self,
+        user_id: &str,
+        session_id: Option<&str>,
+        text: String,
+    ) -> Result<(), &'static str> {
+        use crate::conversation_mode::{MAX_QUOTES_BYTES, QUOTES_NO_CALL, QUOTES_TOO_LARGE, QUOTES_UNSUPPORTED_MODE};
+        if text.len() > MAX_QUOTES_BYTES {
+            return Err(QUOTES_TOO_LARGE);
+        }
+        let Some(call) = session_id
+            .and_then(|id| self.inner.live.get(id).map(|c| c.clone()))
+            .filter(|c| c.user_id == user_id)
+        else {
+            return Err(QUOTES_NO_CALL);
+        };
+        if !call.mode.is_conversation() {
+            return Err(QUOTES_UNSUPPORTED_MODE);
+        }
+        call.cmd_tx
+            .send(CallCommand::Client(ClientEvent::AttachQuotes { text }))
+            .await
+            .map_err(|_| QUOTES_NO_CALL)
+    }
+
     pub(crate) async fn client_event(&self, user_id: &str, session_id: Option<&str>, event: ClientEvent) {
         let call = session_id
             .and_then(|id| self.inner.live.get(id).map(|c| c.clone()))

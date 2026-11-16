@@ -362,6 +362,15 @@ fn split_long(sentence: &str, max: usize) -> Vec<String> {
     pieces
 }
 
+/// `voice.quotesAttached` reasons (TASK-118).
+pub(crate) const QUOTES_POSTED: &str = "posted";
+pub(crate) const QUOTES_CLEARED: &str = "cleared";
+pub(crate) const QUOTES_NO_CALL: &str = "no_call";
+pub(crate) const QUOTES_TOO_LARGE: &str = "too_large";
+pub(crate) const QUOTES_UNSUPPORTED_MODE: &str = "unsupported_mode";
+/// Largest `voice.attachQuotes` text (bytes, UTF-8).
+pub(crate) const MAX_QUOTES_BYTES: usize = 8192;
+
 impl CallRunner {
     /// A final user transcript in conversation mode (an `ask` answer was
     /// already taken). Returns an end reason for "stop voice".
@@ -403,6 +412,7 @@ impl CallRunner {
                         "voice held utterance dropped by stop");
                 }
                 self.flush_next_final = false;
+                self.clear_quotes("stop the task");
                 let dropped = drafts.cancel_voice_queue(&user_id, &conversation_id).await;
                 let (status, line) = match drafts.conversations.cancel_turn(&user_id, &conversation_id).await {
                     Ok(cancelled) if cancelled || dropped > 0 => (STATUS_STOPPED, "Stopped."),
@@ -478,14 +488,67 @@ impl CallRunner {
         self.post_voice_message(&held.conversation_id, held.text()).await;
     }
 
-    /// Post the user's words into the bound conversation (and audit it).
+    /// Quotes for this call's next posted message (TASK-118): the latest frame
+    /// replaces the earlier ones, "" clears them. Bound to the call's own
+    /// conversation, so they never reach another one.
+    pub(crate) fn attach_quotes(&mut self, text: String) {
+        if text.is_empty() {
+            // Always acked, even with nothing pending: the client waits for it.
+            if self.pending_quotes.take().is_some() {
+                tracing::info!(session_id = %self.call.session_id, "voice quotes cleared by the client");
+            }
+            self.send_quotes_ack(false, QUOTES_CLEARED);
+            return;
+        }
+        let Some(conversation_id) = self.call.focus.clone() else {
+            self.send_quotes_ack(false, QUOTES_NO_CALL);
+            return;
+        };
+        tracing::info!(session_id = %self.call.session_id, bytes = text.len(), "voice quotes attached");
+        self.pending_quotes = Some((conversation_id, text));
+    }
+
+    /// Drop pending quotes (stop the task, call end, client clear) and say so.
+    pub(crate) fn clear_quotes(&mut self, why: &str) {
+        if self.pending_quotes.take().is_some() {
+            tracing::info!(session_id = %self.call.session_id, why, "voice quotes cleared");
+            self.send_quotes_ack(false, QUOTES_CLEARED);
+        }
+    }
+
+    fn send_quotes_ack(&self, consumed: bool, reason: &str) {
+        self.inner.sockets.send_user(
+            &self.call.user_id,
+            &crate::frames::quotes_attached_frame(&self.call.session_id, consumed, reason),
+        );
+    }
+
+    /// Post the user's words into the bound conversation (and audit it),
+    /// preceded by the attached quotes of the same conversation (TASK-118).
     async fn post_voice_message(&mut self, conversation_id: &str, message: &str) {
+        let quotes = match &self.pending_quotes {
+            Some((bound, text)) if bound == conversation_id => Some(text.clone()),
+            _ => None,
+        };
+        let message = match &quotes {
+            Some(quotes) => format!("{quotes}\n\n{message}"),
+            None => message.to_owned(),
+        };
         let (user_id, session_id) = (&self.call.user_id, &self.call.session_id);
         let delivered = self
             .inner
             .drafts
-            .send_voice_message(user_id, session_id, conversation_id, message, self.call.car)
+            .send_voice_message(user_id, session_id, conversation_id, &message, self.call.car)
             .await;
+        if quotes.is_some()
+            && !matches!(
+                delivered,
+                crate::drafts::Delivered::Failed | crate::drafts::Delivered::Lost
+            )
+        {
+            self.pending_quotes = None;
+            self.send_quotes_ack(true, QUOTES_POSTED);
+        }
         if !matches!(
             delivered,
             crate::drafts::Delivered::Failed | crate::drafts::Delivered::Lost

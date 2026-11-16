@@ -45,6 +45,11 @@ pub(crate) enum ClientEvent {
     AskPending,
     /// Conversation mode "Done": commit the utterance now.
     Commit,
+    /// Quotes for the next posted message (TASK-118; "" clears). Size and
+    /// mode were checked by the service.
+    AttachQuotes {
+        text: String,
+    },
 }
 
 #[derive(Default)]
@@ -438,6 +443,7 @@ impl CallRunner {
                 }
             }
             ClientEvent::AskPending => self.set_manual(true).await,
+            ClientEvent::AttachQuotes { text } => self.attach_quotes(text),
             ClientEvent::Commit => {
                 if !self.call.mode.is_conversation() {
                     return;

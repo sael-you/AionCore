@@ -3,7 +3,10 @@
 
 use std::sync::Arc;
 
-use aionui_api_types::{VoiceCallEnded, VoiceErrorFrame, VoiceServerFrame, VoiceStateFrame, WebSocketMessage};
+use aionui_api_types::{
+    VoiceCallEnded, VoiceErrorFrame, VoiceQuotesAttached, VoiceServerCapabilities, VoiceServerFrame, VoiceStateFrame,
+    WebSocketMessage,
+};
 use aionui_realtime::{ConnectionId, WebSocketManager};
 use dashmap::DashMap;
 use serde_json::Value;
@@ -41,6 +44,30 @@ pub(crate) fn state_frame(session_id: Option<&str>, state: &str, reason: Option<
         voice_session_id: session_id.map(str::to_owned),
         state: state.to_owned(),
         reason: reason.map(str::to_owned),
+        capabilities: None,
+    })
+}
+
+/// What this backend supports on the socket, advertised on the hello reply
+/// and every `voice.ready` (TASK-118: `voice.attachQuotes`).
+pub(crate) const SERVER_CAPABILITIES: VoiceServerCapabilities = VoiceServerCapabilities { attach_quotes: true };
+
+/// The hello reply without a ready call: `voice.state` armed + capabilities.
+pub(crate) fn hello_armed_frame(session_id: Option<&str>, reason: Option<&str>) -> VoiceServerFrame {
+    VoiceServerFrame::State(VoiceStateFrame {
+        voice_session_id: session_id.map(str::to_owned),
+        state: "armed".to_owned(),
+        reason: reason.map(str::to_owned),
+        capabilities: Some(SERVER_CAPABILITIES),
+    })
+}
+
+/// `voice.quotesAttached` (TASK-118).
+pub(crate) fn quotes_attached_frame(session_id: &str, consumed: bool, reason: &str) -> VoiceServerFrame {
+    VoiceServerFrame::QuotesAttached(VoiceQuotesAttached {
+        voice_session_id: session_id.to_owned(),
+        consumed,
+        reason: reason.to_owned(),
     })
 }
 

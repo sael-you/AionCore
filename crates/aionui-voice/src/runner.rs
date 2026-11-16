@@ -71,6 +71,8 @@ pub(crate) struct CallRunner {
     pub(crate) pending_utterance: Option<PendingUtterance>,
     /// "Done" was pressed: the next final is posted at once.
     pub(crate) flush_next_final: bool,
+    /// Quotes for the next posted message: (bound conversation, text) (TASK-118).
+    pub(crate) pending_quotes: Option<(String, String)>,
 }
 
 impl CallRunner {
@@ -103,6 +105,7 @@ impl CallRunner {
             mouth: None,
             pending_utterance: None,
             flush_next_final: false,
+            pending_quotes: None,
             turn: TurnState::default(),
             carry,
         }
@@ -224,6 +227,7 @@ impl CallRunner {
             voice_session_id: self.call.session_id.clone(),
             engine: self.call.engine.clone(),
             model: self.call.model.clone(),
+            capabilities: Some(crate::frames::SERVER_CAPABILITIES),
         }));
         self.send(state_frame(Some(self.session_id()), "listening", None));
     }
@@ -541,6 +545,8 @@ impl CallRunner {
         if !matches!(reason, EndReason::Disabled | EndReason::AuthRevoked) {
             self.flush_utterance().await;
         }
+        // Quotes nothing carried out: the client keeps them for the next call.
+        self.clear_quotes("call ended");
         if let Some(mouth) = self.mouth.take() {
             mouth.hush();
         }
