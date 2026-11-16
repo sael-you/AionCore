@@ -153,52 +153,138 @@ pub async fn ensure_browser_user() -> Result<(u32, u32), BrowserError> {
         .ok_or_else(|| BrowserError::Internal(format!("{BROWSER_USER} missing after useradd")))
 }
 
-fn create_dir_mode(path: &Path, mode: u32) -> std::io::Result<()> {
-    std::fs::create_dir_all(path)?;
-    set_mode(path, mode)
-}
+// ---------------------------------------------------------------------------
+// Directories of the browser account (train-8 final review: symlinks).
+//
+// Root touches ONLY the browser root (root-owned 0711) and its direct
+// children (`home/`, `<user>/`): their parent is root's, so the account can
+// neither replace nor redirect them, and each is still lstat-checked (never
+// followed). Everything BELOW an account-owned directory (the profile,
+// `.home`, Local State, Singleton locks, Clear) is done by a helper running
+// AS the account: a symlink it plants can only lead it to files it could
+// reach anyway, never to root's.
+// ---------------------------------------------------------------------------
 
-/// `chown -R` (no symlink following) when the top entry is not owned yet.
-fn chown_tree(path: &Path, uid: u32, gid: u32) -> std::io::Result<()> {
-    let meta = std::fs::symlink_metadata(path)?;
-    std::os::unix::fs::lchown(path, Some(uid), Some(gid))?;
-    if meta.is_dir() {
-        for entry in std::fs::read_dir(path)? {
-            chown_tree(&entry?.path(), uid, gid)?;
-        }
+/// Run `sh -c <script> sh <args…>` as the browser account; `input` goes to
+/// stdin. Returns stdout on success.
+pub(crate) async fn as_account(
+    uid: u32,
+    gid: u32,
+    script: &str,
+    args: &[&str],
+    input: Option<&[u8]>,
+) -> std::io::Result<Vec<u8>> {
+    use tokio::io::AsyncWriteExt;
+    let mut cmd = aionui_runtime::Builder::clean_cli("sh");
+    cmd.uid(uid)
+        .gid(gid)
+        .env_clear()
+        .env("PATH", "/usr/bin:/bin")
+        .arg("-c")
+        .arg(script)
+        .arg("sh")
+        .args(args)
+        .stdin(if input.is_some() {
+            std::process::Stdio::piped()
+        } else {
+            std::process::Stdio::null()
+        });
+    let mut child = cmd.spawn()?;
+    if let (Some(bytes), Some(mut stdin)) = (input, child.stdin.take()) {
+        stdin.write_all(bytes).await?;
+        drop(stdin);
     }
-    Ok(())
+    let out = child.wait_with_output().await?;
+    if out.status.success() {
+        Ok(out.stdout)
+    } else {
+        Err(std::io::Error::other(format!(
+            "account helper failed: {}",
+            String::from_utf8_lossy(&out.stderr).trim()
+        )))
+    }
 }
 
-fn ensure_owned_private_dir(path: &Path, uid: u32, gid: u32) -> std::io::Result<()> {
-    create_dir_mode(path, 0o700)?;
-    let meta = std::fs::metadata(path)?;
+/// A direct child of a ROOT-owned directory, made a real directory (never a
+/// symlink), owned by the account, mode 0700. The child entry cannot be
+/// swapped by the account (its parent is root's).
+fn ensure_account_child_dir(path: &Path, uid: u32, gid: u32) -> std::io::Result<()> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
+            return Err(std::io::Error::other(format!("{} is not a directory", path.display())));
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let mut b = std::fs::DirBuilder::new();
+            {
+                use std::os::unix::fs::DirBuilderExt;
+                b.mode(0o700);
+            }
+            b.create(path)?;
+        }
+        Err(e) => return Err(e),
+    }
+    let meta = std::fs::symlink_metadata(path)?;
     if meta.uid() != uid || meta.gid() != gid {
         // A rebuilt container can give the account a new uid: re-own the tree.
-        chown_tree(path, uid, gid)?;
+        chown_tree_postorder(path, uid, gid)?;
     }
+    // Real directory, parent root-owned: chmod cannot be redirected.
     set_mode(path, 0o700)
 }
 
-/// Step 3: root dir (root, 0711), `home/` and this instance's profile (owned
-/// by the browser account, 0700).
-pub fn prepare_dirs(
+/// `chown -R` without following symlinks, CHILDREN FIRST: a directory only
+/// becomes the account's after everything inside it is done, so the account
+/// can never swap an entry of a directory this walk is still inside.
+fn chown_tree_postorder(path: &Path, uid: u32, gid: u32) -> std::io::Result<()> {
+    let meta = std::fs::symlink_metadata(path)?;
+    if meta.is_dir() {
+        for entry in std::fs::read_dir(path)? {
+            chown_tree_postorder(&entry?.path(), uid, gid)?;
+        }
+    }
+    std::os::unix::fs::lchown(path, Some(uid), Some(gid))
+}
+
+/// Step 3: root dir (root, 0711), `home/` and `<user>/` (account, 0700) by
+/// root; the profile and its `.home` by the account.
+pub async fn prepare_dirs(
     layout: &BrowserLayout,
     user_id: &str,
     instance: u8,
     uid: u32,
     gid: u32,
 ) -> Result<PathBuf, BrowserError> {
-    create_dir_mode(&layout.root, 0o711)?;
-    ensure_owned_private_dir(&layout.home_dir(), uid, gid)?;
-    let user_dir = layout.user_dir(user_id)?;
-    ensure_owned_private_dir(&user_dir, uid, gid)?;
+    match std::fs::symlink_metadata(&layout.root) {
+        Ok(meta) if meta.file_type().is_symlink() || !meta.is_dir() => {
+            return Err(BrowserError::Internal("the browser root is not a directory".into()));
+        }
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => std::fs::create_dir_all(&layout.root)?,
+        Err(e) => return Err(e.into()),
+    }
+    set_mode(&layout.root, 0o711)?;
+    ensure_account_child_dir(&layout.home_dir(), uid, gid)?;
+    ensure_account_child_dir(&layout.user_dir(user_id)?, uid, gid)?;
     let profile = layout.profile_dir(user_id, instance)?;
-    ensure_owned_private_dir(&profile, uid, gid)?;
-    // Per-instance HOME (`.config`, NSS db, crashpad database): instances
-    // share nothing, and every helper's command line names its profile.
-    ensure_owned_private_dir(&instance_home(&profile), uid, gid)?;
+    // Per-instance HOME (`.config`, NSS db, crash database): instances share
+    // nothing, and every helper's command line names its profile.
+    let home = instance_home(&profile);
+    as_account(
+        uid,
+        gid,
+        r#"umask 077 && mkdir -p -- "$1" "$2" && chmod 700 -- "$1" "$2""#,
+        &[&profile.to_string_lossy(), &home.to_string_lossy()],
+        None,
+    )
+    .await?;
     Ok(profile)
+}
+
+/// Delete instance `n`'s profile (Clear) as the account.
+pub async fn wipe_profile(profile: &Path, uid: u32, gid: u32) -> Result<(), BrowserError> {
+    as_account(uid, gid, r#"rm -rf -- "$1""#, &[&profile.to_string_lossy()], None).await?;
+    Ok(())
 }
 
 /// Harden, then verify; `BROWSER_UNAVAILABLE` (and an error log naming the
@@ -384,11 +470,17 @@ pub async fn reap_strays(uid: u32, gid: u32, keep_pids: &[u32], keep_profiles: &
     found.len()
 }
 
-/// Chrome's profile locks (`Singleton{Lock,Socket,Cookie}`, symlinks).
-pub(crate) fn remove_profile_locks(profile: &Path) {
-    for name in ["SingletonLock", "SingletonSocket", "SingletonCookie"] {
-        let _ = std::fs::remove_file(profile.join(name));
-    }
+/// Chrome's profile locks (`Singleton{Lock,Socket,Cookie}`), removed as the
+/// account.
+pub(crate) async fn remove_profile_locks(profile: &Path, uid: u32, gid: u32) {
+    let _ = as_account(
+        uid,
+        gid,
+        r#"rm -f -- "$1/SingletonLock" "$1/SingletonSocket" "$1/SingletonCookie""#,
+        &[&profile.to_string_lossy()],
+        None,
+    )
+    .await;
 }
 
 /// Stop the `chrome_crashpad_handler`s of the Chrome using `profile` (as the
@@ -424,19 +516,41 @@ pub(crate) async fn stop_crash_handlers(uid: u32, gid: u32, profile: &Path) {
     }
 }
 
-/// `user_experience_metrics.reporting_enabled = false` in the profile's
-/// Local State (merged; the file stays the account's).
-pub(crate) fn disable_metrics_reporting(profile: &Path, uid: u32, gid: u32) {
-    let path = profile.join("Local State");
-    let mut state: serde_json::Value = std::fs::read(&path)
+/// `Local State` with `user_experience_metrics.reporting_enabled = false`
+/// merged in (other keys kept; unreadable or non-object → a fresh object).
+pub(crate) fn merged_local_state(existing: &[u8]) -> Vec<u8> {
+    let mut state: serde_json::Value = serde_json::from_slice(existing)
         .ok()
-        .and_then(|b| serde_json::from_slice(&b).ok())
         .filter(serde_json::Value::is_object)
         .unwrap_or_else(|| serde_json::json!({}));
     state["user_experience_metrics"]["reporting_enabled"] = serde_json::json!(false);
-    if std::fs::write(&path, state.to_string()).is_ok() {
-        let _ = std::os::unix::fs::lchown(&path, Some(uid), Some(gid));
-    }
+    state.to_string().into_bytes()
+}
+
+/// Turn metrics reporting off in the profile's Local State. Read AND write
+/// run as the account (temp file + rename in the profile), so a planted
+/// symlink can neither leak a root-only file into the profile nor make root
+/// overwrite one.
+pub(crate) async fn disable_metrics_reporting(profile: &Path, uid: u32, gid: u32) {
+    let dir = profile.to_string_lossy().into_owned();
+    let existing = as_account(
+        uid,
+        gid,
+        r#"cat -- "$1/Local State" 2>/dev/null || true"#,
+        &[&dir],
+        None,
+    )
+    .await
+    .unwrap_or_default();
+    let body = merged_local_state(&existing);
+    let _ = as_account(
+        uid,
+        gid,
+        r#"umask 077 && cat > "$1/.aionui-local-state.tmp" && mv -f -- "$1/.aionui-local-state.tmp" "$1/Local State""#,
+        &[&dir],
+        Some(&body),
+    )
+    .await;
 }
 
 /// The browser account's ids if it exists (never creates it).
@@ -568,15 +682,33 @@ mod tests {
     }
 
     #[test]
-    fn metrics_reporting_is_turned_off_and_other_state_kept() {
-        let t = tempfile::tempdir().unwrap();
-        std::fs::write(t.path().join("Local State"), r#"{"browser":{"x":1}}"#).unwrap();
-        let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
-        disable_metrics_reporting(t.path(), uid, gid);
-        let v: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(t.path().join("Local State")).unwrap()).unwrap();
+    fn metrics_reporting_is_merged_into_local_state() {
+        let v: serde_json::Value = serde_json::from_slice(&merged_local_state(br#"{"browser":{"x":1}}"#)).unwrap();
         assert_eq!(v["user_experience_metrics"]["reporting_enabled"], false);
         assert_eq!(v["browser"]["x"], 1);
+        let fresh: serde_json::Value = serde_json::from_slice(&merged_local_state(b"root:x:0:0")).unwrap();
+        assert_eq!(
+            fresh,
+            serde_json::json!({"user_experience_metrics": {"reporting_enabled": false}})
+        );
+    }
+
+    /// Root never follows an account-planted symlink at a directory it
+    /// prepares: a `<user>` entry that is a symlink to an outside directory is
+    /// refused, and the outside directory keeps its mode.
+    #[tokio::test]
+    async fn prepare_dirs_refuses_a_symlinked_user_dir() {
+        let t = tempfile::tempdir().unwrap();
+        let layout = BrowserLayout::new(t.path().join("aionui-browser"), t.path().join("data"));
+        std::fs::create_dir_all(&layout.root).unwrap();
+        let outside = t.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        set_mode(&outside, 0o755).unwrap();
+        std::os::unix::fs::symlink(&outside, layout.root.join("u1")).unwrap();
+        let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
+        assert!(prepare_dirs(&layout, "u1", 1, uid, gid).await.is_err());
+        assert_eq!(mode(&outside), 0o755, "the symlink target was not touched");
+        assert!(!outside.join("1").exists());
     }
 
     #[tokio::test]
@@ -591,16 +723,23 @@ mod tests {
         assert_eq!(parse_passwd(text, "aionui"), None);
     }
 
-    #[test]
-    fn prepare_dirs_creates_the_private_tree() {
+    #[tokio::test]
+    async fn prepare_dirs_creates_the_private_tree() {
         let t = tempfile::tempdir().unwrap();
         let layout = BrowserLayout::new(t.path().join("aionui-browser"), t.path().join("data"));
         let (uid, gid) = unsafe { (libc::getuid(), libc::getgid()) };
-        let profile = prepare_dirs(&layout, "u1", 2, uid, gid).unwrap();
+        let profile = prepare_dirs(&layout, "u1", 2, uid, gid).await.unwrap();
         assert_eq!(profile, layout.root.join("u1/2"));
         assert_eq!(mode(&layout.root), 0o711);
-        for p in [layout.home_dir(), layout.root.join("u1"), profile] {
+        for p in [
+            layout.home_dir(),
+            layout.root.join("u1"),
+            profile.clone(),
+            instance_home(&profile),
+        ] {
             assert_eq!(mode(&p), 0o700, "{}", p.display());
         }
+        wipe_profile(&profile, uid, gid).await.unwrap();
+        assert!(!profile.exists());
     }
 }

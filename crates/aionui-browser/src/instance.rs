@@ -290,8 +290,9 @@ impl ChromeInstance {
             }
         };
         // A Chrome that died with AionCore leaves its profile lock behind.
-        crate::host::remove_profile_locks(&spec.profile);
-        crate::host::disable_metrics_reporting(&spec.profile, spec.uid, spec.gid);
+        // Both run AS the account (the profile is the account's directory).
+        crate::host::remove_profile_locks(&spec.profile, spec.uid, spec.gid).await;
+        crate::host::disable_metrics_reporting(&spec.profile, spec.uid, spec.gid).await;
         let pipes = match CdpPipes::new() {
             Ok(p) => p,
             Err(_) => {

@@ -535,10 +535,49 @@ async fn live_server_browser_end_to_end() {
         String::from_utf8_lossy(&after.stdout).trim().is_empty(),
         "every orphan stopped (reaped {reaped})"
     );
+    // Symlink attack (train-8 final review): the account plants links in its
+    // own profile; root must never follow them (writes/reads run as the account).
+    let profile1 = t.path().join("aionui-browser").join(user).join("1");
+    let secret = t.path().join("root-secret.json");
+    std::fs::write(&secret, r#"{"secret":"s3cr3t-root"}"#).unwrap();
+    let decoy = t.path().join("root-decoy");
+    std::fs::write(&decoy, "keep").unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o600)).unwrap();
+        std::fs::set_permissions(&decoy, std::fs::Permissions::from_mode(0o600)).unwrap();
+    }
+    let _ = std::fs::remove_file(profile1.join("Local State"));
+    let _ = std::fs::remove_file(profile1.join("SingletonLock"));
+    std::os::unix::fs::symlink(&secret, profile1.join("Local State")).unwrap();
+    std::os::unix::fs::symlink(&decoy, profile1.join("SingletonLock")).unwrap();
     let again = svc2
         .start(user, 1)
         .await
         .expect("relaunch on the same profile after a restart");
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        assert_eq!(
+            std::fs::read_to_string(&secret).unwrap(),
+            r#"{"secret":"s3cr3t-root"}"#,
+            "root never wrote through the planted Local State link"
+        );
+        let meta = std::fs::metadata(&secret).unwrap();
+        assert_eq!((meta.uid(), meta.permissions().mode() & 0o777), (0, 0o600));
+        assert!(decoy.exists(), "the planted SingletonLock target was not removed");
+        let local_state = std::fs::read_to_string(profile1.join("Local State")).unwrap_or_default();
+        assert!(
+            !local_state.contains("s3cr3t"),
+            "no root-only content leaked into the profile"
+        );
+        assert!(
+            !std::fs::symlink_metadata(profile1.join("Local State"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "the link was replaced by the account's own file"
+        );
+    }
     assert!(again.is_running());
     svc2.stop(user, 1).await.unwrap();
     tokio::time::sleep(Duration::from_secs(2)).await;

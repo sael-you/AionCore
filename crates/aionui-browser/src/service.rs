@@ -307,7 +307,7 @@ impl BrowserService {
             Some(ids) => ids,
             None => ensure_browser_user().await?,
         };
-        let profile = prepare_dirs(&self.cfg.layout, user_id, n, uid, gid)?;
+        let profile = prepare_dirs(&self.cfg.layout, user_id, n, uid, gid).await?;
         let launching = self.launch_lock.lock().await;
         // Leftovers of a crashed or restarted AionCore hold profile locks.
         self.reap_orphans().await;
@@ -370,10 +370,10 @@ impl BrowserService {
             None => false,
         };
         let profile = self.cfg.layout.profile_dir(user_id, n)?;
-        match std::fs::remove_dir_all(&profile) {
-            Ok(()) => {}
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
-            Err(e) => return Err(e.into()),
+        // The profile lives in an account-owned directory: the wipe runs as
+        // the account, never as root (a planted symlink must not redirect it).
+        if let Some((uid, gid)) = self.cfg.run_as_override.or_else(existing_browser_user) {
+            crate::host::wipe_profile(&profile, uid, gid).await?;
         }
         tracing::info!(user_id, instance = n, "server browser profile cleared");
         drop(held);
