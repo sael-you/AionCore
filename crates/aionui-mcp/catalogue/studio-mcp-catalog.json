@@ -95,6 +95,12 @@
           "official": true,
           "optional": false,
           "summary": "Repos, issues, pull requests and CI"
+        },
+        "import_aliases": {
+          "GITHUB_PAT": [
+            "GITHUB_PERSONAL_ACCESS_TOKEN",
+            "GITHUB_TOKEN"
+          ]
         }
       },
       {
@@ -136,6 +142,11 @@
           "official": true,
           "optional": false,
           "summary": "Up-to-date library and framework docs"
+        },
+        "import_aliases": {
+          "CONTEXT7_API_KEY": [
+            "CONTEXT7_KEY"
+          ]
         }
       },
       {
@@ -249,6 +260,12 @@
           "official": true,
           "optional": false,
           "summary": "Database, SQL and migrations of one Supabase project"
+        },
+        "import_aliases": {
+          "SUPABASE_ACCESS_TOKEN": [
+            "SUPABASE_TOKEN",
+            "SUPABASE_PAT"
+          ]
         }
       },
       {
@@ -312,6 +329,12 @@
           "official": true,
           "optional": false,
           "summary": "Errors, issues and performance monitoring"
+        },
+        "import_aliases": {
+          "SENTRY_AUTH_TOKEN": [
+            "SENTRY_ACCESS_TOKEN",
+            "SENTRY_TOKEN"
+          ]
         }
       },
       {
@@ -366,6 +389,11 @@
           "official": true,
           "optional": false,
           "summary": "DNS, WAF, Workers and the whole Cloudflare API"
+        },
+        "import_aliases": {
+          "CLOUDFLARE_API_TOKEN": [
+            "CF_API_TOKEN"
+          ]
         }
       },
       {
@@ -627,6 +655,12 @@
           "official": true,
           "optional": false,
           "summary": "Stripe payments, customers and subscriptions"
+        },
+        "import_aliases": {
+          "STRIPE_AGENT_KEY": [
+            "STRIPE_SECRET_KEY",
+            "STRIPE_API_KEY"
+          ]
         }
       },
       {
@@ -705,6 +739,12 @@
           "official": true,
           "optional": false,
           "summary": "Product analytics, flags, experiments, heatmaps and replays"
+        },
+        "import_aliases": {
+          "POSTHOG_API_KEY": [
+            "POSTHOG_PERSONAL_API_KEY",
+            "POSTHOG_AUTH_HEADER"
+          ]
         }
       },
       {
@@ -1029,6 +1069,12 @@
           "official": true,
           "optional": false,
           "summary": "Meta (Facebook/Instagram) ads insights and management"
+        },
+        "import_aliases": {
+          "META_ADS_ACCESS_TOKEN": [
+            "META_ACCESS_TOKEN",
+            "FACEBOOK_ACCESS_TOKEN"
+          ]
         }
       },
       {
@@ -1188,6 +1234,11 @@
           "official": true,
           "optional": false,
           "summary": "Email campaigns, contacts and CRM"
+        },
+        "import_aliases": {
+          "BREVO_API_KEY": [
+            "SENDINBLUE_API_KEY"
+          ]
         }
       },
       {
@@ -1236,6 +1287,12 @@
           "official": true,
           "optional": false,
           "summary": "Airtable bases, tables and records"
+        },
+        "import_aliases": {
+          "AIRTABLE_PAT": [
+            "AIRTABLE_API_KEY",
+            "AIRTABLE_TOKEN"
+          ]
         }
       },
       {
@@ -1493,6 +1550,11 @@
           "optional": false,
           "summary": "Answers and deep research with citations",
           "billing": "metered"
+        },
+        "import_aliases": {
+          "PERPLEXITY_API_KEY": [
+            "PPLX_API_KEY"
+          ]
         }
       },
       {
