@@ -170,8 +170,22 @@ impl ConversationService {
         caller_conversation_id: &str,
         req: &ConversationCreateRequest,
     ) -> Result<ConversationCreateResponse, ConversationCreateError> {
+        self.create_for_conversation_helper_with_extra(user_id, caller_conversation_id, req, &Map::new())
+            .await
+    }
+
+    /// [`Self::create_for_conversation_helper`] that also stores `extra_keys`
+    /// in the new row's `extra` in the same create (one write: e.g. an
+    /// idempotency key a retry looks the conversation up by).
+    pub async fn create_for_conversation_helper_with_extra(
+        &self,
+        user_id: &str,
+        caller_conversation_id: &str,
+        req: &ConversationCreateRequest,
+        extra_keys: &Map<String, Value>,
+    ) -> Result<ConversationCreateResponse, ConversationCreateError> {
         match self
-            .create_for_conversation_helper_inner(user_id, caller_conversation_id, req)
+            .create_for_conversation_helper_inner(user_id, caller_conversation_id, req, extra_keys)
             .await
         {
             Ok(response) => Ok(response),
@@ -192,6 +206,7 @@ impl ConversationService {
         user_id: &str,
         caller_conversation_id: &str,
         req: &ConversationCreateRequest,
+        extra_keys: &Map<String, Value>,
     ) -> Result<ConversationCreateResponse, ConversationCreateError> {
         // 1. The caller's own row. Missing means the token names a conversation
         //    that no longer exists — a transport problem, not a user error.
@@ -265,6 +280,9 @@ impl ConversationService {
         extra.insert("report_to_parent".to_owned(), Value::Bool(req.report_to_parent));
         for (key, value) in plan.legacy_triple.iter() {
             extra.insert(key.clone(), value.clone());
+        }
+        for (key, value) in extra_keys {
+            extra.entry(key.clone()).or_insert_with(|| value.clone());
         }
         let request = CreateConversationRequest {
             r#type: plan.r#type,
