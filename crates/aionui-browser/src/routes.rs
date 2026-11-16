@@ -6,7 +6,9 @@
 use std::sync::Arc;
 
 use aionui_api_types::{
-    ApiResponse, BrowserErrorCode, BrowserSettings, BrowserSettingsUpdate, BrowserStatusResponse, BrowserWsQuery,
+    ApiResponse, BROWSER_EXTENSION_ID, BrowserActivityQuery, BrowserApproval, BrowserApprovalDecision, BrowserDevice,
+    BrowserDeviceActivity, BrowserErrorCode, BrowserPairingCode, BrowserSettings, BrowserSettingsUpdate,
+    BrowserStatusResponse, BrowserWsQuery,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -14,7 +16,7 @@ use axum::extract::ws::WebSocketUpgrade;
 use axum::extract::{Extension, Path, Query, State};
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::Response;
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post};
 use axum::{Json, Router};
 
 use crate::error::BrowserError;
@@ -33,7 +35,27 @@ pub fn browser_routes(state: BrowserRouterState) -> Router {
         .route("/api/browser/instances/{n}/clear", post(clear_instance))
         .route("/api/browser/instances/{n}/stop", post(stop_instance))
         .route("/api/browser/ws", get(panel_ws))
+        .route("/api/browser/devices/pairing-code", post(pairing_code))
+        .route("/api/browser/devices", get(list_devices))
+        .route("/api/browser/devices/{device_id}", delete(revoke_device))
+        .route("/api/browser/devices/{device_id}/activity", get(device_activity))
+        .route("/api/browser/approvals", get(list_approvals))
+        .route("/api/browser/approvals/{approval_id}", post(decide_approval))
         .with_state(state)
+}
+
+/// `WS /api/browser/extension` (C34): mounted WITHOUT the session layer. The
+/// extension has no AionUi cookie; it authenticates with its first frame (a
+/// one-time pairing code or its device token, within 5 s). Only the pinned
+/// extension origin may open it (the gateway checks the same).
+pub fn browser_extension_routes(state: BrowserRouterState) -> Router {
+    Router::new()
+        .route("/api/browser/extension", get(extension_ws))
+        .with_state(state)
+}
+
+pub fn extension_origin() -> String {
+    format!("chrome-extension://{BROWSER_EXTENSION_ID}")
 }
 
 pub fn code_str(code: BrowserErrorCode) -> &'static str {
@@ -164,6 +186,85 @@ async fn panel_ws(
     Ok(ws
         .max_message_size(1024 * 1024)
         .on_upgrade(move |socket| run_panel(socket, backend, user_id, instance)))
+}
+
+async fn pairing_code(
+    State(s): State<BrowserRouterState>,
+    Extension(user): Extension<CurrentUser>,
+) -> Result<Json<ApiResponse<BrowserPairingCode>>, ApiError> {
+    Ok(Json(ApiResponse::ok(
+        s.service.device_hub().pairing_code(&user.id).map_err(api_error)?,
+    )))
+}
+
+async fn list_devices(
+    State(s): State<BrowserRouterState>,
+    Extension(user): Extension<CurrentUser>,
+) -> Json<ApiResponse<Vec<BrowserDevice>>> {
+    Json(ApiResponse::ok(s.service.device_hub().devices(&user.id)))
+}
+
+async fn revoke_device(
+    State(s): State<BrowserRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(device_id): Path<String>,
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    s.service.revoke_device(&user.id, &device_id).map_err(api_error)?;
+    Ok(Json(ApiResponse::ok(())))
+}
+
+async fn device_activity(
+    State(s): State<BrowserRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(device_id): Path<String>,
+    Query(q): Query<BrowserActivityQuery>,
+) -> Result<Json<ApiResponse<Vec<BrowserDeviceActivity>>>, ApiError> {
+    Ok(Json(ApiResponse::ok(
+        s.service
+            .device_hub()
+            .activity(&user.id, &device_id, q.limit)
+            .map_err(api_error)?,
+    )))
+}
+
+async fn list_approvals(
+    State(s): State<BrowserRouterState>,
+    Extension(user): Extension<CurrentUser>,
+) -> Json<ApiResponse<Vec<BrowserApproval>>> {
+    Json(ApiResponse::ok(s.service.device_hub().approvals().list(&user.id)))
+}
+
+async fn decide_approval(
+    State(s): State<BrowserRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(approval_id): Path<String>,
+    Json(d): Json<BrowserApprovalDecision>,
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    s.service
+        .device_hub()
+        .approvals()
+        .decide(&user.id, &approval_id, d.approve)
+        .map_err(api_error)?;
+    Ok(Json(ApiResponse::ok(())))
+}
+
+async fn extension_ws(State(s): State<BrowserRouterState>, headers: HeaderMap, ws: WebSocketUpgrade) -> Response {
+    let origin_ok = headers
+        .get(axum::http::header::ORIGIN)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|o| o == extension_origin());
+    if !origin_ok {
+        return axum::response::IntoResponse::into_response(ApiError::coded(
+            StatusCode::FORBIDDEN,
+            code_str(BrowserErrorCode::BrowserBadMessage),
+            "this socket is for the AionUi browser extension".to_owned(),
+            None,
+        ));
+    }
+    learn_host(&s, &headers);
+    let hub = s.service.device_hub().clone();
+    ws.max_message_size(crate::relay::MAX_EXTENSION_FRAME)
+        .on_upgrade(move |socket| hub.run_extension(socket))
 }
 
 #[cfg(test)]

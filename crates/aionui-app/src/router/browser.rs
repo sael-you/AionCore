@@ -58,3 +58,13 @@ impl ConversationBrowserPort for BrowserConversationPort {
         self.service.agents_enabled(user_id)
     }
 }
+
+/// Browser events (C34 approvals, devices) to the owning user's sockets only.
+pub(crate) struct BrowserEventsToUser(pub Arc<aionui_realtime::WebSocketManager>);
+
+impl aionui_browser::BrowserEventSink for BrowserEventsToUser {
+    fn emit(&self, user_id: &str, name: &str, data: serde_json::Value) {
+        self.0
+            .broadcast_to_user(user_id, aionui_api_types::WebSocketMessage::new(name, data));
+    }
+}

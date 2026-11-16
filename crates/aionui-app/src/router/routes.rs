@@ -117,6 +117,12 @@ pub async fn create_router_with_runtime(services: &AppServices) -> Result<(Route
     let event_rx = services.event_bus.subscribe();
     let ws_manager = services.ws_manager.clone();
     tokio::spawn(forward_event_bus_to_websocket(event_rx, ws_manager));
+    // C34: browser approval / device events go to the owning user's sockets only.
+    services
+        .browser_service
+        .set_event_sink(Arc::new(super::browser::BrowserEventsToUser(
+            services.ws_manager.clone(),
+        )));
 
     let (states, channel_components) = build_module_states(services).await?;
     let client_pref_service = states.system.client_pref_service.clone();
@@ -572,6 +578,16 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     } else {
         router
     };
+    // C34 (TASK-125): the browser extension socket. Merged AFTER the session,
+    // CSRF and WebSocket-origin layers on purpose: the extension has no
+    // session, and its origin is chrome-extension://. The handler accepts
+    // exactly the pinned extension origin and authenticates the first frame
+    // (pairing code or device token, within 5 s).
+    let router = router.merge(aionui_browser::browser_extension_routes(
+        aionui_browser::BrowserRouterState {
+            service: services.browser_service.clone(),
+        },
+    ));
     let router = with_access_log(router);
     tracing::info!(
         elapsed_ms = boot.elapsed().as_millis(),

@@ -22,10 +22,11 @@ pub mod routes;
 pub mod service;
 pub mod settings;
 
+pub use approvals::BrowserEventSink;
 pub use error::BrowserError;
 pub use guard::{GuardDecision, NavigationGuard};
 pub use host::HostPaths;
 pub use layout::{BROWSER_USER, BrowserLayout, DEFAULT_BROWSER_ROOT};
-pub use routes::{BrowserRouterState, browser_routes};
+pub use routes::{BrowserRouterState, browser_extension_routes, browser_routes};
 pub use service::{BrowserService, BrowserServiceConfig, DEFAULT_IDLE_TIMEOUT};
 pub use settings::SettingsStore;
