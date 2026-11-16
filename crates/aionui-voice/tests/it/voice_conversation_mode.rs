@@ -396,10 +396,11 @@ async fn turn_end_is_spoken_only_when_the_agent_said_nothing() {
     assert_eq!(end["status"], "finished");
     assert!(end.get("clipId").is_none(), "{end}");
 
-    // It forgot to speak: "<name> finished." is spoken.
+    // It forgot to speak: "The task is finished." is spoken (TASK-112: the
+    // bound conversation is not named, the owner is talking to it).
     bus.broadcast(completed("t2", "finished"));
     let end = c.follow_up().await;
-    assert_eq!(end["line"], "Kanban build finished.");
+    assert_eq!(end["line"], "The task is finished.");
     assert!(end["clipId"].is_string(), "{end}");
 
     // A cancelled turn was already answered with "Stopped.": text only.
@@ -848,7 +849,7 @@ async fn a_finished_turn_is_spoken_with_a_short_summary_of_the_reply() {
     let end = c.follow_up().await;
     assert_eq!(
         end["line"],
-        "Kanban build finished: Fixed the flaky upload test; all 42 tests pass."
+        "The task is finished. Fixed the flaky upload test; all 42 tests pass."
     );
     assert!(end["clipId"].is_string(), "{end}");
 
@@ -860,5 +861,178 @@ async fn a_finished_turn_is_spoken_with_a_short_summary_of_the_reply() {
                "status": "finished", "last_outcome": "finished"}),
     ));
     let end = c.follow_up().await;
-    assert_eq!(end["line"], "Kanban build finished.");
+    assert_eq!(end["line"], "The task is finished.");
+}
+
+// ------------------------------------------------------------- TASK-112
+
+/// A conversation-mode call with a merge window short enough for tests.
+async fn call_with_window(window: Duration) -> Call {
+    let timings = aionui_voice::VoiceTimings {
+        utterance_window: window,
+        ..fast_timings()
+    };
+    let h = Harness::new(Options { timings }).await;
+    h.conversations.add("c-build", "Kanban build", Some("p-aionui"));
+    h.conversations.add_project("p-aionui", "aionui", None);
+    let user = h.enabled_user("alice").await;
+    let (status, body) = create_conversation_session(&h, &user, Some("c-build")).await;
+    assert_eq!(status, 201, "{body}");
+    let session = body["data"]["voice_session_id"].as_str().unwrap().to_owned();
+    let row = wait_for(Duration::from_secs(5), || async {
+        let row = h.session_row(&user, &session).await;
+        row.ready_at.is_some().then_some(row)
+    })
+    .await
+    .expect("call should become ready");
+    let addr = h.serve().await;
+    let mut ws = ws_connect(&addr, &user, Some(ORIGIN)).await.unwrap();
+    ws_send(&mut ws, hello(Some(&session))).await;
+    ws_expect(&mut ws, "voice.ready").await;
+    Call {
+        h,
+        user,
+        session,
+        call_id: row.call_id.unwrap(),
+        ws,
+    }
+}
+
+#[tokio::test]
+async fn half_sentences_within_the_window_become_one_message() {
+    let mut c = call_with_window(Duration::from_millis(800)).await;
+    // The live call of 2026-11-16: thinking pauses cut one thought into finals.
+    c.say("So.");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    c.say("When I'm not at my desk,");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    c.say("use the phone for the review.");
+    assert!(c.h.conversations.sends().is_empty(), "held while the user may go on");
+    let outcome = c.follow_up().await;
+    assert_eq!(outcome["status"], "sent", "{outcome}");
+    let sends = c.h.conversations.sends();
+    assert_eq!(sends.len(), 1, "one thought, one message, one agent turn");
+    assert!(
+        sends[0]
+            .text
+            .starts_with("So. When I'm not at my desk, use the phone for the review.\n\n[[AION_VOICE]]"),
+        "{}",
+        sends[0].text
+    );
+    // After the window a new final is a new message.
+    tokio::time::sleep(Duration::from_millis(1000)).await;
+    c.say("And run the tests.");
+    assert_eq!(c.follow_up().await["status"], "sent");
+    assert_eq!(c.h.conversations.sends().len(), 2);
+}
+
+#[tokio::test]
+async fn speaking_again_keeps_the_message_open_until_that_final() {
+    let mut c = call_with_window(Duration::from_millis(500)).await;
+    c.say("So.");
+    c.h.fake.push_event(
+        &c.call_id,
+        json!({"type": "input_audio_buffer.speech_started", "audio_start_ms": 1000}),
+    );
+    // Well past the window: still held, the user is speaking.
+    tokio::time::sleep(Duration::from_millis(1200)).await;
+    assert!(c.h.conversations.sends().is_empty());
+    c.say("Add a test for the 404 case.");
+    assert_eq!(c.follow_up().await["status"], "sent");
+    let sends = c.h.conversations.sends();
+    assert_eq!(sends.len(), 1);
+    assert!(
+        sends[0].text.starts_with("So. Add a test for the 404 case."),
+        "{}",
+        sends[0].text
+    );
+}
+
+#[tokio::test]
+async fn stop_the_task_acts_at_once_and_takes_back_the_held_words() {
+    let mut c = call_with_window(Duration::from_secs(5)).await;
+    c.set_status(running(true, 0));
+    c.say("Change the port to");
+    c.say("stop the task");
+    let started = std::time::Instant::now();
+    let outcome = c.follow_up().await;
+    assert_eq!(outcome["status"], "stopped", "{outcome}");
+    assert!(started.elapsed() < Duration::from_secs(2), "a stop is never held");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(c.h.conversations.sends().is_empty(), "the held words were taken back");
+}
+
+#[tokio::test]
+async fn stop_voice_posts_the_held_words_then_ends() {
+    let c = call_with_window(Duration::from_secs(5)).await;
+    c.say("Use bun for the tests.");
+    c.say("stop voice");
+    let row = c.h.wait_ended(&c.user, &c.session).await;
+    assert_eq!(row.end_reason.as_deref(), Some("sleep"));
+    let sends = c.h.conversations.sends();
+    assert_eq!(sends.len(), 1, "{sends:?}");
+    assert!(sends[0].text.starts_with("Use bun for the tests."));
+}
+
+#[tokio::test]
+async fn done_posts_at_once() {
+    let mut c = call_with_window(Duration::from_secs(5)).await;
+    c.say("Use bun for the tests.");
+    let started = std::time::Instant::now();
+    ws_send(
+        &mut c.ws,
+        json!({"name": "voice.commit", "data": {"voiceSessionId": c.session}}),
+    )
+    .await;
+    assert_eq!(c.follow_up().await["status"], "sent");
+    assert!(
+        started.elapsed() < Duration::from_secs(2),
+        "Done does not wait for the window"
+    );
+}
+
+#[tokio::test]
+async fn a_turn_started_by_a_session_message_ends_silently() {
+    use aionui_realtime::EventBroadcaster;
+    let mut c = call().await;
+    let bus = std::sync::Arc::new(aionui_realtime::BroadcastEventBus::new(64));
+    c.h.service.start_background(bus.clone());
+    let completed = |turn: &str| {
+        aionui_api_types::WebSocketMessage::new(
+            "turn.completed",
+            json!({"user_id": "alice", "conversation_id": "c-build", "turn_id": turn,
+                   "status": "finished", "last_outcome": "finished"}),
+        )
+    };
+    // A builder's report started this turn: no news for the owner.
+    c.h.conversations.set_user_message(
+        "c-build",
+        "[[AION_SESSION_MESSAGE]]\nfrom: builder\n[[/AION_SESSION_MESSAGE]]\nTASK-91 done",
+        false,
+    );
+    bus.broadcast(completed("t1"));
+    // A child's result and a cron prompt (hidden) neither.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    c.h.conversations.set_user_message(
+        "c-build",
+        "[[AION_CHILD_RESULT child_id=c2 name=Builder status=finished]]\nok\n[[/AION_CHILD_RESULT]]",
+        false,
+    );
+    bus.broadcast(completed("t2"));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    c.h.conversations.set_user_message("c-build", "nightly check", true);
+    bus.broadcast(completed("t3"));
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    // The owner's own (typed) message: announced as before.
+    c.h.conversations
+        .set_user_message("c-build", "fix the login test", false);
+    bus.broadcast(completed("t4"));
+    let end = c.follow_up().await;
+    assert_eq!(end["line"], "The task is finished.", "{end}");
+    assert!(end["clipId"].is_string(), "{end}");
+    assert_eq!(
+        c.h.speech.lines(),
+        vec!["The task is finished.".to_owned()],
+        "only the owner's turn was spoken"
+    );
 }

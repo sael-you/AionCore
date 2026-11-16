@@ -439,9 +439,15 @@ impl CallRunner {
             }
             ClientEvent::AskPending => self.set_manual(true).await,
             ClientEvent::Commit => {
-                if self.call.mode.is_conversation()
-                    && let Err(err) = self.engine_call.commit_input().await
-                {
+                if !self.call.mode.is_conversation() {
+                    return;
+                }
+                // "Done": nothing waits for the merge window any more.
+                match &self.pending_utterance {
+                    Some(pending) if !pending.user_speaking() => self.flush_utterance().await,
+                    _ => self.flush_next_final = true,
+                }
+                if let Err(err) = self.engine_call.commit_input().await {
                     tracing::debug!(session_id = %self.call.session_id, error = %err, "voice commit not sent");
                 }
             }
