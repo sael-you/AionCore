@@ -26,6 +26,7 @@ mod kit;
 mod lifecycle;
 mod mcp;
 mod mcp_market;
+mod memory;
 mod office;
 mod project;
 mod provider;
@@ -171,6 +172,9 @@ pub use mcp_market::{
     McpMarketInstanceResponse, McpMarketInstanceStatus, McpMarketSecretStatus, McpMarketSnapshotQuery,
     McpMarketStatusResponse, McpMarketTemplate, McpMarketTemplateRefreshResponse, SetMcpMarketApprovalRequest,
     SetMcpMarketSecretRequest, UpdateMcpMarketInstanceRequest,
+};
+pub use memory::{
+    MemoryDeleteResponse, MemoryFileResponse, MemoryItem, MemoryLint, MemoryListResponse, UpdateMemoryFileRequest,
 };
 pub use office::{
     CellCoord, CellRange, ConversionResultDto, ConversionTarget, DocumentConversionRequest, DocumentConversionResponse,
