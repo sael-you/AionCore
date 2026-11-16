@@ -2,14 +2,17 @@
 //! account, AionCore's own browser-level CDP session, the tab model and the
 //! navigation guard.
 //!
-//! Guard before the first request: AionCore's session sets
-//! `Target.setAutoAttach {waitForDebuggerOnStart: true, flatten: true}` at
-//! browser level, so every new target (panel tab, agent `createTarget`,
-//! popup) is paused until AionCore has run `Fetch.enable` with the guard's
-//! patterns on it and only then `Runtime.runIfWaitingForDebugger`. Paused
-//! requests are decided by [`NavigationGuard::decide`]. Navigations that
-//! never touch the network (`file:`, `chrome:`) are caught on
-//! `targetInfoChanged` and sent back to `about:blank`.
+//! Guard before the first request: AionCore's own browser-level session runs
+//! `Fetch.enable` with the guard's patterns BEFORE anything else, which
+//! intercepts the requests of every target of the browser, including the
+//! first navigation of a brand-new target. (Per-target `Fetch.enable` after a
+//! `waitForDebuggerOnStart` auto-attach is too late: Chrome 147 had already
+//! sent a `createTarget{url}` target's first request before the pause was
+//! released — reproduced with a raw CDP probe on 2026-11-16; browser-level
+//! Fetch paused that same request.) Paused requests are decided by
+//! [`NavigationGuard::decide`]. AionCore also auto-attaches (no pause) to
+//! every page so navigations that never touch the network (`file:`,
+//! `chrome:`) can be sent back to `about:blank` on `targetInfoChanged`.
 //!
 //! Stop: root here lacks CAP_KILL and cannot signal the browser account's
 //! processes, so the stop is `Browser.close` over our own session, with a
@@ -301,11 +304,20 @@ impl ChromeInstance {
 
         inst.clone().spawn_event_loop(spec.guard.clone());
         inst.clone().spawn_exit_watch(exited_tx);
-        // Order matters: auto-attach (paused) before anything can navigate.
+        // Order matters: browser-wide interception before anything can navigate.
+        let patterns: Vec<Value> = spec
+            .guard
+            .fetch_patterns()
+            .into_iter()
+            .map(|p| json!({"urlPattern": p, "requestStage": "Request"}))
+            .collect();
+        inst.cdp
+            .call("Fetch.enable", json!({"patterns": patterns}), None)
+            .await?;
         inst.cdp
             .call(
                 "Target.setAutoAttach",
-                json!({"autoAttach": true, "waitForDebuggerOnStart": true, "flatten": true}),
+                json!({"autoAttach": true, "waitForDebuggerOnStart": false, "flatten": true}),
                 None,
             )
             .await?;
@@ -381,30 +393,8 @@ impl ChromeInstance {
                     .to_owned();
                 let kind = ev.params["targetInfo"]["type"].as_str().unwrap_or_default().to_owned();
                 if kind == "page" {
-                    sessions.insert(target_id, session.clone());
+                    sessions.insert(target_id, session);
                 }
-                let cdp = self.cdp.clone();
-                let patterns: Vec<Value> = guard
-                    .fetch_patterns()
-                    .into_iter()
-                    .map(|p| json!({"urlPattern": p, "requestStage": "Request"}))
-                    .collect();
-                tokio::spawn(async move {
-                    // Not every target type has Fetch / auto-attach; ignore those errors.
-                    let _ = cdp
-                        .call("Fetch.enable", json!({"patterns": patterns}), Some(&session))
-                        .await;
-                    let _ = cdp
-                        .call(
-                            "Target.setAutoAttach",
-                            json!({"autoAttach": true, "waitForDebuggerOnStart": true, "flatten": true}),
-                            Some(&session),
-                        )
-                        .await;
-                    let _ = cdp
-                        .call("Runtime.runIfWaitingForDebugger", json!({}), Some(&session))
-                        .await;
-                });
             }
             "Target.detachedFromTarget" => {
                 if let Some(sid) = ev.params["sessionId"].as_str() {
@@ -412,7 +402,9 @@ impl ChromeInstance {
                 }
             }
             "Fetch.requestPaused" => {
-                let Some(session) = ev.session_id.clone() else { return };
+                // Browser-level interception: no session id (a target's own
+                // session would carry one; answer in the same scope).
+                let session = ev.session_id.clone();
                 let request_id = ev.params["requestId"].as_str().unwrap_or_default().to_owned();
                 let url = ev.params["request"]["url"].as_str().unwrap_or_default();
                 let decision = guard.decide(url);
@@ -429,13 +421,13 @@ impl ChromeInstance {
                     self.cdp.notify(
                         "Fetch.failRequest",
                         json!({"requestId": request_id, "errorReason": "BlockedByClient"}),
-                        Some(&session),
+                        session.as_deref(),
                     );
                 } else {
                     self.cdp.notify(
                         "Fetch.continueRequest",
                         json!({"requestId": request_id}),
-                        Some(&session),
+                        session.as_deref(),
                     );
                 }
             }
