@@ -51,6 +51,10 @@ pub trait IVoiceSessionRepository: Send + Sync {
 
     /// Cost charged to the user on UTC days starting at or after the day of `since`.
     async fn cost_since(&self, user_id: &str, since: TimestampMs) -> Result<i64, DbError>;
+
+    /// Calls started on or after the UTC day of `since`, and their connected
+    /// seconds (ready → end, or → `now` while live), uncapped by any list limit.
+    async fn calls_since(&self, user_id: &str, since: TimestampMs, now: TimestampMs) -> Result<(i64, i64), DbError>;
 }
 
 /// Append-only voice audit log (`voice_audit`).

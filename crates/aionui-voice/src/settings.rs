@@ -102,6 +102,8 @@ impl VoiceSettings {
             car_mode: self.car_mode,
             daily_budget_usd: micros_to_usd(self.daily_budget_micros),
             used_today_usd: used_today_micros.map(micros_to_usd),
+            calls_today: None,
+            connected_seconds_today: None,
             model: self.model.clone(),
             voice: self.voice.clone(),
             eagerness: self.eagerness.clone(),

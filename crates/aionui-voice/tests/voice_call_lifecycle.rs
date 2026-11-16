@@ -770,3 +770,30 @@ async fn an_unusable_concierge_skill_falls_back_to_the_built_in_instructions() {
         "{session}"
     );
 }
+
+#[tokio::test]
+async fn settings_report_todays_calls_and_connected_seconds_and_accept_them_back() {
+    let h = Harness::new(Options::default()).await;
+    let user = h.enabled_user("alice").await;
+    let (status, body) = h.send(Req::browser("GET", "/api/voice/settings", &user).build()).await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["data"]["calls_today"], 0);
+    assert_eq!(body["data"]["connected_seconds_today"], 0);
+
+    let (status, created) = create_session(&h, &user).await;
+    assert_eq!(status, 201, "{created}");
+    let (_, body) = h.send(Req::browser("GET", "/api/voice/settings", &user).build()).await;
+    assert_eq!(body["data"]["calls_today"], 1, "{body}");
+    assert!(body["data"]["connected_seconds_today"].is_i64());
+
+    // Clients PUT back what they GET: the read-only counters are ignored.
+    let (status, body) = h
+        .send(
+            Req::browser("PUT", "/api/voice/settings", &user)
+                .json(json!({"car_mode": true, "calls_today": 9, "connected_seconds_today": 9}))
+                .build(),
+        )
+        .await;
+    assert_eq!(status, 200, "{body}");
+    assert_eq!(body["data"]["calls_today"], 1);
+}

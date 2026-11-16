@@ -259,6 +259,20 @@ impl IVoiceSessionRepository for SqliteVoiceRepository {
         .await?;
         Ok(total)
     }
+
+    async fn calls_since(&self, user_id: &str, since: TimestampMs, now: TimestampMs) -> Result<(i64, i64), DbError> {
+        let (calls, connected_ms): (i64, i64) = sqlx::query_as(
+            "SELECT COUNT(*), COALESCE(SUM(CASE WHEN ready_at IS NULL THEN 0 \
+             ELSE MAX(0, COALESCE(ended_at, ?) - ready_at) END), 0) \
+             FROM voice_sessions WHERE user_id = ? AND created_at >= ?",
+        )
+        .bind(now)
+        .bind(user_id)
+        .bind(utc_day_start(since))
+        .fetch_one(&self.pool)
+        .await?;
+        Ok((calls, connected_ms / 1000))
+    }
 }
 
 #[async_trait::async_trait]

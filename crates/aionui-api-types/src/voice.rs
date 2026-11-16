@@ -20,6 +20,12 @@ pub struct VoiceSettingsResponse {
     /// Spent today (UTC day) across the user's sessions.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub used_today_usd: Option<f64>,
+    /// Calls started today (UTC day), uncapped (the sessions list stops at 50).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub calls_today: Option<i64>,
+    /// Seconds those calls were connected (ready → end; live calls up to now).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub connected_seconds_today: Option<i64>,
     pub model: String,
     pub voice: String,
     pub eagerness: String,
@@ -45,6 +51,10 @@ pub struct UpdateVoiceSettingsRequest {
     /// what they GET.
     #[serde(default, skip_serializing)]
     pub used_today_usd: Option<f64>,
+    #[serde(default, skip_serializing)]
+    pub calls_today: Option<i64>,
+    #[serde(default, skip_serializing)]
+    pub connected_seconds_today: Option<i64>,
 }
 
 /// `POST /api/voice/sessions` body.

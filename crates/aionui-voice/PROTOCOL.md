@@ -32,8 +32,8 @@ shape, implemented in a later slice.
 
 | Route | Body | Response `data` | Errors |
 |---|---|---|---|
-| `GET /api/voice/settings` | — | `{enabled, engine, wake_word_enabled, car_mode, daily_budget_usd, used_today_usd, model, voice, eagerness, provider_id?}` | |
-| `PUT /api/voice/settings` | any subset of `{enabled, engine, wake_word_enabled, car_mode, daily_budget_usd, model, voice, eagerness, provider_id}` (`used_today_usd` accepted and ignored; unknown fields → 400) | same as GET | `400 BAD_REQUEST` |
+| `GET /api/voice/settings` | — | `{enabled, engine, wake_word_enabled, car_mode, daily_budget_usd, used_today_usd, calls_today, connected_seconds_today, model, voice, eagerness, provider_id?}` (`calls_today`: calls started this UTC day, not capped like the sessions list; `connected_seconds_today`: their connected time, ready → end, a live call counts up to now) | |
+| `PUT /api/voice/settings` | any subset of `{enabled, engine, wake_word_enabled, car_mode, daily_budget_usd, model, voice, eagerness, provider_id}` (`used_today_usd`, `calls_today`, `connected_seconds_today` accepted and ignored; unknown fields → 400) | same as GET | `400 BAD_REQUEST` |
 | `GET /api/voice/status` | — | `{enabled, live_calls, active_session_id?, used_today_usd, limit_usd}` | |
 | `POST /api/voice/sessions` | `{engine?, sdp_offer, device_id?, focus_conversation_id?, resume_of?}` | `201 {voice_session_id, sdp_answer, engine, model}` | `403 VOICE_DISABLED`, `409 VOICE_BUSY` (live call on another device), `412 VOICE_NO_PROVIDER`, `429 VOICE_BUDGET_REACHED`, `400 BAD_REQUEST`, `502 BAD_GATEWAY` (provider refused) |
 | `GET /api/voice/sessions` | — | last 50 sessions `[{id, engine, model, state, end_reason?, created_at, ready_at?, ended_at?, input_tokens, cached_input_tokens, output_tokens, responses, unknown_responses, cost_usd}]` | |

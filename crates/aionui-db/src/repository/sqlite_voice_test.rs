@@ -265,3 +265,30 @@ async fn live_calls_are_counted_read_only() {
     assert!(super::count_live_voice_calls_read_only(&missing).await.is_err());
     assert!(!missing.exists());
 }
+
+#[tokio::test]
+async fn todays_calls_and_connected_seconds_are_counted_without_a_list_cap() {
+    let (repo, _db) = repo().await;
+    let now = aionui_common::now_ms();
+    // A call connected for ~90 s, then ended.
+    repo.create_starting(params("vs_1", USER)).await.unwrap();
+    repo.mark_ready(USER, "vs_1", now - 90_000).await.unwrap();
+    assert!(repo.finish(USER, "vs_1", "ended", "user").await.unwrap());
+    // A call that never connected counts as a call with no connected time.
+    repo.create_starting(params("vs_2", USER)).await.unwrap();
+    assert!(repo.finish(USER, "vs_2", "failed", "create_failed").await.unwrap());
+    // A live call counts up to `now`.
+    repo.create_starting(params("vs_3", USER)).await.unwrap();
+    repo.mark_ready(USER, "vs_3", now - 30_000).await.unwrap();
+    repo.create_starting(params("vs_4", OTHER_USER)).await.unwrap();
+
+    let (calls, seconds) = repo.calls_since(USER, now, now).await.unwrap();
+    assert_eq!(calls, 3);
+    assert!((119..=125).contains(&seconds), "≈ 90 s + 30 s, got {seconds}");
+    assert_eq!(
+        repo.calls_since(USER, now + DAY, now).await.unwrap(),
+        (0, 0),
+        "tomorrow"
+    );
+    assert_eq!(repo.calls_since(OTHER_USER, now, now).await.unwrap().0, 1, "per user");
+}

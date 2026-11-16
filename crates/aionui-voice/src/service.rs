@@ -450,7 +450,16 @@ impl VoiceService {
             .sessions
             .cost_since(user_id, utc_day_start_ms(aionui_common::now_ms()))
             .await?;
-        Ok(settings.to_response(Some(used)))
+        let now = aionui_common::now_ms();
+        let (calls, connected) = self
+            .inner
+            .sessions
+            .calls_since(user_id, utc_day_start_ms(now), now)
+            .await?;
+        let mut response = settings.to_response(Some(used));
+        response.calls_today = Some(calls);
+        response.connected_seconds_today = Some(connected);
+        Ok(response)
     }
 
     pub async fn is_enabled(&self, user_id: &str) -> bool {
