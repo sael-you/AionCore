@@ -143,6 +143,9 @@ pub(crate) struct ServiceInner {
     /// Per-user admission lock: an admission, a resume and the kill switch of
     /// one user never interleave; other users are not blocked.
     admission: DashMap<String, Arc<Mutex<()>>>,
+    /// Per-user settings lock: settings read-apply-writes of one user never
+    /// interleave. Taken before the admission lock, never while holding it.
+    settings_locks: DashMap<String, Arc<Mutex<()>>>,
     /// Set when the HTTP listener is serving; device liveness of recovered
     /// calls is measured from here, not from process start.
     listening_since: std::sync::Mutex<Option<Instant>>,
@@ -151,6 +154,13 @@ pub(crate) struct ServiceInner {
 impl ServiceInner {
     pub(crate) fn user_lock(&self, user_id: &str) -> Arc<Mutex<()>> {
         self.admission
+            .entry(user_id.to_owned())
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
+    fn settings_lock(&self, user_id: &str) -> Arc<Mutex<()>> {
+        self.settings_locks
             .entry(user_id.to_owned())
             .or_insert_with(|| Arc::new(Mutex::new(())))
             .clone()
@@ -282,6 +292,7 @@ impl VoiceService {
                 speech_queues: DashMap::new(),
                 tasks: DashMap::new(),
                 admission: DashMap::new(),
+                settings_locks: DashMap::new(),
                 listening_since: std::sync::Mutex::new(None),
             }),
         }
@@ -319,10 +330,11 @@ impl VoiceService {
         user_id: &str,
         req: &UpdateVoiceSettingsRequest,
     ) -> Result<VoiceSettings, VoiceError> {
-        // Read-apply-write under the user's admission lock: a concurrent update
-        // that read `enabled: true` can never land after the kill switch, and
-        // an admission never sees a half-applied change.
-        let lock = self.inner.user_lock(user_id);
+        // Read-apply-write under the user's settings lock: a concurrent update
+        // that read `enabled: true` can never land after the kill switch. Not
+        // the admission lock: `enabled: false` must be written while an
+        // admission waits on the provider, so its re-check sees it.
+        let lock = self.inner.settings_lock(user_id);
         let _guard = lock.lock().await;
         let current = self.settings(user_id).await?;
         let next = current.apply(req)?;
@@ -344,10 +356,13 @@ impl VoiceService {
         Ok(next)
     }
 
-    /// Kill switch for one user: hang up, notify, close sockets. The caller
-    /// holds the user's admission lock, so an admission in flight finishes
-    /// first (and then sees voice off and hangs up its call itself).
+    /// Kill switch for one user: hang up, notify, close sockets. Runs after
+    /// `enabled: false` is written and holds the user's admission lock, so an
+    /// admission in flight finishes first (and then sees voice off and hangs
+    /// up its call itself).
     async fn kill_user(&self, user_id: &str, audit: bool) {
+        let lock = self.inner.user_lock(user_id);
+        let _guard = lock.lock().await;
         let ended = self.end_user_calls(user_id, EndReason::Disabled).await;
         self.inner.bindings.remove(user_id);
         let cancelled_drafts = self.inner.drafts.cancel_all_for_user(user_id).await;
