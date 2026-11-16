@@ -22,6 +22,7 @@ mod cron;
 mod custom_agent;
 mod extension;
 mod file;
+mod kit;
 mod lifecycle;
 mod mcp;
 mod mcp_market;
@@ -151,6 +152,11 @@ pub use file::{
     ReadFileRequest, RevealItemRequest, SnapshotBaselineRequest, SnapshotCompareResponse, SnapshotDiscardRequest,
     SnapshotInfoResponse, SnapshotMode, SnapshotStageRequest, SnapshotWorkspaceRequest, StreamQuery,
     WorkspaceFlatFileResponse, WriteContentRequest, WriteFileRequest,
+};
+pub use kit::{
+    AttachKitItemRequest, CreateKitRequest, KitAttachmentResponse, KitEffectiveItem, KitEffectiveMcp,
+    KitEffectiveQuery, KitEffectiveSetResponse, KitErrorCode, KitItemKind, KitLevel, KitMcpMember, KitMissingTemplate,
+    KitOp, KitProvenance, KitResponse, ListKitAttachmentsQuery, UpdateKitRequest,
 };
 pub use lifecycle::{GitHubReleaseAsset, SystemInfoResponse, UpdateCheckRequest, UpdateCheckResult, UpdateReleaseInfo};
 pub use mcp::{

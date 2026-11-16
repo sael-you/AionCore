@@ -1,10 +1,11 @@
 #![allow(clippy::disallowed_types)]
 
 //! `/api/mcp/market/*` routes (card C15). Two routers:
-//! - [`mcp_market_read_routes`]: reads (refs, `set` flags, status, snapshot),
+//! - [`mcp_market_read_routes`]: reads (refs, `set` flags, status, snapshot,
+//!   and the C27 kit reads of `kit_routes`),
 //!   mounted behind the ordinary auth middleware;
 //! - [`mcp_market_write_routes`]: every market write (instances, approval
-//!   record, secrets, assignments). The composition layer mounts it behind an
+//!   record, secrets, assignments, C27 kits and attachments). The composition layer mounts it behind an
 //!   auth state that accepts a verified browser session only (no runtime-token
 //!   channel, no `--local` default user, R1 #1), and each handler checks the
 //!   [`AuthChannel`] again, failing closed.
@@ -44,14 +45,20 @@ pub(crate) fn market_api_error(err: MarketError) -> ApiError {
             ApiError::coded(StatusCode::SERVICE_UNAVAILABLE, "MCP_MARKET_UNAVAILABLE", msg, None)
         }
         MarketError::Internal(msg) => ApiError::Internal(msg),
+        MarketError::Kit(code, msg) => ApiError::coded(
+            StatusCode::from_u16(code.http_status()).unwrap_or(StatusCode::BAD_REQUEST),
+            code.as_str(),
+            msg,
+            None,
+        ),
     }
 }
 
-type Channel = Option<Extension<AuthChannel>>;
+pub(crate) type Channel = Option<Extension<AuthChannel>>;
 
 /// Writes need a verified browser session; the runtime-token channel (agent
 /// helper CLIs) and `--local`'s injected default user are refused.
-fn require_session(channel: &Channel) -> Result<(), ApiError> {
+pub(crate) fn require_session(channel: &Channel) -> Result<(), ApiError> {
     match channel.as_ref().map(|Extension(c)| c) {
         Some(AuthChannel::Session) => Ok(()),
         Some(AuthChannel::RuntimeToken { .. }) => Err(ApiError::coded(
@@ -82,7 +89,8 @@ pub fn mcp_market_read_routes(state: McpMarketRouterState) -> Router {
         .route("/api/mcp/market/assignments", get(list_assignments))
         .route("/api/mcp/market/status", get(status))
         .route("/api/mcp/market/snapshot", get(snapshot))
-        .with_state(state)
+        .with_state(state.clone())
+        .merge(crate::kit_routes::kit_read_routes(state))
 }
 
 pub fn mcp_market_write_routes(state: McpMarketRouterState) -> Router {
@@ -108,7 +116,8 @@ pub fn mcp_market_write_routes(state: McpMarketRouterState) -> Router {
             "/api/mcp/market/assignments/{id}",
             axum::routing::delete(delete_assignment),
         )
-        .with_state(state)
+        .with_state(state.clone())
+        .merge(crate::kit_routes::kit_write_routes(state))
 }
 
 // -- reads ------------------------------------------------------------------

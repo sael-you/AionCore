@@ -23,7 +23,7 @@ pub const READ_ENFORCEMENTS: &[&str] = &["server", "credential", "proxy"];
 pub const BILLINGS: &[&str] = &["metered"];
 pub const TRANSPORTS: &[&str] = &["stdio", "http"];
 /// R2: the only instances that may be assigned globally.
-pub const GLOBAL_IDS: &[&str] = &["context7", "studio-memory"];
+pub const GLOBAL_IDS: &[&str] = aionui_db::GLOBAL_MCP_IDS;
 pub const RESERVED: &[&str] = &["aionui-team", "aionui"];
 /// R11: not in the market, matched as prefixes. GitHub and Chrome DevTools
 /// were removed by the owner's picks (D49/D50, GAPS G2).

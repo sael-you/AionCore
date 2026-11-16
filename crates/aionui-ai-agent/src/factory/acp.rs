@@ -454,9 +454,7 @@ async fn load_user_mcp_servers(
 
     let mut servers = Vec::with_capacity(rows.len());
     for aionui_db::GatedMcpRow { row, market: delivery } in rows {
-        let selected = selected_ids
-            .map(|ids| ids.iter().any(|id| id == &row.id))
-            .unwrap_or(row.enabled);
+        let selected = crate::mcp_resolve::is_selected(selected_ids, &row, delivery.as_ref());
         // `aionui-team` is the reserved team coordination MCP name; a user row
         // that collides with it is never injected here (the team bridge is
         // folded in separately and must win).

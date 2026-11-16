@@ -9,6 +9,7 @@ mod convert;
 pub mod error;
 pub mod hierarchy;
 mod hierarchy_ops;
+mod kit_skills;
 pub(crate) mod message_cursor;
 mod message_persistence;
 pub mod response_middleware;

@@ -6,6 +6,8 @@
 
 mod assignments;
 pub mod error;
+pub mod kit_seed;
+mod kits;
 pub mod launch;
 pub mod launcher;
 pub mod params;
@@ -19,6 +21,7 @@ pub mod template;
 pub mod toolchain;
 
 pub use error::MarketError;
+pub use kits::IKitConversationApplier;
 pub use launch::{
     LaunchPlan, LaunchRequest, LaunchScope, child_env, child_env_with, inherit_env_allowed, launch_policy,
     resolve_launch, still_allowed,

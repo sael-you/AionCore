@@ -337,6 +337,9 @@ pub struct ConversationService {
     /// Project-bind side branch (optional). `None` → binding is a no-op, so
     /// conversation create/read behaves exactly as before.
     project_service: Arc<RwLock<Option<Arc<ProjectService>>>>,
+    /// Kits (C27, optional). `None` → a new conversation's skills are exactly
+    /// the pre-kit snapshot.
+    kit_repo: Arc<RwLock<Option<Arc<dyn aionui_db::IKitRepository>>>>,
     runtime_state: Arc<ConversationRuntimeStateService>,
     runtime_helper_bin: Option<String>,
     runtime_base_url: Option<String>,
@@ -421,6 +424,7 @@ impl ConversationService {
             assistant_dispatcher: Arc::new(RwLock::new(None)),
             agent_availability_feedback: Arc::new(RwLock::new(None)),
             project_service: Arc::new(RwLock::new(None)),
+            kit_repo: Arc::new(RwLock::new(None)),
             runtime_state: Arc::new(ConversationRuntimeStateService::default()),
             runtime_helper_bin: None,
             runtime_base_url: None,
@@ -468,6 +472,17 @@ impl ConversationService {
         if let Ok(mut guard) = self.project_service.write() {
             *guard = Some(project_service);
         }
+    }
+
+    /// Inject the kit repository (C27). When unset, kits never touch skills.
+    pub fn with_kit_repo(&self, repo: Arc<dyn aionui_db::IKitRepository>) {
+        if let Ok(mut guard) = self.kit_repo.write() {
+            *guard = Some(repo);
+        }
+    }
+
+    pub(crate) fn kit_repo(&self) -> Option<Arc<dyn aionui_db::IKitRepository>> {
+        self.kit_repo.read().ok().and_then(|guard| guard.clone())
     }
 
     /// Project-bind side branch: resolve the owner's workspace into a
@@ -1483,7 +1498,7 @@ impl ConversationService {
             }
         }
 
-        let row = aionui_db::models::ConversationRow {
+        let mut row = aionui_db::models::ConversationRow {
             id: id.clone(),
             user_id: user_id.to_owned(),
             name: req.name.unwrap_or_default(),
@@ -1523,6 +1538,28 @@ impl ConversationService {
             .filter(|s| !s.is_empty())
         {
             self.bind_project_best_effort(user_id, &id, workspace).await;
+        }
+
+        // Kits (C27): apply the global/project/assistant decisions on top of
+        // the snapshot frozen above, now that the project is bound. Best-effort
+        // like the bind: a kit failure never fails the create.
+        match self.apply_kit_skills(user_id, &id, assistant_id.as_deref()).await {
+            Ok(Some(skills)) => {
+                if let Some(obj) = extra.as_object_mut() {
+                    if !obj.contains_key("kit_base_skills")
+                        && let Some(base) = obj.get("skills").cloned()
+                    {
+                        obj.insert("kit_base_skills".to_owned(), base);
+                    }
+                    obj.insert("skills".to_owned(), serde_json::json!(skills));
+                }
+                row.extra = serde_json::to_string(&extra)
+                    .map_err(|e| ConversationError::internal(format!("Failed to serialize extra: {e}")))?;
+            }
+            Ok(None) => {}
+            Err(err) => {
+                warn!(conversation_id = %id, error = %ErrorChain(&err), "kits: skill apply skipped on create");
+            }
         }
 
         if let Some(snapshot) = assistant_snapshot.as_ref() {

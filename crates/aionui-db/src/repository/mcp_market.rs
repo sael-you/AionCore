@@ -100,6 +100,16 @@ pub trait IMcpMarketRepository: Send + Sync {
         cli: &str,
     ) -> Result<bool, DbError>;
 
+    /// The kit decision about one instance in a conversation's effective set
+    /// (C27), or `None` when no level mentions it. The launcher's
+    /// `--conversation` scope accepts only an `included` decision.
+    async fn kit_mcp_decision(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        instance_id: &str,
+    ) -> Result<Option<crate::kit_resolve::KitDecision>, DbError>;
+
     /// `conversations.project_id` of a conversation, if bound.
     async fn conversation_project_id(&self, user_id: &str, conversation_id: &str) -> Result<Option<String>, DbError>;
 

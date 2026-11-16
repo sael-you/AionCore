@@ -613,6 +613,9 @@ fn build_conversation_service(deps: ConversationServiceDeps<'_>) -> Conversation
     // Path-1 cascade: a deleted conversation drops its `user_order` rows.
     service.with_delete_hook(Arc::new(UserOrderDeleteHook::new(deps.user_order_store)));
     service.with_project_service(Arc::new(deps.project_service));
+    service.with_kit_repo(Arc::new(aionui_db::SqliteKitRepository::new(
+        deps.database.pool().clone(),
+    )));
     service
 }
 

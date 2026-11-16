@@ -22,6 +22,13 @@ pub enum MarketError {
     Unavailable(String),
     #[error("internal error: {0}")]
     Internal(String),
+    /// A kit request refused with a kit-specific code (C27).
+    #[error("{1}")]
+    Kit(aionui_api_types::KitErrorCode, String),
+}
+
+pub(crate) fn kit_error(code: aionui_api_types::KitErrorCode, msg: impl Into<String>) -> MarketError {
+    MarketError::Kit(code, msg.into())
 }
 
 impl From<DbError> for MarketError {

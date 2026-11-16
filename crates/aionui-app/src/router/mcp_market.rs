@@ -92,6 +92,23 @@ impl IMcpAssistantBinder for AssistantMcpBinder {
     }
 }
 
+/// Re-applies a conversation's kit skills (C27) through the conversation
+/// service, which owns `extra.skills` and the skill view.
+pub(crate) struct ConversationKitApplier {
+    pub conversation: aionui_conversation::service::ConversationService,
+}
+
+#[async_trait::async_trait]
+impl aionui_mcp::market::IKitConversationApplier for ConversationKitApplier {
+    async fn reapply_kit_skills(&self, user_id: &str, conversation_id: &str) -> Result<(), String> {
+        self.conversation
+            .reapply_kit_skills(user_id, conversation_id)
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+}
+
 /// Identity for market writes: a validated session (cookie or bearer JWT) in
 /// every mode, never the runtime-token channel and never `--local`'s default
 /// user (the voice `AuthState{UserSession, runtime_token_verifier: None}`

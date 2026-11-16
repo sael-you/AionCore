@@ -86,7 +86,10 @@ pub trait IMcpServerRepository: Send + Sync {
     /// must also have an assistant-channel assignment for (instance, the
     /// conversation's project, `scope.assistant_id`, `scope.cli`) — whole-project
     /// and global assignments are delivered by the native files, never by AionUi
-    /// (R7). Without a conversation (snapshot time) only the status is checked;
+    /// (R7) — OR a kit grant of the conversation's effective set (C27: the
+    /// instance enabled for `scope.cli`; a grant decided at the global level
+    /// only for `GLOBAL_MCP_IDS` read instances). A kit `remove` drops the row
+    /// even when it is assigned. Without a conversation (snapshot time) only the status is checked;
     /// the spawn path and the launcher check the assignment again.
     ///
     /// The default keeps every row as non-market: only the SQLite repository can
@@ -98,6 +101,14 @@ pub trait IMcpServerRepository: Send + Sync {
         rows: Vec<McpServerRow>,
     ) -> Result<Vec<GatedMcpRow>, DbError> {
         Ok(rows.into_iter().map(|row| GatedMcpRow { row, market: None }).collect())
+    }
+
+    /// Market instance ids a conversation's kits grant (C27): the
+    /// `included` MCP decisions of its effective set, before the gate's status,
+    /// CLI and R2/R3 checks. The spawn path loads these rows in addition to the
+    /// selected snapshot. Default: none (test doubles hold no kits).
+    async fn kit_mcp_ids(&self, _user_id: &str, _conversation_id: &str) -> Result<Vec<String>, DbError> {
+        Ok(Vec::new())
     }
 }
 
@@ -128,6 +139,9 @@ pub struct MarketDelivery {
     /// `None` at snapshot time (no conversation in scope).
     pub project_id: Option<String>,
     pub assistant_id: Option<String>,
+    /// `Some` = delivered by a kit grant of this conversation (C27): the
+    /// launcher is invoked with `--conversation` and recomputes the grant.
+    pub conversation_id: Option<String>,
     /// `read` or `write`.
     pub tier: String,
     /// JSON array (read tier allowlist), as stored.

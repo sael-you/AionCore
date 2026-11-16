@@ -5,6 +5,7 @@ pub mod adapter;
 pub mod adapters;
 pub mod connection_test;
 pub mod error;
+pub mod kit_routes;
 pub mod market;
 pub mod market_routes;
 pub mod oauth_service;
@@ -22,7 +23,9 @@ pub use adapters::{
 };
 pub use connection_test::McpConnectionTestService;
 pub use error::McpError;
-pub use market::{IMcpAssistantBinder, IMcpTemplateCatalog, McpMarketService, StaticTemplateCatalog};
+pub use market::{
+    IKitConversationApplier, IMcpAssistantBinder, IMcpTemplateCatalog, McpMarketService, StaticTemplateCatalog,
+};
 pub use market_routes::{McpMarketRouterState, mcp_market_read_routes, mcp_market_write_routes};
 pub use oauth_service::McpOAuthService;
 pub use routes::{McpRouterState, mcp_routes};
