@@ -1,28 +1,45 @@
-//! Per-user browser settings (C30, Settings → Browser): validation and a
-//! root-only JSON file per user under AionCore's data dir. No migration: the
-//! file holds four values and the browser user cannot reach it (it is not in
-//! the browser's own directory).
+//! Per-user browser settings (C30, Settings → Browser; TASK-124 named
+//! instances): validation and a root-only JSON file per user under
+//! AionCore's data dir. No migration: the browser user cannot reach the file
+//! (it is not in the browser's own directory). A file written before TASK-124
+//! has no instance rows; it reads as rows 1..=max_instances with default names
+//! and is made explicit on the next write.
 
 use std::path::{Path, PathBuf};
 
 use aionui_api_types::{
-    BROWSER_MAX_INSTANCES_LIMIT, BROWSER_MAX_TABS_LIMIT, BrowserErrorCode, BrowserInstanceSettings, BrowserSettings,
-    BrowserSettingsUpdate,
+    BROWSER_INSTANCE_COLORS, BROWSER_INSTANCE_EMOJI_MAX_BYTES, BROWSER_INSTANCE_NAME_MAX, BROWSER_MAX_INSTANCES_LIMIT,
+    BROWSER_MAX_TABS_LIMIT, BrowserErrorCode, BrowserInstanceCreate, BrowserInstancePatch, BrowserInstanceSettings,
+    BrowserSettings, BrowserSettingsUpdate, browser_instance_default_name,
 };
 use serde::{Deserialize, Serialize};
 
 use crate::error::BrowserError;
 use crate::layout::safe_user_segment;
 
-/// What is stored: the wire settings plus the per-instance rows of every
-/// possible instance (a lowered `max_instances` keeps the hidden rows).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct StoredInstance {
+    instance: u8,
+    name: String,
+    #[serde(default)]
+    color: Option<String>,
+    #[serde(default)]
+    emoji: Option<String>,
+    #[serde(default)]
+    hide_automation: bool,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 struct StoredSettings {
     agents_enabled: bool,
     max_instances: u8,
     max_tabs: u8,
-    #[serde(default)]
+    /// Pre-TASK-124 per-instance flag list (read only for the migration).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     hide_automation: Vec<u8>,
+    /// The existing instances; `None` = written before TASK-124.
+    #[serde(default)]
+    instances: Option<Vec<StoredInstance>>,
 }
 
 impl Default for StoredSettings {
@@ -33,34 +50,8 @@ impl Default for StoredSettings {
             max_instances: d.max_instances,
             max_tabs: d.max_tabs,
             hide_automation: Vec::new(),
+            instances: None,
         }
-    }
-}
-
-impl StoredSettings {
-    fn to_wire(&self) -> BrowserSettings {
-        BrowserSettings {
-            agents_enabled: self.agents_enabled,
-            max_instances: self.max_instances,
-            max_tabs: self.max_tabs,
-            instances: (1..=self.max_instances)
-                .map(|instance| BrowserInstanceSettings {
-                    instance,
-                    hide_automation: self.hide_automation.contains(&instance),
-                })
-                .collect(),
-        }
-    }
-
-    /// Clamp values a hand-edited file could carry out of range.
-    fn sanitized(mut self) -> Self {
-        self.max_instances = self.max_instances.clamp(1, BROWSER_MAX_INSTANCES_LIMIT);
-        self.max_tabs = self.max_tabs.clamp(1, BROWSER_MAX_TABS_LIMIT);
-        self.hide_automation
-            .retain(|n| (1..=BROWSER_MAX_INSTANCES_LIMIT).contains(n));
-        self.hide_automation.sort_unstable();
-        self.hide_automation.dedup();
-        self
     }
 }
 
@@ -71,35 +62,159 @@ fn out_of_range(what: &str) -> BrowserError {
     )
 }
 
-/// Apply an update to `current`, refusing any out-of-range value.
-pub fn apply_update(
-    current: &BrowserSettings,
-    update: &BrowserSettingsUpdate,
-) -> Result<BrowserSettings, BrowserError> {
-    let mut next = current.clone();
-    if let Some(v) = update.agents_enabled {
-        next.agents_enabled = v;
+fn not_found(n: u8) -> BrowserError {
+    BrowserError::coded(BrowserErrorCode::BrowserInstanceNotFound, format!("no instance {n}"))
+}
+
+/// A trimmed name of 1..=40 characters without control characters.
+pub fn validate_name(raw: &str) -> Result<String, BrowserError> {
+    let name = raw.trim();
+    let chars = name.chars().count();
+    if chars == 0 || chars > BROWSER_INSTANCE_NAME_MAX || name.chars().any(char::is_control) {
+        return Err(out_of_range("name"));
     }
-    if let Some(v) = update.max_instances {
-        if !(1..=BROWSER_MAX_INSTANCES_LIMIT).contains(&v) {
-            return Err(out_of_range("max_instances"));
+    Ok(name.to_owned())
+}
+
+/// `""` = clear; otherwise a palette id.
+fn validate_color(raw: &str) -> Result<Option<String>, BrowserError> {
+    match raw.trim() {
+        "" => Ok(None),
+        id if BROWSER_INSTANCE_COLORS.contains(&id) => Ok(Some(id.to_owned())),
+        _ => Err(out_of_range("color")),
+    }
+}
+
+/// `""` = clear; otherwise at most 16 bytes, no control characters.
+fn validate_emoji(raw: &str) -> Result<Option<String>, BrowserError> {
+    let e = raw.trim();
+    if e.is_empty() {
+        return Ok(None);
+    }
+    if e.len() > BROWSER_INSTANCE_EMOJI_MAX_BYTES || e.chars().any(char::is_control) {
+        return Err(out_of_range("emoji"));
+    }
+    Ok(Some(e.to_owned()))
+}
+
+impl StoredSettings {
+    /// The instance rows (migrated from a pre-TASK-124 file when needed),
+    /// cleaned: numbers 1..=5 once each, instance 1 present, valid unique names.
+    fn rows(&self) -> Vec<StoredInstance> {
+        let mut rows = match &self.instances {
+            Some(rows) => rows.clone(),
+            None => (1..=self.max_instances.clamp(1, BROWSER_MAX_INSTANCES_LIMIT))
+                .map(|n| StoredInstance {
+                    instance: n,
+                    name: browser_instance_default_name(n),
+                    color: None,
+                    emoji: None,
+                    hide_automation: self.hide_automation.contains(&n),
+                })
+                .collect(),
+        };
+        rows.retain(|r| (1..=BROWSER_MAX_INSTANCES_LIMIT).contains(&r.instance));
+        rows.sort_by_key(|r| r.instance);
+        rows.dedup_by_key(|r| r.instance);
+        if rows.first().map(|r| r.instance) != Some(1) {
+            rows.insert(
+                0,
+                StoredInstance {
+                    instance: 1,
+                    name: browser_instance_default_name(1),
+                    color: None,
+                    emoji: None,
+                    hide_automation: false,
+                },
+            );
         }
-        next.max_instances = v;
-    }
-    if let Some(v) = update.max_tabs {
-        if !(1..=BROWSER_MAX_TABS_LIMIT).contains(&v) {
-            return Err(out_of_range("max_tabs"));
+        let mut seen: Vec<String> = Vec::new();
+        for r in &mut rows {
+            let valid = validate_name(&r.name)
+                .ok()
+                .filter(|n| !seen.contains(&n.to_lowercase()));
+            r.name = valid.unwrap_or_else(|| browser_instance_default_name(r.instance));
+            seen.push(r.name.to_lowercase());
+            r.color = r.color.as_deref().and_then(|c| validate_color(c).ok().flatten());
+            r.emoji = r.emoji.as_deref().and_then(|e| validate_emoji(e).ok().flatten());
         }
-        next.max_tabs = v;
+        rows
     }
-    if let Some(rows) = &update.instances {
-        for row in rows {
-            if !(1..=BROWSER_MAX_INSTANCES_LIMIT).contains(&row.instance) {
-                return Err(out_of_range("instance"));
-            }
+
+    fn to_wire(&self) -> BrowserSettings {
+        BrowserSettings {
+            agents_enabled: self.agents_enabled,
+            max_instances: self.max_instances,
+            max_tabs: self.max_tabs,
+            instances: self
+                .rows()
+                .into_iter()
+                .map(|r| BrowserInstanceSettings {
+                    instance: r.instance,
+                    name: r.name,
+                    color: r.color,
+                    emoji: r.emoji,
+                    hide_automation: r.hide_automation,
+                })
+                .collect(),
         }
     }
-    Ok(next)
+
+    /// Clamp values a hand-edited file could carry out of range.
+    fn sanitized(mut self) -> Self {
+        self.max_tabs = self.max_tabs.clamp(1, BROWSER_MAX_TABS_LIMIT);
+        let rows = self.rows();
+        self.max_instances = self
+            .max_instances
+            .clamp(1, BROWSER_MAX_INSTANCES_LIMIT)
+            .max(rows.len() as u8);
+        self
+    }
+
+    /// Make the rows explicit (drops the pre-TASK-124 list).
+    fn with_rows(mut self, rows: Vec<StoredInstance>) -> Self {
+        self.instances = Some(rows);
+        self.hide_automation.clear();
+        self
+    }
+}
+
+/// Apply a patch to row `n` of `rows` (names stay unique case-insensitively).
+fn patch_row(
+    rows: &mut [StoredInstance],
+    n: u8,
+    name: Option<&str>,
+    color: Option<&str>,
+    emoji: Option<&str>,
+    hide_automation: Option<bool>,
+) -> Result<(), BrowserError> {
+    let name = name.map(validate_name).transpose()?;
+    if let Some(name) = &name
+        && rows
+            .iter()
+            .any(|r| r.instance != n && r.name.to_lowercase() == name.to_lowercase())
+    {
+        return Err(BrowserError::coded(
+            BrowserErrorCode::BrowserProfileNameTaken,
+            "another instance has that name",
+        ));
+    }
+    let color = color.map(validate_color).transpose()?;
+    let emoji = emoji.map(validate_emoji).transpose()?;
+    let row = rows.iter_mut().find(|r| r.instance == n).ok_or_else(|| not_found(n))?;
+    if let Some(name) = name {
+        row.name = name;
+    }
+    if let Some(color) = color {
+        row.color = color;
+    }
+    if let Some(emoji) = emoji {
+        row.emoji = emoji;
+    }
+    if let Some(h) = hide_automation {
+        row.hide_automation = h;
+    }
+    Ok(())
 }
 
 /// File store: `<dir>/<user>.json`, written atomically (temp + rename), 0600.
@@ -132,6 +247,11 @@ impl SettingsStore {
         }
     }
 
+    fn save(&self, user_id: &str, stored: StoredSettings) -> Result<BrowserSettings, BrowserError> {
+        write_private_json(&self.path(user_id)?, &stored)?;
+        Ok(stored.to_wire())
+    }
+
     pub fn load(&self, user_id: &str) -> Result<BrowserSettings, BrowserError> {
         Ok(self.load_stored(user_id)?.to_wire())
     }
@@ -139,26 +259,111 @@ impl SettingsStore {
     /// Validate and persist; returns the new settings.
     pub fn update(&self, user_id: &str, update: &BrowserSettingsUpdate) -> Result<BrowserSettings, BrowserError> {
         let mut stored = self.load_stored(user_id)?;
-        let next = apply_update(&stored.to_wire(), update)?;
-        stored.agents_enabled = next.agents_enabled;
-        stored.max_instances = next.max_instances;
-        stored.max_tabs = next.max_tabs;
-        if let Some(rows) = &update.instances {
-            for row in rows {
-                stored.hide_automation.retain(|n| *n != row.instance);
-                if row.hide_automation {
-                    stored.hide_automation.push(row.instance);
-                }
-            }
+        let mut rows = stored.rows();
+        if let Some(v) = update.agents_enabled {
+            stored.agents_enabled = v;
         }
-        let stored = stored.sanitized();
-        write_private_json(&self.path(user_id)?, &stored)?;
-        Ok(stored.to_wire())
+        if let Some(v) = update.max_tabs {
+            if !(1..=BROWSER_MAX_TABS_LIMIT).contains(&v) {
+                return Err(out_of_range("max_tabs"));
+            }
+            stored.max_tabs = v;
+        }
+        if let Some(v) = update.max_instances {
+            // Never below the existing instances (no silent deletes).
+            if !(1..=BROWSER_MAX_INSTANCES_LIMIT).contains(&v) || usize::from(v) < rows.len() {
+                return Err(out_of_range("max_instances"));
+            }
+            stored.max_instances = v;
+        }
+        for row in update.instances.iter().flatten() {
+            patch_row(
+                &mut rows,
+                row.instance,
+                row.name.as_deref(),
+                row.color.as_deref(),
+                row.emoji.as_deref(),
+                row.hide_automation,
+            )?;
+        }
+        self.save(user_id, stored.with_rows(rows))
+    }
+
+    /// A new instance at the lowest free number; returns (settings, number).
+    pub fn create(&self, user_id: &str, req: &BrowserInstanceCreate) -> Result<(BrowserSettings, u8), BrowserError> {
+        let stored = self.load_stored(user_id)?;
+        let mut rows = stored.rows();
+        if rows.len() >= usize::from(stored.max_instances) {
+            return Err(BrowserError::coded(
+                BrowserErrorCode::BrowserInstanceLimit,
+                "all instances are in use",
+            ));
+        }
+        let n = (1..=BROWSER_MAX_INSTANCES_LIMIT)
+            .find(|n| !rows.iter().any(|r| r.instance == *n))
+            .ok_or_else(|| BrowserError::coded(BrowserErrorCode::BrowserInstanceLimit, "no free instance"))?;
+        rows.push(StoredInstance {
+            instance: n,
+            name: browser_instance_default_name(n),
+            color: None,
+            emoji: None,
+            hide_automation: false,
+        });
+        rows.sort_by_key(|r| r.instance);
+        patch_row(
+            &mut rows,
+            n,
+            Some(&req.name),
+            req.color.as_deref(),
+            req.emoji.as_deref(),
+            req.hide_automation,
+        )?;
+        Ok((self.save(user_id, stored.with_rows(rows))?, n))
+    }
+
+    pub fn patch(&self, user_id: &str, n: u8, req: &BrowserInstancePatch) -> Result<BrowserSettings, BrowserError> {
+        let stored = self.load_stored(user_id)?;
+        let mut rows = stored.rows();
+        patch_row(
+            &mut rows,
+            n,
+            req.name.as_deref(),
+            req.color.as_deref(),
+            req.emoji.as_deref(),
+            req.hide_automation,
+        )?;
+        self.save(user_id, stored.with_rows(rows))
+    }
+
+    /// Remove instance `n`'s row (the caller stops it and wipes its profile).
+    pub fn delete(&self, user_id: &str, n: u8) -> Result<BrowserSettings, BrowserError> {
+        if n == 1 {
+            return Err(BrowserError::coded(
+                BrowserErrorCode::BrowserInstanceProtected,
+                "the main instance cannot be deleted",
+            ));
+        }
+        let stored = self.load_stored(user_id)?;
+        let mut rows = stored.rows();
+        if !rows.iter().any(|r| r.instance == n) {
+            return Err(not_found(n));
+        }
+        rows.retain(|r| r.instance != n);
+        self.save(user_id, stored.with_rows(rows))
+    }
+
+    /// Whether instance `n` exists for `user_id`.
+    pub fn exists(&self, user_id: &str, n: u8) -> Result<bool, BrowserError> {
+        Ok(self.load_stored(user_id)?.rows().iter().any(|r| r.instance == n))
     }
 
     /// Whether `instance` launches with the automation flag hidden.
     pub fn hide_automation(&self, user_id: &str, instance: u8) -> Result<bool, BrowserError> {
-        Ok(self.load_stored(user_id)?.hide_automation.contains(&instance))
+        Ok(self
+            .load_stored(user_id)?
+            .rows()
+            .iter()
+            .any(|r| r.instance == instance && r.hide_automation))
     }
 }
 
@@ -196,6 +401,7 @@ fn write_private_json<T: Serialize>(path: &Path, value: &T) -> Result<(), Browse
 #[cfg(test)]
 mod tests {
     use super::*;
+    use aionui_api_types::BrowserInstanceUpdate;
 
     fn store() -> (tempfile::TempDir, SettingsStore) {
         let dir = tempfile::tempdir().unwrap();
@@ -203,30 +409,43 @@ mod tests {
         (dir, store)
     }
 
+    fn create(name: &str) -> BrowserInstanceCreate {
+        BrowserInstanceCreate {
+            name: name.into(),
+            ..Default::default()
+        }
+    }
+
     #[test]
-    fn defaults_until_saved_then_persisted_per_user() {
+    fn defaults_are_main_plus_numbered_instances_and_persist_per_user() {
         let (_d, s) = store();
-        assert_eq!(s.load("u1").unwrap(), BrowserSettings::default());
+        let d = s.load("u1").unwrap();
+        assert_eq!(d, BrowserSettings::default());
+        assert_eq!(d.instances[0].name, "Main");
+        assert_eq!(d.instances[2].name, "Instance 3");
         let saved = s
             .update(
                 "u1",
                 &BrowserSettingsUpdate {
                     agents_enabled: Some(false),
                     max_tabs: Some(4),
-                    instances: Some(vec![BrowserInstanceSettings {
+                    instances: Some(vec![BrowserInstanceUpdate {
                         instance: 2,
-                        hide_automation: true,
+                        name: Some("  TB Discord ".into()),
+                        color: Some("indigo".into()),
+                        emoji: Some("🎮".into()),
+                        hide_automation: Some(true),
                     }]),
                     ..Default::default()
                 },
             )
             .unwrap();
         assert!(!saved.agents_enabled);
-        assert_eq!(saved.max_tabs, 4);
-        assert_eq!(saved.max_instances, 3, "unchanged field kept");
+        assert_eq!(saved.instances[1].name, "TB Discord");
+        assert_eq!(saved.instances[1].color.as_deref(), Some("indigo"));
+        assert_eq!(saved.instances[1].emoji.as_deref(), Some("🎮"));
         assert_eq!(s.load("u1").unwrap(), saved, "read back from disk");
         assert!(s.hide_automation("u1", 2).unwrap());
-        assert!(!s.hide_automation("u1", 1).unwrap());
         assert_eq!(
             s.load("u2").unwrap(),
             BrowserSettings::default(),
@@ -241,30 +460,133 @@ mod tests {
     }
 
     #[test]
+    fn a_pre_task_124_file_migrates_with_its_flags() {
+        let (_d, s) = store();
+        std::fs::create_dir_all(s.dir.clone()).unwrap();
+        std::fs::write(
+            s.path("u1").unwrap(),
+            r#"{"agents_enabled":true,"max_instances":4,"max_tabs":10,"hide_automation":[3]}"#,
+        )
+        .unwrap();
+        let st = s.load("u1").unwrap();
+        let names: Vec<&str> = st.instances.iter().map(|i| i.name.as_str()).collect();
+        assert_eq!(names, vec!["Main", "Instance 2", "Instance 3", "Instance 4"]);
+        assert!(st.instances[2].hide_automation);
+    }
+
+    #[test]
+    fn create_patch_and_delete_follow_the_rules() {
+        let (_d, s) = store();
+        // Defaults fill the cap (3): a fourth needs a higher cap.
+        let err = s.create("u1", &create("Work")).unwrap_err();
+        assert_eq!(err.code(), Some(BrowserErrorCode::BrowserInstanceLimit));
+        s.update(
+            "u1",
+            &BrowserSettingsUpdate {
+                max_instances: Some(5),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let (st, n) = s.create("u1", &create("Work")).unwrap();
+        assert_eq!(n, 4);
+        assert_eq!(st.instances.len(), 4);
+        // Names are unique case-insensitively.
+        let err = s.create("u1", &create("work")).unwrap_err();
+        assert_eq!(err.code(), Some(BrowserErrorCode::BrowserProfileNameTaken));
+        let err = s
+            .patch(
+                "u1",
+                2,
+                &BrowserInstancePatch {
+                    name: Some("MAIN".into()),
+                    ..Default::default()
+                },
+            )
+            .unwrap_err();
+        assert_eq!(err.code(), Some(BrowserErrorCode::BrowserProfileNameTaken));
+        // "" clears colour / emoji; absent keeps them.
+        s.patch(
+            "u1",
+            4,
+            &BrowserInstancePatch {
+                color: Some("teal".into()),
+                emoji: Some("💼".into()),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let st = s
+            .patch(
+                "u1",
+                4,
+                &BrowserInstancePatch {
+                    color: Some(String::new()),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let row = st.instances.iter().find(|i| i.instance == 4).unwrap();
+        assert_eq!((row.color.as_deref(), row.emoji.as_deref()), (None, Some("💼")));
+        // Delete: 1 is protected, unknown is 404, the gap is reused by the next create.
+        assert_eq!(
+            s.delete("u1", 1).unwrap_err().code(),
+            Some(BrowserErrorCode::BrowserInstanceProtected)
+        );
+        assert_eq!(
+            s.delete("u1", 5).unwrap_err().code(),
+            Some(BrowserErrorCode::BrowserInstanceNotFound)
+        );
+        let st = s.delete("u1", 2).unwrap();
+        assert!(!st.instances.iter().any(|i| i.instance == 2));
+        assert!(!s.exists("u1", 2).unwrap());
+        let (_, n) = s.create("u1", &create("Again")).unwrap();
+        assert_eq!(n, 2, "lowest free number");
+    }
+
+    #[test]
     fn out_of_range_values_are_refused_with_the_code() {
         let (_d, s) = store();
+        let bad_patch = |p: BrowserInstancePatch| s.patch("u1", 1, &p).unwrap_err().code();
+        for p in [
+            BrowserInstancePatch {
+                name: Some("   ".into()),
+                ..Default::default()
+            },
+            BrowserInstancePatch {
+                name: Some("x".repeat(41)),
+                ..Default::default()
+            },
+            BrowserInstancePatch {
+                name: Some("bad\nname".into()),
+                ..Default::default()
+            },
+            BrowserInstancePatch {
+                color: Some("#ff0000".into()),
+                ..Default::default()
+            },
+            BrowserInstancePatch {
+                emoji: Some("x".repeat(17)),
+                ..Default::default()
+            },
+        ] {
+            assert_eq!(
+                bad_patch(p.clone()),
+                Some(BrowserErrorCode::BrowserSettingOutOfRange),
+                "{p:?}"
+            );
+        }
         for update in [
             BrowserSettingsUpdate {
                 max_instances: Some(0),
                 ..Default::default()
             },
             BrowserSettingsUpdate {
-                max_instances: Some(6),
-                ..Default::default()
-            },
-            BrowserSettingsUpdate {
-                max_tabs: Some(0),
+                max_instances: Some(2),
                 ..Default::default()
             },
             BrowserSettingsUpdate {
                 max_tabs: Some(21),
-                ..Default::default()
-            },
-            BrowserSettingsUpdate {
-                instances: Some(vec![BrowserInstanceSettings {
-                    instance: 6,
-                    hide_automation: true,
-                }]),
                 ..Default::default()
             },
         ] {
@@ -275,43 +597,19 @@ mod tests {
                 "{update:?}"
             );
         }
-        assert_eq!(s.load("u1").unwrap(), BrowserSettings::default(), "nothing persisted");
-    }
-
-    #[test]
-    fn a_lowered_instance_limit_keeps_hidden_rows_for_later() {
-        let (_d, s) = store();
-        s.update(
-            "u1",
-            &BrowserSettingsUpdate {
-                instances: Some(vec![BrowserInstanceSettings {
-                    instance: 3,
-                    hide_automation: true,
-                }]),
+        let unknown = BrowserSettingsUpdate {
+            instances: Some(vec![BrowserInstanceUpdate {
+                instance: 5,
+                name: Some("x".into()),
                 ..Default::default()
-            },
-        )
-        .unwrap();
-        let low = s
-            .update(
-                "u1",
-                &BrowserSettingsUpdate {
-                    max_instances: Some(2),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        assert_eq!(low.instances.len(), 2);
-        let back = s
-            .update(
-                "u1",
-                &BrowserSettingsUpdate {
-                    max_instances: Some(3),
-                    ..Default::default()
-                },
-            )
-            .unwrap();
-        assert!(back.instances[2].hide_automation);
+            }]),
+            ..Default::default()
+        };
+        assert_eq!(
+            s.update("u1", &unknown).unwrap_err().code(),
+            Some(BrowserErrorCode::BrowserInstanceNotFound)
+        );
+        assert_eq!(s.load("u1").unwrap(), BrowserSettings::default(), "nothing persisted");
     }
 
     #[test]

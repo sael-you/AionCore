@@ -12,7 +12,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use aionui_api_types::{BrowserInstanceSettings, BrowserSettingsUpdate};
+use aionui_api_types::{BrowserInstanceUpdate, BrowserSettingsUpdate};
 use aionui_browser::bridge::{ENV_ACTIVE_PORT, ENV_ACTIVE_TOKEN, ENV_PLAYWRIGHT_HEADERS};
 use aionui_browser::{BrowserLayout, BrowserService, BrowserServiceConfig, NavigationGuard};
 use futures_util::{SinkExt, StreamExt};
@@ -120,9 +120,10 @@ async fn live_server_browser_end_to_end() {
         user,
         &BrowserSettingsUpdate {
             max_tabs: Some(3),
-            instances: Some(vec![BrowserInstanceSettings {
+            instances: Some(vec![BrowserInstanceUpdate {
                 instance: 2,
-                hide_automation: true,
+                hide_automation: Some(true),
+                ..Default::default()
             }]),
             ..Default::default()
         },

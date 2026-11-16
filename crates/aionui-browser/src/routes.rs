@@ -6,7 +6,8 @@
 use std::sync::Arc;
 
 use aionui_api_types::{
-    ApiResponse, BrowserErrorCode, BrowserSettings, BrowserSettingsUpdate, BrowserStatusResponse, BrowserWsQuery,
+    ApiResponse, BrowserErrorCode, BrowserInstanceCreate, BrowserInstancePatch, BrowserSettings, BrowserSettingsUpdate,
+    BrowserStatusResponse, BrowserWsQuery,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
@@ -30,6 +31,11 @@ pub fn browser_routes(state: BrowserRouterState) -> Router {
     Router::new()
         .route("/api/browser/settings", get(get_settings).put(put_settings))
         .route("/api/browser/status", get(get_status))
+        .route("/api/browser/instances", post(create_instance))
+        .route(
+            "/api/browser/instances/{n}",
+            axum::routing::patch(patch_instance).delete(delete_instance),
+        )
         .route("/api/browser/instances/{n}/clear", post(clear_instance))
         .route("/api/browser/instances/{n}/stop", post(stop_instance))
         .route("/api/browser/ws", get(panel_ws))
@@ -50,6 +56,9 @@ pub fn code_str(code: BrowserErrorCode) -> &'static str {
         BrowserErrorCode::BrowserTabNotFound => "BROWSER_TAB_NOT_FOUND",
         BrowserErrorCode::BrowserBadMessage => "BROWSER_BAD_MESSAGE",
         BrowserErrorCode::BrowserBusy => "BROWSER_BUSY",
+        BrowserErrorCode::BrowserProfileNameTaken => "BROWSER_PROFILE_NAME_TAKEN",
+        BrowserErrorCode::BrowserInstanceProtected => "BROWSER_INSTANCE_PROTECTED",
+        BrowserErrorCode::BrowserInstanceNotFound => "BROWSER_INSTANCE_NOT_FOUND",
     }
 }
 
@@ -73,9 +82,13 @@ fn api_error(e: BrowserError) -> ApiError {
                 BrowserErrorCode::BrowserSettingOutOfRange | BrowserErrorCode::BrowserBadMessage => {
                     StatusCode::BAD_REQUEST
                 }
-                BrowserErrorCode::BrowserInstanceLimit => StatusCode::BAD_REQUEST,
-                BrowserErrorCode::BrowserBusy => StatusCode::CONFLICT,
-                BrowserErrorCode::BrowserTabNotFound => StatusCode::NOT_FOUND,
+                BrowserErrorCode::BrowserInstanceProtected => StatusCode::BAD_REQUEST,
+                BrowserErrorCode::BrowserInstanceLimit
+                | BrowserErrorCode::BrowserProfileNameTaken
+                | BrowserErrorCode::BrowserBusy => StatusCode::CONFLICT,
+                BrowserErrorCode::BrowserTabNotFound | BrowserErrorCode::BrowserInstanceNotFound => {
+                    StatusCode::NOT_FOUND
+                }
                 _ => StatusCode::SERVICE_UNAVAILABLE,
             };
             ApiError::coded(status, code_str(code), e.to_string(), None)
@@ -113,6 +126,37 @@ async fn get_status(
     Ok(Json(ApiResponse::ok(s.service.status(&user.id).map_err(api_error)?)))
 }
 
+async fn create_instance(
+    State(s): State<BrowserRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Json(req): Json<BrowserInstanceCreate>,
+) -> Result<Json<ApiResponse<BrowserSettings>>, ApiError> {
+    Ok(Json(ApiResponse::ok(
+        s.service.create_instance(&user.id, &req).map_err(api_error)?,
+    )))
+}
+
+async fn patch_instance(
+    State(s): State<BrowserRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(n): Path<u8>,
+    Json(req): Json<BrowserInstancePatch>,
+) -> Result<Json<ApiResponse<BrowserSettings>>, ApiError> {
+    Ok(Json(ApiResponse::ok(
+        s.service.patch_instance(&user.id, n, &req).map_err(api_error)?,
+    )))
+}
+
+async fn delete_instance(
+    State(s): State<BrowserRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(n): Path<u8>,
+) -> Result<Json<ApiResponse<BrowserSettings>>, ApiError> {
+    Ok(Json(ApiResponse::ok(
+        s.service.delete_instance(&user.id, n).await.map_err(api_error)?,
+    )))
+}
+
 async fn clear_instance(
     State(s): State<BrowserRouterState>,
     Extension(user): Extension<CurrentUser>,
@@ -142,11 +186,10 @@ async fn panel_ws(
 ) -> Result<Response, ApiError> {
     learn_host(&s, &headers);
     let instance = q.instance.unwrap_or(1);
-    let max = s.service.settings(&user.id).map_err(api_error)?.max_instances;
-    if instance == 0 || instance > max {
+    if !s.service.instance_exists(&user.id, instance) {
         return Err(api_error(BrowserError::coded(
-            BrowserErrorCode::BrowserInstanceLimit,
-            "instance above the limit",
+            BrowserErrorCode::BrowserInstanceNotFound,
+            "no such instance",
         )));
     }
     let backend: Arc<dyn PanelBackend> = s.service.clone();
@@ -175,6 +218,9 @@ mod tests {
             BrowserErrorCode::BrowserTabNotFound,
             BrowserErrorCode::BrowserBadMessage,
             BrowserErrorCode::BrowserBusy,
+            BrowserErrorCode::BrowserProfileNameTaken,
+            BrowserErrorCode::BrowserInstanceProtected,
+            BrowserErrorCode::BrowserInstanceNotFound,
         ] {
             assert_eq!(serde_json::to_value(code).unwrap(), code_str(code));
         }

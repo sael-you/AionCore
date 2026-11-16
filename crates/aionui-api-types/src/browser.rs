@@ -34,12 +34,35 @@ pub enum BrowserErrorCode {
     BrowserBadMessage,
     /// `clear` while that profile is being wiped already.
     BrowserBusy,
+    /// Another instance of this user already has that name (case-insensitive).
+    BrowserProfileNameTaken,
+    /// Instance 1 (the panel default with the owner's logins) cannot be deleted.
+    BrowserInstanceProtected,
+    /// No instance with that number exists.
+    BrowserInstanceNotFound,
 }
 
 /// Hard upper bound of `max_instances` (one bridge port per possible instance).
 pub const BROWSER_MAX_INSTANCES_LIMIT: u8 = 5;
 /// Hard upper bound of `max_tabs`.
 pub const BROWSER_MAX_TABS_LIMIT: u8 = 20;
+/// Palette ids an instance colour may take (the UI's project palette).
+pub const BROWSER_INSTANCE_COLORS: &[&str] = &[
+    "red", "orange", "amber", "lime", "green", "teal", "cyan", "blue", "indigo", "violet", "pink", "slate",
+];
+/// Longest instance name (characters, after trimming).
+pub const BROWSER_INSTANCE_NAME_MAX: usize = 40;
+/// Longest instance emoji (UTF-8 bytes).
+pub const BROWSER_INSTANCE_EMOJI_MAX_BYTES: usize = 16;
+
+/// Default name of instance `n`: "Main" for 1, else "Instance n".
+pub fn browser_instance_default_name(n: u8) -> String {
+    if n == 1 {
+        "Main".to_owned()
+    } else {
+        format!("Instance {n}")
+    }
+}
 
 // ---------------------------------------------------------------------------
 // HTTP
@@ -50,19 +73,28 @@ pub const BROWSER_MAX_TABS_LIMIT: u8 = 20;
 pub struct BrowserSettings {
     /// "Agents can use the browser" (default true).
     pub agents_enabled: bool,
-    /// 1..=5, default 3. Instance 1 is the panel's (owner logins).
+    /// The most instances (profiles) a user may have: 1..=5, default 3; never
+    /// below the number of existing instances.
     pub max_instances: u8,
     /// 1..=20, default 10, per instance.
     pub max_tabs: u8,
-    /// One row per instance 1..=max_instances.
+    /// The EXISTING instances, ascending. Instance 1 always exists.
     pub instances: Vec<BrowserInstanceSettings>,
 }
 
-/// Per-instance settings. A change applies at the instance's next start.
+/// One instance (a named browser profile). A `hide_automation` change applies
+/// at the instance's next start.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
 pub struct BrowserInstanceSettings {
     pub instance: u8,
+    /// 1..=40 characters, unique per user (case-insensitive).
+    pub name: String,
+    /// A palette id from [`BROWSER_INSTANCE_COLORS`]; `None` = neutral.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+    /// At most 16 bytes of UTF-8.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub emoji: Option<String>,
     /// "Hide that the browser is automated" (default false): launches with
     /// `--disable-blink-features=AutomationControlled`, nothing else changes.
     pub hide_automation: bool,
@@ -78,6 +110,9 @@ impl Default for BrowserSettings {
             instances: (1..=max_instances)
                 .map(|instance| BrowserInstanceSettings {
                     instance,
+                    name: browser_instance_default_name(instance),
+                    color: None,
+                    emoji: None,
                     hide_automation: false,
                 })
                 .collect(),
@@ -86,8 +121,8 @@ impl Default for BrowserSettings {
 }
 
 /// `PUT /api/browser/settings`: only the given fields change. Out of range →
-/// 400 `BROWSER_SETTING_OUT_OF_RANGE`. Lowering `max_instances` stops running
-/// instances above the new limit.
+/// 400 `BROWSER_SETTING_OUT_OF_RANGE` (also `max_instances` below the number
+/// of existing instances).
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct BrowserSettingsUpdate {
@@ -97,9 +132,54 @@ pub struct BrowserSettingsUpdate {
     pub max_instances: Option<u8>,
     #[serde(default)]
     pub max_tabs: Option<u8>,
-    /// Only the listed instances change (instance 1..=5).
+    /// Existing instances only (unknown → 404 `BROWSER_INSTANCE_NOT_FOUND`).
     #[serde(default)]
-    pub instances: Option<Vec<BrowserInstanceSettings>>,
+    pub instances: Option<Vec<BrowserInstanceUpdate>>,
+}
+
+/// One row of `BrowserSettingsUpdate.instances`: absent = unchanged; `""`
+/// for `color` / `emoji` clears it.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserInstanceUpdate {
+    pub instance: u8,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub color: Option<String>,
+    #[serde(default)]
+    pub emoji: Option<String>,
+    #[serde(default)]
+    pub hide_automation: Option<bool>,
+}
+
+/// `PATCH /api/browser/instances/{n}`: absent = unchanged; `""` clears
+/// `color` / `emoji`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserInstancePatch {
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub color: Option<String>,
+    #[serde(default)]
+    pub emoji: Option<String>,
+    #[serde(default)]
+    pub hide_automation: Option<bool>,
+}
+
+/// `POST /api/browser/instances`: a new instance at the lowest free number
+/// (409 `BROWSER_INSTANCE_LIMIT` when `max_instances` are in use).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BrowserInstanceCreate {
+    pub name: String,
+    #[serde(default)]
+    pub color: Option<String>,
+    #[serde(default)]
+    pub emoji: Option<String>,
+    #[serde(default)]
+    pub hide_automation: Option<bool>,
 }
 
 /// `GET /api/browser/status`, also the answer of
@@ -111,7 +191,7 @@ pub struct BrowserStatusResponse {
     pub unavailable_reason: Option<BrowserErrorCode>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub chrome_version: Option<String>,
-    /// One row per instance 1..=max_instances.
+    /// One row per existing instance, ascending.
     pub instances: Vec<BrowserInstanceStatus>,
     pub idle_timeout_secs: u64,
 }
@@ -120,6 +200,11 @@ pub struct BrowserStatusResponse {
 pub struct BrowserInstanceStatus {
     /// 1 = the panel's instance with the owner logins.
     pub instance: u8,
+    pub name: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub color: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub emoji: Option<String>,
     pub running: bool,
     pub tabs: u16,
     pub agent_active: bool,
@@ -395,9 +480,9 @@ mod tests {
         assert_eq!(
             serde_json::to_value(BrowserSettings::default()).unwrap(),
             json!({"agents_enabled": true, "max_instances": 3, "max_tabs": 10, "instances": [
-                {"instance": 1, "hide_automation": false},
-                {"instance": 2, "hide_automation": false},
-                {"instance": 3, "hide_automation": false}
+                {"instance": 1, "name": "Main", "hide_automation": false},
+                {"instance": 2, "name": "Instance 2", "hide_automation": false},
+                {"instance": 3, "name": "Instance 3", "hide_automation": false}
             ]})
         );
     }
