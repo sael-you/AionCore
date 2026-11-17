@@ -4124,6 +4124,28 @@ impl ConversationService {
             .await
     }
 
+    /// [`Self::send_message`] with a CLIENT retry key (TASK-127): the same user,
+    /// conversation and key return the first send's result. Stored as
+    /// `client:<key>` so a client key never matches an internal (voice) key.
+    pub async fn send_message_with_client_key(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        req: SendMessageRequest,
+        task_manager: &Arc<dyn IWorkerTaskManager>,
+        idempotency_key: &str,
+    ) -> Result<SendMessageResponse, ConversationError> {
+        let key = idempotency_key.trim();
+        if key.is_empty() || key.chars().count() > 128 {
+            return Err(ConversationError::BadRequest {
+                reason: "idempotency_key must be 1-128 characters".into(),
+            });
+        }
+        let stored = format!("client:{key}");
+        self.send_message_keyed(user_id, conversation_id, req, task_manager, Some(&stored))
+            .await
+    }
+
     /// Response for a send that matched a stored idempotency key.
     async fn idempotent_replay(
         &self,
@@ -6565,6 +6587,7 @@ mod tests {
             project_id: None,
             fork_capability: None,
             prompt_capability: None,
+            capabilities: None,
             live: None,
             created_at: 0,
             modified_at: 0,

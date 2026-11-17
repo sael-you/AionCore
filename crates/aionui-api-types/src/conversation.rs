@@ -121,6 +121,14 @@ pub struct ForkConversationRequest {
 /// unknown/unsupported — the UI then hints that media attachments are sent
 /// as file paths. Filled only on the single-conversation detail path (list
 /// responses omit it — no N+1).
+/// What the conversation API of this core supports (TASK-127).
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ConversationCapabilitiesView {
+    /// `POST /api/conversations/{id}/messages` takes `idempotency_key`.
+    #[serde(default)]
+    pub send_idempotency: bool,
+}
+
 #[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct PromptCapabilityView {
     /// Agent takes native image content blocks.
@@ -202,6 +210,10 @@ pub struct SendMessageRequest {
     pub inject_skills: Vec<String>,
     #[serde(default)]
     pub hidden: bool,
+    /// Client retry key (TASK-127, ≤128 chars): the same user, conversation
+    /// and key return the FIRST send's result; no second message or turn.
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
 }
 
 /// Response for `POST /api/conversations/:id/messages`.
@@ -374,6 +386,10 @@ pub struct ConversationResponse {
     /// `None` on list responses. See [`PromptCapabilityView`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub prompt_capability: Option<PromptCapabilityView>,
+    /// Conversation API features of this backend build (TASK-127): absent on
+    /// an older core. See [`ConversationCapabilitiesView`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub capabilities: Option<ConversationCapabilitiesView>,
     /// List-path post-fill (C21): present only for a conversation whose agent
     /// is alive and doing something (a turn, a pending approval or question,
     /// background work), so the sidebar is right right after a reload. `None`
@@ -815,6 +831,7 @@ mod tests {
             extra: json!({ "workspace": "/project" }),
             fork_capability: None,
             prompt_capability: None,
+            capabilities: None,
             live: None,
             parent_conversation_id: None,
             depth: 0,
@@ -860,6 +877,7 @@ mod tests {
             extra: json!({}),
             fork_capability: None,
             prompt_capability: None,
+            capabilities: None,
             live: None,
             parent_conversation_id: None,
             depth: 0,
@@ -899,6 +917,7 @@ mod tests {
             extra: json!({}),
             fork_capability: None,
             prompt_capability: None,
+            capabilities: None,
             live: None,
             parent_conversation_id: None,
             depth: 0,
@@ -992,6 +1011,7 @@ mod tests {
                 extra: json!({}),
                 fork_capability: None,
                 prompt_capability: None,
+                capabilities: None,
                 live: None,
                 parent_conversation_id: None,
                 depth: 0,
@@ -1036,6 +1056,7 @@ mod tests {
                 extra: json!({}),
                 fork_capability: None,
                 prompt_capability: None,
+                capabilities: None,
                 live: None,
                 parent_conversation_id: None,
                 depth: 0,
@@ -1132,6 +1153,7 @@ mod tests {
                 extra: json!({}),
                 fork_capability: None,
                 prompt_capability: None,
+                capabilities: None,
                 live: None,
                 parent_conversation_id: None,
                 depth: 0,
@@ -1191,6 +1213,7 @@ mod tests {
                     extra: json!({}),
                     fork_capability: None,
                     prompt_capability: None,
+                    capabilities: None,
                     live: None,
                     parent_conversation_id: None,
                     depth: 0,

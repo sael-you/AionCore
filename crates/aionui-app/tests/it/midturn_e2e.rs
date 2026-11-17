@@ -383,3 +383,133 @@ async fn idempotency_keys_are_validated() {
         "{err:?}"
     );
 }
+
+/// TASK-127: the client retry key on `POST /api/conversations/{id}/messages`.
+async fn post_send(
+    app: &mut axum::Router,
+    token: &str,
+    csrf: &str,
+    conv_id: &str,
+    body: serde_json::Value,
+) -> (StatusCode, serde_json::Value) {
+    let req = json_with_token(
+        "POST",
+        &format!("/api/conversations/{conv_id}/messages"),
+        body,
+        token,
+        csrf,
+    );
+    let resp = app.clone().oneshot(req).await.unwrap();
+    let status = resp.status();
+    (status, body_json(resp).await)
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_client_idempotency_key_sends_once_per_conversation() {
+    let MidturnRig { mut app, services, .. } = build_midturn_app(true).await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "pw").await;
+    let conv_id = create_conversation(&mut app, &token, &csrf).await;
+
+    // The conversation detail says the route takes a key.
+    let resp = app
+        .clone()
+        .oneshot(get_with_token(&format!("/api/conversations/{conv_id}"), &token))
+        .await
+        .unwrap();
+    let detail = body_json(resp).await;
+    assert_eq!(detail["data"]["capabilities"]["send_idempotency"], true, "{detail}");
+
+    let (status, first) = post_send(
+        &mut app,
+        &token,
+        &csrf,
+        &conv_id,
+        json!({"content": "hello", "idempotency_key": "k-1"}),
+    )
+    .await;
+    assert!(status.is_success(), "{status} {first}");
+    wait_for_agent_registered(&services, &conv_id).await;
+    let (status, again) = post_send(
+        &mut app,
+        &token,
+        &csrf,
+        &conv_id,
+        json!({"content": "hello", "idempotency_key": "k-1"}),
+    )
+    .await;
+    assert!(status.is_success(), "{status} {again}");
+    assert_eq!(
+        again["data"]["msg_id"], first["data"]["msg_id"],
+        "the retry returns the first result"
+    );
+    assert_eq!(again["data"]["turn_id"], first["data"]["turn_id"]);
+    assert_eq!(user_messages(&services, &conv_id).await, 1, "one message for one key");
+
+    let (status, other) = post_send(
+        &mut app,
+        &token,
+        &csrf,
+        &conv_id,
+        json!({"content": "and this", "idempotency_key": "k-2"}),
+    )
+    .await;
+    assert!(status.is_success(), "{status} {other}");
+    assert_ne!(other["data"]["msg_id"], first["data"]["msg_id"]);
+    assert_eq!(
+        user_messages(&services, &conv_id).await,
+        2,
+        "a different key is a different message"
+    );
+
+    let (status, body) = post_send(
+        &mut app,
+        &token,
+        &csrf,
+        &conv_id,
+        json!({"content": "x", "idempotency_key": "k".repeat(129)}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
+    assert_eq!(user_messages(&services, &conv_id).await, 2);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn the_same_client_key_of_another_user_is_independent() {
+    let MidturnRig { mut app, services, .. } = build_midturn_app(true).await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "admin", "pw").await;
+    let conv_a = create_conversation(&mut app, &token, &csrf).await;
+    let (status, a) = post_send(
+        &mut app,
+        &token,
+        &csrf,
+        &conv_a,
+        json!({"content": "mine", "idempotency_key": "shared"}),
+    )
+    .await;
+    assert!(status.is_success(), "{status} {a}");
+
+    let (token_b, csrf_b) = setup_and_login(&mut app, &services, "bob", "pw-bob").await;
+    let conv_b = create_conversation(&mut app, &token_b, &csrf_b).await;
+    let (status, b) = post_send(
+        &mut app,
+        &token_b,
+        &csrf_b,
+        &conv_b,
+        json!({"content": "theirs", "idempotency_key": "shared"}),
+    )
+    .await;
+    assert!(status.is_success(), "{status} {b}");
+    assert_ne!(b["data"]["msg_id"], a["data"]["msg_id"], "independent sends");
+    assert_eq!(user_messages(&services, &conv_a).await, 1);
+    assert_eq!(user_messages(&services, &conv_b).await, 1);
+    // B cannot reach A's conversation with A's key at all.
+    let (status, _) = post_send(
+        &mut app,
+        &token_b,
+        &csrf_b,
+        &conv_a,
+        json!({"content": "x", "idempotency_key": "shared"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::NOT_FOUND);
+}
