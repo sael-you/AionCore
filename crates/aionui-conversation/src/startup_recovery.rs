@@ -3,6 +3,7 @@ use aionui_db::MessageRowUpdate;
 use aionui_db::models::MessageRow;
 use tracing::{info, warn};
 
+use crate::restart_resume::StaleStep;
 use crate::runtime_persistence::RuntimeWriteKind;
 use crate::service::ConversationService;
 
@@ -21,7 +22,10 @@ enum StartupRecoveryAction {
 }
 
 impl ConversationService {
-    pub async fn recover_stale_runtime_state_on_startup(&self) {
+    /// Close what a previous process left unfinished. Returns those rows as
+    /// they were found (TASK-44: they tell which turns the restart
+    /// interrupted and at which step).
+    pub async fn recover_stale_runtime_state_on_startup(&self) -> Vec<StaleStep> {
         let rows = match self.conversation_repo().list_stale_runtime_messages().await {
             Ok(rows) => rows,
             Err(error) => {
@@ -29,13 +33,20 @@ impl ConversationService {
                     error = %ErrorChain(&error),
                     "startup recovery skipped because stale runtime message query failed"
                 );
-                return;
+                return Vec::new();
             }
         };
 
+        let mut found = Vec::with_capacity(rows.len());
         let mut recovered = 0usize;
         for stale in rows {
             let row = stale.message;
+            found.push(StaleStep {
+                user_id: stale.user_id.clone(),
+                conversation_id: row.conversation_id.clone(),
+                row_type: row.r#type.clone(),
+                content: row.content.clone(),
+            });
             if !self
                 .runtime_persistence()
                 .allows(&row.conversation_id, RuntimeWriteKind::StartupRecovery)
@@ -83,6 +94,7 @@ impl ConversationService {
         if recovered > 0 {
             info!(recovered, "startup recovery completed for stale runtime messages");
         }
+        found
     }
 }
 

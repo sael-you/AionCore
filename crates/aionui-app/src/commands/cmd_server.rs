@@ -29,6 +29,11 @@ const LISTENING_EVENT_PREFIX: &str = "AIONCORE_LISTENING";
 const READY_EVENT_MARKER: &str = "AIONCORE_READY";
 const DYNAMIC_BACKEND_BIND_MAX_ATTEMPTS: usize = 50;
 const WORKER_TASK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
+/// TASK-44: how long running turns may finish by themselves before the
+/// worker tasks are cleared (turns waiting for an approval are not waited
+/// for: nobody can answer during a shutdown).
+const SHUTDOWN_TURN_DRAIN_TIMEOUT: Duration = Duration::from_secs(20);
+const SHUTDOWN_TURN_DRAIN_POLL: Duration = Duration::from_millis(250);
 
 // Bounded graceful-shutdown tail (AIONUI-16). The data-dir instance flock is
 // only released when this process exits, so every await between the shutdown
@@ -50,7 +55,7 @@ const SHUTDOWN_KEEP_AWAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 const SHUTDOWN_IDLE_SCANNER_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
 const SHUTDOWN_DB_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
-const SHUTDOWN_WATCHDOG_TIMEOUT: Duration = Duration::from_secs(30);
+const SHUTDOWN_WATCHDOG_TIMEOUT: Duration = Duration::from_secs(50);
 
 // The watchdog must outlast the sum of every bounded stage, otherwise it can
 // force-exit a shutdown that is still making progress within its per-stage
@@ -58,7 +63,8 @@ const SHUTDOWN_WATCHDOG_TIMEOUT: Duration = Duration::from_secs(30);
 // invalidate it.
 const _: () = assert!(
     SHUTDOWN_WATCHDOG_TIMEOUT.as_secs()
-        > WORKER_TASK_SHUTDOWN_TIMEOUT.as_secs()
+        > SHUTDOWN_TURN_DRAIN_TIMEOUT.as_secs()
+            + WORKER_TASK_SHUTDOWN_TIMEOUT.as_secs()
             + SHUTDOWN_KEEP_AWAKE_TIMEOUT.as_secs()
             + SHUTDOWN_DRAIN_TIMEOUT.as_secs()
             + SHUTDOWN_IDLE_SCANNER_JOIN_TIMEOUT.as_secs()
@@ -340,6 +346,7 @@ pub(crate) async fn run_server(
     );
     let conversation_runtime_state = services.conversation_runtime_state.clone();
     let worker_task_manager = services.worker_task_manager.clone();
+    let interrupted_snapshot_path = aionui_conversation::restart_resume::snapshot_path(&services.data_dir);
     let client_pref_service = router_runtime.client_pref_service.clone();
 
     // All initialization is complete and we are about to begin serving. Emit the
@@ -396,6 +403,12 @@ pub(crate) async fn run_server(
                         reason = "graceful_shutdown",
                         active_turn_count, "conversation runtime shutdown prepared"
                     );
+                    drain_running_turns(
+                        &conversation_runtime_state,
+                        &worker_task_manager,
+                        &interrupted_snapshot_path,
+                    )
+                    .await;
                     let active_task_count = worker_task_manager.active_count();
                     match tokio::time::timeout(WORKER_TASK_SHUTDOWN_TIMEOUT, worker_task_manager.clear()).await {
                         Ok(()) => info!(
@@ -569,6 +582,48 @@ where
 }
 
 type ShutdownFuture = Pin<Box<dyn Future<Output = Result<ShutdownReason, BootstrapError>> + Send>>;
+
+/// TASK-44: record the running turns for the next start, then let them finish
+/// for up to [`SHUTDOWN_TURN_DRAIN_TIMEOUT`]. The snapshot is written FIRST
+/// (the web host hard-kills this process a few seconds after SIGTERM) and
+/// again after the drain with what is still running. New turns are already
+/// refused (`mark_shutting_down`).
+async fn drain_running_turns(
+    runtime_state: &Arc<aionui_conversation::runtime_state::ConversationRuntimeStateService>,
+    task_manager: &Arc<dyn aionui_ai_agent::IWorkerTaskManager>,
+    snapshot_path: &std::path::Path,
+) {
+    use aionui_conversation::restart_resume::{build_snapshot, write_snapshot};
+    let save = |stage: &'static str| {
+        let snapshot = build_snapshot(runtime_state, task_manager);
+        let turns = snapshot.turns.len();
+        match write_snapshot(snapshot_path, &snapshot) {
+            Ok(()) => info!(stage, turns, "shutdown: running turns recorded for the next start"),
+            Err(error) => warn!(stage, turns, error = %error, "shutdown: running turns not recorded"),
+        }
+        snapshot
+    };
+    let first = save("shutdown.turn_snapshot");
+    if first.turns.is_empty() {
+        return;
+    }
+    let deadline = tokio::time::Instant::now() + SHUTDOWN_TURN_DRAIN_TIMEOUT;
+    loop {
+        let snapshot = build_snapshot(runtime_state, task_manager);
+        // Nothing left that could finish by itself.
+        if snapshot.turns.iter().all(|t| !t.approvals.is_empty()) || tokio::time::Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(SHUTDOWN_TURN_DRAIN_POLL).await;
+    }
+    let left = save("shutdown.turn_drain");
+    info!(
+        stage = "shutdown.turn_drain",
+        started = first.turns.len(),
+        interrupted = left.turns.len(),
+        "shutdown: turn drain finished"
+    );
+}
 
 async fn shutdown_signal(parent_exit: Option<ParentExitSignal>) -> Result<ShutdownReason, BootstrapError> {
     let ctrl_c = async {

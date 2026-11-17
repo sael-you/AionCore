@@ -14,6 +14,7 @@ mod kit_skills;
 pub(crate) mod message_cursor;
 mod message_persistence;
 pub mod response_middleware;
+pub mod restart_resume;
 pub mod routes;
 pub mod routes_aux;
 mod runtime_completion;

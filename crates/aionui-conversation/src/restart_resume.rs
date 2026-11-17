@@ -94,10 +94,7 @@ pub fn snapshot_path(data_dir: &Path) -> PathBuf {
 }
 
 fn clip(text: &str) -> String {
-    let flat: String = text
-        .chars()
-        .map(|c| if c.is_control() { ' ' } else { c })
-        .collect();
+    let flat: String = text.chars().map(|c| if c.is_control() { ' ' } else { c }).collect();
     let flat = flat.split_whitespace().collect::<Vec<_>>().join(" ");
     if flat.chars().count() > SUMMARY_CHARS {
         let mut out: String = flat.chars().take(SUMMARY_CHARS - 1).collect();
@@ -139,7 +136,9 @@ pub fn build_snapshot(
 
 /// Write the snapshot atomically (temp file + rename), owner-only.
 pub fn write_snapshot(path: &Path, snapshot: &ShutdownSnapshot) -> std::io::Result<()> {
-    let dir = path.parent().ok_or_else(|| std::io::Error::other("snapshot path has no parent"))?;
+    let dir = path
+        .parent()
+        .ok_or_else(|| std::io::Error::other("snapshot path has no parent"))?;
     std::fs::create_dir_all(dir)?;
     let tmp = dir.join(format!(".interrupted-turns.{}.tmp", std::process::id()));
     let body = serde_json::to_vec(snapshot).map_err(std::io::Error::other)?;
@@ -221,7 +220,6 @@ const SENSITIVE_MARKERS: &[&str] = &[
     "ship.sh",
     "deploy",
     "publish",
-    "release",
     "production",
     "--prod",
     "kubectl",
@@ -232,7 +230,6 @@ const SENSITIVE_MARKERS: &[&str] = &[
     "payment",
     "refund",
     "invoice",
-    "checkout",
     "send_email",
     "send-email",
     "sendmail",
@@ -240,8 +237,10 @@ const SENSITIVE_MARKERS: &[&str] = &[
     "gmail",
     "smtp",
     "mailgun",
-    "resend",
-    "ads",
+    "google_ads",
+    "googleads",
+    "meta_ads",
+    "ads_",
     "campaign",
     "drop table",
     "delete from",
@@ -429,7 +428,13 @@ impl ConversationService {
         let value = serde_json::to_value(record).map_err(|e| ConversationError::internal(e.to_string()))?;
         let matched = self
             .conversation_repo()
-            .set_extra_keys(user_id, conversation_id, &[(EXTRA_RESTART_INTERRUPTED, value)], None, None)
+            .set_extra_keys(
+                user_id,
+                conversation_id,
+                &[(EXTRA_RESTART_INTERRUPTED, value)],
+                None,
+                None,
+            )
             .await?;
         if !matched {
             return Err(ConversationError::NotFound {
@@ -479,8 +484,13 @@ impl ConversationService {
                 })
             }
             RestartResumeAction::Continue => {
-                self.continue_after_restart(user_id, conversation_id, RestartInterruptedState::Continued, task_manager)
-                    .await
+                self.continue_after_restart(
+                    user_id,
+                    conversation_id,
+                    RestartInterruptedState::Continued,
+                    task_manager,
+                )
+                .await
             }
         }
     }
@@ -561,10 +571,11 @@ impl ConversationService {
         }
         tokio::time::sleep(start_delay).await;
         let mut running: Vec<(String, tokio::time::Instant)> = Vec::new();
-        for candidate in candidates {
+        let last = candidates.len().saturating_sub(1);
+        for (index, candidate) in candidates.into_iter().enumerate() {
             loop {
                 running.retain(|(id, started)| {
-                    self.runtime_state_ref().is_claimed(id) && started.elapsed() < AUTO_CONTINUE_SLOT_TIMEOUT
+                    self.runtime_state().is_claimed(id) && started.elapsed() < AUTO_CONTINUE_SLOT_TIMEOUT
                 });
                 if running.len() < AUTO_CONTINUE_PARALLEL {
                     break;
@@ -587,7 +598,9 @@ impl ConversationService {
                     "restart resume: automatic continue failed; waiting for the owner"
                 ),
             }
-            tokio::time::sleep(AUTO_CONTINUE_STAGGER).await;
+            if index < last {
+                tokio::time::sleep(AUTO_CONTINUE_STAGGER).await;
+            }
         }
     }
 }
@@ -628,7 +641,11 @@ mod tests {
             assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
         }
         assert_eq!(take_snapshot(&path), snapshot);
-        assert_eq!(take_snapshot(&path), ShutdownSnapshot::default(), "removed after the first read");
+        assert_eq!(
+            take_snapshot(&path),
+            ShutdownSnapshot::default(),
+            "removed after the first read"
+        );
         std::fs::write(&path, "not json").unwrap();
         assert_eq!(take_snapshot(&path), ShutdownSnapshot::default());
     }
