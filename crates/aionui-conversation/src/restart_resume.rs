@@ -85,8 +85,13 @@ pub struct SnapshotTurn {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SnapshotApproval {
+    /// Clipped, for display.
     pub title: String,
+    /// Clipped, for display.
     pub summary: String,
+    /// Judged on the FULL request before clipping (train-10 review).
+    #[serde(default)]
+    pub sensitive: bool,
 }
 
 pub fn snapshot_path(data_dir: &Path) -> PathBuf {
@@ -119,9 +124,20 @@ pub fn build_snapshot(
                 .map(|agent| agent.get_confirmations())
                 .unwrap_or_default()
                 .into_iter()
-                .map(|c| SnapshotApproval {
-                    title: clip(c.title.as_deref().or(c.action.as_deref()).unwrap_or("approval")),
-                    summary: clip(&c.description),
+                .map(|c| {
+                    let title = c.title.as_deref().or(c.action.as_deref()).unwrap_or("approval");
+                    let full = format!(
+                        "{} {} {} {}",
+                        c.title.as_deref().unwrap_or_default(),
+                        c.action.as_deref().unwrap_or_default(),
+                        c.command_type.as_deref().unwrap_or_default(),
+                        c.description
+                    );
+                    SnapshotApproval {
+                        title: clip(title),
+                        summary: clip(&c.description),
+                        sensitive: is_sensitive_step(Some(title), Some(&full)),
+                    }
                 })
                 .collect();
             SnapshotTurn {
@@ -186,8 +202,9 @@ pub struct StaleStep {
     pub content: String,
 }
 
-/// Tool name and what it was asked to do, from a stale tool row.
-fn tool_of(step: &StaleStep) -> Option<(String, String)> {
+/// Tool name, what it was asked to do (for display) and the FULL text of the
+/// call (for the safety check), from a stale tool row. Nothing is clipped here.
+fn tool_of(step: &StaleStep) -> Option<(String, String, String)> {
     let value: serde_json::Value = serde_json::from_str(&step.content).ok()?;
     let entry = match step.row_type.as_str() {
         "tool_call" => &value,
@@ -210,7 +227,13 @@ fn tool_of(step: &StaleStep) -> Option<(String, String)> {
         .or_else(|| args.filter(|a| !a.is_null()).map(|a| a.to_string()))
         .or_else(|| entry.get("description").and_then(|d| d.as_str()).map(str::to_owned))
         .unwrap_or_default();
-    Some((clip(name), clip(&summary)))
+    // Everything the call carries: name, all arguments, description.
+    let full = format!(
+        "{name} {} {}",
+        args.map(|a| a.to_string()).unwrap_or_default(),
+        entry.get("description").and_then(|d| d.as_str()).unwrap_or_default()
+    );
+    Some((name.to_owned(), summary, full))
 }
 
 /// Substrings that mark a step AionCore must not continue by itself: it
@@ -250,42 +273,74 @@ const SENSITIVE_MARKERS: &[&str] = &[
     "rm -rf",
 ];
 
-/// MCP tools: any verb that changes something on the other side.
+/// MCP tools: any verb that changes something on the other side. Applied to
+/// every MCP-shaped call: Claude names them `mcp__<server>__<tool>`; Codex
+/// reports every MCP call as the tool `mcpToolCall` with the whole item
+/// (server, tool, arguments) as its input (verified:
+/// `aionui-session/src/backend/codex_conn.rs` ToolCall for item types,
+/// name = item_type); ACP agents (Gemini) carry the agent's own tool title,
+/// whose MCP shape is not captured yet, so any server-qualified name
+/// (`server__tool`, `mcp_…`) counts too.
 const MCP_WRITE_VERBS: &[&str] = &[
     "create", "update", "delete", "insert", "write", "send", "post", "apply", "execute", "merge", "push", "remove",
     "set_", "upload", "pay",
 ];
 
+fn is_mcp_shaped(tool: &str) -> bool {
+    tool.starts_with("mcp__") || tool.starts_with("mcp_") || tool == "mcptoolcall" || tool.contains("__")
+}
+
 /// Whether the interrupted step must never be continued automatically.
-pub fn is_sensitive_step(tool: Option<&str>, summary: Option<&str>) -> bool {
+/// Always called with the FULL, unclipped text of the call: a marker after
+/// the display cut must still count.
+pub fn is_sensitive_step(tool: Option<&str>, full_text: Option<&str>) -> bool {
     let tool = tool.unwrap_or_default().to_ascii_lowercase();
-    let text = format!("{tool} {}", summary.unwrap_or_default().to_ascii_lowercase());
+    let text = format!("{tool} {}", full_text.unwrap_or_default().to_ascii_lowercase());
     if SENSITIVE_MARKERS.iter().any(|m| text.contains(m)) {
         return true;
     }
-    tool.starts_with("mcp__") && MCP_WRITE_VERBS.iter().any(|v| tool.contains(v))
+    if !is_mcp_shaped(&tool) {
+        return false;
+    }
+    // Codex: the tool and server names are in the input, not in the name.
+    let haystack = if tool == "mcptoolcall" { &text } else { &tool };
+    MCP_WRITE_VERBS.iter().any(|v| haystack.contains(v))
+}
+
+/// One interrupted step: display fields (clipped) and the safety verdict
+/// (judged on the full text).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct Step {
+    kind: RestartInterruptedKind,
+    tool: Option<String>,
+    summary: Option<String>,
+    sensitive: bool,
 }
 
 /// What one conversation was doing, from its snapshot entry and stale rows.
-fn classify(
-    snapshot: Option<&SnapshotTurn>,
-    stale: &[&StaleStep],
-) -> (RestartInterruptedKind, Option<String>, Option<String>) {
+fn classify(snapshot: Option<&SnapshotTurn>, stale: &[&StaleStep]) -> Step {
     if let Some(approval) = snapshot.and_then(|t| t.approvals.first()) {
-        return (
-            RestartInterruptedKind::Approval,
-            Some(approval.title.clone()),
-            Some(approval.summary.clone()).filter(|s| !s.is_empty()),
-        );
+        return Step {
+            kind: RestartInterruptedKind::Approval,
+            tool: Some(approval.title.clone()),
+            summary: Some(approval.summary.clone()).filter(|s| !s.is_empty()),
+            sensitive: approval.sensitive,
+        };
     }
-    if let Some((name, summary)) = stale.iter().rev().find_map(|s| tool_of(s)) {
-        return (
-            RestartInterruptedKind::Tool,
-            Some(name),
-            Some(summary).filter(|s| !s.is_empty()),
-        );
+    if let Some((name, summary, full)) = stale.iter().rev().find_map(|s| tool_of(s)) {
+        return Step {
+            kind: RestartInterruptedKind::Tool,
+            sensitive: is_sensitive_step(Some(&name), Some(&full)),
+            tool: Some(clip(&name)),
+            summary: Some(clip(&summary)).filter(|s| !s.is_empty()),
+        };
     }
-    (RestartInterruptedKind::Text, None, None)
+    Step {
+        kind: RestartInterruptedKind::Text,
+        tool: None,
+        summary: None,
+        sensitive: false,
+    }
 }
 
 /// The one message that resumes an interrupted conversation.
@@ -365,7 +420,12 @@ impl ConversationService {
                 _ => continue,
             };
             let turn = snapshot.turns.iter().find(|t| t.conversation_id == id);
-            let (kind, tool, summary) = classify(turn, steps);
+            let Step {
+                kind,
+                tool,
+                summary,
+                sensitive,
+            } = classify(turn, steps);
             // The same step again, after it was already continued once.
             let repeat = parse_record(&row.extra)
                 .filter(|prev| {
@@ -381,7 +441,7 @@ impl ConversationService {
             let auto = auto_enabled(&row.extra);
             let auto_blocked = if !auto {
                 None
-            } else if is_sensitive_step(tool.as_deref(), summary.as_deref()) {
+            } else if sensitive {
                 Some(RestartAutoBlocked::Sensitive)
             } else if repeat > 0 {
                 Some(RestartAutoBlocked::Repeat)
@@ -515,6 +575,10 @@ impl ConversationService {
             sessions: Vec::new(),
             inject_skills: Vec::new(),
             hidden: false,
+            // The client retry key is for HTTP callers; this send is keyed
+            // below with the deterministic internal key (one per restart and
+            // conversation), which `send_message_idempotent` stores and checks.
+            idempotency_key: None,
         };
         // One resume per restart, whoever asks (button and automatic path).
         let key = format!("restart-resume:{conversation_id}:{}", record.at);
@@ -631,6 +695,7 @@ mod tests {
                 approvals: vec![SnapshotApproval {
                     title: "Bash".into(),
                     summary: "rm build".into(),
+                    sensitive: false,
                 }],
             }],
         };
@@ -662,23 +727,18 @@ mod tests {
             approvals: vec![SnapshotApproval {
                 title: "Write".into(),
                 summary: "/etc/hosts".into(),
+                sensitive: false,
             }],
         };
+        let approval = classify(Some(&turn), &[&tool]);
         assert_eq!(
-            classify(Some(&turn), &[&tool]),
-            (
-                RestartInterruptedKind::Approval,
-                Some("Write".into()),
-                Some("/etc/hosts".into())
-            )
+            (approval.kind, approval.tool.as_deref(), approval.summary.as_deref()),
+            (RestartInterruptedKind::Approval, Some("Write"), Some("/etc/hosts"))
         );
+        let running = classify(None, &[&tool]);
         assert_eq!(
-            classify(None, &[&tool]),
-            (
-                RestartInterruptedKind::Tool,
-                Some("Bash".into()),
-                Some("cargo test -p x".into())
-            )
+            (running.kind, running.tool.as_deref(), running.summary.as_deref()),
+            (RestartInterruptedKind::Tool, Some("Bash"), Some("cargo test -p x"))
         );
         let group = step(
             "tool_group",
@@ -687,10 +747,17 @@ mod tests {
                 {"name": "Edit", "args": {"file_path": "a.rs"}, "status": "Executing"}
             ]),
         );
-        let (kind, name, _) = classify(None, &[&group]);
-        assert_eq!((kind, name.as_deref()), (RestartInterruptedKind::Tool, Some("Edit")));
+        let edit = classify(None, &[&group]);
+        assert_eq!(
+            (edit.kind, edit.tool.as_deref()),
+            (RestartInterruptedKind::Tool, Some("Edit"))
+        );
         let text = step("text", serde_json::json!({"content": "half"}));
-        assert_eq!(classify(None, &[&text]), (RestartInterruptedKind::Text, None, None));
+        let text = classify(None, &[&text]);
+        assert_eq!(
+            (text.kind, text.tool, text.sensitive),
+            (RestartInterruptedKind::Text, None, false)
+        );
         let long = clip(&"x".repeat(500));
         assert_eq!(long.chars().count(), SUMMARY_CHARS);
     }
@@ -707,6 +774,13 @@ mod tests {
             ("mcp__gmail__send_email", "to: a@b.c"),
             ("mcp__github__create_pull_request", "title"),
             ("mcp__google_ads__mutate", "pause campaign"),
+            // Codex: every MCP call is `mcpToolCall`; server and tool are in the input.
+            (
+                "mcpToolCall",
+                r#"{"type":"mcpToolCall","server":"stripe","tool":"create_refund"}"#,
+            ),
+            // Server-qualified names of other agents.
+            ("github__create_issue", "{}"),
         ] {
             assert!(is_sensitive_step(Some(tool), Some(summary)), "{tool} {summary}");
         }
@@ -715,6 +789,10 @@ mod tests {
             ("Read", "src/main.rs"),
             ("mcp__context7__get_library_docs", "tokio"),
             ("Bash", "git status"),
+            (
+                "mcpToolCall",
+                r#"{"type":"mcpToolCall","server":"context7","tool":"get_library_docs"}"#,
+            ),
         ] {
             assert!(!is_sensitive_step(Some(tool), Some(summary)), "{tool} {summary}");
         }
@@ -743,5 +821,36 @@ mod tests {
         record.kind = RestartInterruptedKind::Text;
         record.tool = None;
         assert!(resume_message(&record).contains("Continue where you stopped"));
+    }
+
+    /// Train-10 review: a push / deploy AFTER the 200-character display cut
+    /// still blocks the automatic continue; the display stays clipped.
+    #[test]
+    fn markers_after_the_display_cut_still_count() {
+        let long = format!("cd /work && {} && git push origin youssef", "echo build; ".repeat(40));
+        assert!(long.find("git push").unwrap() > SUMMARY_CHARS);
+        let stale = step(
+            "tool_call",
+            serde_json::json!({"name": "Bash", "args": {"command": long}, "status": "running"}),
+        );
+        let found = classify(None, &[&stale]);
+        assert!(found.sensitive, "the push after char 200 is seen");
+        assert_eq!(found.summary.as_deref().unwrap().chars().count(), SUMMARY_CHARS);
+        assert!(
+            !found.summary.as_deref().unwrap().contains("git push"),
+            "display is clipped"
+        );
+
+        // The same for a marker in another argument than `command`.
+        let other = step(
+            "tool_call",
+            serde_json::json!({"name": "Bash", "args": {"command": "make", "description": format!("{} vercel deploy --prod", "x".repeat(300))}, "status": "running"}),
+        );
+        assert!(classify(None, &[&other]).sensitive);
+        let fine = step(
+            "tool_call",
+            serde_json::json!({"name": "Bash", "args": {"command": "x".repeat(400)}, "status": "running"}),
+        );
+        assert!(!classify(None, &[&fine]).sensitive);
     }
 }
