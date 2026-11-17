@@ -46,6 +46,9 @@ pub struct StoredDevice {
     pub created_at: i64,
     #[serde(default)]
     pub last_seen_at: Option<i64>,
+    /// The extension's self-reported version (TASK-133); display only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extension_version: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -252,6 +255,7 @@ impl DeviceStore {
             token_sha256: sha256_hex(&token),
             created_at: now_ms(),
             last_seen_at: Some(now_ms()),
+            extension_version: None,
         };
         let mut users = self.users.lock().expect("users lock");
         let list = users.entry(user_id.clone()).or_default();
@@ -313,6 +317,32 @@ impl DeviceStore {
         Ok(())
     }
 
+    /// Remember the version the extension reports about itself. Anything that
+    /// is not a short dotted version is ignored (the value comes from the
+    /// device and is only ever displayed).
+    pub fn set_extension_version(&self, user_id: &str, device_id: &str, reported: &str) {
+        let Some(version) = valid_extension_version(reported) else {
+            tracing::warn!(
+                user_id,
+                device_id,
+                "browser device reported an unusable extension version; ignored"
+            );
+            return;
+        };
+        let mut users = self.users.lock().expect("users lock");
+        let Some(list) = users.get_mut(user_id) else { return };
+        let Some(d) = list.iter_mut().find(|d| d.device_id == device_id) else {
+            return;
+        };
+        if d.extension_version.as_deref() == Some(version) {
+            return;
+        }
+        d.extension_version = Some(version.to_owned());
+        if let Err(e) = self.persist(user_id, list) {
+            tracing::warn!(user_id, device_id, error = %e, "browser device extension version not saved");
+        }
+    }
+
     /// Record a connection (persisted; called on hello and disconnect only).
     pub fn touch(&self, user_id: &str, device_id: &str) {
         let mut users = self.users.lock().expect("users lock");
@@ -327,6 +357,30 @@ impl DeviceStore {
     }
 }
 
+/// A dotted numeric version with an optional `-pre` / `+build` tail, at most
+/// 32 characters: `1.2`, `0.1.2`, `1.0.0-beta.1`.
+pub fn valid_extension_version(raw: &str) -> Option<&str> {
+    let v = raw.trim();
+    if v.is_empty() || v.len() > 32 {
+        return None;
+    }
+    let (core, tail) = match v.find(['-', '+']) {
+        Some(i) => (&v[..i], Some(&v[i + 1..])),
+        None => (v, None),
+    };
+    let parts: Vec<&str> = core.split('.').collect();
+    let core_ok = (2..=4).contains(&parts.len())
+        && parts
+            .iter()
+            .all(|p| !p.is_empty() && p.len() <= 6 && p.bytes().all(|b| b.is_ascii_digit()));
+    let tail_ok = tail.is_none_or(|t| {
+        !t.is_empty()
+            && t.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'+'))
+    });
+    (core_ok && tail_ok).then_some(v)
+}
+
 fn not_found() -> BrowserError {
     BrowserError::coded(BrowserErrorCode::BrowserDeviceNotFound, "no such device")
 }
@@ -334,6 +388,49 @@ fn not_found() -> BrowserError {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extension_version_is_validated_stored_and_survives_reload() {
+        for ok in ["0.1.2", "1.2", "10.20.30.40", "1.0.0-beta.1", "1.0.0+build.5"] {
+            assert_eq!(valid_extension_version(ok), Some(ok), "{ok}");
+        }
+        for bad in [
+            "",
+            "1",
+            "v1.2.3",
+            "1..2",
+            "1.2.3.4.5",
+            "1.2.3-",
+            "1.2.3 <script>",
+            "1.2.3\n",
+            "9999999.1",
+            "1.2.3-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        ] {
+            assert_eq!(valid_extension_version(bad), None, "{bad:?}");
+        }
+        let t = tempfile::tempdir().unwrap();
+        let store = DeviceStore::open(t.path());
+        let code = store.pairing_code("u1").unwrap();
+        let (auth, _token) = store.pair(&code.code, "Mac", "Chrome 157").unwrap();
+        let id = auth.device.device_id;
+        assert_eq!(store.device("u1", &id).unwrap().extension_version, None);
+        store.set_extension_version("u1", &id, "<img src=x>");
+        assert_eq!(
+            store.device("u1", &id).unwrap().extension_version,
+            None,
+            "garbage is ignored"
+        );
+        store.set_extension_version("u1", &id, " 0.1.2 ");
+        store.set_extension_version("u2", &id, "9.9.9");
+        assert_eq!(
+            DeviceStore::open(t.path())
+                .device("u1", &id)
+                .unwrap()
+                .extension_version
+                .as_deref(),
+            Some("0.1.2")
+        );
+    }
 
     #[test]
     fn codes_are_single_use_case_and_dash_insensitive_and_replaced() {
