@@ -21,6 +21,16 @@ impl SqliteServerPoolRepository {
     pub fn new(pool: SqlitePool) -> Self {
         Self { pool }
     }
+
+    pub(crate) async fn any_enabled_server_impl(&self, user_id: &str) -> Result<bool, DbError> {
+        let found: Option<i64> = sqlx::query_scalar(
+            "SELECT 1 FROM servers WHERE user_id = ? AND deleted_at IS NULL AND enabled = 1 LIMIT 1",
+        )
+        .bind(user_id)
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(found.is_some())
+    }
 }
 
 fn name_conflict(err: sqlx::Error) -> DbError {
@@ -64,13 +74,7 @@ impl IServerPoolRepository for SqliteServerPoolRepository {
     }
 
     async fn any_enabled_server(&self, user_id: &str) -> Result<bool, DbError> {
-        let found: Option<i64> = sqlx::query_scalar(
-            "SELECT 1 FROM servers WHERE user_id = ? AND deleted_at IS NULL AND enabled = 1 LIMIT 1",
-        )
-        .bind(user_id)
-        .fetch_optional(&self.pool)
-        .await?;
-        Ok(found.is_some())
+        self.any_enabled_server_impl(user_id).await
     }
 
     async fn create_server(&self, params: &CreateServerParams<'_>) -> Result<ServerRow, DbError> {

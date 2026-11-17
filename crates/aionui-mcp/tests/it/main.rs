@@ -16,6 +16,7 @@ mod market_lost_update;
 mod market_routes_auth;
 mod market_tier_env;
 mod oauth_integration;
+mod server_pool;
 mod service_integration;
 mod session_injection_integration;
 mod sync_integration;

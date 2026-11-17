@@ -56,7 +56,11 @@ async fn fx() -> Fx {
         "tiers": ["read"], "enforcement": "server", "clis": ["claude"]
     }})]);
     let market = McpMarketService::new(repo, servers, Arc::new(catalog), [9u8; 32])
-        .with_kits(Arc::new(aionui_db::SqliteKitRepository::new(db.pool().clone())));
+        .with_kits(Arc::new(aionui_db::SqliteKitRepository::new(db.pool().clone())))
+        .with_server_pool(aionui_mcp::server_pool::ServerPoolService::new(
+            Arc::new(aionui_db::SqliteServerPoolRepository::new(db.pool().clone())),
+            [9u8; 32],
+        ));
     Fx {
         db: db.clone(),
         jwt: Arc::new(JwtService::new("route-test-signing-secret".into())),
@@ -612,4 +616,124 @@ async fn project_kit_routes_return_their_codes() {
     .await;
     assert_eq!(status, StatusCode::OK, "{preview}");
     assert_eq!(preview["data"]["file_found"], false);
+}
+
+/// C36: `/api/servers` rides the market stacks — reads with the ordinary auth
+/// state, writes session-only + Origin, agents refused, the key never echoed.
+#[tokio::test]
+async fn server_routes_use_the_market_auth_stacks_and_never_echo_the_key() {
+    let f = fx().await;
+    let app = app(&f);
+    let (status, body) = send(&app, Request::get("/api/servers").body(Body::empty()).unwrap()).await;
+    assert_eq!((status, body["data"].clone()), (StatusCode::OK, json!([])));
+
+    let key = "-----BEGIN OPENSSH PRIVATE KEY-----\nROUTEKEYMATERIAL0123456789\n-----END OPENSSH PRIVATE KEY-----";
+    let server = json!({"name": "web-1", "host": "10.0.0.5", "ssh_user": "deploy", "private_key": key,
+                        "environment": "production", "tier": "write"});
+    // No session (loopback caller).
+    let (status, _) = send(
+        &app,
+        post("/api/servers", &server)
+            .body(Body::from(server.to_string()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    // Agent runtime-token channel, mis-mounted: the handler refuses.
+    let runtime = mcp_market_write_routes(f.state.clone()).route_layer(from_fn_with_state(
+        auth(&f, AuthIdentityMode::UserSession, Some(Arc::new(AlwaysValid))),
+        auth_middleware,
+    ));
+    let (status, resp) = send(
+        &runtime,
+        post("/api/servers", &server)
+            .header(aionui_auth::RUNTIME_TOKEN_HEADER, "tok")
+            .header(aionui_auth::RUNTIME_USER_ID_HEADER, USER)
+            .header(aionui_auth::RUNTIME_CONVERSATION_ID_HEADER, "conv-1")
+            .body(Body::from(server.to_string()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        (status, resp["code"].as_str()),
+        (StatusCode::FORBIDDEN, Some("MCP_MARKET_SESSION_REQUIRED"))
+    );
+
+    let token = f.jwt.sign(USER, USER).unwrap();
+    // Session without Origin.
+    let (status, _) = send_raw(
+        &app,
+        post("/api/servers", &server)
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::from(server.to_string()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN);
+
+    let (status, created) = send(
+        &app,
+        post("/api/servers", &server)
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::from(server.to_string()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    assert!(!created.to_string().contains("ROUTEKEYMATERIAL"));
+    assert_eq!(created["data"]["has_key"], true);
+    assert_eq!(created["data"]["crucial_commands_ask"], true);
+    let id = created["data"]["id"].as_str().unwrap().to_owned();
+
+    // Same name again → 409 with the code; bad host → 400.
+    let (status, resp) = send(
+        &app,
+        post("/api/servers", &server)
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::from(server.to_string()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        (status, resp["code"].as_str()),
+        (StatusCode::CONFLICT, Some("SERVER_NAME_TAKEN"))
+    );
+    let mut bad = server.clone();
+    bad["name"] = json!("web-2");
+    bad["host"] = json!("-oProxyCommand=sh");
+    let (status, resp) = send(
+        &app,
+        post("/api/servers", &bad)
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::from(bad.to_string()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        (status, resp["code"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("SERVER_INVALID"))
+    );
+
+    let (status, listed) = send(&app, Request::get("/api/servers").body(Body::empty()).unwrap()).await;
+    assert_eq!(status, StatusCode::OK);
+    assert!(!listed.to_string().contains("ROUTEKEYMATERIAL"));
+
+    let (status, resp) = send(
+        &app,
+        Request::delete(format!("/api/servers/{id}"))
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{resp}");
+    let (status, resp) = send(
+        &app,
+        Request::get(format!("/api/servers/{id}")).body(Body::empty()).unwrap(),
+    )
+    .await;
+    assert_eq!(
+        (status, resp["code"].as_str()),
+        (StatusCode::NOT_FOUND, Some("SERVER_NOT_FOUND"))
+    );
 }

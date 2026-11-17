@@ -509,6 +509,23 @@ async fn load_user_mcp_servers_with_approval(
 
     let mut servers = Vec::with_capacity(rows.len());
     let mut approval = Vec::new();
+    // C36: the built-in server-pool MCPs (crucial channel = ask every call).
+    for server in crate::mcp_resolve::server_pool_session_servers(repo, user_id, conversation_id, market).await {
+        if !session_server_supported_by_capabilities(&server, capabilities) {
+            continue;
+        }
+        match session_server_to_sdk_mcp_server(&server).await {
+            Ok(sdk) => {
+                if server.tool_filter.require_approval {
+                    approval.push(server.name.clone());
+                }
+                servers.push(sdk);
+            }
+            Err(err) => {
+                warn!(conversation_id, server_name = %server.name, error = %err, "user_mcp: server pool entry failed; skipping")
+            }
+        }
+    }
     for aionui_db::GatedMcpRow { row, market: delivery } in rows {
         let selected = crate::mcp_resolve::is_selected(selected_ids, &row, delivery.as_ref());
         // `aionui-team` is the reserved team coordination MCP name; a user row

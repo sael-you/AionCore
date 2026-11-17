@@ -11,6 +11,8 @@ pub mod market_routes;
 pub mod oauth_service;
 pub mod routes;
 pub mod secret_mask;
+pub mod server_pool;
+pub mod server_routes;
 pub mod service;
 pub mod session_injection;
 pub mod sync_service;

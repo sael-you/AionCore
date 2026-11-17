@@ -445,9 +445,10 @@ impl McpMarketService {
             .map(|k| (k.id, k.name))
             .collect();
         let instances = self.instances_by_id(user_id).await?;
+        let server_names = self.server_names(user_id).await?;
         Ok(rows
             .into_iter()
-            .map(|a| attachment_response(a, &kit_names, &instances))
+            .map(|a| attachment_response(a, &kit_names, &instances, &server_names))
             .collect())
     }
 
@@ -557,6 +558,26 @@ impl McpMarketService {
                     ));
                 }
             }
+            KitItemKind::Server => {
+                let pool = self
+                    .server_pool
+                    .as_ref()
+                    .ok_or_else(|| MarketError::Unavailable("server pool is not configured".to_owned()))?;
+                let server =
+                    pool.repo().find_server(user_id, &item_ref).await?.ok_or_else(|| {
+                        kit_error(KitErrorCode::InvalidItem, format!("server {item_ref} does not exist"))
+                    })?;
+                // C36: a production server is never handed to every conversation.
+                if global_add && server.environment == "production" {
+                    return Err(kit_error(
+                        KitErrorCode::GlobalNotAllowed,
+                        format!(
+                            "production server \"{}\" cannot be attached globally; attach it to a project",
+                            server.name
+                        ),
+                    ));
+                }
+            }
             KitItemKind::Mcp => {
                 let row = instances.get(&item_ref).ok_or_else(|| {
                     kit_error(
@@ -596,7 +617,22 @@ impl McpMarketService {
             .into_iter()
             .map(|k| (k.id, k.name))
             .collect();
-        Ok(attachment_response(row, &kit_names, &instances))
+        let server_names = self.server_names(user_id).await?;
+        Ok(attachment_response(row, &kit_names, &instances, &server_names))
+    }
+
+    /// Server id → name (C36); empty when the pool is not configured.
+    async fn server_names(&self, user_id: &str) -> Result<HashMap<String, String>, MarketError> {
+        let Some(pool) = self.server_pool.as_ref() else {
+            return Ok(HashMap::new());
+        };
+        Ok(pool
+            .repo()
+            .list_servers(user_id)
+            .await?
+            .into_iter()
+            .map(|s| (s.id, s.name))
+            .collect())
     }
 
     pub async fn detach_kit_item(&self, user_id: &str, id: &str) -> Result<(), MarketError> {
@@ -680,6 +716,17 @@ impl McpMarketService {
                 mcp: Some(effective_mcp(instances.get(id), d, &shadow_names)),
             })
             .collect();
+        let servers = resolution
+            .servers
+            .iter()
+            .map(|(id, d)| KitEffectiveItem {
+                kind: KitItemKind::Server,
+                item_ref: id.clone(),
+                included: d.included,
+                provenance: provenance(d),
+                mcp: None,
+            })
+            .collect();
         // A wanted template is missing when no included instance of that template is in the set.
         let delivered_templates: BTreeSet<&str> = resolution
             .mcps
@@ -704,6 +751,7 @@ impl McpMarketService {
             assistant_id: scope.assistant_id,
             skills,
             mcps,
+            servers,
             conversation_skills,
             missing_templates,
         })
@@ -795,10 +843,12 @@ fn attachment_response(
     a: KitAttachmentRow,
     kit_names: &HashMap<String, String>,
     instances: &HashMap<String, McpMarketRow>,
+    server_names: &HashMap<String, String>,
 ) -> KitAttachmentResponse {
     let item_name = match a.item_kind.as_str() {
         "kit" => kit_names.get(&a.item_ref).cloned().unwrap_or_default(),
         "mcp" => instances.get(&a.item_ref).map(|r| r.name.clone()).unwrap_or_default(),
+        "server" => server_names.get(&a.item_ref).cloned().unwrap_or_default(),
         _ => a.item_ref.clone(),
     };
     KitAttachmentResponse {

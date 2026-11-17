@@ -47,6 +47,7 @@ const EXIT_INTERNAL: u8 = 4;
 pub async fn run_mcp(args: McpArgs) -> ExitCode {
     match args.command {
         McpCommand::Exec(args) => run_exec(args).await,
+        McpCommand::Servers(args) => super::cmd_mcp_servers::run_servers(args).await,
     }
 }
 
@@ -57,17 +58,22 @@ fn fail(code: u8, msg: &str) -> ExitCode {
 
 /// `AIONUI_DATA_DIR` (non-empty) wins over `--data-dir`; both must be absolute.
 pub(crate) fn resolve_data_dir(args: &McpExecArgs) -> Option<PathBuf> {
+    data_dir_from(args.data_dir.as_ref())
+}
+
+/// `AIONUI_DATA_DIR` (non-empty) wins over the flag; both must be absolute.
+pub(crate) fn data_dir_from(flag: Option<&PathBuf>) -> Option<PathBuf> {
     std::env::var_os("AIONUI_DATA_DIR")
         .filter(|v| !v.is_empty())
         .map(PathBuf::from)
-        .or_else(|| args.data_dir.clone())
+        .or_else(|| flag.cloned())
         .filter(|p| p.is_absolute())
 }
 
 /// The storage-encryption key, resolved like the server does
 /// (`AIONUI_ENCRYPTION_SECRET` env → users.encryption_secret → seeded from the
 /// JWT secret), read-only.
-async fn encryption_key(db: &aionui_db::Database) -> Result<[u8; 32], String> {
+pub(crate) async fn encryption_key(db: &aionui_db::Database) -> Result<[u8; 32], String> {
     let users = SqliteUserRepository::new(db.pool().clone());
     let user = users
         .get_system_user()

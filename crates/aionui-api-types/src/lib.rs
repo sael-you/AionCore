@@ -34,6 +34,7 @@ mod provider;
 mod remote_agent;
 mod response;
 mod runtime;
+mod server_pool;
 mod session_tools;
 mod shell;
 mod sidebar;
@@ -213,6 +214,10 @@ pub use response::{ApiResponse, ErrorResponse};
 pub use runtime::{
     EnsureNodeRuntimeRequest, EnsureNodeRuntimeResponse, RuntimeFailureKind, RuntimeResourceKind, RuntimeStatusPayload,
     RuntimeStatusPhase, RuntimeStatusScope, RuntimeStatusScopeKind,
+};
+pub use server_pool::{
+    CreateServerRequest, ListServerAuditQuery, SERVER_TIER_NOTE, ServerAuditResponse, ServerResponse,
+    UpdateServerRequest,
 };
 pub use session_tools::{
     SESSION_TOOLS_SCHEMA_VERSION, SessionCliEnvelope, SessionCliMeta, SessionDeliveryStatus, SessionMentionTarget,

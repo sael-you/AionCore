@@ -90,7 +90,8 @@ pub fn mcp_market_read_routes(state: McpMarketRouterState) -> Router {
         .route("/api/mcp/market/status", get(status))
         .route("/api/mcp/market/snapshot", get(snapshot))
         .with_state(state.clone())
-        .merge(crate::kit_routes::kit_read_routes(state))
+        .merge(crate::kit_routes::kit_read_routes(state.clone()))
+        .merge(crate::server_routes::server_read_routes(state))
 }
 
 pub fn mcp_market_write_routes(state: McpMarketRouterState) -> Router {
@@ -117,7 +118,8 @@ pub fn mcp_market_write_routes(state: McpMarketRouterState) -> Router {
             axum::routing::delete(delete_assignment),
         )
         .with_state(state.clone())
-        .merge(crate::kit_routes::kit_write_routes(state))
+        .merge(crate::kit_routes::kit_write_routes(state.clone()))
+        .merge(crate::server_routes::server_write_routes(state))
 }
 
 // -- reads ------------------------------------------------------------------

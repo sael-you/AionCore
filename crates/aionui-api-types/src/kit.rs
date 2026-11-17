@@ -62,6 +62,8 @@ pub enum KitItemKind {
     Skill,
     /// One MCP market instance (`item_ref` = `mcp_servers.id`).
     Mcp,
+    /// One SSH server of the server pool (C36, `item_ref` = `servers.id`).
+    Server,
 }
 
 impl KitItemKind {
@@ -70,13 +72,19 @@ impl KitItemKind {
             KitItemKind::Kit => "kit",
             KitItemKind::Skill => "skill",
             KitItemKind::Mcp => "mcp",
+            KitItemKind::Server => "server",
         }
     }
 
     pub fn parse(value: &str) -> Option<Self> {
-        [KitItemKind::Kit, KitItemKind::Skill, KitItemKind::Mcp]
-            .into_iter()
-            .find(|k| k.as_str() == value)
+        [
+            KitItemKind::Kit,
+            KitItemKind::Skill,
+            KitItemKind::Mcp,
+            KitItemKind::Server,
+        ]
+        .into_iter()
+        .find(|k| k.as_str() == value)
     }
 }
 
@@ -389,6 +397,10 @@ pub struct KitEffectiveSetResponse {
     pub skills: Vec<KitEffectiveItem>,
     /// MCP instances decided by kits/attachments (sorted by instance id).
     pub mcps: Vec<KitEffectiveItem>,
+    /// Servers decided by attachments (C36, sorted by server id); `item_ref`
+    /// = server id. A server reaches a conversation only through an `add`.
+    #[serde(default)]
+    pub servers: Vec<KitEffectiveItem>,
     /// The conversation's frozen skill snapshot (`extra.skills`, base + kits
     /// applied at creation); `None` for a project/assistant preview.
     #[serde(default, skip_serializing_if = "Option::is_none")]

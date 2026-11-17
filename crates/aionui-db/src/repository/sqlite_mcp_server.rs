@@ -418,6 +418,12 @@ impl IMcpServerRepository for SqliteMcpServerRepository {
         Ok(out)
     }
 
+    async fn server_pool_enabled(&self, user_id: &str) -> Result<bool, DbError> {
+        crate::repository::sqlite_server_pool::SqliteServerPoolRepository::new(self.pool.clone())
+            .any_enabled_server_impl(user_id)
+            .await
+    }
+
     async fn kit_mcp_ids(&self, user_id: &str, conversation_id: &str) -> Result<Vec<String>, DbError> {
         let kits = conversation_kits(&self.pool, user_id, conversation_id).await?;
         Ok(kits

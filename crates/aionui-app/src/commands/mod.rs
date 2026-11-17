@@ -12,6 +12,7 @@ pub(crate) mod cmd_conversation;
 pub(crate) mod cmd_diagnose;
 pub(crate) mod cmd_doctor;
 pub(crate) mod cmd_mcp;
+pub(crate) mod cmd_mcp_servers;
 pub(crate) mod cmd_prepare_managed_resources;
 pub(crate) mod cmd_secret;
 pub(crate) mod cmd_server;
