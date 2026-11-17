@@ -21,7 +21,12 @@
 //!   to Google's hosts plus the pinned URL shape; the sha256 of the zip is
 //!   recorded in the install's verification record.
 
-use aionui_api_types::{BrowserEngine, BrowserEngineVerification};
+//! - **Camoufox** (`github.com/daijro/camoufox`, TASK-136 K6): a GitHub
+//!   release asset; no signature is published, so its sha256 is pinned in
+//!   [`crate::camoufox`] and must also equal the digest GitHub's release API
+//!   reports. Driven by Playwright over Juggler, not CDP ([`EngineProtocol`]).
+
+use aionui_api_types::{BrowserEngine, BrowserEngineVerification, BrowserPanelKind};
 
 /// A vendor's signed apt repository.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -43,6 +48,23 @@ pub enum EngineSource {
         product: &'static str,
         zip_dir: &'static str,
     },
+    /// A pinned GitHub release asset (Camoufox; see [`crate::camoufox`]).
+    GithubRelease {
+        repo: &'static str,
+        tag: &'static str,
+        asset: &'static str,
+        sha256: &'static str,
+    },
+}
+
+/// How AionCore and agents drive an engine.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EngineProtocol {
+    /// Chrome DevTools Protocol over a pipe: CDP bridge, screencast panel.
+    Cdp,
+    /// Playwright over Juggler through the Camoufox sidecar: Playwright
+    /// protocol filter ([`crate::pwfilter`]), VNC panel.
+    Juggler,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -53,6 +75,7 @@ pub struct EngineSpec {
     pub source: EngineSource,
     /// Headful engines run on their own Xvfb display.
     pub needs_display: bool,
+    pub protocol: EngineProtocol,
 }
 
 pub const GOOGLE_PRIMARY_FPR: &str = "EB4C1BFD4F042F6DDDCCEC917721F63BD38B4796";
@@ -65,7 +88,7 @@ pub const CFT_INDEX_URL: &str =
 /// Every Chrome for Testing download lives under this prefix.
 pub const CFT_DOWNLOAD_PREFIX: &str = "https://storage.googleapis.com/chrome-for-testing-public/";
 
-const SPECS: [EngineSpec; 5] = [
+const SPECS: [EngineSpec; 6] = [
     EngineSpec {
         engine: BrowserEngine::Chrome,
         binary: "chrome",
@@ -77,6 +100,7 @@ const SPECS: [EngineSpec; 5] = [
             tree: "opt/google/chrome",
         }),
         needs_display: true,
+        protocol: EngineProtocol::Cdp,
     },
     EngineSpec {
         engine: BrowserEngine::ChromeForTesting,
@@ -86,6 +110,7 @@ const SPECS: [EngineSpec; 5] = [
             zip_dir: "chrome-linux64",
         },
         needs_display: true,
+        protocol: EngineProtocol::Cdp,
     },
     EngineSpec {
         engine: BrowserEngine::Brave,
@@ -98,6 +123,7 @@ const SPECS: [EngineSpec; 5] = [
             tree: "opt/brave.com/brave",
         }),
         needs_display: true,
+        protocol: EngineProtocol::Cdp,
     },
     EngineSpec {
         engine: BrowserEngine::Edge,
@@ -110,6 +136,7 @@ const SPECS: [EngineSpec; 5] = [
             tree: "opt/microsoft/msedge",
         }),
         needs_display: true,
+        protocol: EngineProtocol::Cdp,
     },
     EngineSpec {
         engine: BrowserEngine::HeadlessShell,
@@ -119,6 +146,19 @@ const SPECS: [EngineSpec; 5] = [
             zip_dir: "chrome-headless-shell-linux64",
         },
         needs_display: false,
+        protocol: EngineProtocol::Cdp,
+    },
+    EngineSpec {
+        engine: BrowserEngine::Camoufox,
+        binary: "camoufox-bin",
+        source: EngineSource::GithubRelease {
+            repo: crate::camoufox::REPO,
+            tag: crate::camoufox::TAG,
+            asset: crate::camoufox::ASSET,
+            sha256: crate::camoufox::ASSET_SHA256,
+        },
+        needs_display: true,
+        protocol: EngineProtocol::Juggler,
     },
 ];
 
@@ -131,6 +171,14 @@ impl EngineSpec {
         match self.source {
             EngineSource::Apt(_) => BrowserEngineVerification::SignedRepository,
             EngineSource::ChromeForTesting { .. } => BrowserEngineVerification::TlsOnly,
+            EngineSource::GithubRelease { .. } => BrowserEngineVerification::PinnedSha256,
+        }
+    }
+
+    pub fn panel(&self) -> BrowserPanelKind {
+        match self.protocol {
+            EngineProtocol::Cdp => BrowserPanelKind::Screencast,
+            EngineProtocol::Juggler => BrowserPanelKind::Vnc,
         }
     }
 
@@ -167,5 +215,13 @@ mod tests {
             spec(BrowserEngine::Edge).verification(),
             BrowserEngineVerification::SignedRepository
         );
+        let camoufox = spec(BrowserEngine::Camoufox);
+        assert_eq!(camoufox.protocol, EngineProtocol::Juggler);
+        assert_eq!(camoufox.panel(), BrowserPanelKind::Vnc);
+        assert_eq!(camoufox.verification(), BrowserEngineVerification::PinnedSha256);
+        assert!(!camoufox.agents_only());
+        for engine in BROWSER_ENGINES.into_iter().filter(|e| *e != BrowserEngine::Camoufox) {
+            assert_eq!(spec(engine).protocol, EngineProtocol::Cdp, "{engine:?}");
+        }
     }
 }

@@ -83,8 +83,10 @@ pub fn browser_instance_default_name(n: u8) -> String {
 // HTTP
 // ---------------------------------------------------------------------------
 
-/// The browser engines an instance can run (C35, all of the Chromium family:
-/// same CDP bridge, filters, guard and panel). Wire ids are kebab-case.
+/// The browser engines an instance can run (C35): the Chromium family (CDP
+/// bridge, filters, guard, screencast panel) and Camoufox (Playwright over
+/// Juggler behind a protocol filter, VNC panel; TASK-136 K6). Wire ids are
+/// kebab-case.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum BrowserEngine {
@@ -97,15 +99,19 @@ pub enum BrowserEngine {
     /// `chrome-headless-shell`: no window, lighter; its User-Agent says
     /// HeadlessChrome, so it is for agent work, not for sign-ins.
     HeadlessShell,
+    /// Camoufox (anti-detect Firefox, github.com/daijro/camoufox): driven
+    /// through a Playwright sidecar, shown in the panel over VNC.
+    Camoufox,
 }
 
 /// Every engine, in display order.
-pub const BROWSER_ENGINES: [BrowserEngine; 5] = [
+pub const BROWSER_ENGINES: [BrowserEngine; 6] = [
     BrowserEngine::Chrome,
     BrowserEngine::ChromeForTesting,
     BrowserEngine::Brave,
     BrowserEngine::Edge,
     BrowserEngine::HeadlessShell,
+    BrowserEngine::Camoufox,
 ];
 
 impl BrowserEngine {
@@ -117,6 +123,7 @@ impl BrowserEngine {
             Self::Brave => "brave",
             Self::Edge => "edge",
             Self::HeadlessShell => "headless-shell",
+            Self::Camoufox => "camoufox",
         }
     }
 
@@ -136,6 +143,22 @@ pub enum BrowserEngineVerification {
     /// hosts and the version from the vendor's JSON only. The sha256 of what
     /// was downloaded is recorded next to the install.
     TlsOnly,
+    /// A release asset whose sha256 is pinned in AionCore's source and must
+    /// also equal the digest the hosting API reports (Camoufox: GitHub
+    /// release asset, no signature published).
+    PinnedSha256,
+}
+
+/// How the panel shows an engine's instance.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BrowserPanelKind {
+    /// `WS /api/browser/ws`: CDP screencast + input (Chromium family).
+    #[default]
+    Screencast,
+    /// `WS /api/browser/instances/{n}/vnc`: raw RFB 3.8 of the instance's
+    /// display (Camoufox).
+    Vnc,
 }
 
 /// One engine in `BrowserStatusResponse.engines`.
@@ -153,6 +176,9 @@ pub struct BrowserEngineStatus {
     pub verification: BrowserEngineVerification,
     /// No window and a headless User-Agent: meant for agent-only instances.
     pub agents_only: bool,
+    /// Which panel shows this engine's instances.
+    #[serde(default)]
+    pub panel: BrowserPanelKind,
 }
 
 /// `GET /api/browser/settings` and the answer of `PUT`.

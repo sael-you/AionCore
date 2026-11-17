@@ -1,0 +1,218 @@
+//! x11vnc for the Camoufox panel (TASK-136 K6), from Debian 12's signed
+//! archive, unpacked into the engine's own directory (the container image
+//! has Xvfb but no VNC server, and system packages vanish with the image).
+//!
+//! Chain (run by hand 2026-11-17):
+//! 1. Debian's archive keyrings from the image (`/usr/share/keyrings`,
+//!    package debian-archive-keyring) → `gpg --import` into a throw-away home
+//!    → BOTH pinned primary fingerprints present (Debian lists them on
+//!    ftp-master.debian.org/keys.html: bookworm archive signing key and
+//!    bookworm release key; InRelease carries one signature of each, and
+//!    gpgv needs both keys to exit 0) → exported as the only keys;
+//! 2. `gpgv --status-fd` on `dists/bookworm/InRelease`: exit 0 and a
+//!    `VALIDSIG` whose primary key is pinned;
+//! 3. the Release's SHA256 of `main/binary-amd64/Packages.xz` =
+//!    sha256(download) → `xz -dc`;
+//! 4. each package's stanza: SHA256 + Size = the downloaded `.deb` →
+//!    `dpkg-deb -x` (no maintainer scripts).
+//!
+//! Packages: x11vnc, libvncserver1, libvncclient1 (their other dependencies
+//! are in the image: checked with `ldd` against the image's libraries).
+
+use std::path::Path;
+
+use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
+
+use crate::error::BrowserError;
+use crate::install::{packages_entry, primary_fingerprints, release_sha256};
+
+pub const DEBIAN_REPO: &str = "https://deb.debian.org/debian";
+pub const SUITE: &str = "bookworm";
+/// Debian 12/bookworm archive signing key (primary).
+pub const ARCHIVE_FPR: &str = "B8B80B5B623EAB6AD8775C45B7C5D7D6350947F8";
+/// Debian 12/bookworm release key.
+pub const RELEASE_FPR: &str = "4D64FEC119C2029067D6E791F8D2585B8783D481";
+const KEYRINGS: [&str; 2] = [
+    "/usr/share/keyrings/debian-archive-bookworm-automatic.gpg",
+    "/usr/share/keyrings/debian-archive-bookworm-stable.gpg",
+];
+const PACKAGES_XZ: &str = "main/binary-amd64/Packages.xz";
+pub const VNC_PACKAGES: [&str; 3] = ["x11vnc", "libvncserver1", "libvncclient1"];
+const MAX_DEB_BYTES: u64 = 32 * 1024 * 1024;
+const MAX_INDEX_BYTES: u64 = 64 * 1024 * 1024;
+
+fn sha256_hex(bytes: &[u8]) -> String {
+    hex::encode(Sha256::digest(bytes))
+}
+
+fn internal(what: &str) -> BrowserError {
+    BrowserError::Internal(what.to_owned())
+}
+
+/// `VALIDSIG` lines of `gpgv --status-fd`: the primary-key fingerprint is
+/// the last field.
+pub fn valid_signers(status: &str) -> Vec<String> {
+    status
+        .lines()
+        .filter_map(|l| l.strip_prefix("[GNUPG:] VALIDSIG "))
+        .filter_map(|rest| rest.split_whitespace().last().map(str::to_owned))
+        .collect()
+}
+
+async fn gpg(home: &Path, args: &[&str]) -> Result<std::process::Output, BrowserError> {
+    let mut cmd = aionui_runtime::Builder::clean_cli("gpg");
+    cmd.arg("--homedir")
+        .arg(home)
+        .arg("--batch")
+        .arg("--no-tty")
+        .arg("--no-autostart")
+        .args(args);
+    Ok(cmd.output().await?)
+}
+
+/// A gpgv keyring holding exactly the two pinned Debian keys.
+async fn pinned_keyring(staging: &Path) -> Result<std::path::PathBuf, BrowserError> {
+    let home = staging.join("debian-gnupg");
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        std::fs::DirBuilder::new().mode(0o700).create(&home)?;
+    }
+    for keyring in KEYRINGS {
+        if !gpg(&home, &["--import", keyring]).await?.status.success() {
+            return Err(internal("Debian keyring import failed"));
+        }
+    }
+    let listing = gpg(&home, &["--with-colons", "--fingerprint"]).await?;
+    let fprs = primary_fingerprints(&String::from_utf8_lossy(&listing.stdout));
+    for pinned in [ARCHIVE_FPR, RELEASE_FPR] {
+        if !fprs.iter().any(|f| f == pinned) {
+            return Err(internal("Debian signing key fingerprint mismatch"));
+        }
+    }
+    let keyring = staging.join("debian.gpg");
+    let out = gpg(
+        &home,
+        &[
+            "--export",
+            "--output",
+            &keyring.to_string_lossy(),
+            ARCHIVE_FPR,
+            RELEASE_FPR,
+        ],
+    )
+    .await?;
+    if !out.status.success() || !keyring.exists() {
+        return Err(internal("gpg --export failed"));
+    }
+    Ok(keyring)
+}
+
+async fn get(http: &reqwest::Client, url: &str, max: u64) -> Result<Vec<u8>, BrowserError> {
+    let resp = http
+        .get(url)
+        .send()
+        .await
+        .map_err(|e| BrowserError::Internal(format!("download failed: {e}")))?;
+    if !resp.status().is_success() {
+        return Err(BrowserError::Internal(format!("{url} → HTTP {}", resp.status())));
+    }
+    if resp.content_length().unwrap_or(0) > max {
+        return Err(internal("download is too large"));
+    }
+    let body = resp
+        .bytes()
+        .await
+        .map_err(|e| BrowserError::Internal(format!("download failed: {e}")))?;
+    if body.len() as u64 > max {
+        return Err(internal("download is too large"));
+    }
+    Ok(body.to_vec())
+}
+
+/// Verify and unpack x11vnc and its two missing libraries into `dest`.
+pub async fn install_vnc(http: &reqwest::Client, staging: &Path, dest: &Path) -> Result<Value, BrowserError> {
+    let keyring = pinned_keyring(staging).await?;
+    let in_release = get(http, &format!("{DEBIAN_REPO}/dists/{SUITE}/InRelease"), MAX_INDEX_BYTES).await?;
+    let signed = staging.join("debian-InRelease");
+    let release_path = staging.join("debian-Release");
+    std::fs::write(&signed, &in_release)?;
+    let mut cmd = aionui_runtime::Builder::clean_cli("gpgv");
+    cmd.arg("--status-fd")
+        .arg("1")
+        .arg("--keyring")
+        .arg(&keyring)
+        .arg("--output")
+        .arg(&release_path)
+        .arg(&signed);
+    let out = cmd.output().await?;
+    let signers = valid_signers(&String::from_utf8_lossy(&out.stdout));
+    if !out.status.success() || !signers.iter().any(|f| f == ARCHIVE_FPR || f == RELEASE_FPR) {
+        return Err(internal("Debian InRelease signature did not verify"));
+    }
+    let release = std::fs::read_to_string(&release_path)?;
+    let want = release_sha256(&release, PACKAGES_XZ).ok_or_else(|| internal("Release has no Packages.xz hash"))?;
+    let xz = get(
+        http,
+        &format!("{DEBIAN_REPO}/dists/{SUITE}/{PACKAGES_XZ}"),
+        MAX_INDEX_BYTES,
+    )
+    .await?;
+    if sha256_hex(&xz) != want {
+        return Err(internal("Packages.xz does not match the signed Release"));
+    }
+    let xz_path = staging.join("Packages.xz");
+    std::fs::write(&xz_path, &xz)?;
+    let mut cmd = aionui_runtime::Builder::clean_cli("xz");
+    cmd.arg("-dc").arg(&xz_path);
+    let out = cmd.output().await?;
+    if !out.status.success() {
+        return Err(internal("xz -dc failed"));
+    }
+    let packages = String::from_utf8_lossy(&out.stdout).into_owned();
+    std::fs::create_dir_all(dest)?;
+    let mut record = Vec::new();
+    for name in VNC_PACKAGES {
+        let entry =
+            packages_entry(&packages, name).ok_or_else(|| BrowserError::Internal(format!("{name} not in Packages")))?;
+        if entry.size > MAX_DEB_BYTES || !entry.filename.starts_with("pool/main/") || entry.filename.contains("..") {
+            return Err(internal("refusing an unexpected package entry"));
+        }
+        let deb = get(http, &format!("{DEBIAN_REPO}/{}", entry.filename), MAX_DEB_BYTES).await?;
+        if deb.len() as u64 != entry.size || sha256_hex(&deb) != entry.sha256.to_ascii_lowercase() {
+            return Err(internal(".deb does not match the signed Packages entry"));
+        }
+        let deb_path = staging.join(format!("{name}.deb"));
+        std::fs::write(&deb_path, &deb)?;
+        let mut cmd = aionui_runtime::Builder::clean_cli("dpkg-deb");
+        cmd.arg("-x").arg(&deb_path).arg(dest);
+        if !cmd.output().await?.status.success() {
+            return Err(internal("dpkg-deb -x failed"));
+        }
+        record.push(json!({"package": name, "version": entry.version, "sha256": entry.sha256, "size": entry.size}));
+    }
+    Ok(json!({
+        "verification": "signed-repository",
+        "checked": "pinned Debian keys -> gpgv InRelease -> Packages.xz sha256 -> package sha256 + size",
+        "signing_keys": [ARCHIVE_FPR, RELEASE_FPR],
+        "source": format!("{DEBIAN_REPO} {SUITE} main"),
+        "packages": record,
+    }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn validsig_primary_is_the_last_field() {
+        let status = "[GNUPG:] GOODSIG 6ED0E7B82643E131 Debian Archive Automatic Signing Key\n\
+            [GNUPG:] VALIDSIG 4CB50190207B4758A3F73A796ED0E7B82643E131 2026-07-11 1783765031 0 4 0 1 8 01 B8B80B5B623EAB6AD8775C45B7C5D7D6350947F8\n\
+            [GNUPG:] VALIDSIG 4D64FEC119C2029067D6E791F8D2585B8783D481 2026-07-11 1783765141 0 4 0 22 8 01 4D64FEC119C2029067D6E791F8D2585B8783D481\n";
+        assert_eq!(
+            valid_signers(status),
+            vec![ARCHIVE_FPR.to_owned(), RELEASE_FPR.to_owned()]
+        );
+        assert!(valid_signers("[GNUPG:] BADSIG x").is_empty());
+    }
+}

@@ -51,6 +51,8 @@ pub enum EngineRelease {
     Deb(PackageEntry),
     /// A Chrome for Testing zip (HTTPS + URL shape only).
     Zip { version: String, url: String },
+    /// A release pinned in AionCore's source (Camoufox): no update discovery.
+    Pinned { version: String },
 }
 
 impl EngineRelease {
@@ -58,6 +60,7 @@ impl EngineRelease {
         match self {
             Self::Deb(e) => &e.version,
             Self::Zip { version, .. } => version,
+            Self::Pinned { version } => version,
         }
     }
 }
@@ -154,6 +157,17 @@ pub fn cft_stable_entry(index: &str, product: &str) -> Option<(String, String)> 
     ok.then(|| (version, url.to_owned()))
 }
 
+/// A pinned version used verbatim as a directory name: starts with a digit,
+/// then digits, letters, `.` and `-` only.
+pub fn pinned_dir_name(version: &str) -> bool {
+    version.len() <= 64
+        && version.starts_with(|c: char| c.is_ascii_digit())
+        && version
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'-')
+        && !version.contains("..")
+}
+
 /// `157.0.8103.78-1` → `157.0.8103.78` (also a safe directory name).
 pub fn dir_version(version: &str) -> Option<String> {
     let v = version.split('-').next()?;
@@ -220,6 +234,9 @@ impl EngineInstaller {
                 })?;
                 Ok(EngineRelease::Zip { version, url })
             }
+            EngineSource::GithubRelease { .. } => Ok(EngineRelease::Pinned {
+                version: crate::camoufox::VERSION.to_owned(),
+            }),
         }
     }
 
@@ -244,8 +261,13 @@ impl EngineInstaller {
     /// the version dir. Does NOT switch `current` (see [`Self::activate`]).
     pub async fn install(&self, engine: BrowserEngine, release: &EngineRelease) -> Result<String, BrowserError> {
         let s = spec(engine);
-        let version =
-            dir_version(release.version()).ok_or_else(|| BrowserError::Internal("unexpected engine version".into()))?;
+        let version = match release {
+            // A pinned release keeps its exact name (`159.0-beta.42`): a later
+            // beta must not collide with it.
+            EngineRelease::Pinned { version } if pinned_dir_name(version) => version.clone(),
+            _ => dir_version(release.version())
+                .ok_or_else(|| BrowserError::Internal("unexpected engine version".into()))?,
+        };
         let engine_dir = self.layout.engine_dir(engine);
         let dest = engine_dir.join(&version);
         if dest.join(s.binary).exists() {
@@ -314,6 +336,9 @@ impl EngineInstaller {
                         "size": zip.len(),
                     });
                     (x.join(zip_dir), record)
+                }
+                (EngineSource::GithubRelease { .. }, EngineRelease::Pinned { .. }) => {
+                    crate::camoufox::build_tree(&self.http, &staging, &x).await?
                 }
                 _ => return Err(BrowserError::Internal("release does not match the engine".into())),
             };

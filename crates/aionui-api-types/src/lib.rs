@@ -112,9 +112,9 @@ pub use browser::{
     BrowserEngineVerification, BrowserErrorCode, BrowserFileChooser, BrowserFileChooserMode, BrowserFrameMeta,
     BrowserInstanceCreate, BrowserInstancePatch, BrowserInstanceSettings, BrowserInstanceStatus, BrowserInstanceUpdate,
     BrowserKeyEventKind, BrowserKeyInput, BrowserMouseButton, BrowserMouseEventKind, BrowserMouseInput,
-    BrowserPairingCode, BrowserRunStatus, BrowserServerMessage, BrowserSettings, BrowserSettingsUpdate, BrowserState,
-    BrowserStatusResponse, BrowserTab, BrowserWsError, BrowserWsQuery, ExtensionError, ExtensionInbound,
-    ExtensionOutbound, ExtensionTab, browser_instance_default_name,
+    BrowserPairingCode, BrowserPanelKind, BrowserRunStatus, BrowserServerMessage, BrowserSettings,
+    BrowserSettingsUpdate, BrowserState, BrowserStatusResponse, BrowserTab, BrowserWsError, BrowserWsQuery,
+    ExtensionError, ExtensionInbound, ExtensionOutbound, ExtensionTab, browser_instance_default_name,
 };
 pub use channel::{
     ApprovePairingRequest, BridgeResponse, ChannelAssistantSettingRequest, ChannelAssistantSettingResponse,
