@@ -7,6 +7,7 @@ pub mod bridge;
 pub mod cdp;
 pub mod device_bridge;
 pub mod devices;
+pub mod engine;
 pub mod error;
 pub mod filter;
 pub mod guard;
