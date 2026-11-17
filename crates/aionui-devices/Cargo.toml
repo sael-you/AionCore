@@ -8,6 +8,7 @@ aionui-api-types.workspace = true
 aionui-common.workspace = true
 aionui-auth.workspace = true
 aionui-db.workspace = true
+aionui-ai-agent.workspace = true
 axum.workspace = true
 tokio.workspace = true
 serde.workspace = true
