@@ -472,7 +472,6 @@ async fn a_crucial_app_gates_reads_and_actions_and_one_ok_covers_both() {
         Some(DeviceErrorCode::DeviceApprovalExpired)
     );
 
-    // Switching the phone off refuses what is waiting.
     let outcomes: Vec<_> = svc
         .audit("u1", &phone, None, Some(50))
         .await
@@ -482,7 +481,9 @@ async fn a_crucial_app_gates_reads_and_actions_and_one_ok_covers_both() {
         .map(|r| r.outcome)
         .collect();
     use aionui_api_types::devices::DeviceAuditOutcome as O;
-    assert!(outcomes.contains(&O::Denied) && outcomes.contains(&O::Approved) && outcomes.contains(&O::Ok));
+    // The denied read, then the allowed action and the read its OK covered.
+    assert_eq!(outcomes.iter().filter(|o| **o == O::Denied).count(), 1);
+    assert_eq!(outcomes.iter().filter(|o| **o == O::Approved).count(), 2);
 }
 
 /// Password managers: their screen is never read (no prompt); actions ask.
