@@ -28,16 +28,16 @@ const LISTENING_EVENT_PREFIX: &str = "AIONCORE_LISTENING";
 // false gap.
 const READY_EVENT_MARKER: &str = "AIONCORE_READY";
 const DYNAMIC_BACKEND_BIND_MAX_ATTEMPTS: usize = 50;
-const WORKER_TASK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(4);
+const WORKER_TASK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 /// TASK-44: how long running turns may finish by themselves before the
 /// worker tasks are cleared (turns waiting for an approval are not waited
-/// for: nobody can answer during a shutdown). The whole shutdown must end
-/// before the web host's SIGKILL 30 s after SIGTERM
-/// (`ui/packages/web-host/src/backend-launcher.ts` stop()), so every stage
-/// bound below adds up to 24 s and the watchdog fires at 25 s.
-const SHUTDOWN_TURN_DRAIN_TIMEOUT: Duration = Duration::from_secs(12);
+/// for: nobody can answer during a shutdown). 20 s = owner decision
+/// (2026-11-17). The whole shutdown must end before the web host's SIGKILL
+/// after SIGTERM (`ui/packages/web-host/src/backend-launcher.ts` stop(),
+/// 45 s): the stage bounds below add up to 39 s and the watchdog fires at 40 s.
+const SHUTDOWN_TURN_DRAIN_TIMEOUT: Duration = Duration::from_secs(20);
 /// The web host's hard kill after SIGTERM; the watchdog must fire before it.
-const WEB_HOST_STOP_KILL_AFTER: Duration = Duration::from_secs(30);
+const WEB_HOST_STOP_KILL_AFTER: Duration = Duration::from_secs(45);
 const SHUTDOWN_TURN_DRAIN_POLL: Duration = Duration::from_millis(250);
 
 // Bounded graceful-shutdown tail (AIONUI-16). The data-dir instance flock is
@@ -56,11 +56,11 @@ const SHUTDOWN_TURN_DRAIN_POLL: Duration = Duration::from_millis(250);
 // including a runtime that wedges mid-tail. (It cannot cover a runtime that
 // wedges before the shutdown signal is observed — arming itself runs inside
 // the runtime; see `bootstrap::shutdown_watchdog`.)
-const SHUTDOWN_KEEP_AWAKE_TIMEOUT: Duration = Duration::from_secs(2);
-const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(3);
-const SHUTDOWN_IDLE_SCANNER_JOIN_TIMEOUT: Duration = Duration::from_secs(1);
+const SHUTDOWN_KEEP_AWAKE_TIMEOUT: Duration = Duration::from_secs(5);
+const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+const SHUTDOWN_IDLE_SCANNER_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
 const SHUTDOWN_DB_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
-const SHUTDOWN_WATCHDOG_TIMEOUT: Duration = Duration::from_secs(25);
+const SHUTDOWN_WATCHDOG_TIMEOUT: Duration = Duration::from_secs(40);
 
 // The watchdog must outlast the sum of every bounded stage, otherwise it can
 // force-exit a shutdown that is still making progress within its per-stage
