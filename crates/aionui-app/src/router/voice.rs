@@ -49,6 +49,44 @@ impl CredentialPort for ProviderCredentialAdapter {
     }
 }
 
+/// STT settings without their own OpenAI key use the Model-page key, resolved
+/// exactly like voice (STT key hotfix 2026-11-17).
+struct SttOpenAiKey {
+    credentials: ProviderCredentialAdapter,
+    policy: CredentialPolicy,
+}
+
+#[async_trait::async_trait]
+impl aionui_shell::SttKeyFallback for SttOpenAiKey {
+    async fn openai_key(&self, user_id: &str) -> Option<aionui_shell::SttFallbackKey> {
+        let rows = match self.credentials.provider_credentials(user_id).await {
+            Ok(rows) => rows,
+            Err(error) => {
+                tracing::warn!(error = %error, "stt: model-page OpenAI key unavailable");
+                return None;
+            }
+        };
+        let credential = self.policy.resolve_openai(rows, None).ok()?;
+        Some(aionui_shell::SttFallbackKey {
+            api_key: credential.api_key.expose().to_owned(),
+            base_url: credential.base_url,
+        })
+    }
+}
+
+pub(crate) fn stt_key_fallback(services: &AppServices) -> Arc<dyn aionui_shell::SttKeyFallback> {
+    let pool = services.database.pool().clone();
+    Arc::new(SttOpenAiKey {
+        credentials: ProviderCredentialAdapter {
+            providers: ProviderService::new(
+                Arc::new(SqliteProviderRepository::new(pool)),
+                derive_encryption_key(&services.encryption_secret_raw),
+            ),
+        },
+        policy: CredentialPolicy::from_env(),
+    })
+}
+
 /// Identity for voice routes: a validated session cookie in every mode. In
 /// `--local` the rest of the app injects the default user; voice does not.
 fn voice_auth_state(services: &AppServices) -> AuthState {

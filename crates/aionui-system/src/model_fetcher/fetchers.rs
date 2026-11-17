@@ -62,7 +62,7 @@ pub(super) async fn fetch_openai_compatible(
     let body: OpenAiModelsResponse = resp
         .json()
         .await
-        .map_err(|e| SystemError::BadGateway(format!("Failed to parse models response: {e}")))?;
+        .map_err(|e| SystemError::BadGateway(format!("Failed to parse models response: {}", e.without_url())))?;
 
     Ok(body.data.into_iter().map(|m| ModelInfo::Id(m.id)).collect())
 }
@@ -104,10 +104,9 @@ async fn fetch_anthropic(
 
     match result {
         Ok(resp) if resp.status().is_success() => {
-            let body: AnthropicModelsResponse = resp
-                .json()
-                .await
-                .map_err(|e| SystemError::BadGateway(format!("Failed to parse Anthropic response: {e}")))?;
+            let body: AnthropicModelsResponse = resp.json().await.map_err(|e| {
+                SystemError::BadGateway(format!("Failed to parse Anthropic response: {}", e.without_url()))
+            })?;
             Ok(body.data.into_iter().map(|m| ModelInfo::Id(m.id)).collect())
         }
         Ok(resp) => {
@@ -146,10 +145,9 @@ async fn fetch_gemini(client: &reqwest::Client, base_url: &str, api_key: &str) -
 
     match result {
         Ok(resp) if resp.status().is_success() => {
-            let body: GeminiModelsResponse = resp
-                .json()
-                .await
-                .map_err(|e| SystemError::BadGateway(format!("Failed to parse Gemini response: {e}")))?;
+            let body: GeminiModelsResponse = resp.json().await.map_err(|e| {
+                SystemError::BadGateway(format!("Failed to parse Gemini response: {}", e.without_url()))
+            })?;
             let models = body
                 .models
                 .into_iter()
@@ -169,7 +167,7 @@ async fn fetch_gemini(client: &reqwest::Client, base_url: &str, api_key: &str) -
             Ok(fallback_models(GEMINI_FALLBACK_MODELS))
         }
         Err(e) => {
-            warn!(error = %e, "Gemini models API unreachable, using fallback list");
+            warn!(error = %e.without_url(), "Gemini models API unreachable, using fallback list");
             Ok(fallback_models(GEMINI_FALLBACK_MODELS))
         }
     }
@@ -331,17 +329,41 @@ fn check_response_status(resp: &reqwest::Response) -> Result<(), SystemError> {
     )))
 }
 
+/// The URL is dropped from the error text: Gemini carries the key in the
+/// query string (`?key=`), and the text reaches the UI and the logs.
 fn remote_error(e: &reqwest::Error) -> SystemError {
     if e.is_timeout() {
         SystemError::Timeout("Remote API request timed out".into())
     } else {
-        SystemError::BadGateway(format!("Remote API request failed: {e}"))
+        let text = aionui_common::redact_secrets(&e.to_string(), &[]);
+        let text = match e.url() {
+            Some(url) => text.replace(url.as_str(), "<url>"),
+            None => text,
+        };
+        SystemError::BadGateway(format!("Remote API request failed: {text}"))
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn a_failed_request_never_carries_the_key_in_the_query_string() {
+        // Gemini puts the key in the URL; reqwest's error text quotes the URL.
+        let error = reqwest::Client::new()
+            .get("http://127.0.0.1:9/v1beta/models?key=AIzaFAKEFAKEFAKEFAKEFAKE0123")
+            .timeout(std::time::Duration::from_secs(2))
+            .send()
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("AIzaFAKE"),
+            "precondition: reqwest quotes the URL"
+        );
+        let text = remote_error(&error).to_string();
+        assert!(!text.contains("AIzaFAKE"), "{text}");
+    }
 
     #[test]
     fn ensure_v1_path_already_present() {

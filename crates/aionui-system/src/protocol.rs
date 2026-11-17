@@ -224,7 +224,7 @@ impl ProtocolDetectionService {
                     let body: DataResponse = r
                         .json()
                         .await
-                        .map_err(|e| SystemError::BadGateway(format!("Parse failed: {e}")))?;
+                        .map_err(|e| SystemError::BadGateway(format!("Parse failed: {}", e.without_url())))?;
                     let confidence = if fixed.is_some() { 80 } else { 90 };
                     return Ok(ProbeOutcome::Success {
                         models: body.data.into_iter().map(|m| m.id).collect(),
@@ -256,13 +256,13 @@ impl ProtocolDetectionService {
             .timeout(timeout)
             .send()
             .await
-            .map_err(|e| SystemError::BadGateway(format!("Anthropic probe failed: {e}")))?;
+            .map_err(|e| SystemError::BadGateway(format!("Anthropic probe failed: {}", e.without_url())))?;
 
         if resp.status().is_success() {
             let body: DataResponse = resp
                 .json()
                 .await
-                .map_err(|e| SystemError::BadGateway(format!("Parse failed: {e}")))?;
+                .map_err(|e| SystemError::BadGateway(format!("Parse failed: {}", e.without_url())))?;
             return Ok(ProbeOutcome::Success {
                 models: body.data.into_iter().map(|m| m.id).collect(),
                 fixed_base_url: None,
@@ -285,13 +285,13 @@ impl ProtocolDetectionService {
             .timeout(timeout)
             .send()
             .await
-            .map_err(|e| SystemError::BadGateway(format!("Gemini probe failed: {e}")))?;
+            .map_err(|e| SystemError::BadGateway(format!("Gemini probe failed: {}", e.without_url())))?;
 
         if resp.status().is_success() {
             let body: GeminiResponse = resp
                 .json()
                 .await
-                .map_err(|e| SystemError::BadGateway(format!("Parse failed: {e}")))?;
+                .map_err(|e| SystemError::BadGateway(format!("Parse failed: {}", e.without_url())))?;
             let models = body
                 .models
                 .into_iter()
@@ -507,7 +507,7 @@ async fn test_single_key(
     let resp = req
         .send()
         .await
-        .map_err(|e| SystemError::BadGateway(format!("Request failed: {e}")))?;
+        .map_err(|e| SystemError::BadGateway(format!("Request failed: {}", e.without_url())))?;
 
     if resp.status().is_success() {
         Ok(())

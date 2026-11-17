@@ -71,11 +71,25 @@ pub trait UpstreamFactory: Send + Sync {
 const NON_STREAMING_OPENAI_MODELS: &[&str] = &["whisper-1"];
 
 /// Build the protocol `error` frame for an [`SttError`].
-fn error_frame(e: &SttError) -> SttStreamServerMessage {
+/// The client frame for an error, with the configured key values redacted
+/// (provider messages echo them).
+fn error_frame(e: &SttError, keys: &[&str]) -> SttStreamServerMessage {
     SttStreamServerMessage::Error {
         code: e.error_code().to_owned(),
-        msg: e.to_string(),
+        msg: aionui_common::redact_secrets(&e.to_string(), keys),
     }
+}
+
+/// The API key values of the config (redacted from every log and frame).
+fn configured_keys(config: &SpeechToTextConfig) -> Vec<String> {
+    [
+        config.openai.as_ref().map(|c| c.api_key.clone()),
+        config.deepgram.as_ref().map(|c| c.api_key.clone()),
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|key| !key.is_empty())
+    .collect()
 }
 
 /// Validated parameters extracted from the client `start` frame.
@@ -180,6 +194,9 @@ pub async fn run_stream_session(
     config: SpeechToTextConfig,
     factory: &dyn UpstreamFactory,
 ) {
+    let owned_keys = configured_keys(&config);
+    let keys: Vec<&str> = owned_keys.iter().map(String::as_str).collect();
+    let redacted = |e: &SttError| aionui_common::redact_secrets(&e.to_string(), &keys);
     // -- 1. Await and validate the start frame -----------------------------
     let Some(first) = incoming.recv().await else {
         return; // channel closed before any frame
@@ -188,15 +205,15 @@ pub async fn run_stream_session(
         Ok(Some(start)) => start,
         Ok(None) => return, // client closed before starting
         Err(e) => {
-            tracing::warn!(error = %e, "stt stream: rejected start frame");
-            let _ = send.send(error_frame(&e)).await;
+            tracing::warn!(error = %redacted(&e), "stt stream: rejected start frame");
+            let _ = send.send(error_frame(&e, &keys)).await;
             return;
         }
     };
 
     // -- 2. Validate config and streaming capability -----------------------
     if let Err(e) = validate_config(&config) {
-        let _ = send.send(error_frame(&e)).await;
+        let _ = send.send(error_frame(&e, &keys)).await;
         return;
     }
 
@@ -209,8 +226,8 @@ pub async fn run_stream_session(
     let mut upstream = match factory.connect(&config, start.sample_rate, language_hint).await {
         Ok(upstream) => upstream,
         Err(e) => {
-            tracing::warn!(error = %e, "stt stream: upstream connect failed");
-            let _ = send.send(error_frame(&e)).await;
+            tracing::warn!(error = %redacted(&e), "stt stream: upstream connect failed");
+            let _ = send.send(error_frame(&e, &keys)).await;
             return;
         }
     };
@@ -230,7 +247,7 @@ pub async fn run_stream_session(
                 match frame {
                     Some(ClientFrame::Binary(pcm)) => {
                         if let Err(e) = upstream.send_audio(&pcm).await {
-                            let _ = send.send(error_frame(&e)).await;
+                            let _ = send.send(error_frame(&e, &keys)).await;
                             return;
                         }
                     }
@@ -238,15 +255,15 @@ pub async fn run_stream_session(
                         match serde_json::from_str::<SttStreamClientMessage>(&text) {
                             Ok(SttStreamClientMessage::Stop) => {
                                 if let Err(e) = upstream.finish().await {
-                                    let _ = send.send(error_frame(&e)).await;
+                                    let _ = send.send(error_frame(&e, &keys)).await;
                                     return;
                                 }
                                 stopping = true;
                             }
                             _ => {
                                 let e = SttError::StreamProtocol("unexpected control frame mid-session".into());
-                                tracing::warn!(error = %e, "stt stream: protocol violation");
-                                let _ = send.send(error_frame(&e)).await;
+                                tracing::warn!(error = %redacted(&e), "stt stream: protocol violation");
+                                let _ = send.send(error_frame(&e, &keys)).await;
                                 return;
                             }
                         }
@@ -272,14 +289,14 @@ pub async fn run_stream_session(
                             let _ = send.send(SttStreamServerMessage::Done).await;
                         } else {
                             let e = SttError::RequestFailed("upstream closed unexpectedly".into());
-                            tracing::warn!(error = %e, "stt stream: upstream closed before stop");
-                            let _ = send.send(error_frame(&e)).await;
+                            tracing::warn!(error = %redacted(&e), "stt stream: upstream closed before stop");
+                            let _ = send.send(error_frame(&e, &keys)).await;
                         }
                         return;
                     }
                     Some(Err(e)) => {
-                        tracing::warn!(error = %e, "stt stream: upstream error");
-                        let _ = send.send(error_frame(&e)).await;
+                        tracing::warn!(error = %redacted(&e), "stt stream: upstream error");
+                        let _ = send.send(error_frame(&e, &keys)).await;
                         return;
                     }
                 }

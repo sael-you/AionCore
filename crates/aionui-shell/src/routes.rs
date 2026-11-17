@@ -43,9 +43,10 @@ impl From<ShellError> for ApiError {
 impl From<SttError> for ApiError {
     fn from(err: SttError) -> Self {
         match &err {
-            SttError::Disabled | SttError::OpenaiNotConfigured | SttError::DeepgramNotConfigured => {
-                ApiError::BadRequest(err.to_string())
-            }
+            SttError::Disabled
+            | SttError::OpenaiNotConfigured
+            | SttError::DeepgramNotConfigured
+            | SttError::KeyInvalid => ApiError::BadRequest(err.to_string()),
             SttError::RequestFailed(_) => ApiError::BadGateway(err.to_string()),
             SttError::Unknown(_) => ApiError::Internal(err.to_string()),
             SttError::StreamUnsupported | SttError::StreamProtocol(_) => ApiError::BadRequest(err.to_string()),
@@ -205,18 +206,16 @@ async fn speech_to_text(
         (status, Json(body))
     })?;
 
-    let config = load_stt_config(&state.client_pref_service, &user.id)
-        .await
-        .map_err(|e| {
-            let e = ApiError::from(e);
-            let status = e.status_code();
-            let body = serde_json::json!({
-                "success": false,
-                "error": e.to_string(),
-                "code": e.error_code(),
-            });
-            (status, Json(body))
-        })?;
+    let config = resolved_stt_config(&state, &user.id).await.map_err(|e| {
+        let e = ApiError::from(e);
+        let status = e.status_code();
+        let body = serde_json::json!({
+            "success": false,
+            "error": e.to_string(),
+            "code": e.error_code(),
+        });
+        (status, Json(body))
+    })?;
 
     let result = state
         .stt_service
@@ -245,6 +244,16 @@ fn stt_error_response(err: &SttError) -> (StatusCode, Json<serde_json::Value>) {
         "code": err.error_code(),
     });
     (status, Json(body))
+}
+
+/// The stored STT config with the Model-page OpenAI key filled in when the
+/// STT settings carry none (both the REST and the streaming route).
+async fn resolved_stt_config(
+    state: &ShellRouterState,
+    user_id: &str,
+) -> Result<SpeechToTextConfig, aionui_system::SystemError> {
+    let config = load_stt_config(&state.client_pref_service, user_id).await?;
+    Ok(crate::stt_key::fill_openai_key(config, state.stt_key_fallback.as_deref(), user_id).await)
 }
 
 /// Load the stored STT config from client preferences.
@@ -308,7 +317,7 @@ async fn speech_to_text_stream(
 async fn speech_to_text_stream_socket(socket: WebSocket, state: ShellRouterState, user_id: String) {
     let (mut ws_tx, mut ws_rx) = socket.split();
 
-    let config = match load_stt_config(&state.client_pref_service, &user_id).await {
+    let config = match resolved_stt_config(&state, &user_id).await {
         Ok(config) => config,
         Err(e) => {
             tracing::error!(error = %e, "stt stream: failed to load config");
@@ -389,6 +398,7 @@ mod tests {
             shell_service: Arc::new(ShellService::new(Arc::new(NoopSystemOpener))),
             stt_service: Arc::new(SttService::new(reqwest::Client::new())),
             client_pref_service,
+            stt_key_fallback: None,
         }
     }
 

@@ -42,6 +42,11 @@ pub enum SttError {
     #[error("STT request failed: {0}")]
     RequestFailed(String),
 
+    /// The provider refused the API key (OpenAI `invalid_api_key`, HTTP 401):
+    /// a settings problem the user can fix, never a 502.
+    #[error("the Speech-to-Text API key is invalid")]
+    KeyInvalid,
+
     #[error("STT unknown error: {0}")]
     Unknown(String),
 
@@ -59,6 +64,7 @@ impl SttError {
             Self::OpenaiNotConfigured => "STT_OPENAI_NOT_CONFIGURED",
             Self::DeepgramNotConfigured => "STT_DEEPGRAM_NOT_CONFIGURED",
             Self::RequestFailed(_) => "STT_REQUEST_FAILED",
+            Self::KeyInvalid => "STT_KEY_INVALID",
             Self::Unknown(_) => "STT_UNKNOWN",
             Self::StreamUnsupported => "STT_STREAM_UNSUPPORTED",
             Self::StreamProtocol(_) => "STT_STREAM_PROTOCOL",
@@ -67,7 +73,8 @@ impl SttError {
 
     pub fn status_code(&self) -> u16 {
         match self {
-            Self::Disabled | Self::OpenaiNotConfigured | Self::DeepgramNotConfigured => 400,
+            // 400, not 401: a 401 reads as the user's own session expiring.
+            Self::Disabled | Self::OpenaiNotConfigured | Self::DeepgramNotConfigured | Self::KeyInvalid => 400,
             Self::RequestFailed(_) => 502,
             Self::Unknown(_) => 500,
             Self::StreamUnsupported | Self::StreamProtocol(_) => 400,
@@ -140,6 +147,8 @@ mod tests {
         assert_eq!(SttError::OpenaiNotConfigured.status_code(), 400);
         assert_eq!(SttError::DeepgramNotConfigured.status_code(), 400);
         assert_eq!(SttError::RequestFailed("x".into()).status_code(), 502);
+        assert_eq!(SttError::KeyInvalid.status_code(), 400);
+        assert_eq!(SttError::KeyInvalid.error_code(), "STT_KEY_INVALID");
         assert_eq!(SttError::Unknown("x".into()).status_code(), 500);
         assert_eq!(SttError::StreamUnsupported.status_code(), 400);
         assert_eq!(SttError::StreamProtocol("x".into()).status_code(), 400);

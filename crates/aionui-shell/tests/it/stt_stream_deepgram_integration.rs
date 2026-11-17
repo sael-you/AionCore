@@ -270,7 +270,7 @@ async fn explicit_language_suppresses_multi_mode() {
 }
 
 #[tokio::test]
-async fn handshake_rejection_maps_to_request_failed_with_status() {
+async fn handshake_rejection_with_401_maps_to_key_invalid() {
     // Plain HTTP server answering 401 to the upgrade request (bad API key path).
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
@@ -299,8 +299,9 @@ async fn handshake_rejection_maps_to_request_failed_with_status() {
     };
     within(server).await.unwrap();
 
-    assert_eq!(err.error_code(), "STT_REQUEST_FAILED");
-    assert!(err.to_string().contains("401"), "got: {err}");
+    // STT key hotfix: a 401 handshake is a refused key, shown as a settings problem.
+    assert_eq!(err.error_code(), "STT_KEY_INVALID");
+    assert_eq!(err.status_code(), 400);
 }
 
 #[tokio::test]

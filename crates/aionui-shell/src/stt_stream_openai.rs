@@ -114,11 +114,16 @@ fn connect_error(e: tungstenite::Error) -> SttError {
     match e {
         tungstenite::Error::Http(response) => {
             let status = response.status();
+            if status.as_u16() == 401 || status.as_u16() == 403 {
+                return SttError::KeyInvalid;
+            }
             let body = response
                 .body()
                 .as_deref()
                 .map(|b| String::from_utf8_lossy(b).into_owned())
                 .unwrap_or_default();
+            // Provider bodies may echo the key: never log or return it.
+            let body = aionui_common::redact_secrets(&body, &[]);
             SttError::RequestFailed(format!("OpenAI realtime WS handshake returned {status}: {body}"))
         }
         other => SttError::RequestFailed(format!("OpenAI realtime WS connect error: {other}")),
@@ -258,7 +263,8 @@ fn parse_text_frame(text: &str) -> Parsed {
             transcript: value["transcript"].as_str().unwrap_or("").to_owned(),
         },
         Some("conversation.item.input_audio_transcription.failed") => {
-            let message = value["error"]["message"].as_str().unwrap_or("unknown error");
+            let message =
+                aionui_common::redact_secrets(value["error"]["message"].as_str().unwrap_or("unknown error"), &[]);
             Parsed::Failed {
                 item_id: item_id(),
                 error: SttError::RequestFailed(format!("OpenAI transcription failed: {message}")),
@@ -269,7 +275,12 @@ fn parse_text_frame(text: &str) -> Parsed {
             if code == "input_audio_buffer_commit_empty" {
                 return Parsed::CommitEmpty;
             }
-            let message = value["error"]["message"].as_str().unwrap_or("unknown error");
+            // The key is wrong: a settings problem, and the message echoes it.
+            if code == "invalid_api_key" {
+                return Parsed::Error(SttError::KeyInvalid);
+            }
+            let message =
+                aionui_common::redact_secrets(value["error"]["message"].as_str().unwrap_or("unknown error"), &[]);
             Parsed::Error(SttError::RequestFailed(format!(
                 "OpenAI realtime error ({code}): {message}"
             )))
@@ -524,6 +535,26 @@ mod tests {
                 assert!(error.to_string().contains("asr down"), "got: {error}");
             }
             _ => panic!("expected failed"),
+        }
+    }
+
+    #[test]
+    fn an_invalid_api_key_is_key_invalid_and_other_messages_lose_the_key() {
+        let frame = r#"{"type":"error","error":{"type":"invalid_request_error","code":"invalid_api_key","message":"Incorrect API key provided: sk-proj-FAKE0123456789abcdefFAKE0123456789."}}"#;
+        match parse_text_frame(frame) {
+            Parsed::Error(e) => {
+                assert_eq!(e.error_code(), "STT_KEY_INVALID");
+                assert!(!e.to_string().contains("FAKE0123"), "{e}");
+            }
+            _ => panic!("expected error"),
+        }
+        let frame = r#"{"type":"error","error":{"code":"server_error","message":"failed for sk-proj-FAKE0123456789abcdefFAKE0123456789"}}"#;
+        match parse_text_frame(frame) {
+            Parsed::Error(e) => {
+                let text = e.to_string();
+                assert!(!text.contains("FAKE0123") && text.contains("[REDACTED]"), "{text}");
+            }
+            _ => panic!("expected error"),
         }
     }
 

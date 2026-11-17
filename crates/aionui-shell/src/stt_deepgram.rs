@@ -56,11 +56,16 @@ pub async fn transcribe(
         .body(audio_data)
         .send()
         .await
-        .map_err(|e| SttError::RequestFailed(format!("Deepgram request error: {e}")))?;
+        .map_err(|e| SttError::RequestFailed(format!("Deepgram request error: {}", e.without_url())))?;
 
     let status = response.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED || status == reqwest::StatusCode::FORBIDDEN {
+        return Err(SttError::KeyInvalid);
+    }
     if !status.is_success() {
         let body = response.text().await.unwrap_or_else(|_| "<unreadable>".to_owned());
+        // Provider bodies may echo the key: never log or return it.
+        let body = aionui_common::redact_secrets(&body, &[&config.api_key]);
         return Err(SttError::RequestFailed(format!(
             "Deepgram API returned {status}: {body}"
         )));

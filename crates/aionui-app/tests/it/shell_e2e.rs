@@ -389,7 +389,7 @@ async fn st6_deepgram_not_configured() {
     assert_eq!(json["code"], "STT_DEEPGRAM_NOT_CONFIGURED");
 }
 
-// ST-7: STT third-party API failure (fake API key → 401)
+// ST-7: STT third-party API failure (fake API key → 401 → STT_KEY_INVALID)
 #[tokio::test]
 async fn st7_stt_api_failure() {
     let mock_server = MockServer::start().await;
@@ -426,9 +426,12 @@ async fn st7_stt_api_failure() {
 
     let req = multipart_request("/api/stt", &content_type, body, &token, &csrf);
     let resp = app.oneshot(req).await.unwrap();
-    assert_eq!(resp.status(), StatusCode::BAD_GATEWAY);
+    // STT key hotfix (2026-11-17): a refused key is a settings problem the UI
+    // names ("Speech-to-Text key is invalid"), not a bare 502.
+    assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
     let json = body_json(resp).await;
-    assert_eq!(json["code"], "STT_REQUEST_FAILED");
+    assert_eq!(json["code"], "STT_KEY_INVALID");
+    assert!(!json.to_string().contains("sk-fake-key"), "{json}");
 }
 
 // ST-8: multipart missing fileName

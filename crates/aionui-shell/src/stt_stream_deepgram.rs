@@ -76,11 +76,16 @@ fn connect_error(e: tungstenite::Error) -> SttError {
     match e {
         tungstenite::Error::Http(response) => {
             let status = response.status();
+            if status.as_u16() == 401 || status.as_u16() == 403 {
+                return SttError::KeyInvalid;
+            }
             let body = response
                 .body()
                 .as_deref()
                 .map(|b| String::from_utf8_lossy(b).into_owned())
                 .unwrap_or_default();
+            // Provider bodies may echo the key: never log or return it.
+            let body = aionui_common::redact_secrets(&body, &[]);
             SttError::RequestFailed(format!("Deepgram WS handshake returned {status}: {body}"))
         }
         other => SttError::RequestFailed(format!("Deepgram WS connect error: {other}")),

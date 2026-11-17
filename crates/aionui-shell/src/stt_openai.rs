@@ -70,11 +70,16 @@ pub async fn transcribe(
         .multipart(form)
         .send()
         .await
-        .map_err(|e| SttError::RequestFailed(format!("OpenAI request error: {e}")))?;
+        .map_err(|e| SttError::RequestFailed(format!("OpenAI request error: {}", e.without_url())))?;
 
     let status = response.status();
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return Err(SttError::KeyInvalid);
+    }
     if !status.is_success() {
         let body = response.text().await.unwrap_or_else(|_| "<unreadable>".to_owned());
+        // Provider bodies echo the key: never log or return it.
+        let body = aionui_common::redact_secrets(&body, &[&config.api_key]);
         return Err(SttError::RequestFailed(format!("OpenAI API returned {status}: {body}")));
     }
 

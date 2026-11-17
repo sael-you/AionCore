@@ -265,12 +265,49 @@ async fn st7_openai_upstream_failure() {
         .transcribe(dummy_audio(), "test.wav", "audio/wav", None, &config)
         .await;
 
+    // STT key hotfix: a refused key is a settings problem (400 STT_KEY_INVALID), not a 502.
     match result {
-        Err(SttError::RequestFailed(msg)) => {
-            assert!(msg.contains("401"), "expected 401 in error: {msg}");
-        }
-        other => panic!("expected RequestFailed, got: {other:?}"),
+        Err(SttError::KeyInvalid) => {}
+        other => panic!("expected KeyInvalid, got: {other:?}"),
     }
+}
+
+// ---------------------------------------------------------------------------
+// STT key hotfix: an upstream error body never carries the key out
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn upstream_error_bodies_are_redacted_before_they_leave() {
+    const FAKE_KEY: &str = "sk-proj-FAKEKEY0123456789abcdefghijFAKEKEY";
+    let mock_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/audio/transcriptions"))
+        .respond_with(ResponseTemplate::new(500).set_body_json(serde_json::json!({
+            "error": { "message": format!("internal error for key {FAKE_KEY} (sk-pr****KEY)") }
+        })))
+        .mount(&mock_server)
+        .await;
+    let config = SpeechToTextConfig {
+        enabled: true,
+        provider: SpeechToTextProvider::Openai,
+        auto_send: None,
+        openai: Some(OpenAISpeechToTextConfig {
+            api_key: FAKE_KEY.into(),
+            base_url: Some(mock_server.uri()),
+            model: "whisper-1".into(),
+            language: None,
+            prompt: None,
+            temperature: None,
+        }),
+        deepgram: None,
+    };
+    let error = stt_service()
+        .transcribe(dummy_audio(), "test.wav", "audio/wav", None, &config)
+        .await
+        .unwrap_err();
+    let text = error.to_string();
+    assert!(!text.contains("FAKEKEY"), "{text}");
+    assert!(!text.contains("sk-pr****"), "{text}");
+    assert!(text.contains("500") && text.contains("[REDACTED]"), "{text}");
 }
 
 // ---------------------------------------------------------------------------
@@ -306,11 +343,10 @@ async fn st7b_deepgram_upstream_failure() {
         .transcribe(dummy_audio(), "test.wav", "audio/wav", None, &config)
         .await;
 
+    // STT key hotfix: refused credentials are STT_KEY_INVALID.
     match result {
-        Err(SttError::RequestFailed(msg)) => {
-            assert!(msg.contains("403"), "expected 403 in error: {msg}");
-        }
-        other => panic!("expected RequestFailed, got: {other:?}"),
+        Err(SttError::KeyInvalid) => {}
+        other => panic!("expected KeyInvalid, got: {other:?}"),
     }
 }
 

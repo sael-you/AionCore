@@ -13,6 +13,7 @@ pub mod error_extract;
 mod hooks;
 mod id;
 mod pagination;
+mod redact;
 mod timestamp;
 mod types;
 
@@ -31,6 +32,7 @@ pub use error::{
 pub use hooks::{ChildResultDelivery, OnConversationDelete, OnConversationTurnCancelled, TurnCancelCause};
 pub use id::{fnv1a_hex8, generate_id, generate_id_with_length, generate_prefixed_id, generate_short_id};
 pub use pagination::PaginatedResult;
+pub use redact::{REDACTED, redact_secrets};
 pub use timestamp::{TimestampMs, now_ms};
 pub use types::{CommandSpec, Confirmation, ConfirmationOption, EnvVar, ProviderWithModel, UpdateType, VersionInfo};
 pub use user_paths::{UserDirNameError, user_dir_name};

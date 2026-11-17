@@ -1242,6 +1242,7 @@ pub fn build_shell_state(services: &AppServices) -> ShellRouterState {
         ))),
         stt_service: Arc::new(aionui_shell::SttService::new(reqwest::Client::new())),
         client_pref_service,
+        stt_key_fallback: Some(super::voice::stt_key_fallback(services)),
     }
 }
 
