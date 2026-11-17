@@ -10,6 +10,7 @@ use aionui_api_types::devices::{
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
+use axum::extract::rejection::JsonRejection;
 use axum::extract::{Extension, Path, Query, State};
 use axum::http::StatusCode;
 use axum::routing::{get, post, put};
@@ -89,8 +90,9 @@ async fn update(
     State(s): State<DevicesRouterState>,
     Extension(user): Extension<CurrentUser>,
     Path(id): Path<String>,
-    Json(body): Json<DeviceUpdate>,
+    body: Result<Json<DeviceUpdate>, JsonRejection>,
 ) -> Result<Json<ApiResponse<Device>>, ApiError> {
+    let Json(body) = body.map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(
         s.service.update(&user.id, &id, &body).await.map_err(api_error)?,
     )))
@@ -100,8 +102,9 @@ async fn update_route(
     State(s): State<DevicesRouterState>,
     Extension(user): Extension<CurrentUser>,
     Path((id, route)): Path<(String, String)>,
-    Json(body): Json<DeviceRouteUpdate>,
+    body: Result<Json<DeviceRouteUpdate>, JsonRejection>,
 ) -> Result<Json<ApiResponse<Device>>, ApiError> {
+    let Json(body) = body.map_err(ApiError::from)?;
     let route: DeviceRouteKind = serde_json::from_value(serde_json::Value::String(route))
         .map_err(|_| api_error(DevicesError::coded(DeviceErrorCode::DeviceBadMessage, "unknown route")))?;
     Ok(Json(ApiResponse::ok(
