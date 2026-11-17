@@ -40,6 +40,17 @@ const EXPIRE_EVERY: Duration = Duration::from_secs(15);
 const AUDIT_PAGE_DEFAULT: u32 = 50;
 const AUDIT_PAGE_MAX: u32 = 200;
 
+/// One audit row: what was done, never payload.
+#[derive(Debug, Clone, Copy)]
+pub struct AuditNote<'a> {
+    pub verb: &'a str,
+    pub package: Option<&'a str>,
+    pub origin: Option<&'a str>,
+    pub outcome: DeviceAuditOutcome,
+    pub conversation_id: Option<&'a str>,
+    pub detail: Option<&'a str>,
+}
+
 /// Installs or removes one kind of device (K5 add-ons, K7 engines).
 #[async_trait::async_trait]
 pub trait DeviceInstaller: Send + Sync {
@@ -755,17 +766,15 @@ impl DevicesService {
 
     // -- audit ----------------------------------------------------------------
 
-    pub async fn record(
-        &self,
-        user_id: &str,
-        device_id: &str,
-        verb: &str,
-        package: Option<&str>,
-        origin: Option<&str>,
-        outcome: DeviceAuditOutcome,
-        conversation_id: Option<&str>,
-        detail: Option<&str>,
-    ) {
+    pub async fn record(&self, user_id: &str, device_id: &str, note: AuditNote<'_>) {
+        let AuditNote {
+            verb,
+            package,
+            origin,
+            outcome,
+            conversation_id,
+            detail,
+        } = note;
         let outcome = serde_json::to_value(outcome)
             .ok()
             .and_then(|v| v.as_str().map(str::to_owned))

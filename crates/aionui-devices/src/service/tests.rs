@@ -381,8 +381,19 @@ async fn audit_pages_and_never_leaks_across_users() {
         DeviceAuditOutcome::Refused,
         DeviceAuditOutcome::Approved,
     ] {
-        svc.record("u1", &phone, "tap", Some("com.app"), None, outcome, Some("c1"), None)
-            .await;
+        svc.record(
+            "u1",
+            &phone,
+            AuditNote {
+                verb: "tap",
+                package: Some("com.app"),
+                origin: None,
+                outcome,
+                conversation_id: Some("c1"),
+                detail: None,
+            },
+        )
+        .await;
     }
     let first = svc.audit("u1", &phone, None, Some(2)).await.unwrap();
     assert_eq!(first.rows.len(), 2);
