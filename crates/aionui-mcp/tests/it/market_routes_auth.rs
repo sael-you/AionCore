@@ -628,7 +628,7 @@ async fn server_routes_use_the_market_auth_stacks_and_never_echo_the_key() {
     assert_eq!((status, body["data"].clone()), (StatusCode::OK, json!([])));
 
     let key = "-----BEGIN OPENSSH PRIVATE KEY-----\nROUTEKEYMATERIAL0123456789\n-----END OPENSSH PRIVATE KEY-----";
-    let server = json!({"name": "web-1", "host": "10.0.0.5", "ssh_user": "deploy", "private_key": key,
+    let server = json!({"name": "web-1", "host": "127.0.0.1", "port": 1, "ssh_user": "deploy", "private_key": key,
                         "environment": "production", "tier": "write"});
     // No session (loopback caller).
     let (status, _) = send(
@@ -706,6 +706,57 @@ async fn server_routes_use_the_market_auth_stacks_and_never_echo_the_key() {
         post("/api/servers", &bad)
             .header(header::AUTHORIZATION, format!("Bearer {token}"))
             .body(Body::from(bad.to_string()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        (status, resp["code"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("SERVER_INVALID"))
+    );
+
+    // Classify (read stack, runs nothing): the card's reason + environment.
+    let classify = json!({"server": "web-1", "command": "systemctl restart nginx"});
+    let (status, resp) = send(
+        &app,
+        post("/api/servers/classify", &classify)
+            .body(Body::from(classify.to_string()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{resp}");
+    assert_eq!(resp["data"]["crucial"], true);
+    assert_eq!(resp["data"]["reason"], "stops, restarts or disables a service");
+    assert_eq!(resp["data"]["environment"], "production");
+    assert_eq!(resp["data"]["server_id"], id.as_str());
+
+    // Test connection: session only; without a stored host key it reports host_key_unknown.
+    let (status, _) = send(
+        &app,
+        Request::post(format!("/api/servers/{id}/test"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED);
+    let (status, resp) = send(
+        &app,
+        Request::post(format!("/api/servers/{id}/test"))
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{resp}");
+    assert_eq!(
+        (resp["data"]["ok"].as_bool(), resp["data"]["error_code"].as_str()),
+        (Some(false), Some("host_key_unknown"))
+    );
+    let scan = json!({"host": "-oProxyCommand=sh"});
+    let (status, resp) = send(
+        &app,
+        post("/api/servers/scan-host-key", &scan)
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::from(scan.to_string()))
             .unwrap(),
     )
     .await;

@@ -900,6 +900,7 @@ async fn seed_attaches_k0_globally_and_moves_builtins_off_global_once() {
             aionui_api_types::ListKitAttachmentsQuery {
                 level: Some(KitLevel::Global),
                 target_id: None,
+                ..Default::default()
             },
         )
         .await
@@ -915,6 +916,7 @@ async fn seed_attaches_k0_globally_and_moves_builtins_off_global_once() {
             aionui_api_types::ListKitAttachmentsQuery {
                 level: Some(KitLevel::Project),
                 target_id: Some("proj-aionui".into()),
+                ..Default::default()
             },
         )
         .await
@@ -939,6 +941,7 @@ async fn seed_attaches_k0_globally_and_moves_builtins_off_global_once() {
             aionui_api_types::ListKitAttachmentsQuery {
                 level: Some(KitLevel::Global),
                 target_id: None,
+                ..Default::default()
             },
         )
         .await

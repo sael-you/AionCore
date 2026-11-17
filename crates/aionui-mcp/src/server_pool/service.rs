@@ -5,7 +5,8 @@
 use std::sync::Arc;
 
 use aionui_api_types::{
-    CreateServerRequest, ListServerAuditQuery, SERVER_TIER_NOTE, ServerAuditResponse, ServerResponse,
+    ClassifyServerCommandRequest, ClassifyServerCommandResponse, CreateServerRequest, ListServerAuditQuery,
+    SERVER_TIER_NOTE, ScanHostKeyRequest, ScanHostKeyResponse, ServerAuditResponse, ServerResponse, ServerTestResponse,
     UpdateServerRequest,
 };
 use aionui_common::{decrypt_string, encrypt_string};
@@ -44,6 +45,8 @@ pub enum ServerPoolError {
     NameTaken(String),
     #[error("{0}")]
     NotFound(String),
+    #[error("{0}")]
+    Unreachable(String),
     #[error("internal error: {0}")]
     Internal(String),
 }
@@ -70,11 +73,27 @@ fn invalid(msg: impl Into<String>) -> ServerPoolError {
 pub struct ServerPoolService {
     repo: Arc<dyn IServerPoolRepository>,
     encryption_key: [u8; 32],
+    /// Private scratch dir for key files of a connection test.
+    scratch_root: std::path::PathBuf,
 }
 
 impl ServerPoolService {
     pub fn new(repo: Arc<dyn IServerPoolRepository>, encryption_key: [u8; 32]) -> Self {
-        Self { repo, encryption_key }
+        Self {
+            repo,
+            encryption_key,
+            scratch_root: std::env::temp_dir().join("aionui-servers"),
+        }
+    }
+
+    /// Use `<data_dir>/run/servers` instead of the system temp dir.
+    pub fn with_scratch_root(mut self, root: std::path::PathBuf) -> Self {
+        self.scratch_root = root;
+        self
+    }
+
+    pub fn scratch_root(&self) -> &std::path::Path {
+        &self.scratch_root
     }
 
     pub fn repo(&self) -> &Arc<dyn IServerPoolRepository> {
@@ -218,6 +237,116 @@ impl ServerPoolService {
             .into_iter()
             .map(audit_response)
             .collect())
+    }
+
+    /// What the crucial-command rules say about `command` on the server
+    /// named `server` (for the confirmation card). Runs nothing.
+    pub async fn classify(
+        &self,
+        user_id: &str,
+        req: ClassifyServerCommandRequest,
+    ) -> Result<ClassifyServerCommandResponse, ServerPoolError> {
+        let row = self.repo.find_server_by_name(user_id, req.server.trim()).await?;
+        let reason = super::classifier::classify(&req.command);
+        Ok(ClassifyServerCommandResponse {
+            crucial: reason.is_some(),
+            reason,
+            server_id: row.as_ref().map(|r| r.id.clone()),
+            environment: row.as_ref().map(|r| r.environment.clone()),
+            tier: row.as_ref().map(|r| r.tier.clone()),
+        })
+    }
+
+    /// Read the key(s) a host presents, for the owner to check and save.
+    pub async fn scan_host_key(&self, req: ScanHostKeyRequest) -> Result<ScanHostKeyResponse, ServerPoolError> {
+        let host = clean_host(&req.host)?;
+        let port = clean_port(req.port.unwrap_or(22))?;
+        let scanned = super::ssh::scan_host_key(&host, port).await.map_err(|e| {
+            tracing::warn!(error = %e, "servers: host key scan failed");
+            ServerPoolError::Unreachable("could not scan the host key".to_owned())
+        })?;
+        if scanned.is_empty() {
+            return Err(ServerPoolError::Unreachable(format!(
+                "{host}:{port} presented no host key"
+            )));
+        }
+        Ok(ScanHostKeyResponse {
+            host_key: clean_host_key(&scanned)?,
+        })
+    }
+
+    /// Connect with the stored key and run `true`. `scratch_root` = a
+    /// directory only the AionUi user can read. Never returns key material.
+    pub async fn test_connection(
+        &self,
+        user_id: &str,
+        id: &str,
+        scratch_root: &std::path::Path,
+    ) -> Result<ServerTestResponse, ServerPoolError> {
+        let server = self
+            .repo
+            .find_server(user_id, id)
+            .await?
+            .ok_or_else(|| ServerPoolError::NotFound(format!("server {id} not found")))?;
+        let fail = |code: &str, message: String, seen: Option<String>| ServerTestResponse {
+            ok: false,
+            latency_ms: None,
+            error_code: Some(code.to_owned()),
+            message: Some(message),
+            seen_host_key: seen,
+        };
+        let port = u16::try_from(server.port).unwrap_or(22);
+        if server.host_key.trim().is_empty() {
+            let seen = super::ssh::scan_host_key(&server.host, port)
+                .await
+                .ok()
+                .filter(|k| !k.is_empty());
+            return Ok(fail(
+                "host_key_unknown",
+                "no host key is stored for this server yet".to_owned(),
+                seen,
+            ));
+        }
+        let Some(key) = self.private_key(user_id, id).await? else {
+            return Ok(fail(
+                "auth_failed",
+                "no private key is stored for this server".to_owned(),
+                None,
+            ));
+        };
+        let out = super::ssh::run_ssh(&server, &key, "true", std::time::Duration::from_secs(30), scratch_root)
+            .await
+            .map_err(|e| {
+                tracing::error!(error = %e, "servers: cannot start ssh");
+                ServerPoolError::Internal("ssh could not be started".to_owned())
+            })?;
+        if out.exit_code == Some(0) {
+            return Ok(ServerTestResponse {
+                ok: true,
+                latency_ms: Some(out.duration_ms),
+                error_code: None,
+                message: None,
+                seen_host_key: None,
+            });
+        }
+        let code = super::ssh::failure_code(&out);
+        let seen = if code.starts_with("host_key") {
+            super::ssh::scan_host_key(&server.host, port)
+                .await
+                .ok()
+                .filter(|k| !k.is_empty())
+        } else {
+            None
+        };
+        // ssh's own last line; it names hosts and users, never key material.
+        let message = out
+            .stderr
+            .lines()
+            .rev()
+            .find(|l| !l.trim().is_empty())
+            .unwrap_or("")
+            .trim();
+        Ok(fail(code, message.chars().take(300).collect(), seen))
     }
 
     /// The decrypted private key of a server (helper use only, never an API).

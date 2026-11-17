@@ -305,6 +305,12 @@ pub struct ListKitAttachmentsQuery {
     pub level: Option<KitLevel>,
     #[serde(default)]
     pub target_id: Option<String>,
+    /// Only attachments of this kind (e.g. `server` for a server's "Used in").
+    #[serde(default)]
+    pub item_kind: Option<KitItemKind>,
+    /// Only attachments of this item (kit id, skill name, instance/server id).
+    #[serde(default)]
+    pub item_ref: Option<String>,
 }
 
 // ---------------------------------------------------------------------------

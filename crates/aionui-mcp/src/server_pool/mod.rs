@@ -14,4 +14,4 @@ pub mod ssh;
 pub use classifier::classify;
 pub use gate::{CRUCIAL_SERVER_NAME, ExecChannel, ExecDecision, STANDARD_SERVER_NAME, decide, redact_command};
 pub use service::{ServerPoolError, ServerPoolService, granted_servers, server_response};
-pub use ssh::{SshOutput, run_ssh};
+pub use ssh::{SshOutput, failure_code, run_ssh, scan_host_key};

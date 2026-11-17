@@ -348,6 +348,8 @@ fn crucial(reason: &str) -> Option<String> {
     Some(reason.to_owned())
 }
 
+// One arm per command keeps the rule table readable and each arm extensible.
+#[allow(clippy::collapsible_match)]
 fn classify_segment(segment: &Segment) -> Option<String> {
     // `> file` / `: > file` with nothing written = emptying a file.
     let no_output = segment.words.is_empty() || matches!(segment.words[0].as_str(), ":" | "true");
@@ -357,9 +359,7 @@ fn classify_segment(segment: &Segment) -> Option<String> {
         }
     }
     let words = command_words(&segment.words);
-    let Some(first) = words.first() else {
-        return None;
-    };
+    let first = words.first()?;
     let cmd = basename(first).to_ascii_lowercase();
     let args = &words[1..];
     let sub = args
@@ -542,9 +542,11 @@ fn classify_segment(segment: &Segment) -> Option<String> {
         | "groupmod" | "gpasswd" | "visudo" | "chage" => return crucial("changes users or credentials"),
         // -- git on servers
         "git" => {
-            if sub == "push" && (has_flag(args, 'f', "--force") || lower_args.iter().any(|a| a.starts_with("--force")))
-                || lower_args.iter().any(|a| a.starts_with('+')) && sub == "push"
-            {
+            let forced = has_flag(args, 'f', "--force")
+                || lower_args
+                    .iter()
+                    .any(|a| a.starts_with("--force") || a.starts_with('+'));
+            if sub == "push" && forced {
                 return crucial("git push --force");
             }
             if sub == "reset" && any_arg(&["--hard"]) {

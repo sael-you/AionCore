@@ -808,12 +808,15 @@ pub fn build_mcp_state(
             conversation: services.conversation_service.clone(),
         }))
         // Server access pools (C36): same storage-encryption key for SSH keys.
-        .with_server_pool(aionui_mcp::server_pool::ServerPoolService::new(
-            Arc::new(aionui_db::SqliteServerPoolRepository::new(
-                services.database.pool().clone(),
-            )),
-            derive_encryption_key(&services.encryption_secret_raw),
-        ));
+        .with_server_pool(
+            aionui_mcp::server_pool::ServerPoolService::new(
+                Arc::new(aionui_db::SqliteServerPoolRepository::new(
+                    services.database.pool().clone(),
+                )),
+                derive_encryption_key(&services.encryption_secret_raw),
+            )
+            .with_scratch_root(services.data_dir.join("run").join("servers")),
+        );
 
     let adapters: Vec<Arc<dyn McpAgentAdapter>> = vec![
         Arc::new(ClaudeAdapter),

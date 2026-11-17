@@ -435,9 +435,13 @@ impl McpMarketService {
         query: ListKitAttachmentsQuery,
     ) -> Result<Vec<KitAttachmentResponse>, MarketError> {
         let kits = self.kits()?;
-        let rows = kits
+        let rows: Vec<KitAttachmentRow> = kits
             .list_attachments(user_id, query.level.map(KitLevel::as_str), query.target_id.as_deref())
-            .await?;
+            .await?
+            .into_iter()
+            .filter(|a| query.item_kind.is_none_or(|k| a.item_kind == k.as_str()))
+            .filter(|a| query.item_ref.as_deref().is_none_or(|r| a.item_ref == r))
+            .collect();
         let kit_names: HashMap<String, String> = kits
             .list_kits(user_id)
             .await?
