@@ -10,6 +10,7 @@ use tokio::task::JoinHandle;
 use tracing::{debug, info, warn};
 
 use crate::broadcaster::EventBroadcaster;
+use crate::replay::{ReplayConfig, ReplayLog, hello_text, outcome_text};
 use crate::types::{
     ClientInfo, ConnectionId, HEARTBEAT_INTERVAL, HEARTBEAT_TIMEOUT, RealtimeError, WebSocketCloseCode, WsOutbound,
 };
@@ -23,6 +24,8 @@ pub type TokenValidator = Arc<dyn Fn(&str) -> bool + Send + Sync>;
 pub struct WebSocketManager {
     connections: Arc<DashMap<ConnectionId, ClientInfo>>,
     next_id: AtomicU64,
+    /// Per-user `seq` + replay ring (TASK-43); `None` = plain frames.
+    replay: Option<Arc<ReplayLog>>,
 }
 
 impl WebSocketManager {
@@ -30,7 +33,21 @@ impl WebSocketManager {
         Self {
             connections: Arc::new(DashMap::new()),
             next_id: AtomicU64::new(1),
+            replay: None,
         }
+    }
+
+    /// A manager whose user-stream frames carry a per-user `seq` and can be
+    /// replayed after a reconnect (`realtime.hello` / `realtime.resume`).
+    pub fn with_replay(cfg: ReplayConfig) -> Self {
+        Self {
+            replay: Some(Arc::new(ReplayLog::new(cfg))),
+            ..Self::new()
+        }
+    }
+
+    pub fn replay(&self) -> Option<&Arc<ReplayLog>> {
+        self.replay.as_ref()
     }
 
     /// Register a new client connection and return its assigned ID.
@@ -41,15 +58,101 @@ impl WebSocketManager {
     /// Register a new authenticated client connection for an internal user ID.
     pub fn add_client_for_user(&self, user_id: String, token: String, tx: mpsc::Sender<WsOutbound>) -> ConnectionId {
         let id = ConnectionId(self.next_id.fetch_add(1, Ordering::Relaxed));
-        let info = ClientInfo {
-            user_id,
-            token,
-            last_ping: Instant::now(),
-            tx,
+        let Some(replay) = self.replay.clone() else {
+            let info = ClientInfo {
+                user_id,
+                token,
+                last_ping: Instant::now(),
+                tx,
+            };
+            self.connections.insert(id, info);
+            debug!(%id, "client added");
+            return id;
         };
-        self.connections.insert(id, info);
+        // Registered and greeted under the stream lock: no live frame can be
+        // stamped between the hello's seq and the connection seeing frames.
+        replay.with_stream(&user_id.clone(), |stream| {
+            let _ = tx.try_send(WsOutbound::Text(hello_text(replay.epoch(), stream.last_seq())));
+            self.connections.insert(
+                id,
+                ClientInfo {
+                    user_id,
+                    token,
+                    last_ping: Instant::now(),
+                    tx,
+                },
+            );
+        });
         debug!(%id, "client added");
         id
+    }
+
+    /// `realtime.resume {epoch, last_seq}` from `conn_id`: one `realtime.replay`
+    /// (or `realtime.resyncRequired`) built and queued under the user's stream
+    /// lock, so live frames follow it. Returns `false` without replay support.
+    pub fn resume(&self, conn_id: ConnectionId, user_id: &str, data: &serde_json::Value) -> bool {
+        let Some(replay) = self.replay.clone() else {
+            return false;
+        };
+        let epoch = data.get("epoch").and_then(|v| v.as_str()).unwrap_or("");
+        let last_seq = data.get("last_seq").and_then(|v| v.as_u64()).unwrap_or(0);
+        let (bytes, missed, dropped) = replay.with_stream(user_id, |stream| {
+            let outcome = replay.resume(stream, epoch, last_seq);
+            let missed = match &outcome {
+                crate::replay::ResumeOutcome::Replay { frames, .. } => Some(frames.len()),
+                crate::replay::ResumeOutcome::Resync { .. } => None,
+            };
+            let text = outcome_text(replay.epoch(), &outcome);
+            let bytes = text.len();
+            let dropped = match self.connections.get(&conn_id) {
+                Some(client) => client.tx.try_send(WsOutbound::Text(text)).is_err(),
+                None => false,
+            };
+            (bytes, missed, dropped)
+        });
+        if dropped {
+            // No room for the replay: drop the connection like the ordered
+            // stream does; the client reconnects and resumes again.
+            warn!(%conn_id, user_id, "realtime replay did not fit; closing connection");
+            self.remove_client(conn_id);
+        }
+        info!(%conn_id, user_id, last_seq, replayed = ?missed, bytes, "realtime resume answered");
+        true
+    }
+
+    /// Deliver an already serialized frame to every connection of `user_id`.
+    fn deliver_to_user(&self, user_id: &str, text: &str) {
+        let mut disconnected = Vec::new();
+        for entry in self.connections.iter() {
+            let conn_id = *entry.key();
+            let client = entry.value();
+            if client.user_id != user_id {
+                continue;
+            }
+            match client.tx.try_send(WsOutbound::Text(text.to_owned())) {
+                Ok(()) => {}
+                Err(mpsc::error::TrySendError::Full(_)) => {
+                    warn!(
+                        %conn_id,
+                        user_id = %user_id,
+                        code = RealtimeError::Backpressure.code(),
+                        "outbound channel full, user broadcast message dropped (replayable)"
+                    );
+                }
+                Err(mpsc::error::TrySendError::Closed(_)) => disconnected.push(conn_id),
+            }
+        }
+        for conn_id in disconnected {
+            self.remove_client(conn_id);
+        }
+    }
+
+    /// Stamp `msg` for `user_id`, record it and deliver it, atomically.
+    fn stamp_and_deliver(&self, replay: &ReplayLog, user_id: &str, name: &str, data_json: &str) {
+        replay.with_stream(user_id, |stream| {
+            let text = replay.stamp(stream, name, data_json);
+            self.deliver_to_user(user_id, &text);
+        });
     }
 
     /// Remove a client connection by ID.
@@ -129,6 +232,24 @@ impl WebSocketManager {
     /// broadcast backpressure is logged and the connection is left alive.
     /// Closed channels trigger client removal.
     pub fn broadcast_all(&self, msg: WebSocketMessage<serde_json::Value>) {
+        if let Some(replay) = self.replay.clone() {
+            // Every user's stream gets the frame (with its own seq), connected
+            // or not: a user reconnecting within the window replays it too.
+            let Ok(data_json) = serde_json::to_string(&msg.data) else {
+                warn!("failed to serialize broadcast message");
+                return;
+            };
+            let mut users = replay.users();
+            for entry in self.connections.iter() {
+                if !users.contains(&entry.value().user_id) {
+                    users.push(entry.value().user_id.clone());
+                }
+            }
+            for user in users {
+                self.stamp_and_deliver(&replay, &user, &msg.name, &data_json);
+            }
+            return;
+        }
         let text = match serde_json::to_string(&msg) {
             Ok(t) => t,
             Err(e) => {
@@ -162,6 +283,14 @@ impl WebSocketManager {
 
     /// Send a message to all connections authenticated as `user_id`.
     pub fn broadcast_to_user(&self, user_id: &str, msg: WebSocketMessage<serde_json::Value>) {
+        if let Some(replay) = self.replay.clone() {
+            let Ok(data_json) = serde_json::to_string(&msg.data) else {
+                warn!(user_id = %user_id, "failed to serialize user broadcast message");
+                return;
+            };
+            self.stamp_and_deliver(&replay, user_id, &msg.name, &data_json);
+            return;
+        }
         let text = match serde_json::to_string(&msg) {
             Ok(t) => t,
             Err(e) => {
@@ -287,11 +416,15 @@ impl WebSocketManager {
     /// Returns a `JoinHandle` — abort it to stop the heartbeat loop.
     pub fn start_heartbeat(&self, token_validator: TokenValidator) -> JoinHandle<()> {
         let connections = Arc::clone(&self.connections);
+        let replay = self.replay.clone();
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(HEARTBEAT_INTERVAL);
             loop {
                 interval.tick().await;
                 heartbeat_tick(&connections, &token_validator);
+                if let Some(replay) = &replay {
+                    replay.sweep(|user| connections.iter().any(|c| c.value().user_id == user));
+                }
             }
         })
     }
@@ -412,6 +545,147 @@ mod tests {
 
     fn new_client_tx() -> (mpsc::Sender<WsOutbound>, mpsc::Receiver<WsOutbound>) {
         mpsc::channel(PER_CONNECTION_BUFFER)
+    }
+
+    // ---- TASK-43: per-user seq + replay ----
+
+    fn next_json(rx: &mut mpsc::Receiver<WsOutbound>) -> serde_json::Value {
+        match rx.try_recv().expect("a frame") {
+            WsOutbound::Text(text) => serde_json::from_str(&text).unwrap(),
+            other => panic!("unexpected outbound {other:?}"),
+        }
+    }
+
+    fn ev(name: &str, i: u64) -> WebSocketMessage<serde_json::Value> {
+        WebSocketMessage::new(name, json!({"i": i}))
+    }
+
+    #[test]
+    fn a_replay_manager_greets_with_hello_and_stamps_user_frames() {
+        let mgr = WebSocketManager::with_replay(ReplayConfig::default());
+        let (tx, mut rx) = new_client_tx();
+        mgr.add_client_for_user("alice".into(), "t".into(), tx);
+        let hello = next_json(&mut rx);
+        assert_eq!(hello["name"], "realtime.hello");
+        assert_eq!(hello["data"]["seq"], 0);
+        assert_eq!(hello["data"]["epoch"], mgr.replay().unwrap().epoch());
+        mgr.broadcast_to_user("alice", ev("message.stream", 1));
+        mgr.broadcast_to_user("alice", ev("message.stream", 2));
+        let (a, b) = (next_json(&mut rx), next_json(&mut rx));
+        assert_eq!((a["seq"].as_u64(), b["seq"].as_u64()), (Some(1), Some(2)));
+        assert_eq!(b["data"]["i"], 2);
+        // Per-connection replies stay out of the stream.
+        mgr.send_to(ConnectionId(1), WebSocketMessage::new("pong-ish", json!({})));
+        assert!(next_json(&mut rx).get("seq").is_none());
+    }
+
+    #[test]
+    fn global_frames_get_each_users_own_seq() {
+        let mgr = WebSocketManager::with_replay(ReplayConfig::default());
+        let (ta, mut ra) = new_client_tx();
+        let (tb, mut rb) = new_client_tx();
+        mgr.add_client_for_user("a".into(), "t".into(), ta);
+        mgr.add_client_for_user("b".into(), "t".into(), tb);
+        let _ = (next_json(&mut ra), next_json(&mut rb));
+        mgr.broadcast_to_user("a", ev("x", 1));
+        mgr.broadcast_all(ev("global", 2));
+        assert_eq!(next_json(&mut ra)["seq"], 1);
+        assert_eq!(next_json(&mut ra)["seq"], 2, "a: 1 own + the global");
+        assert_eq!(next_json(&mut rb)["seq"], 1, "b: the global is its first");
+    }
+
+    #[test]
+    fn a_reconnect_replays_the_gap_before_any_later_live_frame() {
+        let mgr = WebSocketManager::with_replay(ReplayConfig::default());
+        let epoch = mgr.replay().unwrap().epoch().to_owned();
+        let (tx, mut rx) = new_client_tx();
+        let first = mgr.add_client_for_user("alice".into(), "t".into(), tx);
+        let _ = next_json(&mut rx);
+        mgr.broadcast_to_user("alice", ev("m", 1));
+        assert_eq!(next_json(&mut rx)["seq"], 1);
+        // The connection drops; three frames happen meanwhile.
+        mgr.remove_client(first);
+        for i in 2..=4 {
+            mgr.broadcast_to_user("alice", ev("m", i));
+        }
+        let (tx, mut rx) = new_client_tx();
+        let second = mgr.add_client_for_user("alice".into(), "t".into(), tx);
+        let hello = next_json(&mut rx);
+        assert_eq!(hello["data"]["seq"], 4);
+        assert!(mgr.resume(second, "alice", &json!({"epoch": epoch, "last_seq": 1})));
+        mgr.broadcast_to_user("alice", ev("m", 5));
+        let replay = next_json(&mut rx);
+        assert_eq!(replay["name"], "realtime.replay");
+        assert_eq!(
+            (replay["data"]["from_seq"].as_u64(), replay["data"]["to_seq"].as_u64()),
+            (Some(2), Some(4))
+        );
+        let seqs: Vec<u64> = replay["data"]["frames"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|f| f["seq"].as_u64().unwrap())
+            .collect();
+        assert_eq!(seqs, vec![2, 3, 4]);
+        assert_eq!(next_json(&mut rx)["seq"], 5, "the live frame comes after the replay");
+    }
+
+    #[test]
+    fn concurrent_live_frames_never_overtake_or_duplicate_a_replay() {
+        let mgr = Arc::new(WebSocketManager::with_replay(ReplayConfig::default()));
+        let epoch = mgr.replay().unwrap().epoch().to_owned();
+        for i in 0..50 {
+            mgr.broadcast_to_user("alice", ev("m", i));
+        }
+        let (tx, mut rx) = mpsc::channel(10_000);
+        let conn = mgr.add_client_for_user("alice".into(), "t".into(), tx);
+        let writer = {
+            let mgr = Arc::clone(&mgr);
+            std::thread::spawn(move || {
+                for i in 0..500 {
+                    mgr.broadcast_to_user("alice", ev("m", 100 + i));
+                }
+            })
+        };
+        assert!(mgr.resume(conn, "alice", &json!({"epoch": epoch, "last_seq": 10})));
+        writer.join().unwrap();
+        // Apply like the client: replay frames, then live frames above to_seq.
+        let mut applied: Vec<u64> = Vec::new();
+        let mut held: Vec<u64> = Vec::new();
+        let mut replay_to = None;
+        let _hello = next_json(&mut rx);
+        while let Ok(WsOutbound::Text(text)) = rx.try_recv() {
+            let v: serde_json::Value = serde_json::from_str(&text).unwrap();
+            if v["name"] == "realtime.replay" {
+                for f in v["data"]["frames"].as_array().unwrap() {
+                    applied.push(f["seq"].as_u64().unwrap());
+                }
+                replay_to = v["data"]["to_seq"].as_u64();
+            } else if let Some(to) = replay_to {
+                let seq = v["seq"].as_u64().unwrap();
+                assert!(seq > to, "a live frame after the replay is newer than it");
+                applied.push(seq);
+            } else {
+                held.push(v["seq"].as_u64().unwrap());
+            }
+        }
+        let to = replay_to.expect("a replay");
+        applied.extend(held.into_iter().filter(|s| *s > to));
+        applied.sort_unstable();
+        let expected: Vec<u64> = (11..=550).collect();
+        assert_eq!(applied, expected, "every missed and live frame exactly once");
+    }
+
+    #[test]
+    fn a_plain_manager_is_unchanged() {
+        let mgr = WebSocketManager::new();
+        let (tx, mut rx) = new_client_tx();
+        let conn = mgr.add_client_for_user("alice".into(), "t".into(), tx);
+        mgr.broadcast_to_user("alice", ev("m", 1));
+        let first = next_json(&mut rx);
+        assert_eq!(first["name"], "m", "no hello");
+        assert!(first.get("seq").is_none(), "no seq");
+        assert!(!mgr.resume(conn, "alice", &json!({"epoch": "e", "last_seq": 0})));
     }
 
     fn assert_realtime_auth_expired(text: &str) {

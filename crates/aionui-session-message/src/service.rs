@@ -364,6 +364,7 @@ impl SessionMessageService {
             // see this message. (cron uses hidden=true because its prompt is
             // template boilerplate; this is real content.)
             hidden: false,
+            idempotency_key: None,
         };
         match self
             .deps
