@@ -79,6 +79,7 @@ pub struct DevicesService {
     online_pairings: DashMap<String, ()>,
     relay: RelayState,
     companion: std::sync::RwLock<Option<Arc<crate::companion::CompanionDownloads>>>,
+    approvals: aionui_common::approval_queue::ApprovalQueue<aionui_api_types::devices::DeviceApproval>,
 }
 
 impl std::fmt::Debug for DevicesService {
@@ -111,7 +112,20 @@ impl DevicesService {
             online_pairings: DashMap::new(),
             relay: RelayState::default(),
             companion: std::sync::RwLock::new(None),
+            approvals: Default::default(),
         })
+    }
+
+    pub(crate) fn approval_queue(
+        &self,
+    ) -> &aionui_common::approval_queue::ApprovalQueue<aionui_api_types::devices::DeviceApproval> {
+        &self.approvals
+    }
+
+    /// One event to the owning user only.
+    pub fn emit(&self, user_id: &str, name: &str, data: serde_json::Value) {
+        let sink = self.sink.read().expect("sink lock").clone();
+        sink.emit(user_id, name, data);
     }
 
     /// Where the signed companion APK lives (`<data dir>/devices/companion`).

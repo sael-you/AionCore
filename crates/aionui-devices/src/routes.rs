@@ -27,6 +27,8 @@ pub fn devices_routes(state: DevicesRouterState) -> Router {
         .route("/api/devices", get(list))
         .route("/api/devices/jobs/{job_id}", get(job))
         .route("/api/devices/pairing-codes", post(pairing_code))
+        .route("/api/devices/approvals", get(list_approvals))
+        .route("/api/devices/approvals/{approval_id}", post(decide_approval))
         .route("/api/devices/{id}", put(update))
         .route("/api/devices/{id}/routes/{route}", put(update_route))
         .route("/api/devices/{id}/install", post(install))
@@ -183,6 +185,27 @@ pub fn api_error(e: DevicesError) -> ApiError {
             ApiError::Internal("devices request failed".into())
         }
     }
+}
+
+async fn list_approvals(
+    State(s): State<DevicesRouterState>,
+    Extension(user): Extension<CurrentUser>,
+) -> Json<ApiResponse<Vec<aionui_api_types::devices::DeviceApproval>>> {
+    Json(ApiResponse::ok(s.service.approvals(&user.id)))
+}
+
+async fn decide_approval(
+    State(s): State<DevicesRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(approval_id): Path<String>,
+    body: Result<Json<aionui_api_types::devices::DeviceApprovalDecision>, JsonRejection>,
+) -> Result<Json<ApiResponse<()>>, ApiError> {
+    let Json(body) = body.map_err(ApiError::from)?;
+    let allow = body.decision == aionui_api_types::devices::DeviceApprovalVerdict::Allow;
+    s.service
+        .decide_approval(&user.id, &approval_id, allow)
+        .map_err(api_error)?;
+    Ok(Json(ApiResponse::ok(())))
 }
 
 async fn list(
