@@ -111,21 +111,15 @@ async fn pair_mac(svc: &Arc<DevicesService>, port: u16) -> (Ws, String, String) 
 
 async fn wait_status(svc: &Arc<DevicesService>, id: &str, want: DeviceStatus) {
     for _ in 0..200 {
-        if svc.get("u1", id).await.map(|d| d.status) == Ok(want) {
+        if matches!(svc.get("u1", id).await, Ok(d) if d.status == want) {
             return;
         }
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
-    panic!("{id} never became {want:?}: {:?}", svc.get("u1", id).await);
-}
-
-trait OkCode {
-    fn ok(self) -> Result<DeviceStatus, ()>;
-}
-impl OkCode for Result<aionui_api_types::devices::Device, aionui_devices::DevicesError> {
-    fn ok(self) -> Result<DeviceStatus, ()> {
-        self.map(|d| d.status).map_err(|_| ())
-    }
+    panic!(
+        "{id} never became {want:?}: {:?}",
+        svc.get("u1", id).await.map(|d| d.status)
+    );
 }
 
 #[tokio::test]
