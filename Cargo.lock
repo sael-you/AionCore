@@ -411,6 +411,7 @@ dependencies = [
  "aionui-conversation",
  "aionui-cron",
  "aionui-db",
+ "aionui-devices",
  "aionui-extension",
  "aionui-file",
  "aionui-mcp",
@@ -627,6 +628,7 @@ dependencies = [
  "semver",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
  "thiserror 2.0.18",
  "tokio",
  "uuid",
@@ -707,6 +709,27 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "aionui-devices"
+version = "0.2.2"
+dependencies = [
+ "aionui-api-types",
+ "aionui-auth",
+ "aionui-common",
+ "aionui-db",
+ "async-trait",
+ "axum",
+ "dashmap",
+ "futures-util",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tokio",
+ "tokio-tungstenite 0.26.2",
+ "tracing",
+ "uuid",
 ]
 
 [[package]]

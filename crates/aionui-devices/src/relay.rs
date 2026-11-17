@@ -12,7 +12,7 @@
 //! - `inventory` refreshes the client's phones / Mac / add-ons (rows of
 //!   migration 911). A device missing from the latest inventory is offline.
 //! - `request {id, device, verb, args}` → `response {id, ok, …}`; the caller
-//!   waits at most [`REQUEST_TIMEOUT`].
+//!   waits at most [`request_timeout`] (60 s; 21 min for add-on installs).
 //! - A switch going off (owner, timeout, revoke) sends `stop {device}`.
 //! - A client silent for 60 s is closed; `ping` → `pong`.
 //!
@@ -42,6 +42,17 @@ use crate::service::DevicesService;
 
 pub const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// `addon_install` / `addon_remove` answer when the work is finished (the Mac
+/// helper caps an install at 20 minutes).
+pub const ADDON_INSTALL_TIMEOUT: Duration = Duration::from_secs(21 * 60);
+
+/// How long AionCore waits for the response to `verb`.
+pub fn request_timeout(verb: &str) -> Duration {
+    match verb {
+        "addon_install" | "addon_remove" => ADDON_INSTALL_TIMEOUT,
+        _ => REQUEST_TIMEOUT,
+    }
+}
 pub const PAIRING_TTL: Duration = Duration::from_secs(5 * 60);
 const MAX_LABEL: usize = 64;
 
@@ -135,7 +146,7 @@ impl RelayClient {
                 message: "the device went offline".into(),
             });
         }
-        match tokio::time::timeout(REQUEST_TIMEOUT, rx).await {
+        match tokio::time::timeout(request_timeout(verb), rx).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(RelayError {
                 code: relay_error::FAILED.into(),
