@@ -99,6 +99,20 @@ fn route_of_pairing_kind(kind: &str) -> Option<DeviceRouteKind> {
     }
 }
 
+/// The companion card a Mac-relay phone row belongs to: its inventory named
+/// a companion app (`companion_client_id`) that is one of this user's
+/// companion pairings. Such a phone is ONE card (the companion's) with two
+/// routes (director, 2026-11-17).
+fn companion_card_of(row: &DeviceRow, pairings: &HashMap<String, String>) -> Option<String> {
+    if row.kind != "phone" || row.source_id == aionui_api_types::devices::RELAY_DEVICE_SELF {
+        return None;
+    }
+    let meta = meta_of(row);
+    let cid = meta.get("companion_client_id")?.as_str()?;
+    (pairings.get(cid).map(String::as_str) == Some("companion"))
+        .then(|| crate::relay::relay_device_id("phone", cid, aionui_api_types::devices::RELAY_DEVICE_SELF))
+}
+
 fn meta_of(row: &DeviceRow) -> serde_json::Value {
     serde_json::from_str(&row.meta).unwrap_or(serde_json::Value::Null)
 }
@@ -257,6 +271,12 @@ impl DevicesService {
             .collect();
         let mut has_mac = false;
         let mut installed_addons: Vec<String> = Vec::new();
+        // Mac-relay rows that are the same phone as a companion card.
+        let merged: HashMap<String, &DeviceRow> = rows
+            .iter()
+            .filter_map(|r| companion_card_of(r, &pairings).map(|card| (card, r)))
+            .filter(|(card, _)| rows.iter().any(|r| &r.id == card))
+            .collect();
         for row in &rows {
             // A device whose pairing was revoked is gone from the page.
             if let Some(p) = &row.pairing_id
@@ -264,7 +284,32 @@ impl DevicesService {
             {
                 continue;
             }
-            let card = self.row_card(row, &pairings);
+            if merged.values().any(|m| m.id == row.id) {
+                continue; // shown inside its companion card
+            }
+            let mut card = self.row_card(row, &pairings);
+            if let Some(mac_row) = merged.get(&row.id) {
+                let via_mac = self.row_card(mac_row, &pairings);
+                if let (Some(routes), Some(mac_routes)) = (card.routes.as_mut(), via_mac.routes) {
+                    let extra: Vec<DeviceRoute> = mac_routes
+                        .into_iter()
+                        .filter(|r| r.route == DeviceRouteKind::MacRelay)
+                        .map(|r| DeviceRoute {
+                            enabled: card.enabled,
+                            ..r
+                        })
+                        .collect();
+                    routes.splice(0..0, extra);
+                }
+                // Reachable through either route.
+                if card.status == DeviceStatus::Offline && via_mac.status != DeviceStatus::Offline {
+                    card.status = if card.enabled {
+                        DeviceStatus::On
+                    } else {
+                        DeviceStatus::Off
+                    };
+                }
+            }
             match card.kind {
                 DeviceKind::Mac => has_mac = true,
                 DeviceKind::Addon => installed_addons.push(row.source_id.clone()),
@@ -514,6 +559,17 @@ impl DevicesService {
                 {
                     return Err(DevicesError::not_found());
                 }
+                // One phone, two routes: the Mac-relay row follows the card.
+                for linked in self.linked_rows(user_id, id).await? {
+                    self.repo
+                        .set_device_enabled(user_id, &linked.id, update.enabled, until, now_ms())
+                        .await?;
+                    if !update.enabled
+                        && let Some(p) = &linked.pairing_id
+                    {
+                        self.relay_stop(p, &linked.source_id);
+                    }
+                }
                 if !update.enabled {
                     // Off: stop the device and refuse what waits for an OK.
                     if let Some(row) = self.repo.get_device(user_id, id).await?
@@ -573,6 +629,47 @@ impl DevicesService {
             },
         )
         .await
+    }
+
+    /// The Mac-relay rows that are the same phone as card `id`.
+    pub(crate) async fn linked_rows(&self, user_id: &str, id: &str) -> Result<Vec<DeviceRow>, DevicesError> {
+        let pairings: HashMap<String, String> = self
+            .repo
+            .list_pairings(user_id)
+            .await?
+            .into_iter()
+            .map(|p| (p.id, p.kind))
+            .collect();
+        Ok(self
+            .repo
+            .list_devices(user_id)
+            .await?
+            .into_iter()
+            .filter(|r| r.pairing_id.as_ref().is_some_and(|p| pairings.contains_key(p)))
+            .filter(|r| companion_card_of(r, &pairings).as_deref() == Some(id))
+            .collect())
+    }
+
+    /// Run `verb` on the phone behind card `id` over whichever route serves
+    /// it: the Mac relay first (it also serves `logcat`, `install_apk`,
+    /// Chrome), else the companion app.
+    pub async fn routed_call(
+        &self,
+        user_id: &str,
+        id: &str,
+        verb: &str,
+        args: serde_json::Value,
+    ) -> Result<serde_json::Value, DevicesError> {
+        for linked in self.linked_rows(user_id, id).await? {
+            let usable = linked.pairing_id.as_deref().is_some_and(|p| {
+                self.relay_client(user_id, p)
+                    .is_some_and(|c| c.is_present(&linked.source_id) && c.serves(verb))
+            });
+            if usable {
+                return self.relay_call(user_id, &linked.id, verb, args).await;
+            }
+        }
+        self.relay_call(user_id, id, verb, args).await
     }
 
     /// Whether agents may use the device right now (switch on, not expired).

@@ -272,7 +272,7 @@ impl DevicesService {
             // The app in front decides. Ask the phone (cheap) every time: the
             // owner may have switched apps since the last event.
             package = self
-                .relay_call(&user_id, &device_id, "foreground", serde_json::json!({}))
+                .routed_call(&user_id, &device_id, "foreground", serde_json::json!({}))
                 .await
                 .ok()
                 .and_then(|v| v.get("package").and_then(Value::as_str).map(str::to_owned));
@@ -344,7 +344,7 @@ impl DevicesService {
                 ));
             }
         }
-        match self.relay_call(&user_id, &device_id, &verb, args).await {
+        match self.routed_call(&user_id, &device_id, &verb, args).await {
             Ok(result) => {
                 let outcome = if approved {
                     DeviceAuditOutcome::Approved

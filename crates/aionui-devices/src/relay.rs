@@ -651,9 +651,14 @@ impl DevicesService {
                 clean_label(&p.serial, "phone")
             };
             present.insert(source.clone());
+            // Only a well-formed id is kept; whether it is one of this
+            // user's companion pairings is checked when cards are built.
+            let companion = p.companion_client_id.as_deref().filter(|c| {
+                !c.is_empty() && c.len() <= 64 && c.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+            });
             let meta = json!({
                 "model": p.model, "android_version": p.android_version, "transport": p.transport,
-                "chrome": p.chrome, "peer_enabled": p.enabled,
+                "chrome": p.chrome, "peer_enabled": p.enabled, "companion_client_id": companion,
             });
             upsert("phone", source, clean_label(&p.name, "Phone"), meta).await;
         }

@@ -569,3 +569,145 @@ async fn switching_off_refuses_what_waits_for_an_ok() {
         .unwrap_err();
     assert_eq!(err.code(), Some(DeviceErrorCode::DeviceApprovalTimeout));
 }
+
+/// Director 2026-11-17: a phone reached via the Mac relay AND the companion
+/// app is ONE card with both routes; calls go over the route that serves them.
+#[tokio::test]
+async fn a_phone_reached_both_ways_is_one_card() {
+    let (svc, port) = harness().await;
+    // The companion app pairs first.
+    let code = svc
+        .pairing_code("u1", DevicePairingKind::Companion, Some("h"))
+        .unwrap()
+        .code;
+    let mut app = open(port, None).await.unwrap();
+    send(
+        &mut app,
+        json!({"type": "pair", "code": code, "kind": "companion", "name": "Pixel", "version": "0.1.0",
+               "capabilities": ["tap", "key", "foreground"]}),
+    )
+    .await;
+    let companion_id = next(&mut app).await.unwrap()["client_id"].as_str().unwrap().to_owned();
+    send(
+        &mut app,
+        json!({"type": "inventory", "phones": [{"serial": "self", "name": "Pixel", "transport": "self", "enabled": true}]}),
+    )
+    .await;
+    let card = format!("phone:{companion_id}:self");
+    wait_status(&svc, &card, DeviceStatus::Off).await;
+
+    // The Mac helper sees the same phone over adb and names its companion.
+    let code = svc.pairing_code("u1", DevicePairingKind::MacHelper, None).unwrap().code;
+    let mut mac = open(port, None).await.unwrap();
+    send(
+        &mut mac,
+        json!({"type": "pair", "code": code, "kind": "mac_helper", "name": "MacBook", "version": "0.1.0",
+               "capabilities": ["tap", "foreground", "logcat"]}),
+    )
+    .await;
+    let mac_id = next(&mut mac).await.unwrap()["client_id"].as_str().unwrap().to_owned();
+    send(
+        &mut mac,
+        json!({"type": "inventory", "phones": [
+            {"serial": "R5CX", "name": "Pixel 9", "transport": "usb", "enabled": true, "companion_client_id": companion_id},
+            {"serial": "OTHER", "name": "Tablet", "transport": "usb", "enabled": true, "companion_client_id": "pair_someone_else"}
+        ]}),
+    )
+    .await;
+    let hidden = format!("phone:{mac_id}:R5CX");
+    let tablet = format!("phone:{mac_id}:OTHER");
+    wait_status(&svc, &tablet, DeviceStatus::Off).await;
+
+    let list = svc.list("u1").await.unwrap();
+    let phones: Vec<&str> = list
+        .iter()
+        .filter(|d| d.kind == DeviceKind::Phone)
+        .map(|d| d.id.as_str())
+        .collect();
+    assert_eq!(phones.len(), 2, "{phones:?}");
+    assert!(phones.contains(&card.as_str()) && phones.contains(&tablet.as_str()));
+    assert!(
+        !phones.contains(&hidden.as_str()),
+        "the Mac-relay row is inside the companion card"
+    );
+    let merged = list.iter().find(|d| d.id == card).unwrap();
+    let routes: Vec<_> = merged.routes.as_ref().unwrap().iter().map(|r| r.route).collect();
+    assert_eq!(
+        routes,
+        [
+            aionui_api_types::devices::DeviceRouteKind::MacRelay,
+            aionui_api_types::devices::DeviceRouteKind::Companion,
+            aionui_api_types::devices::DeviceRouteKind::WifiDirect
+        ]
+    );
+    // An id that is not one of this user's companion pairings merges nothing.
+    assert_eq!(
+        list.iter()
+            .find(|d| d.id == tablet)
+            .unwrap()
+            .routes
+            .as_ref()
+            .unwrap()
+            .len(),
+        2
+    );
+
+    // One switch for the card: the hidden row follows it.
+    svc.update(
+        "u1",
+        &card,
+        &DeviceUpdate {
+            enabled: true,
+            timeout_minutes: Some(15),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(svc.is_enabled("u1", &hidden).await.unwrap());
+
+    // `tap` is served by both: it goes over the Mac relay. `key` only by the app.
+    let svc2 = svc.clone();
+    let card2 = card.clone();
+    let tap = tokio::spawn(async move { svc2.routed_call("u1", &card2, "tap", json!({})).await });
+    let req = next(&mut mac).await.unwrap();
+    assert_eq!(
+        (req["verb"].as_str(), req["device"].as_str()),
+        (Some("tap"), Some("R5CX"))
+    );
+    send(
+        &mut mac,
+        json!({"type": "response", "id": req["id"], "ok": true, "result": {}}),
+    )
+    .await;
+    tap.await.unwrap().unwrap();
+
+    let svc2 = svc.clone();
+    let card2 = card.clone();
+    let key = tokio::spawn(async move { svc2.routed_call("u1", &card2, "key", json!({"code": 4})).await });
+    let req = next(&mut app).await.unwrap();
+    assert_eq!(
+        (req["verb"].as_str(), req["device"].as_str()),
+        (Some("key"), Some("self"))
+    );
+    send(
+        &mut app,
+        json!({"type": "response", "id": req["id"], "ok": true, "result": {}}),
+    )
+    .await;
+    key.await.unwrap().unwrap();
+
+    // Off: both routes are told to stop.
+    svc.update(
+        "u1",
+        &card,
+        &DeviceUpdate {
+            enabled: false,
+            timeout_minutes: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(next(&mut mac).await.unwrap(), json!({"type": "stop", "device": "R5CX"}));
+    assert_eq!(next(&mut app).await.unwrap(), json!({"type": "stop", "device": "self"}));
+    assert!(!svc.is_enabled("u1", &hidden).await.unwrap());
+}
