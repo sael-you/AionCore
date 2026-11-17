@@ -126,16 +126,18 @@ pub use chat_file::ChatFileRef;
 pub use confirmation::{ApprovalCheckQuery, ApprovalCheckResponse, ConfirmRequest, ConfirmationListResponse};
 pub use connection_test::TestBedrockConnectionRequest;
 pub use conversation::{
-    ActiveCountResponse, AssistantConversationOverridesRequest, AssistantConversationRequest,
+    ActiveCountResponse, AssistantConversationOverridesRequest, AssistantConversationRequest, AutoContinueSetting,
     CancelConversationRequest, CancelConversationResponse, CloneConversationRequest, ConversationArtifactKind,
     ConversationArtifactListResponse, ConversationArtifactResponse, ConversationArtifactStatus,
     ConversationAssistantIdentityResponse, ConversationListResponse, ConversationLiveState, ConversationMcpStatus,
     ConversationMcpStatusKind, ConversationNameUpdatedPayload, ConversationResponse, ConversationRuntimeStateKind,
-    ConversationRuntimeSummary, CreateConversationRequest, EnsureConversationRuntimeResponse, ForkCapabilityView,
-    ForkConversationRequest, ListConversationsQuery, ListMessagesQuery, McpRuntimeSnapshot, MessageListResponse,
-    MessageResponse, MessageSearchItem, MessageSearchResponse, MessageStatusChangedPayload, OutcomeSeenResponse,
-    PromptCapabilityView, ReparentConversationRequest, SearchMessagesQuery, SendMessageRequest, SendMessageResponse,
-    SessionRef, UpdateConversationArtifactRequest, UpdateConversationRequest,
+    ConversationRuntimeSummary, CreateConversationRequest, EXTRA_AUTO_CONTINUE_AFTER_RESTART,
+    EXTRA_RESTART_INTERRUPTED, EnsureConversationRuntimeResponse, ForkCapabilityView, ForkConversationRequest,
+    ListConversationsQuery, ListMessagesQuery, McpRuntimeSnapshot, MessageListResponse, MessageResponse,
+    MessageSearchItem, MessageSearchResponse, MessageStatusChangedPayload, OutcomeSeenResponse, PromptCapabilityView,
+    ReparentConversationRequest, RestartAutoBlocked, RestartInterrupted, RestartInterruptedKind,
+    RestartInterruptedState, RestartResumeAction, RestartResumeRequest, RestartResumeResponse, SearchMessagesQuery,
+    SendMessageRequest, SendMessageResponse, SessionRef, UpdateConversationArtifactRequest, UpdateConversationRequest,
 };
 pub use conversation_tools::{
     CONVERSATION_TOOLS_SCHEMA_VERSION, ConversationCliEnvelope, ConversationCliMeta, ConversationCreateAssistant,

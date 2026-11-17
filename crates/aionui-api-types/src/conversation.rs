@@ -393,6 +393,105 @@ pub struct OutcomeSeenResponse {
     pub last_outcome_seen_at: TimestampMs,
 }
 
+// ---------------------------------------------------------------------------
+// TASK-44: turns interrupted by an AionUi restart
+// ---------------------------------------------------------------------------
+
+/// `conversations.extra` key holding a [`RestartInterrupted`] record.
+pub const EXTRA_RESTART_INTERRUPTED: &str = "restart_interrupted";
+/// `conversations.extra` key (bool, default false): continue this
+/// conversation by itself after a restart interrupted it.
+pub const EXTRA_AUTO_CONTINUE_AFTER_RESTART: &str = "auto_continue_after_restart";
+
+/// What the turn was doing when the restart killed it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RestartInterruptedKind {
+    /// It was waiting for the owner's approval (the approval is gone).
+    Approval,
+    /// A tool call was running (it may have run fully, partly or not at all).
+    Tool,
+    /// Only text was being written.
+    Text,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RestartInterruptedState {
+    /// Nothing happened yet: show the notice and the Continue button, and
+    /// list it under "Needs you".
+    Waiting,
+    /// The owner pressed Continue.
+    Continued,
+    /// AionCore continued it by itself (the per-conversation switch is on).
+    AutoContinued,
+    /// The owner dismissed the notice.
+    Dismissed,
+}
+
+/// Why AionCore did not continue by itself although the switch is on.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RestartAutoBlocked {
+    /// The interrupted step writes to production, pays, mails, pushes or deploys.
+    Sensitive,
+    /// The same step was already interrupted and continued once.
+    Repeat,
+}
+
+/// `conversations.extra.restart_interrupted`: the last turn was killed by an
+/// AionUi restart. Written at startup; `state` changes on Continue / dismiss.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestartInterrupted {
+    /// Epoch ms of the startup that found it (one record per restart).
+    pub at: i64,
+    pub kind: RestartInterruptedKind,
+    /// The tool (or approval title) that was running / waiting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
+    /// At most 200 characters of the command / request.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub summary: Option<String>,
+    pub state: RestartInterruptedState,
+    /// Times this same step was interrupted in a row (0 = first time).
+    #[serde(default)]
+    pub repeat: u32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_blocked: Option<RestartAutoBlocked>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RestartResumeAction {
+    Continue,
+    Dismiss,
+}
+
+/// `POST /api/conversations/{id}/restart-resume`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RestartResumeRequest {
+    pub action: RestartResumeAction,
+}
+
+/// Answer of `POST /api/conversations/{id}/restart-resume`: the record after
+/// the action; `msg_id` / `turn_id` of the resume message on `continue`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RestartResumeResponse {
+    pub restart_interrupted: RestartInterrupted,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub msg_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub turn_id: Option<String>,
+}
+
+/// `PUT /api/conversations/{id}/auto-continue` (body and answer).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AutoContinueSetting {
+    pub enabled: bool,
+}
+
 /// What a live conversation is doing right now (see [`ConversationResponse::live`]).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ConversationLiveState {
