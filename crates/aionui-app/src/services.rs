@@ -559,7 +559,8 @@ impl AppServices {
             cookie_config: Arc::new(cookie_config),
             origin_policy: Arc::new(origin_policy),
             qr_token_store: Arc::new(QrTokenStore::new()),
-            ws_manager: Arc::new(WebSocketManager::new()),
+            // TASK-43: frames carry a per-user seq; reconnects replay the gap.
+            ws_manager: Arc::new(WebSocketManager::with_replay(aionui_realtime::ReplayConfig::default())),
             event_bus,
             worker_task_manager,
             active_lease_registry,

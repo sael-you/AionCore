@@ -90,6 +90,8 @@ pub fn row_to_response_with_extra(
         // stays a pure mapper with no repo access.
         fork_capability: None,
         prompt_capability: None,
+        // TASK-127: every response says what the send route takes.
+        capabilities: Some(aionui_api_types::ConversationCapabilitiesView { send_idempotency: true }),
         live: None,
         created_at: row.created_at,
         modified_at: row.updated_at,

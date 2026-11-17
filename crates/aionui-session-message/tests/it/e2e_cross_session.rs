@@ -204,6 +204,7 @@ async fn the_send_message_team_guard_cannot_be_bypassed_by_calling_the_layer_bel
                 sessions: Vec::new(),
                 inject_skills: Vec::new(),
                 hidden: false,
+                idempotency_key: None,
             },
             &ctx.task_manager,
         )

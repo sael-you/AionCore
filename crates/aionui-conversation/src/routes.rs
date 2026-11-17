@@ -344,12 +344,23 @@ async fn send_msg(
     Path(id): Path<String>,
     body: Result<Json<SendMessageRequest>, JsonRejection>,
 ) -> Result<(StatusCode, Json<ApiResponse<SendMessageResponse>>), ApiError> {
-    let Json(req) = body.map_err(ApiError::from)?;
-    let response = state
-        .service
-        .send_message(&user.id, &id, req, &state.task_manager)
-        .await
-        .map_err(ApiError::from)?;
+    let Json(mut req) = body.map_err(ApiError::from)?;
+    // TASK-127: a client retry key makes the send idempotent per conversation.
+    let response = match req.idempotency_key.take() {
+        Some(key) => {
+            state
+                .service
+                .send_message_with_client_key(&user.id, &id, req, &state.task_manager, &key)
+                .await
+        }
+        None => {
+            state
+                .service
+                .send_message(&user.id, &id, req, &state.task_manager)
+                .await
+        }
+    }
+    .map_err(ApiError::from)?;
     // B5: a mid-turn delivery already handed the message to the RUNNING turn —
     // that is a completed delivery (200), not a scheduled one (202).
     let status = if response.delivered_midturn {

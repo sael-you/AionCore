@@ -78,6 +78,7 @@ impl ChannelMessageService {
             sessions: vec![],
             inject_skills: vec![],
             hidden: false,
+            idempotency_key: None,
         };
 
         let user_id = owner_user_id;

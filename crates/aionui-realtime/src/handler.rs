@@ -213,6 +213,8 @@ fn handle_text_message(conn_id: ConnectionId, user_id: &str, text: &str, state: 
         "subscribe-show-open" => {
             handle_subscribe_show_open(state, conn_id, msg.data);
         }
+        // TASK-43: replay what this user missed (managers with replay only).
+        "realtime.resume" if state.manager.resume(conn_id, user_id, &msg.data) => {}
         name => {
             if !state.router.route(conn_id, user_id, name, msg.data) {
                 send_realtime_error(state, conn_id, RealtimeError::UnsupportedMessage);
