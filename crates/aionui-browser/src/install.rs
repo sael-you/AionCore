@@ -1,16 +1,28 @@
-//! Chrome installer/updater (C30, decision c): Google's official stable .deb,
-//! verified end to end against Google's signed apt repository, extracted
-//! (no apt, no root scripts) under `<root>/chrome/<version>/`, and switched
-//! to by an atomic `current` symlink.
+//! Engine installer/updater (C30 decision c for Chrome; C35 for the other
+//! engines of the Chromium family): the vendor's official download, verified
+//! as far as the vendor allows, extracted (no apt, no root scripts) under the
+//! engine's directory `<version>/`, and switched to by an atomic `current`
+//! symlink.
 //!
-//! Chain (verified by hand 2026-11-16 for 157.0.8103.78):
-//! 1. `linux_signing_key.pub` → `gpg --import` into a throw-away home (gpg
-//!    checks the subkey bindings) → the PRIMARY fingerprint must equal
-//!    [`GOOGLE_PRIMARY_FPR`] (google.com/linuxrepositories) → export it as
-//!    the only key of a gpgv keyring;
+//! Signed apt repositories (Chrome, Brave, Edge; chain verified by hand
+//! 2026-11-16 for Chrome 157.0.8103.78 and 2026-11-17 for Brave 1.99.57 and
+//! Edge 157.0.4341.60):
+//! 1. the vendor's key file → `gpg --import` into a throw-away home (gpg
+//!    checks the subkey bindings) → the PRIMARY fingerprint must equal the
+//!    pinned one ([`crate::engine`]) → export it as the only key of a gpgv
+//!    keyring;
 //! 2. `gpgv` on `dists/stable/InRelease` → the signed Release text;
 //! 3. its SHA256 line for `main/binary-amd64/Packages` = sha256(Packages);
-//! 4. the `google-chrome-stable` stanza's SHA256 + Size = the downloaded .deb.
+//! 4. the package's stanza with the highest version: SHA256 + Size = the
+//!    downloaded .deb.
+//!
+//! Chrome for Testing and chrome-headless-shell: Google publishes neither a
+//! signature nor a checksum (C35 §5), so the chain is HTTPS to Google's index
+//! → the Stable entry → a URL that must sit under Google's download prefix
+//! for exactly that version. Weaker than the apt chain; the status says so.
+//!
+//! Every install writes `AIONUI-VERIFIED.json` into its version directory:
+//! what was checked and the sha256 of the downloaded file.
 //!
 //! Every download and extraction happens in root-only staging under the data
 //! dir; only the finished tree is moved into the browser root.
@@ -19,16 +31,36 @@ use std::path::{Path, PathBuf};
 
 use sha2::{Digest, Sha256};
 
+use aionui_api_types::BrowserEngine;
+
+use crate::engine::{AptSource, CFT_DOWNLOAD_PREFIX, CFT_INDEX_URL, EngineSource, spec};
 use crate::error::BrowserError;
 use crate::layout::BrowserLayout;
 
-pub const GOOGLE_PRIMARY_FPR: &str = "EB4C1BFD4F042F6DDDCCEC917721F63BD38B4796";
-const REPO: &str = "https://dl.google.com/linux/chrome/deb";
-const KEY_URL: &str = "https://dl.google.com/linux/linux_signing_key.pub";
+pub use crate::engine::GOOGLE_PRIMARY_FPR;
 const PACKAGES_PATH: &str = "main/binary-amd64/Packages";
-const PACKAGE: &str = "google-chrome-stable";
-/// Refuse absurd sizes before downloading (the .deb is ~150 MB).
-const MAX_DEB_BYTES: u64 = 600 * 1024 * 1024;
+/// Refuse absurd sizes before downloading (the largest package is ~200 MB).
+const MAX_DOWNLOAD_BYTES: u64 = 600 * 1024 * 1024;
+/// The verification record inside every installed version directory.
+pub const VERIFY_RECORD: &str = "AIONUI-VERIFIED.json";
+
+/// What [`EngineInstaller::latest`] resolved: the newest release of an engine.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EngineRelease {
+    /// A stanza of a signature-verified apt `Packages` file.
+    Deb(PackageEntry),
+    /// A Chrome for Testing zip (HTTPS + URL shape only).
+    Zip { version: String, url: String },
+}
+
+impl EngineRelease {
+    pub fn version(&self) -> &str {
+        match self {
+            Self::Deb(e) => &e.version,
+            Self::Zip { version, .. } => version,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PackageEntry {
@@ -56,8 +88,19 @@ pub fn release_sha256(release: &str, path: &str) -> Option<String> {
     None
 }
 
-/// The stanza of `package` in a Packages text.
+/// The numeric parts of a version (`157.0.4341.60-1` → `[157,0,4341,60,1]`).
+fn version_key(version: &str) -> Vec<u64> {
+    version
+        .split(|c: char| !c.is_ascii_digit())
+        .filter(|p| !p.is_empty())
+        .map(|p| p.parse().unwrap_or(u64::MAX))
+        .collect()
+}
+
+/// The stanza of `package` with the highest version in a Packages text
+/// (Brave's and Microsoft's repositories keep every old version).
 pub fn packages_entry(packages: &str, package: &str) -> Option<PackageEntry> {
+    let mut best: Option<PackageEntry> = None;
     for stanza in packages.split("\n\n") {
         let field = |name: &str| {
             stanza.lines().find_map(|l| {
@@ -69,14 +112,46 @@ pub fn packages_entry(packages: &str, package: &str) -> Option<PackageEntry> {
         if field("Package").as_deref() != Some(package) {
             continue;
         }
-        return Some(PackageEntry {
-            version: field("Version")?,
-            filename: field("Filename")?,
-            sha256: field("SHA256")?.to_ascii_lowercase(),
-            size: field("Size")?.parse().ok()?,
-        });
+        let entry = (|| {
+            Some(PackageEntry {
+                version: field("Version")?,
+                filename: field("Filename")?,
+                sha256: field("SHA256")?.to_ascii_lowercase(),
+                size: field("Size")?.parse().ok()?,
+            })
+        })();
+        let Some(entry) = entry else { continue };
+        if best
+            .as_ref()
+            .is_none_or(|b| version_key(&entry.version) > version_key(&b.version))
+        {
+            best = Some(entry);
+        }
     }
-    None
+    best
+}
+
+/// The Stable `linux64` download of `product` in Google's Chrome for Testing
+/// index: `(version, url)`. The URL must be exactly Google's download prefix
+/// + that version + `/linux64/` + a plain zip name.
+pub fn cft_stable_entry(index: &str, product: &str) -> Option<(String, String)> {
+    let v: serde_json::Value = serde_json::from_str(index).ok()?;
+    let stable = v.get("channels")?.get("Stable")?;
+    let version = dir_version(stable.get("version")?.as_str()?)?;
+    let url = stable
+        .get("downloads")?
+        .get(product)?
+        .as_array()?
+        .iter()
+        .find(|d| d.get("platform").and_then(|p| p.as_str()) == Some("linux64"))?
+        .get("url")?
+        .as_str()?;
+    let name = url.strip_prefix(&format!("{CFT_DOWNLOAD_PREFIX}{version}/linux64/"))?;
+    let ok = name.ends_with(".zip")
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'.');
+    ok.then(|| (version, url.to_owned()))
 }
 
 /// `157.0.8103.78-1` → `157.0.8103.78` (also a safe directory name).
@@ -89,19 +164,19 @@ fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
 
-/// The version `current` points at, if Chrome is installed.
-pub fn installed_version(layout: &BrowserLayout) -> Option<String> {
-    let target = std::fs::read_link(layout.chrome_current()).ok()?;
+/// The version `current` points at, if `engine` is installed.
+pub fn installed_version(layout: &BrowserLayout, engine: BrowserEngine) -> Option<String> {
+    let target = std::fs::read_link(layout.engine_current(engine)).ok()?;
     let name = target.file_name()?.to_string_lossy().into_owned();
-    layout.chrome_binary().exists().then_some(name)
+    layout.engine_binary(engine).exists().then_some(name)
 }
 
-pub struct ChromeInstaller {
+pub struct EngineInstaller {
     layout: BrowserLayout,
     http: reqwest::Client,
 }
 
-impl ChromeInstaller {
+impl EngineInstaller {
     pub fn new(layout: BrowserLayout) -> Result<Self, BrowserError> {
         let http = reqwest::Client::builder()
             .user_agent("aionui-browser-updater")
@@ -128,68 +203,140 @@ impl ChromeInstaller {
             .to_vec())
     }
 
-    /// Steps 1–3: the verified latest stable entry.
-    pub async fn latest(&self) -> Result<PackageEntry, BrowserError> {
-        let staging = self.fresh_staging("verify")?;
-        let result = self.latest_in(&staging).await;
-        let _ = std::fs::remove_dir_all(&staging);
-        result
+    /// The newest release of `engine`, verified as far as its source allows
+    /// (apt: steps 1–3 of the signed chain).
+    pub async fn latest(&self, engine: BrowserEngine) -> Result<EngineRelease, BrowserError> {
+        match spec(engine).source {
+            EngineSource::Apt(apt) => {
+                let staging = self.fresh_staging("verify")?;
+                let result = self.latest_apt(&apt, &staging).await;
+                let _ = std::fs::remove_dir_all(&staging);
+                result.map(EngineRelease::Deb)
+            }
+            EngineSource::ChromeForTesting { product, .. } => {
+                let index = self.get(CFT_INDEX_URL).await?;
+                let (version, url) = cft_stable_entry(&String::from_utf8_lossy(&index), product).ok_or_else(|| {
+                    BrowserError::Internal(format!("no usable {product} download in the Chrome for Testing index"))
+                })?;
+                Ok(EngineRelease::Zip { version, url })
+            }
+        }
     }
 
-    async fn latest_in(&self, staging: &Path) -> Result<PackageEntry, BrowserError> {
-        let key = self.get(KEY_URL).await?;
-        let keyring = pinned_keyring(staging, &key).await?;
-        let in_release = self.get(&format!("{REPO}/dists/stable/InRelease")).await?;
+    /// The signed chain for one apt package (steps 1–3); also used by other
+    /// engine lanes for their own pinned repositories.
+    pub(crate) async fn latest_apt(&self, apt: &AptSource, staging: &Path) -> Result<PackageEntry, BrowserError> {
+        let key = self.get(apt.key_url).await?;
+        let keyring = pinned_keyring(staging, &key, apt.primary_fpr).await?;
+        let in_release = self.get(&format!("{}/dists/{}/InRelease", apt.repo, apt.suite)).await?;
         let release = gpgv_verify(staging, &keyring, &in_release).await?;
         let want = release_sha256(&release, PACKAGES_PATH)
             .ok_or_else(|| BrowserError::Internal("Release has no Packages hash".into()))?;
-        let packages = self.get(&format!("{REPO}/dists/stable/{PACKAGES_PATH}")).await?;
+        let packages = self
+            .get(&format!("{}/dists/{}/{PACKAGES_PATH}", apt.repo, apt.suite))
+            .await?;
         if sha256_hex(&packages) != want {
             return Err(BrowserError::Internal(
                 "Packages hash does not match the signed Release".into(),
             ));
         }
-        packages_entry(&String::from_utf8_lossy(&packages), PACKAGE)
-            .ok_or_else(|| BrowserError::Internal(format!("{PACKAGE} not in Packages")))
+        packages_entry(&String::from_utf8_lossy(&packages), apt.package)
+            .ok_or_else(|| BrowserError::Internal(format!("{} not in Packages", apt.package)))
     }
 
-    /// Install `entry` unless it is installed already; returns the version dir.
-    /// Does NOT switch `current` (see [`Self::activate`]).
-    pub async fn install(&self, entry: &PackageEntry) -> Result<String, BrowserError> {
+    /// Install `release` of `engine` unless it is installed already; returns
+    /// the version dir. Does NOT switch `current` (see [`Self::activate`]).
+    pub async fn install(&self, engine: BrowserEngine, release: &EngineRelease) -> Result<String, BrowserError> {
+        let s = spec(engine);
         let version =
-            dir_version(&entry.version).ok_or_else(|| BrowserError::Internal("unexpected Chrome version".into()))?;
-        let dest = self.layout.chrome_dir().join(&version);
-        if dest.join("chrome").exists() {
+            dir_version(release.version()).ok_or_else(|| BrowserError::Internal("unexpected engine version".into()))?;
+        let engine_dir = self.layout.engine_dir(engine);
+        let dest = engine_dir.join(&version);
+        if dest.join(s.binary).exists() {
             return Ok(version);
-        }
-        if entry.size > MAX_DEB_BYTES || !entry.filename.starts_with("pool/") || entry.filename.contains("..") {
-            return Err(BrowserError::Internal("refusing an unexpected package entry".into()));
         }
         let staging = self.fresh_staging("install")?;
         let result = async {
-            let deb = self.get(&format!("{REPO}/{}", entry.filename)).await?;
-            if deb.len() as u64 != entry.size || sha256_hex(&deb) != entry.sha256 {
+            let x = staging.join("x");
+            let (tree, record) = match (s.source, release) {
+                (EngineSource::Apt(apt), EngineRelease::Deb(entry)) => {
+                    if entry.size > MAX_DOWNLOAD_BYTES
+                        || !entry.filename.starts_with("pool/")
+                        || entry.filename.contains("..")
+                    {
+                        return Err(BrowserError::Internal("refusing an unexpected package entry".into()));
+                    }
+                    let url = format!("{}/{}", apt.repo, entry.filename);
+                    let deb = self.get(&url).await?;
+                    if deb.len() as u64 != entry.size || sha256_hex(&deb) != entry.sha256 {
+                        return Err(BrowserError::Internal(
+                            ".deb does not match the signed Packages entry".into(),
+                        ));
+                    }
+                    let deb_path = staging.join("engine.deb");
+                    std::fs::write(&deb_path, &deb)?;
+                    let mut cmd = aionui_runtime::Builder::clean_cli("dpkg-deb");
+                    cmd.arg("-x").arg(&deb_path).arg(&x);
+                    if !cmd.output().await?.status.success() {
+                        return Err(BrowserError::Internal("dpkg-deb -x failed".into()));
+                    }
+                    let record = serde_json::json!({
+                        "engine": engine.id(),
+                        "version": version,
+                        "verification": "signed-repository",
+                        "checked": "pinned primary key -> gpgv InRelease -> Packages sha256 -> package sha256 + size",
+                        "signing_key": apt.primary_fpr,
+                        "source": url,
+                        "sha256": entry.sha256,
+                        "size": entry.size,
+                    });
+                    (x.join(apt.tree), record)
+                }
+                (EngineSource::ChromeForTesting { zip_dir, .. }, EngineRelease::Zip { url, .. }) => {
+                    if !url.starts_with(CFT_DOWNLOAD_PREFIX) {
+                        return Err(BrowserError::Internal("refusing an unexpected download URL".into()));
+                    }
+                    let zip = self.get(url).await?;
+                    if zip.len() as u64 > MAX_DOWNLOAD_BYTES {
+                        return Err(BrowserError::Internal("download is too large".into()));
+                    }
+                    let zip_path = staging.join("engine.zip");
+                    std::fs::write(&zip_path, &zip)?;
+                    let mut cmd = aionui_runtime::Builder::clean_cli("unzip");
+                    cmd.arg("-q").arg(&zip_path).arg("-d").arg(&x);
+                    if !cmd.output().await?.status.success() {
+                        return Err(BrowserError::Internal("unzip failed".into()));
+                    }
+                    let record = serde_json::json!({
+                        "engine": engine.id(),
+                        "version": version,
+                        "verification": "tls-only",
+                        "checked": "HTTPS to Google's Chrome for Testing index and download host; URL pinned to that version",
+                        "not_checked": "the vendor publishes no signature and no checksum for this download",
+                        "source": url,
+                        "sha256": sha256_hex(&zip),
+                        "size": zip.len(),
+                    });
+                    (x.join(zip_dir), record)
+                }
+                _ => return Err(BrowserError::Internal("release does not match the engine".into())),
+            };
+            if !tree.join(s.binary).exists() {
                 return Err(BrowserError::Internal(
-                    ".deb does not match the signed Packages entry".into(),
+                    "extracted package has no browser binary".into(),
                 ));
             }
-            let deb_path = staging.join("chrome.deb");
-            std::fs::write(&deb_path, &deb)?;
-            let x = staging.join("x");
-            let mut cmd = aionui_runtime::Builder::clean_cli("dpkg-deb");
-            cmd.arg("-x").arg(&deb_path).arg(&x);
-            let out = cmd.output().await?;
-            if !out.status.success() {
-                return Err(BrowserError::Internal("dpkg-deb -x failed".into()));
-            }
-            let tree = x.join("opt/google/chrome");
-            if !tree.join("chrome").exists() {
-                return Err(BrowserError::Internal("extracted package has no chrome binary".into()));
-            }
+            let body = serde_json::to_vec_pretty(&record).map_err(|e| BrowserError::Internal(e.to_string()))?;
+            std::fs::write(tree.join(VERIFY_RECORD), body)?;
             make_world_readable(&tree)?;
-            std::fs::create_dir_all(self.layout.chrome_dir())?;
-            set_mode(&self.layout.chrome_dir(), 0o755)?;
-            let tmp = self.layout.chrome_dir().join(format!(".{version}.tmp"));
+            std::fs::create_dir_all(&engine_dir)?;
+            // `engines/` and the engine's own directory: traversable, root-owned.
+            for dir in [engine_dir.parent(), Some(engine_dir.as_path())].into_iter().flatten() {
+                if dir != self.layout.root {
+                    set_mode(dir, 0o755)?;
+                }
+            }
+            let tmp = engine_dir.join(format!(".{version}.tmp"));
             let _ = std::fs::remove_dir_all(&tmp);
             move_dir(&tree, &tmp)?;
             std::fs::rename(&tmp, &dest)?;
@@ -200,14 +347,15 @@ impl ChromeInstaller {
         result
     }
 
-    /// Point `current` at `version` atomically (temp link + rename) and remove
-    /// older versions. Callers do this only while no instance runs.
-    pub fn activate(&self, version: &str) -> Result<(), BrowserError> {
-        let dir = self.layout.chrome_dir();
+    /// Point `engine`'s `current` at `version` atomically (temp link + rename)
+    /// and remove older versions. Callers do this only while no instance of
+    /// that engine runs.
+    pub fn activate(&self, engine: BrowserEngine, version: &str) -> Result<(), BrowserError> {
+        let dir = self.layout.engine_dir(engine);
         let tmp = dir.join(".current.tmp");
         let _ = std::fs::remove_file(&tmp);
         std::os::unix::fs::symlink(version, &tmp)?;
-        std::fs::rename(&tmp, self.layout.chrome_current())?;
+        std::fs::rename(&tmp, self.layout.engine_current(engine))?;
         for entry in std::fs::read_dir(&dir)?.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
             if name != version && name != "current" && dir_version(&name).is_some() {
@@ -283,9 +431,10 @@ fn copy_tree(from: &Path, to: &Path) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Import `key` into a fresh gpg home, require the pinned primary fingerprint,
-/// and export exactly that key as a gpgv keyring.
-async fn pinned_keyring(staging: &Path, key: &[u8]) -> Result<PathBuf, BrowserError> {
+/// Import `key` into a fresh gpg home, require the pinned primary fingerprint
+/// `fpr`, and export exactly that key as a gpgv keyring (a key file may hold
+/// several keys, e.g. Brave's: only the pinned one is trusted).
+async fn pinned_keyring(staging: &Path, key: &[u8], fpr: &str) -> Result<PathBuf, BrowserError> {
     let home = staging.join("gnupg");
     let mut b = std::fs::DirBuilder::new();
     {
@@ -301,6 +450,10 @@ async fn pinned_keyring(staging: &Path, key: &[u8]) -> Result<PathBuf, BrowserEr
             .arg(&home)
             .arg("--batch")
             .arg("--no-tty")
+            // Public keys only: no gpg-agent. With a long staging path the
+            // agent's socket path is too long, it fails to start and
+            // `--import` exits 2 although the key was imported.
+            .arg("--no-autostart")
             .args(args);
         cmd
     };
@@ -308,15 +461,13 @@ async fn pinned_keyring(staging: &Path, key: &[u8]) -> Result<PathBuf, BrowserEr
     if !out.status.success() {
         return Err(BrowserError::Internal("gpg --import failed".into()));
     }
-    let out = gpg(&["--with-colons", "--fingerprint", GOOGLE_PRIMARY_FPR])
-        .output()
-        .await?;
+    let out = gpg(&["--with-colons", "--fingerprint", fpr]).output().await?;
     let listing = String::from_utf8_lossy(&out.stdout);
-    if !out.status.success() || !primary_fingerprints(&listing).iter().any(|f| f == GOOGLE_PRIMARY_FPR) {
-        return Err(BrowserError::Internal("Google signing key fingerprint mismatch".into()));
+    if !out.status.success() || !primary_fingerprints(&listing).iter().any(|f| f == fpr) {
+        return Err(BrowserError::Internal("vendor signing key fingerprint mismatch".into()));
     }
-    let keyring = staging.join("google.gpg");
-    let out = gpg(&["--export", "--output", &keyring.to_string_lossy(), GOOGLE_PRIMARY_FPR])
+    let keyring = staging.join("vendor.gpg");
+    let out = gpg(&["--export", "--output", &keyring.to_string_lossy(), fpr])
         .output()
         .await?;
     if !out.status.success() || !keyring.exists() {
@@ -410,23 +561,94 @@ mod tests {
             std::fs::create_dir_all(&d).unwrap();
             std::fs::write(d.join("chrome"), "#!").unwrap();
         }
-        let inst = ChromeInstaller::new(layout.clone()).unwrap();
-        inst.activate("157.0.8103.78").unwrap();
-        assert_eq!(installed_version(&layout).as_deref(), Some("157.0.8103.78"));
+        let inst = EngineInstaller::new(layout.clone()).unwrap();
+        inst.activate(BrowserEngine::Chrome, "157.0.8103.78").unwrap();
+        assert_eq!(
+            installed_version(&layout, BrowserEngine::Chrome).as_deref(),
+            Some("157.0.8103.78")
+        );
         assert!(!layout.chrome_dir().join("156.0.1.1").exists());
+        assert_eq!(
+            installed_version(&layout, BrowserEngine::Edge),
+            None,
+            "engines are separate"
+        );
     }
 
-    /// The real chain against dl.google.com (network; run with
+    #[test]
+    fn engines_install_side_by_side_under_their_own_directory() {
+        let t = tempfile::tempdir().unwrap();
+        let layout = BrowserLayout::new(t.path().join("b"), t.path().join("d"));
+        let d = layout.engine_dir(BrowserEngine::Edge).join("157.0.4341.60");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(d.join("msedge"), "#!").unwrap();
+        let inst = EngineInstaller::new(layout.clone()).unwrap();
+        inst.activate(BrowserEngine::Edge, "157.0.4341.60").unwrap();
+        assert_eq!(
+            installed_version(&layout, BrowserEngine::Edge).as_deref(),
+            Some("157.0.4341.60")
+        );
+        assert_eq!(installed_version(&layout, BrowserEngine::Chrome), None);
+        assert_eq!(
+            layout.engine_binary(BrowserEngine::Edge),
+            t.path().join("b/engines/edge/current/msedge")
+        );
+    }
+
+    /// Brave's and Microsoft's repositories list every old version first.
+    #[test]
+    fn the_highest_version_of_a_package_wins() {
+        let packages = "Package: brave-browser\nVersion: 1.51.114\nFilename: pool/main/b/brave-browser/a.deb\nSize: 1\nSHA256: aa\n\nPackage: brave-browser\nVersion: 1.99.57\nFilename: pool/main/b/brave-browser/c.deb\nSize: 3\nSHA256: cc\n\nPackage: brave-browser\nVersion: 1.9.200\nFilename: pool/main/b/brave-browser/b.deb\nSize: 2\nSHA256: bb\n\nPackage: brave-browser-beta\nVersion: 2.0.1\nFilename: pool/x.deb\nSize: 9\nSHA256: ee\n";
+        let e = packages_entry(packages, "brave-browser").unwrap();
+        assert_eq!((e.version.as_str(), e.size), ("1.99.57", 3));
+        assert!(version_key("157.0.4341.60-1") > version_key("116.0.1938.76-1"));
+        assert!(version_key("157.0.4341.60-2") > version_key("157.0.4341.60-1"));
+    }
+
+    #[test]
+    fn chrome_for_testing_entry_needs_googles_prefix_and_the_same_version() {
+        let index = |url: &str| {
+            format!(
+                r#"{{"channels":{{"Stable":{{"version":"157.0.8103.78","downloads":{{"chrome-headless-shell":[{{"platform":"mac-arm64","url":"https://storage.googleapis.com/chrome-for-testing-public/157.0.8103.78/mac-arm64/x.zip"}},{{"platform":"linux64","url":"{url}"}}]}}}}}}}}"#
+            )
+        };
+        let good = "https://storage.googleapis.com/chrome-for-testing-public/157.0.8103.78/linux64/chrome-headless-shell-linux64.zip";
+        assert_eq!(
+            cft_stable_entry(&index(good), "chrome-headless-shell"),
+            Some(("157.0.8103.78".to_owned(), good.to_owned()))
+        );
+        assert_eq!(cft_stable_entry(&index(good), "chrome"), None, "product missing");
+        for bad in [
+            "https://evil.example/chrome-for-testing-public/157.0.8103.78/linux64/a.zip",
+            "https://storage.googleapis.com/chrome-for-testing-public/156.0.1.1/linux64/a.zip",
+            "https://storage.googleapis.com/chrome-for-testing-public/157.0.8103.78/linux64/../../x/a.zip",
+            "https://storage.googleapis.com/chrome-for-testing-public/157.0.8103.78/linux64/a.zip?x=1",
+            "https://storage.googleapis.com/chrome-for-testing-public/157.0.8103.78/linux64/a.tar",
+        ] {
+            assert_eq!(cft_stable_entry(&index(bad), "chrome-headless-shell"), None, "{bad}");
+        }
+    }
+
+    /// The real chains against the vendors (network; run with
     /// `AIONUI_BROWSER_NET_TESTS=1`). Verifies signatures and hashes only.
     #[tokio::test]
-    async fn live_signed_chain_resolves_the_stable_entry() {
+    async fn live_chains_resolve_every_engine() {
         if std::env::var("AIONUI_BROWSER_NET_TESTS").is_err() {
             return;
         }
         let t = tempfile::tempdir().unwrap();
         let layout = BrowserLayout::new(t.path().join("b"), t.path().join("d"));
-        let entry = ChromeInstaller::new(layout).unwrap().latest().await.unwrap();
-        assert!(entry.version.contains('.'), "{entry:?}");
-        assert_eq!(entry.sha256.len(), 64);
+        let installer = EngineInstaller::new(layout).unwrap();
+        for engine in aionui_api_types::BROWSER_ENGINES {
+            let release = installer
+                .latest(engine)
+                .await
+                .unwrap_or_else(|e| panic!("{engine:?}: {e}"));
+            eprintln!("{engine:?}: {release:?}");
+            assert!(dir_version(release.version()).is_some(), "{engine:?} {release:?}");
+            if let EngineRelease::Deb(entry) = &release {
+                assert_eq!(entry.sha256.len(), 64);
+            }
+        }
     }
 }

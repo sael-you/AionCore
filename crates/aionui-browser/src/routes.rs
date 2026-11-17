@@ -39,6 +39,7 @@ pub fn browser_routes(state: BrowserRouterState) -> Router {
         )
         .route("/api/browser/instances/{n}/clear", post(clear_instance))
         .route("/api/browser/instances/{n}/stop", post(stop_instance))
+        .route("/api/browser/engines/{engine}/install", post(install_engine))
         .route("/api/browser/ws", get(panel_ws))
         .route("/api/browser/devices/pairing-code", post(pairing_code))
         .route("/api/browser/devices", get(list_devices))
@@ -206,6 +207,25 @@ async fn stop_instance(
 ) -> Result<Json<ApiResponse<BrowserStatusResponse>>, ApiError> {
     Ok(Json(ApiResponse::ok(
         s.service.stop(&user.id, n).await.map_err(api_error)?,
+    )))
+}
+
+/// `POST /api/browser/engines/{engine}/install` (C35): download or update an
+/// engine in the background; the answer is the status (poll it for progress).
+/// Unknown engine id → 400 `BROWSER_BAD_MESSAGE`.
+async fn install_engine(
+    State(s): State<BrowserRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(engine): Path<String>,
+) -> Result<Json<ApiResponse<BrowserStatusResponse>>, ApiError> {
+    let engine = aionui_api_types::BrowserEngine::from_id(&engine).ok_or_else(|| {
+        api_error(BrowserError::coded(
+            BrowserErrorCode::BrowserBadMessage,
+            "unknown engine",
+        ))
+    })?;
+    Ok(Json(ApiResponse::ok(
+        s.service.install_engine(&user.id, engine).map_err(api_error)?,
     )))
 }
 

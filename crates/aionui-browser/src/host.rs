@@ -535,7 +535,16 @@ pub(crate) async fn remove_profile_locks(profile: &Path, uid: u32, gid: u32) {
     .await;
 }
 
-/// Stop the `chrome_crashpad_handler`s of the Chrome using `profile` (as the
+/// Whether a `/proc/<pid>/comm` value (at most 15 characters) names a crash
+/// handler of any engine: `chrome_crashpad_handler` (Chrome, Chrome for
+/// Testing, Brave) or `msedge_crashpad_handler` (Edge).
+pub(crate) fn is_crash_handler_comm(comm: &str) -> bool {
+    let comm = comm.trim();
+    comm.starts_with("chrome_crashpad") || comm.starts_with("msedge_crashpad")
+}
+
+/// Stop the crash handlers (`chrome_crashpad_handler`, Edge's
+/// `msedge_crashpad_handler`) of the browser using `profile` (as the
 /// account; they re-parent to init with their own group, and their database
 /// lives under the instance HOME inside the profile). Polls up to 3 s.
 pub(crate) async fn stop_crash_handlers(uid: u32, gid: u32, profile: &Path) {
@@ -547,8 +556,7 @@ pub(crate) async fn stop_crash_handlers(uid: u32, gid: u32, profile: &Path) {
         let handlers: Vec<u32> = processes_of(uid)
             .into_iter()
             .filter(|p| {
-                std::fs::read_to_string(format!("/proc/{}/comm", p.pid))
-                    .is_ok_and(|c| c.trim().starts_with("chrome_crashpad"))
+                std::fs::read_to_string(format!("/proc/{}/comm", p.pid)).is_ok_and(|c| is_crash_handler_comm(&c))
                     && read_cmdline(p.pid).is_some_and(|c| names_profile(&c, &dir))
             })
             .map(|p| p.pid)
@@ -559,8 +567,7 @@ pub(crate) async fn stop_crash_handlers(uid: u32, gid: u32, profile: &Path) {
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         if handlers.is_empty()
             && !processes_of(uid).iter().any(|p| {
-                std::fs::read_to_string(format!("/proc/{}/comm", p.pid))
-                    .is_ok_and(|c| c.trim().starts_with("chrome_crashpad"))
+                std::fs::read_to_string(format!("/proc/{}/comm", p.pid)).is_ok_and(|c| is_crash_handler_comm(&c))
             })
         {
             return;
@@ -720,6 +727,16 @@ mod tests {
         assert!(err.to_string().contains(".token-pool"), "names the path: {err}");
         let coded = harden_and_verify_with(&paths, chmod).unwrap_err();
         assert_eq!(coded.code(), Some(BrowserErrorCode::BrowserUnavailable));
+    }
+
+    #[test]
+    fn crash_handlers_of_every_engine_are_recognised() {
+        // comm is cut at 15 characters.
+        assert!(is_crash_handler_comm("chrome_crashpad\n"));
+        assert!(is_crash_handler_comm("msedge_crashpad\n"));
+        for other in ["chrome", "msedge", "brave", "chrome-headless", "Xvfb"] {
+            assert!(!is_crash_handler_comm(other), "{other}");
+        }
     }
 
     #[test]

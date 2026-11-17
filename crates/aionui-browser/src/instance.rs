@@ -25,7 +25,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicI64, AtomicU8, Ordering};
 use std::time::Duration;
 
-use aionui_api_types::BrowserErrorCode;
+use aionui_api_types::{BrowserEngine, BrowserErrorCode};
 use serde_json::{Value, json};
 use tokio::process::Child;
 use tokio::sync::{Mutex, broadcast, watch};
@@ -40,6 +40,8 @@ use crate::host::kill_group_as as kill_as;
 pub struct LaunchSpec {
     pub user_id: String,
     pub instance: u8,
+    /// The engine and its binary (C35; every engine speaks CDP on the pipe).
+    pub engine: BrowserEngine,
     pub chrome: PathBuf,
     pub profile: PathBuf,
     pub home: PathBuf,
@@ -69,6 +71,8 @@ pub struct ChromeInstance {
     pub user_id: String,
     pub instance: u8,
     pub hide_automation: bool,
+    /// The engine this instance was launched with.
+    pub engine: BrowserEngine,
     pub version: String,
     /// The only CDP channel (Chrome's pipe), shared by AionCore and agent links.
     mux: crate::mux::CdpMux,
@@ -133,6 +137,9 @@ fn release_display(n: u16) {
 /// Chrome's launch arguments. No CDP port at all (`--remote-debugging-pipe`).
 /// All traffic goes through the egress proxy (only the browser account may
 /// use it, so its port in argv opens nothing).
+///
+/// The same list for every engine (C35): they are all Chromium, and each of
+/// the protections below is a Chromium switch.
 pub fn chrome_args(profile: &Path, hide_automation: bool, proxy_port: u16) -> Vec<String> {
     let mut args = vec![
         // The container forbids every Chrome sandbox (NoNewPrivs, seccomp, no
@@ -270,14 +277,20 @@ impl ChromeInstance {
         .stdin(std::process::Stdio::null())
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null());
-        let mut xvfb_child = xvfb.spawn().map_err(|_| failed("Xvfb did not start"))?;
-        let xvfb_pid = xvfb_child.id();
-        if !wait_for(Path::new(&format!("/tmp/.X11-unix/X{display}")), Duration::from_secs(8)).await {
-            if let Some(pid) = xvfb_pid {
-                kill_as(spec.uid, spec.gid, pid, "KILL").await;
+        // A headless engine (chrome-headless-shell) draws no window: no Xvfb.
+        let mut xvfb_child = None;
+        let mut xvfb_pid = None;
+        if crate::engine::spec(spec.engine).needs_display {
+            let mut child = xvfb.spawn().map_err(|_| failed("Xvfb did not start"))?;
+            xvfb_pid = child.id();
+            if !wait_for(Path::new(&format!("/tmp/.X11-unix/X{display}")), Duration::from_secs(8)).await {
+                if let Some(pid) = xvfb_pid {
+                    kill_as(spec.uid, spec.gid, pid, "KILL").await;
+                }
+                let _ = child.wait().await;
+                return Err(failed("Xvfb display did not appear"));
             }
-            let _ = xvfb_child.wait().await;
-            return Err(failed("Xvfb display did not appear"));
+            xvfb_child = Some(child);
         }
 
         let proxy = match crate::proxy::EgressProxy::start(spec.guard.clone(), spec.uid).await {
@@ -357,13 +370,15 @@ impl ChromeInstance {
             user_id: spec.user_id.clone(),
             instance: spec.instance,
             hide_automation: spec.hide_automation,
-            version: version.trim_start_matches("Chrome/").to_owned(),
+            engine: spec.engine,
+            // `Chrome/157…`, `HeadlessChrome/157…`: keep the number.
+            version: version.rsplit('/').next().unwrap_or_default().to_owned(),
             mux,
             profile: spec.profile.clone(),
             uid: spec.uid,
             gid: spec.gid,
             chrome_child: Mutex::new(Some(chrome_child)),
-            xvfb_child: Mutex::new(Some(xvfb_child)),
+            xvfb_child: Mutex::new(xvfb_child),
             chrome_pid,
             xvfb_pid,
             display,
@@ -389,6 +404,7 @@ impl ChromeInstance {
         tracing::info!(
             user_id = %inst.user_id,
             instance = inst.instance,
+            engine = inst.engine.id(),
             chrome = %inst.version,
             hide_automation = inst.hide_automation,
             "server browser instance started"
