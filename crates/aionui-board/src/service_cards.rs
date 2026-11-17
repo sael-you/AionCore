@@ -932,7 +932,10 @@ fn check_agent_move(
     };
     let columns = std::iter::once(to).chain(from);
     for column in columns {
-        let open = if gates_open && is_gate(column) {
+        // With access, gates and the terminal columns are open (the Butler
+        // records shipped, done, parked and rejected cards); `deploying`
+        // itself never is.
+        let open = if gates_open && (is_gate(column) || column.kind == ColumnKind::Terminal.as_str()) {
             true
         } else if agent.keeper {
             !is_gate(column) && column.key != DEPLOYING
@@ -966,10 +969,11 @@ fn check_barrier(
     }
     let barrier = columns
         .iter()
-        .filter(|c| !c.archived && c.position > from_position && ((is_gate(c) && !gates_open) || c.key == DEPLOYING))
+        .filter(|c| !c.archived && c.position > from_position && !gates_open && (is_gate(c) || c.key == DEPLOYING))
         .min_by_key(|c| c.position);
     let blocked_by_barrier = barrier.is_some_and(|barrier| to.position > barrier.position);
-    let keeper_terminal = actor.as_agent().is_some_and(|agent| agent.keeper)
+    let keeper_terminal = !gates_open
+        && actor.as_agent().is_some_and(|agent| agent.keeper)
         && to.kind == ColumnKind::Terminal.as_str()
         && columns
             .iter()
@@ -986,7 +990,9 @@ fn check_barrier(
 }
 
 /// The gate an agent's move touches (TASK-116): the gate it leaves, else the
-/// gate it enters, else the first gate it passes moving forward.
+/// gate it enters, else the first gate (or `deploying`) it passes moving
+/// forward, else `deploying` for a move to a terminal column after it
+/// (recording a shipped / done / parked / rejected card).
 fn touched_gate<'a>(
     columns: &'a [BoardColumnRow],
     from: Option<&'a BoardColumnRow>,
@@ -998,14 +1004,19 @@ fn touched_gate<'a>(
     if is_gate(to) {
         return Some(to);
     }
+    let deploying = columns.iter().find(|c| !c.archived && c.key == DEPLOYING);
+    let past_deploying = || deploying.filter(|d| to.kind == ColumnKind::Terminal.as_str() && to.position > d.position);
     let from_position = from.map(|c| c.position).unwrap_or(i64::MIN);
     if to.position <= from_position {
-        return None;
+        return past_deploying();
     }
     columns
         .iter()
-        .filter(|c| !c.archived && is_gate(c) && c.position > from_position && c.position < to.position)
+        .filter(|c| {
+            !c.archived && (is_gate(c) || c.key == DEPLOYING) && c.position > from_position && c.position < to.position
+        })
         .min_by_key(|c| c.position)
+        .or_else(past_deploying)
 }
 
 /// Leaving a decided gate or `deploying` needs the owner's force with a

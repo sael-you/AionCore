@@ -14,9 +14,9 @@
 
 use aionui_ai_agent::{RuntimeTokenScope, TEAM_RUNTIME_TOKEN_SESSION_GENERATION};
 use aionui_api_types::{
-    AgentBlockBoardCardRequest, AgentLinkBoardCardRequest, AgentMoveBoardCardRequest, AgentShowBoardCardQuery,
-    AgentUpdateBoardCardRequest, BoardCardListQuery, BoardCliEnvelope, BoardCliError, BoardCommentRequest,
-    BoardEmptyRequest, BoardEventsQuery, BoardReviewRequest, CreateBoardCardRequest,
+    AgentBlockBoardCardRequest, AgentLinkBoardCardRequest, AgentMoveBoardCardRequest, AgentSetWipLimitsRequest,
+    AgentShowBoardCardQuery, AgentUpdateBoardCardRequest, BoardCardListQuery, BoardCliEnvelope, BoardCliError,
+    BoardCommentRequest, BoardEmptyRequest, BoardEventsQuery, BoardReviewRequest, CreateBoardCardRequest,
 };
 use axum::extract::rejection::{JsonRejection, QueryRejection};
 use axum::extract::{Path, Query, State};
@@ -55,6 +55,7 @@ pub fn board_runtime_routes(state: BoardRuntimeRouterState) -> Router {
         .route("/api/runtime/board/cards/{number}/links", post(link))
         .route("/api/runtime/board/cards/{number}/packet", get(packet))
         .route("/api/runtime/board/events", get(events))
+        .route("/api/runtime/board/wip", put(set_wip))
         .with_state(state)
 }
 
@@ -207,6 +208,25 @@ macro_rules! try_reply {
             Err(reply) => return *reply,
         }
     };
+}
+
+/// `board wip --set <column>=<n>`: the Keeper's WIP limits (board `agent_access: full`).
+async fn set_wip(
+    State(state): State<BoardRuntimeRouterState>,
+    headers: HeaderMap,
+    body: Result<Json<AgentSetWipLimitsRequest>, JsonRejection>,
+) -> Reply {
+    const COMMAND: &str = "board wip";
+    let actor = try_reply!(agent(&state, &headers, COMMAND).await);
+    let request = try_reply!(parse_body(body, COMMAND));
+    let project_id = match actor.as_agent() {
+        Some(agent) => agent.project_id.clone(),
+        None => return board_failure(BoardError::invalid("actor", "agents only"), COMMAND),
+    };
+    match state.service.set_wip_limits(&actor, &project_id, &request.limits).await {
+        Ok(columns) => success(StatusCode::OK, columns, COMMAND),
+        Err(error) => board_failure(error, COMMAND),
+    }
 }
 
 async fn status(State(state): State<BoardRuntimeRouterState>, headers: HeaderMap) -> Reply {

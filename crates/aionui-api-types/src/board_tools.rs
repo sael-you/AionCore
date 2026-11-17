@@ -266,6 +266,27 @@ fn specs() -> Vec<Spec> {
             reads_stdin: false,
         },
         Spec {
+            name: "board_wip",
+            description: "Set column WIP limits (1-20 each) of THIS project's board. Only the project's Board \
+                          Keeper, and only on a board with agent_access full; recorded in the board history.",
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "limits": {
+                        "type": "object",
+                        "description": "Column key -> WIP limit (1-20); also --set <column>=<limit>.",
+                        "additionalProperties": { "type": "integer", "minimum": 1, "maximum": 20 }
+                    }
+                },
+                "additionalProperties": false
+            }),
+            cli_command: &["wip"],
+            selectors: &["--set <column>=<1-20>"],
+            when: "You are the Board Keeper and a WIP limit blocks the flow the owner wants.",
+            input_summary: "{ limits? } (stdin optional; --set building=3 --set local_test=3)",
+            reads_stdin: true,
+        },
+        Spec {
             name: "board_events",
             description: "Read this project's board history by seq (paged).",
             input_schema: empty,

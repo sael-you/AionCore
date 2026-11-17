@@ -379,6 +379,9 @@ pub(crate) enum BoardCommand {
     Link(BoardLinkArgs),
     /// Read this project's board events (paged by seq).
     Events(BoardEventsArgs),
+    /// Board Keeper on a board with agent_access full: set column WIP limits
+    /// (`--set building=3 --set local_test=3`, each 1-20).
+    Wip(BoardWipArgs),
     /// Operator only (AionUi stopped): copy board writes back from a kept
     /// database after a rollback. Opens <data-dir>/aionui-backend.db directly.
     /// On success writes the marker at $AIONUI_BOARD_RECOVER_MARKER (default
@@ -389,6 +392,29 @@ pub(crate) enum BoardCommand {
 }
 
 /// Accept `N` or `TASK-N` (N ≥ 1) and normalise to `N`.
+#[derive(Args, Debug, Clone)]
+pub(crate) struct BoardWipArgs {
+    /// `<column>=<limit>`, limit 1-20; repeat for several columns.
+    #[arg(long = "set", value_parser = parse_wip_limit)]
+    pub set: Vec<(String, i64)>,
+}
+
+/// `building=3` → `("building", 3)` (the server checks the column and 1-20).
+pub(crate) fn parse_wip_limit(value: &str) -> Result<(String, i64), String> {
+    let (key, limit) = value
+        .split_once('=')
+        .ok_or_else(|| format!("`{value}` is not <column>=<limit>"))?;
+    let key = key.trim();
+    let limit: i64 = limit
+        .trim()
+        .parse()
+        .map_err(|_| format!("`{value}`: the limit must be a whole number"))?;
+    if key.is_empty() {
+        return Err(format!("`{value}`: name the column"));
+    }
+    Ok((key.to_owned(), limit))
+}
+
 pub(crate) fn parse_card_selector(value: &str) -> Result<String, String> {
     let trimmed = value.trim();
     let digits = trimmed

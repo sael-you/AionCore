@@ -92,6 +92,7 @@ fn stdin_tool(command: &BoardCommand) -> Option<&'static str> {
         BoardCommand::Move(_) => Some("move"),
         BoardCommand::Review(_) => Some("review"),
         BoardCommand::Comment(_) => Some("comment"),
+        BoardCommand::Wip(_) => Some("wip"),
         _ => None,
     }
 }
@@ -111,6 +112,7 @@ fn command_name(command: &BoardCommand) -> &'static str {
         BoardCommand::Unblock(_) => "board unblock",
         BoardCommand::Link(_) => "board link",
         BoardCommand::Events(_) => "board events",
+        BoardCommand::Wip(_) => "board wip",
         BoardCommand::Recover(_) => "board recover",
         BoardCommand::Unknown(_) => "board",
     }
@@ -293,6 +295,18 @@ pub(crate) fn build_request(command: &BoardCommand, stdin: Value) -> Result<Boar
                 None => json!({}),
             };
             write(reqwest::Method::POST, card_path(&args.card, "/links"), body)
+        }
+        BoardCommand::Wip(args) => {
+            let mut body = payload.unwrap_or_default();
+            let mut limits = body
+                .remove("limits")
+                .and_then(|v| v.as_object().cloned())
+                .unwrap_or_default();
+            for (column, limit) in &args.set {
+                limits.insert(column.clone(), json!(limit));
+            }
+            body.insert("limits".into(), Value::Object(limits));
+            write(reqwest::Method::PUT, "/wip".into(), Value::Object(body))
         }
         BoardCommand::Events(args) => {
             let mut query = Vec::new();
@@ -548,6 +562,24 @@ mod tests {
         let request = build_request(&parse(&["move", "4", "done"]), json!({ "after": 2 })).unwrap();
         assert_eq!(request.path, "/cards/4/move");
         assert_eq!(request.body, Some(json!({ "after": 2, "to_column": "done" })));
+
+        // TASK-116 hotfix: the Keeper's WIP limits.
+        let request = build_request(
+            &parse(&["wip", "--set", "building=3", "--set", "local_test=3"]),
+            json!({}),
+        )
+        .unwrap();
+        assert_eq!(
+            (request.method.clone(), request.path.as_str()),
+            (reqwest::Method::PUT, "/wip")
+        );
+        assert_eq!(
+            request.body,
+            Some(json!({ "limits": { "building": 3, "local_test": 3 } }))
+        );
+        assert!(crate::cli::parse_wip_limit("building").is_err());
+        assert!(crate::cli::parse_wip_limit("building=three").is_err());
+        assert!(crate::cli::parse_wip_limit("=3").is_err());
 
         // TASK-116: the gate approval note and the conversation assignee.
         let request = build_request(
