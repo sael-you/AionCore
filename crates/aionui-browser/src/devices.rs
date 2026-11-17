@@ -7,23 +7,21 @@
 //! - Pairing returns a fresh device token ONCE. Only its SHA-256 is stored, in
 //!   a root-only JSON file per user next to the settings (`0600`, atomic
 //!   write). Revoking deletes the row; the token then never matches again.
-//! - Failed pairing attempts are counted per pending code (train-9 review: a
-//!   global lock let anyone block pairing for every user). A wrong code could
-//!   be a guess at ANY pending code, so each failure counts against every
-//!   code pending at that moment; a code that has seen [`MAX_FAILED_PAIRS`]
-//!   failures is burned and its owner makes a new one. A code made later
-//!   starts at zero. With 32^8 codes, 10 guesses per code stay negligible; the
-//!   gateway also limits extension upgrades to 10 per minute per IP.
+//! - Codes, tokens, hashing and the per-code failure burn are the shared
+//!   [`aionui_common::pairing`] (also used by the C38 device relay). With 32^8
+//!   codes, 10 guesses per code stay negligible; the gateway also limits
+//!   extension upgrades to 10 per minute per IP.
 //!
 //! Tokens and codes are never logged.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use aionui_api_types::{BrowserErrorCode, BrowserPairingCode};
+pub use aionui_common::pairing::{MAX_FAILED_PAIRS, new_device_token, normalize_pairing_code as normalize_code};
+use aionui_common::pairing::{PairingCodes, RedeemOutcome, token_sha256_hex as sha256_hex};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 
 use crate::error::BrowserError;
 use crate::filter::tokens_match;
@@ -31,8 +29,6 @@ use crate::layout::safe_user_segment;
 use crate::settings::write_private_json;
 
 pub const PAIRING_TTL: Duration = Duration::from_secs(5 * 60);
-pub const MAX_FAILED_PAIRS: u32 = 10;
-const CODE_ALPHABET: &[u8; 32] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 const MAX_NAME: usize = 64;
 
 /// One stored device (never the token itself).
@@ -64,18 +60,11 @@ pub struct Authenticated {
     pub device: StoredDevice,
 }
 
-struct PendingCode {
-    code: String,
-    expires: Instant,
-    /// Wrong pair attempts seen while this code was pending.
-    failures: u32,
-}
-
 pub struct DeviceStore {
     dir: PathBuf,
     /// user id → that user's devices (loaded from `dir` at construction).
     users: std::sync::Mutex<HashMap<String, Vec<StoredDevice>>>,
-    codes: std::sync::Mutex<HashMap<String, PendingCode>>,
+    codes: PairingCodes<String>,
 }
 
 impl std::fmt::Debug for DeviceStore {
@@ -89,54 +78,6 @@ pub fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| i64::try_from(d.as_millis()).unwrap_or(i64::MAX))
         .unwrap_or(0)
-}
-
-fn sha256_hex(token: &str) -> String {
-    hex::encode(Sha256::digest(token.as_bytes()))
-}
-
-fn random_bytes<const N: usize>() -> [u8; N] {
-    let mut out = [0u8; N];
-    let mut filled = 0;
-    while filled < N {
-        let chunk = uuid::Uuid::new_v4().into_bytes();
-        // Bytes 6 and 8 carry the version / variant bits.
-        for (i, b) in chunk.iter().enumerate() {
-            if i == 6 || i == 8 || filled == N {
-                continue;
-            }
-            out[filled] = *b;
-            filled += 1;
-        }
-    }
-    out
-}
-
-fn new_code() -> String {
-    random_bytes::<8>()
-        .iter()
-        .map(|b| char::from(CODE_ALPHABET[usize::from(*b) % CODE_ALPHABET.len()]))
-        .collect()
-}
-
-/// `abcd-2345` / `ABCD 2345` → `ABCD2345`.
-pub fn normalize_code(raw: &str) -> String {
-    raw.chars()
-        .filter(|c| !matches!(c, '-' | ' ' | '\t'))
-        .map(|c| c.to_ascii_uppercase())
-        .collect()
-}
-
-fn display_code(code: &str) -> String {
-    if code.len() == 8 {
-        format!("{}-{}", &code[..4], &code[4..])
-    } else {
-        code.to_owned()
-    }
-}
-
-pub fn new_device_token() -> String {
-    hex::encode(random_bytes::<32>())
 }
 
 fn clean_label(raw: &str, fallback: &str) -> String {
@@ -179,7 +120,7 @@ impl DeviceStore {
         Self {
             dir,
             users: std::sync::Mutex::new(users),
-            codes: std::sync::Mutex::new(HashMap::new()),
+            codes: PairingCodes::new(PAIRING_TTL),
         }
     }
 
@@ -197,52 +138,22 @@ impl DeviceStore {
     /// A new one-time code for `user_id`; the previous one stops working.
     pub fn pairing_code(&self, user_id: &str) -> Result<BrowserPairingCode, BrowserError> {
         safe_user_segment(user_id)?;
-        let code = new_code();
         let expires_at = now_ms() + i64::try_from(PAIRING_TTL.as_millis()).unwrap_or(0);
-        self.codes.lock().expect("codes lock").insert(
-            user_id.to_owned(),
-            PendingCode {
-                code: code.clone(),
-                expires: Instant::now() + PAIRING_TTL,
-                failures: 0,
-            },
-        );
-        Ok(BrowserPairingCode {
-            code: display_code(&code),
-            expires_at,
-        })
+        let code = self.codes.issue(user_id.to_owned());
+        Ok(BrowserPairingCode { code, expires_at })
     }
 
     /// Consume `code` and create a device. Returns the device and its token
     /// (the only time the token exists in clear outside the extension).
     pub fn pair(&self, code: &str, name: &str, browser: &str) -> Result<(Authenticated, String), BrowserError> {
-        let wanted = normalize_code(code);
-        let user_id = {
-            let mut codes = self.codes.lock().expect("codes lock");
-            let now = Instant::now();
-            codes.retain(|_, p| p.expires > now);
-            let hit = codes
-                .iter()
-                .find(|(_, p)| tokens_match(&p.code, &wanted))
-                .map(|(u, _)| u.clone());
-            match &hit {
-                Some(u) => {
-                    codes.remove(u);
+        let user_id = match self.codes.redeem(code) {
+            RedeemOutcome::Paired(user_id) => Some(user_id),
+            RedeemOutcome::Invalid { burned } => {
+                for user_id in burned {
+                    tracing::warn!(user_id, "browser pairing code burned after too many wrong attempts");
                 }
-                None => {
-                    for p in codes.values_mut() {
-                        p.failures = p.failures.saturating_add(1);
-                    }
-                    codes.retain(|user_id, p| {
-                        let burned = p.failures >= MAX_FAILED_PAIRS;
-                        if burned {
-                            tracing::warn!(user_id, "browser pairing code burned after too many wrong attempts");
-                        }
-                        !burned
-                    });
-                }
+                None
             }
-            hit
         };
         let Some(user_id) = user_id else {
             return Err(pairing_invalid());
@@ -442,7 +353,7 @@ mod tests {
             first
                 .code
                 .chars()
-                .all(|c| c == '-' || CODE_ALPHABET.contains(&(c as u8)))
+                .all(|c| c == '-' || b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789".contains(&(c as u8)))
         );
         let second = store.pairing_code("u1").unwrap();
         // The first code no longer works (unless both draws collide).
