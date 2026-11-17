@@ -475,7 +475,9 @@ pub enum RelayOutbound {
         token: Option<String>,
     },
     /// Then the socket closes.
-    Error { code: DeviceErrorCode },
+    Error {
+        code: DeviceErrorCode,
+    },
     Request {
         id: u64,
         device: String,
@@ -486,7 +488,9 @@ pub enum RelayOutbound {
     },
     /// The owner switched this device off / its timeout passed: stop at once
     /// (cancel running verbs and add-on runs on it).
-    Stop { device: String },
+    Stop {
+        device: String,
+    },
     Pong,
 }
 
