@@ -18,7 +18,7 @@ pub use agent_binding::{
 pub use database::{
     DATABASE_NEWER_THAN_APP_STAGE, Database, DatabaseInitError, DatabaseInitOptions, init_database,
     init_database_memory, init_database_staged, init_database_staged_with_options, init_database_with_options,
-    latest_known_migration_version, maybe_copy_legacy_database, open_database_read_only,
+    latest_known_migration_version, maybe_copy_legacy_database, open_database_existing, open_database_read_only,
 };
 pub use error::{
     DbError, SQLITE_BUSY_MESSAGE_MARKERS, SQLITE_UNIQUE_VIOLATION_MARKER, message_indicates_busy,
@@ -57,6 +57,7 @@ pub use repository::mcp_server::{
 pub use repository::oauth_token::UpsertOAuthTokenParams;
 pub use repository::provider::{CreateProviderParams, UpdateProviderParams};
 pub use repository::remote_agent::{CreateRemoteAgentParams, UpdateRemoteAgentParams};
+pub use repository::server_pool::{CreateServerParams, SERVER_NAME_TAKEN_MSG, ServerAuditParams, UpdateServerParams};
 pub use repository::skill::{CreateSkillImportRecordParams, UpsertSkillParams};
 pub use repository::sqlite_board_recover::{
     BoardRecoverConflict, BoardRecoverCursor, BoardRecoverListedEvent, BoardRecoverRenumber, BoardRecoverReport,
@@ -74,17 +75,18 @@ pub use repository::{
     IAssistantOverlayRepository, IAssistantOverrideRepository, IAssistantPreferenceRepository, IAssistantRepository,
     IBoardStore, IBoardTx, IChannelRepository, IClientPreferenceRepository, IConversationRepository, ICronRepository,
     IFeedbackDiagnosticsRepository, IKitRepository, IMcpMarketRepository, IMcpServerRepository, IOAuthTokenRepository,
-    IProjectStore, IProviderRepository, IRemoteAgentRepository, ISettingsRepository, ISidebarStore, ISkillRepository,
-    ITeamRepository, IUserOrderStore, IUserRepository, IVoiceAuditRepository, IVoiceSessionRepository,
-    IVoiceSettingsRepository, MoveOutcome, NewBoardEvent, OrderItemRef, PageDirection, PersistedSessionState,
-    PinOutcome, PinnedCursor, SaveRuntimeStateParams, SidebarConversationThin, SidebarProjectMeta, SidebarTeamThin,
-    SqliteAcpSessionRepository, SqliteAgentMetadataRepository, SqliteAssistantDefinitionRepository,
-    SqliteAssistantOverlayRepository, SqliteAssistantOverrideRepository, SqliteAssistantPreferenceRepository,
-    SqliteAssistantRepository, SqliteBoardStore, SqliteChannelRepository, SqliteClientPreferenceRepository,
-    SqliteConversationRepository, SqliteCronRepository, SqliteFeedbackDiagnosticsRepository, SqliteKitRepository,
-    SqliteMcpMarketRepository, SqliteMcpServerRepository, SqliteOAuthTokenRepository, SqliteProjectStore,
-    SqliteProviderRepository, SqliteRemoteAgentRepository, SqliteSettingsRepository, SqliteSidebarStore,
-    SqliteSkillRepository, SqliteTeamRepository, SqliteUserOrderStore, SqliteUserRepository, SqliteVoiceRepository,
+    IProjectStore, IProviderRepository, IRemoteAgentRepository, IServerPoolRepository, ISettingsRepository,
+    ISidebarStore, ISkillRepository, ITeamRepository, IUserOrderStore, IUserRepository, IVoiceAuditRepository,
+    IVoiceSessionRepository, IVoiceSettingsRepository, MoveOutcome, NewBoardEvent, OrderItemRef, PageDirection,
+    PersistedSessionState, PinOutcome, PinnedCursor, SaveRuntimeStateParams, SidebarConversationThin,
+    SidebarProjectMeta, SidebarTeamThin, SqliteAcpSessionRepository, SqliteAgentMetadataRepository,
+    SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository, SqliteAssistantOverrideRepository,
+    SqliteAssistantPreferenceRepository, SqliteAssistantRepository, SqliteBoardStore, SqliteChannelRepository,
+    SqliteClientPreferenceRepository, SqliteConversationRepository, SqliteCronRepository,
+    SqliteFeedbackDiagnosticsRepository, SqliteKitRepository, SqliteMcpMarketRepository, SqliteMcpServerRepository,
+    SqliteOAuthTokenRepository, SqliteProjectStore, SqliteProviderRepository, SqliteRemoteAgentRepository,
+    SqliteServerPoolRepository, SqliteSettingsRepository, SqliteSidebarStore, SqliteSkillRepository,
+    SqliteTeamRepository, SqliteUserOrderStore, SqliteUserRepository, SqliteVoiceRepository,
     count_live_voice_calls_read_only,
 };
 

@@ -69,6 +69,9 @@ pub struct KitDecision {
 pub struct KitResolution {
     pub skills: BTreeMap<String, KitDecision>,
     pub mcps: BTreeMap<String, KitDecision>,
+    /// Servers (C36, `servers.id`). A server has no base state: it reaches a
+    /// conversation only through an `add` that is still standing.
+    pub servers: BTreeMap<String, KitDecision>,
     /// (template id, kit id) wanted by a kit attached with `add` and still
     /// contributing at the end (at least one level adds it).
     pub templates: Vec<(String, String)>,
@@ -86,6 +89,10 @@ impl KitResolution {
 
     pub fn mcp_removed(&self, id: &str) -> bool {
         self.mcps.get(id).is_some_and(|d| !d.included)
+    }
+
+    pub fn server_granted(&self, id: &str) -> bool {
+        self.servers.get(id).is_some_and(|d| d.included)
     }
 }
 
@@ -145,6 +152,7 @@ pub fn resolve(scope: &KitScope, layers: &KitLayers) -> KitResolution {
             match a.item_kind.as_str() {
                 "skill" => put("skill", &a.item_ref, None),
                 "mcp" => put("mcp", &a.item_ref, None),
+                "server" => put("server", &a.item_ref, None),
                 "kit" => {
                     let Some(kit) = layers.kits.get(&a.item_ref) else {
                         continue;
@@ -157,6 +165,7 @@ pub fn resolve(scope: &KitScope, layers: &KitLayers) -> KitResolution {
                         match m.kind.as_str() {
                             "skill" => put("skill", &m.item_ref, Some(&a.item_ref)),
                             "mcp" => put("mcp", &m.item_ref, Some(&a.item_ref)),
+                            "server" => put("server", &m.item_ref, Some(&a.item_ref)),
                             "template" if a.op == "add" => {
                                 templates.insert((m.item_ref.clone(), a.item_ref.clone()), ());
                             }
@@ -198,10 +207,10 @@ pub fn resolve(scope: &KitScope, layers: &KitLayers) -> KitResolution {
 }
 
 fn target_map<'a>(out: &'a mut KitResolution, kind: &str) -> &'a mut BTreeMap<String, KitDecision> {
-    if kind == "skill" {
-        &mut out.skills
-    } else {
-        &mut out.mcps
+    match kind {
+        "skill" => &mut out.skills,
+        "server" => &mut out.servers,
+        _ => &mut out.mcps,
     }
 }
 

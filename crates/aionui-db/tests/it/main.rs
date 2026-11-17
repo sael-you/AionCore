@@ -40,6 +40,7 @@ mod provider_repository;
 mod registry_binary_agents_migration;
 mod registry_npx_agents_migration;
 mod remote_agent_repository;
+mod server_pool_repository;
 mod settings_repository;
 mod skill_management_schema;
 mod team_capability_criteria_migration;
