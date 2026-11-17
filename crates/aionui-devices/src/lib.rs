@@ -3,6 +3,7 @@
 //! from `aionui-browser` (through [`ports::BrowserDevices`], no second store);
 //! phones, the Mac and add-ons live in migration 911.
 
+pub mod companion;
 pub mod error;
 pub mod ports;
 pub mod relay;

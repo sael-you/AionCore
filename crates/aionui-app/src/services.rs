@@ -535,6 +535,9 @@ impl AppServices {
             }),
         );
         devices_service.spawn_background();
+        devices_service.set_companion_downloads(Arc::new(aionui_devices::companion::CompanionDownloads::new(
+            data_dir.join("devices").join("companion"),
+        )));
 
         let session_message_queue = Arc::new(DeliveryQueue::new(Arc::new(SystemClock)));
         let session_message_notify = Arc::new(Notify::new());

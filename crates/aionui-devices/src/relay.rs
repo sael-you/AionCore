@@ -247,10 +247,13 @@ impl DevicesService {
         let code = self.relay().codes.issue((user_id.to_owned(), kind));
         let qr_payload = (kind == DevicePairingKind::Companion)
             .then(|| format!("aionui-pair:v1?host={}&code={}", public_host.unwrap_or_default(), code));
+        let download_url = (kind == DevicePairingKind::Companion)
+            .then(|| self.companion_downloads().and_then(|d| d.link(public_host)))
+            .flatten();
         Ok(DevicePairingCode {
             code,
             expires_at,
-            download_url: None,
+            download_url,
             qr_payload,
         })
     }

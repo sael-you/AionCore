@@ -67,6 +67,7 @@ pub struct DevicesService {
     /// Relay clients connected right now.
     online_pairings: DashMap<String, ()>,
     relay: RelayState,
+    companion: std::sync::RwLock<Option<Arc<crate::companion::CompanionDownloads>>>,
 }
 
 impl std::fmt::Debug for DevicesService {
@@ -98,7 +99,17 @@ impl DevicesService {
             jobs: Arc::new(DashMap::new()),
             online_pairings: DashMap::new(),
             relay: RelayState::default(),
+            companion: std::sync::RwLock::new(None),
         })
+    }
+
+    /// Where the signed companion APK lives (`<data dir>/devices/companion`).
+    pub fn set_companion_downloads(&self, downloads: Arc<crate::companion::CompanionDownloads>) {
+        *self.companion.write().expect("companion lock") = Some(downloads);
+    }
+
+    pub fn companion_downloads(&self) -> Option<Arc<crate::companion::CompanionDownloads>> {
+        self.companion.read().expect("companion lock").clone()
     }
 
     pub(crate) fn relay(&self) -> &RelayState {

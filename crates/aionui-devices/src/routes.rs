@@ -41,7 +41,50 @@ pub fn devices_routes(state: DevicesRouterState) -> Router {
 pub fn devices_relay_routes(state: DevicesRouterState) -> Router {
     Router::new()
         .route("/api/devices/relay", get(relay_ws))
+        // The phone's browser has no session: the short-lived link token is
+        // the credential (K8).
+        .route("/api/devices/companion.apk", get(companion_apk))
         .with_state(state)
+}
+
+#[derive(serde::Deserialize)]
+struct ApkQuery {
+    #[serde(default)]
+    t: String,
+}
+
+async fn companion_apk(State(s): State<DevicesRouterState>, Query(q): Query<ApkQuery>) -> Response {
+    let Some(downloads) = s.service.companion_downloads() else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    if !downloads.check(&q.t) {
+        return api_error(DevicesError::coded(
+            DeviceErrorCode::DevicePairingInvalid,
+            "the download link expired; make a new pairing code",
+        ))
+        .into_response();
+    }
+    match downloads.read_apk().await {
+        Ok(bytes) => (
+            [
+                (
+                    axum::http::header::CONTENT_TYPE,
+                    "application/vnd.android.package-archive",
+                ),
+                (
+                    axum::http::header::CONTENT_DISPOSITION,
+                    "attachment; filename=\"aionui-companion.apk\"",
+                ),
+                (axum::http::header::CACHE_CONTROL, "no-store"),
+            ],
+            bytes,
+        )
+            .into_response(),
+        Err(error) => {
+            tracing::warn!(error = %error, "companion APK not readable");
+            StatusCode::NOT_FOUND.into_response()
+        }
+    }
 }
 
 async fn relay_ws(
