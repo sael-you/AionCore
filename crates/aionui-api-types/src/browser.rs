@@ -268,6 +268,10 @@ pub struct BrowserDevice {
     /// The extension's "agents may open new tabs" switch.
     pub new_tabs: bool,
     pub shared_tabs: u16,
+    /// What the extension reported about itself (absent for old extensions).
+    /// Display only ("new version available").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub extension_version: Option<String>,
 }
 
 /// A paused agent action on a high-value origin, waiting for the owner.
@@ -356,6 +360,10 @@ pub enum ExtensionInbound {
         device_name: String,
         #[serde(default)]
         browser: String,
+        /// The extension's own version (TASK-133), e.g. "0.1.2". Shown in
+        /// Settings; never used for a security decision.
+        #[serde(default)]
+        extension_version: Option<String>,
     },
     Hello {
         token: String,
@@ -363,11 +371,19 @@ pub enum ExtensionInbound {
         browser: String,
         #[serde(default)]
         version: Option<u32>,
+        /// The extension's own version (TASK-133), e.g. "0.1.2". Shown in
+        /// Settings; never used for a security decision.
+        #[serde(default)]
+        extension_version: Option<String>,
     },
     /// The FULL list of shared tabs, on every change.
     State {
         new_tabs: bool,
         tabs: Vec<ExtensionTab>,
+        /// The extension's own version (TASK-133), e.g. "0.1.2". Shown in
+        /// Settings; never used for a security decision.
+        #[serde(default)]
+        extension_version: Option<String>,
     },
     Result {
         id: u64,
@@ -701,7 +717,12 @@ mod tests {
             "type": "state", "new_tabs": true, "tabs": [{"tab_id": 123, "url": "https://a.test/", "title": "A"}]
         }))
         .unwrap();
-        assert!(matches!(state, ExtensionInbound::State { new_tabs: true, ref tabs } if tabs[0].tab_id == 123));
+        assert!(matches!(state, ExtensionInbound::State { new_tabs: true, ref tabs, .. } if tabs[0].tab_id == 123));
+        let versioned: ExtensionInbound = serde_json::from_value(
+            json!({"type": "hello", "token": "t", "browser": "Chrome", "version": 1, "extension_version": "0.1.2"}),
+        )
+        .unwrap();
+        assert!(matches!(versioned, ExtensionInbound::Hello { extension_version: Some(ref v), .. } if v == "0.1.2"));
         let res: ExtensionInbound = serde_json::from_value(
             json!({"type": "result", "id": 7, "error": {"message": "off", "code": "new_tabs_disabled"}}),
         )

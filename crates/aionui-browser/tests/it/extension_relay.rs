@@ -359,6 +359,10 @@ async fn pair_then_hello_and_revoke_ends_everything() {
     let devices = h.svc.device_hub().devices("u1");
     assert_eq!(devices.len(), 1);
     assert!(devices[0].online);
+    assert!(
+        devices[0].extension_version.is_none(),
+        "an extension that sends none has none"
+    );
     let listed = serde_json::to_string(&devices).unwrap();
     assert!(!listed.contains(&token), "the token never appears in the device list");
     assert!(!h.events.named("browser.devicesChanged").is_empty());
@@ -368,13 +372,18 @@ async fn pair_then_hello_and_revoke_ends_everything() {
     let mut ws = open_extension(h.port, Some(&extension_origin())).await.unwrap();
     send(
         &mut ws,
-        json!({"type": "hello", "token": token, "browser": "Chrome 157", "version": 1}),
+        json!({"type": "hello", "token": token, "browser": "Chrome 157", "version": 1, "extension_version": "0.1.2"}),
     )
     .await;
     let welcome = next_json(&mut ws).await.unwrap();
     assert_eq!(welcome["type"], "welcome");
     assert_eq!(welcome["device_id"], ext.device_id.as_str());
     assert!(welcome.get("token").is_none(), "the token is only sent once, on pair");
+    // TASK-133: the extension's own version is stored and listed (display only).
+    assert_eq!(
+        h.svc.device_hub().devices("u1")[0].extension_version.as_deref(),
+        Some("0.1.2")
+    );
     ext.expect(|v| v["type"] == "closed").await;
     send(&mut ws, json!({"type": "ping"})).await;
     assert_eq!(next_json(&mut ws).await.unwrap(), json!({"type": "pong"}));

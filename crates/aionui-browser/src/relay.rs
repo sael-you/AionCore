@@ -418,6 +418,7 @@ impl DeviceHub {
                     browser: d.browser,
                     created_at: d.created_at,
                     last_seen_at: d.last_seen_at,
+                    extension_version: d.extension_version,
                 }
             })
             .collect()
@@ -592,23 +593,38 @@ impl DeviceHub {
         &self,
         text: &str,
     ) -> Result<(Authenticated, Option<String>), (BrowserErrorCode, Option<String>)> {
-        match serde_json::from_str::<ExtensionInbound>(text) {
+        let (result, version) = match serde_json::from_str::<ExtensionInbound>(text) {
             Ok(ExtensionInbound::Pair {
                 code,
                 device_name,
                 browser,
-            }) => self
-                .store
-                .pair(&code, &device_name, &browser)
-                .map(|(auth, token)| (auth, Some(token)))
-                .map_err(|e| (e.code().unwrap_or(BrowserErrorCode::BrowserPairingInvalid), None)),
-            Ok(ExtensionInbound::Hello { token, .. }) => self
-                .store
-                .authenticate(&token)
-                .map(|auth| (auth, None))
-                .map_err(|e| (e.code().unwrap_or(BrowserErrorCode::BrowserDeviceRevoked), None)),
-            _ => Err((BrowserErrorCode::BrowserBadMessage, None)),
+                extension_version,
+            }) => (
+                self.store
+                    .pair(&code, &device_name, &browser)
+                    .map(|(auth, token)| (auth, Some(token)))
+                    .map_err(|e| (e.code().unwrap_or(BrowserErrorCode::BrowserPairingInvalid), None)),
+                extension_version,
+            ),
+            Ok(ExtensionInbound::Hello {
+                token,
+                extension_version,
+                ..
+            }) => (
+                self.store
+                    .authenticate(&token)
+                    .map(|auth| (auth, None))
+                    .map_err(|e| (e.code().unwrap_or(BrowserErrorCode::BrowserDeviceRevoked), None)),
+                extension_version,
+            ),
+            _ => return Err((BrowserErrorCode::BrowserBadMessage, None)),
+        };
+        // Only for an authenticated device, and only for display.
+        if let (Ok((auth, _)), Some(version)) = (&result, version) {
+            self.store
+                .set_extension_version(&auth.user_id, &auth.device.device_id, &version);
         }
+        result
     }
 
     fn on_frame(self: &Arc<Self>, conn: &Arc<DeviceConn>, frame: ExtensionInbound) {
@@ -617,7 +633,17 @@ impl DeviceHub {
                 let _ = conn.send(ExtensionOutbound::Pong);
             }
             ExtensionInbound::Result { id, result, error } => conn.resolve(id, result, error),
-            ExtensionInbound::State { new_tabs, tabs } => self.on_state(conn, new_tabs, tabs),
+            ExtensionInbound::State {
+                new_tabs,
+                tabs,
+                extension_version,
+            } => {
+                if let Some(version) = extension_version {
+                    self.store
+                        .set_extension_version(&conn.user_id, &conn.device_id, &version);
+                }
+                self.on_state(conn, new_tabs, tabs)
+            }
             ExtensionInbound::Event { tab_id, method, params } => self.on_event(conn, tab_id, method, params),
             ExtensionInbound::Detached { tab_id, .. } => {
                 {
