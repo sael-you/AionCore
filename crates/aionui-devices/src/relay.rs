@@ -61,6 +61,8 @@ pub struct RelayClient {
     pub pairing_id: String,
     pub user_id: String,
     pub kind: RelayClientKind,
+    /// Verbs the client said it serves (`pair` / `hello` capabilities).
+    capabilities: HashSet<String>,
     out: mpsc::UnboundedSender<RelayOutbound>,
     next_id: AtomicU64,
     pending: std::sync::Mutex<Pending>,
@@ -98,6 +100,10 @@ impl RelayClient {
                 message: "the device went offline".into(),
             }));
         }
+    }
+
+    pub fn serves(&self, verb: &str) -> bool {
+        self.capabilities.contains(verb)
     }
 
     pub fn is_present(&self, device: &str) -> bool {
@@ -320,6 +326,10 @@ impl DevicesService {
             pairing_id: pairing.id.clone(),
             user_id: pairing.user_id.clone(),
             kind,
+            capabilities: serde_json::from_str::<Vec<String>>(&pairing.capabilities)
+                .unwrap_or_default()
+                .into_iter()
+                .collect(),
             out: out_tx,
             next_id: AtomicU64::new(1),
             pending: std::sync::Mutex::new(HashMap::new()),

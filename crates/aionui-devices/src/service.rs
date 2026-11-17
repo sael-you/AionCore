@@ -709,6 +709,14 @@ impl DevicesService {
         if !client.is_present(&row.source_id) {
             return Err(offline());
         }
+        // Never route a verb the client did not announce (the companion app
+        // serves no logcat / install_apk / cdp_*).
+        if !client.serves(verb) {
+            return Err(DevicesError::coded(
+                DeviceErrorCode::DeviceVerbRefused,
+                format!("{verb} is not available on this device"),
+            ));
+        }
         client
             .call(&row.source_id, verb, args)
             .await
