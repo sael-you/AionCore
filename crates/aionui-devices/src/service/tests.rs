@@ -122,8 +122,10 @@ async fn list_aggregates_browsers_phones_and_library_without_a_second_store() {
     let routes = p.routes.as_ref().unwrap();
     assert_eq!(routes[0].route, DeviceRouteKind::MacRelay);
     assert!(routes[1].experimental && routes[1].route == DeviceRouteKind::WifiDirect);
+    // Connected but not in the client's inventory: still offline (relay
+    // presence is covered end to end in tests/it/relay.rs).
     svc.set_pairing_online("pair_u1", true);
-    assert_eq!(svc.get("u1", &phone).await.unwrap().status, DeviceStatus::Off);
+    assert_eq!(svc.get("u1", &phone).await.unwrap().status, DeviceStatus::Offline);
     // Another user sees none of u1's phones or browsers.
     let other = svc.list("u2").await.unwrap();
     assert!(other.iter().all(|d| d.id != phone && d.id != "my_browser:dev_1"));
@@ -161,7 +163,7 @@ async fn phone_switch_needs_a_valid_timeout_and_expires_with_an_event() {
         )
         .await
         .unwrap();
-    assert!(on.enabled && on.status == DeviceStatus::On);
+    assert!(on.enabled);
     let until = on.enabled_until.expect("timeout persisted");
     assert!(until > now_ms() + 14 * 60_000 && until <= now_ms() + 15 * 60_000);
     assert!(svc.is_enabled("u1", &phone).await.unwrap());

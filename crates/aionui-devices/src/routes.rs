@@ -5,14 +5,17 @@
 
 use aionui_api_types::ApiResponse;
 use aionui_api_types::devices::{
-    Device, DeviceAuditPage, DeviceAuditQuery, DeviceErrorCode, DeviceJob, DeviceJobStarted, DeviceRouteKind,
-    DeviceRouteUpdate, DeviceUpdate,
+    Device, DeviceAuditPage, DeviceAuditQuery, DeviceErrorCode, DeviceJob, DeviceJobStarted, DevicePairingCode,
+    DevicePairingCodeRequest, DeviceRouteKind, DeviceRouteUpdate, DeviceUpdate, RELAY_MAX_FRAME_BYTES,
 };
 use aionui_auth::CurrentUser;
 use aionui_common::ApiError;
 use axum::extract::rejection::JsonRejection;
+use axum::extract::ws::WebSocketUpgrade;
 use axum::extract::{Extension, Path, Query, State};
+use axum::http::HeaderMap;
 use axum::http::StatusCode;
+use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post, put};
 use axum::{Json, Router};
 
@@ -23,12 +26,74 @@ pub fn devices_routes(state: DevicesRouterState) -> Router {
     Router::new()
         .route("/api/devices", get(list))
         .route("/api/devices/jobs/{job_id}", get(job))
+        .route("/api/devices/pairing-codes", post(pairing_code))
         .route("/api/devices/{id}", put(update))
         .route("/api/devices/{id}/routes/{route}", put(update_route))
         .route("/api/devices/{id}/install", post(install))
         .route("/api/devices/{id}/remove", post(remove))
         .route("/api/devices/{id}/audit", get(audit))
         .with_state(state)
+}
+
+/// `WS /api/devices/relay` (C38 W2): mounted WITHOUT the session layer and
+/// outside the browser WebSocket-origin rule. Non-browser clients only: any
+/// `Origin` header is refused; the first frame authenticates.
+pub fn devices_relay_routes(state: DevicesRouterState) -> Router {
+    Router::new()
+        .route("/api/devices/relay", get(relay_ws))
+        .with_state(state)
+}
+
+async fn relay_ws(
+    State(s): State<DevicesRouterState>,
+    headers: HeaderMap,
+    ws: Result<WebSocketUpgrade, axum::extract::ws::rejection::WebSocketUpgradeRejection>,
+) -> Response {
+    if headers.contains_key(axum::http::header::ORIGIN) {
+        return api_error(DevicesError::coded(
+            DeviceErrorCode::DeviceOriginRefused,
+            "the device relay does not accept browsers",
+        ))
+        .into_response();
+    }
+    let ws = match ws {
+        Ok(ws) => ws,
+        Err(rejection) => return rejection.into_response(),
+    };
+    let service = s.service.clone();
+    ws.max_message_size(RELAY_MAX_FRAME_BYTES)
+        .max_frame_size(RELAY_MAX_FRAME_BYTES)
+        .on_upgrade(move |socket| service.run_relay(socket))
+}
+
+/// The host the owner reaches AionUi under: the web host forwards it as
+/// `X-Forwarded-Host` (it rewrites `Host`).
+fn public_host(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get("x-forwarded-host")
+        .or_else(|| headers.get(axum::http::header::HOST))
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next())
+        .map(|h| h.trim().to_owned())
+        .filter(|h| {
+            !h.is_empty()
+                && h.bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b':' | b'[' | b']'))
+        })
+}
+
+async fn pairing_code(
+    State(s): State<DevicesRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    headers: HeaderMap,
+    body: Result<Json<DevicePairingCodeRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<DevicePairingCode>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(
+        s.service
+            .pairing_code(&user.id, req.kind, public_host(&headers).as_deref())
+            .map_err(api_error)?,
+    )))
 }
 
 /// The wire string of a code (`DEVICE_NOT_FOUND`, …).

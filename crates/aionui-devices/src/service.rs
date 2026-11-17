@@ -28,6 +28,7 @@ use tracing::{info, warn};
 
 use crate::error::DevicesError;
 use crate::ports::{BrowserDevices, DevicesEventSink, NoopDevicesEventSink};
+use crate::relay::{RelayState, relay_error_code};
 
 pub const SERVER_BROWSER_ID: &str = "server_browser:chrome";
 pub const CAMOUFOX_ID: &str = "server_browser:camoufox";
@@ -63,8 +64,9 @@ pub struct DevicesService {
     sink: std::sync::RwLock<Arc<dyn DevicesEventSink>>,
     installers: std::sync::RwLock<Vec<Arc<dyn DeviceInstaller>>>,
     jobs: Arc<DashMap<String, JobEntry>>,
-    /// Relay clients connected right now (K2 sets this).
+    /// Relay clients connected right now.
     online_pairings: DashMap<String, ()>,
+    relay: RelayState,
 }
 
 impl std::fmt::Debug for DevicesService {
@@ -95,7 +97,12 @@ impl DevicesService {
             installers: std::sync::RwLock::new(Vec::new()),
             jobs: Arc::new(DashMap::new()),
             online_pairings: DashMap::new(),
+            relay: RelayState::default(),
         })
+    }
+
+    pub(crate) fn relay(&self) -> &RelayState {
+        &self.relay
     }
 
     pub fn repo(&self) -> &Arc<dyn IDeviceRepository> {
@@ -157,6 +164,9 @@ impl DevicesService {
             Ok(rows) => {
                 for row in &rows {
                     info!(user_id = %row.user_id, device_id = %row.id, "device switch timed out; agents may no longer use it");
+                    if let Some(p) = &row.pairing_id {
+                        self.relay_stop(p, &row.source_id);
+                    }
                     self.changed(&row.user_id, Some(&row.id));
                 }
                 rows.len()
@@ -341,7 +351,21 @@ impl DevicesService {
             _ => DeviceKind::Phone,
         };
         let meta = meta_of(row);
-        let online = row.pairing_id.is_none() || self.pairing_online(row.pairing_id.as_deref());
+        let presence_key = if kind == DeviceKind::Addon {
+            format!("addon:{}", row.source_id)
+        } else {
+            row.source_id.clone()
+        };
+        let online = match row.pairing_id.as_deref() {
+            None => true,
+            Some(p) => self.pairing_online(Some(p)) && self.relay_present(p, &presence_key),
+        };
+        // The Mac itself is "later" until the helper reports it (M3).
+        let available = if kind == DeviceKind::Mac && meta.get("mac_reported").and_then(|v| v.as_bool()) != Some(true) {
+            DeviceAvailability::Later
+        } else {
+            DeviceAvailability::Now
+        };
         let status = if let Some(status) = self.job_status(&row.id) {
             status
         } else if !online {
@@ -382,7 +406,7 @@ impl DevicesService {
             source_id: Some(row.source_id.clone()),
             name: row.name.clone(),
             status,
-            available: DeviceAvailability::Now,
+            available,
             enabled: row.enabled,
             enabled_until: row.enabled_until,
             installed: true,
@@ -443,6 +467,12 @@ impl DevicesService {
                     .await?
                 {
                     return Err(DevicesError::not_found());
+                }
+                if !update.enabled
+                    && let Some(row) = self.repo.get_device(user_id, id).await?
+                    && let Some(p) = &row.pairing_id
+                {
+                    self.relay_stop(p, &row.source_id);
                 }
             }
         }
@@ -535,6 +565,9 @@ impl DevicesService {
     /// `POST /api/devices/{id}/install|remove`.
     pub async fn start_job(self: &Arc<Self>, user_id: &str, id: &str, remove: bool) -> Result<String, DevicesError> {
         let device = self.get(user_id, id).await?;
+        if remove && let Some(job_id) = self.remove_relay_device(user_id, id).await? {
+            return Ok(job_id);
+        }
         if device.available == DeviceAvailability::Later {
             return Err(DevicesError::coded(
                 DeviceErrorCode::DeviceVerbRefused,
@@ -605,6 +638,81 @@ impl DevicesService {
             svc.changed(&user, Some(&device_id));
         });
         Ok(job_id)
+    }
+
+    /// Remove of a device a relay client reaches: the client's own card
+    /// (`mac` / companion `self`) revokes its pairing (token dead, socket
+    /// closed, its devices off); a phone behind a Mac helper is forgotten
+    /// (it comes back with the next inventory). Done at once; the job is
+    /// recorded as `done` for the UI's polling.
+    async fn remove_relay_device(&self, user_id: &str, id: &str) -> Result<Option<String>, DevicesError> {
+        let Some(row) = self.repo.get_device(user_id, id).await? else {
+            return Ok(None);
+        };
+        let Some(pairing_id) = row.pairing_id.clone() else {
+            return Ok(None);
+        };
+        let own_card = matches!(
+            row.source_id.as_str(),
+            aionui_api_types::devices::RELAY_DEVICE_MAC | aionui_api_types::devices::RELAY_DEVICE_SELF
+        );
+        if own_card {
+            self.repo.revoke_pairing(user_id, &pairing_id, now_ms()).await?;
+            self.relay_disconnect(&pairing_id);
+            self.set_pairing_online(&pairing_id, false);
+            info!(user_id, pairing_id = %pairing_id, "device relay pairing revoked");
+        } else {
+            self.relay_stop(&pairing_id, &row.source_id);
+            self.repo.delete_device(user_id, id).await?;
+        }
+        let job_id = format!("job_{}", uuid::Uuid::new_v4().simple());
+        self.jobs.insert(
+            job_id.clone(),
+            JobEntry {
+                user_id: user_id.to_owned(),
+                removing: true,
+                job: DeviceJob {
+                    job_id: job_id.clone(),
+                    device_id: id.to_owned(),
+                    state: DeviceJobState::Done,
+                    progress: 100,
+                    error: None,
+                },
+            },
+        );
+        self.changed(user_id, None);
+        Ok(Some(job_id))
+    }
+
+    /// Run one verb on a relay device (no switch / approval checks: the agent
+    /// surface does those, K3).
+    pub async fn relay_call(
+        &self,
+        user_id: &str,
+        device_id: &str,
+        verb: &str,
+        args: serde_json::Value,
+    ) -> Result<serde_json::Value, DevicesError> {
+        let row = self
+            .repo
+            .get_device(user_id, device_id)
+            .await?
+            .ok_or_else(DevicesError::not_found)?;
+        let Some(pairing_id) = row.pairing_id.as_deref() else {
+            return Err(DevicesError::coded(
+                DeviceErrorCode::DeviceVerbRefused,
+                "this device has no relay",
+            ));
+        };
+        let offline = || DevicesError::coded(DeviceErrorCode::DeviceOffline, "the device is offline");
+        let client = self.relay_client(user_id, pairing_id).ok_or_else(offline)?;
+        if !client.is_present(&row.source_id) {
+            return Err(offline());
+        }
+        client
+            .call(&row.source_id, verb, args)
+            .await
+            .map_err(|e| DevicesError::coded(relay_error_code(&e), e.message))
     }
 
     fn set_job(&self, job_id: &str, state: DeviceJobState, progress: u8, error: Option<String>) {

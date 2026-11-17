@@ -5,12 +5,13 @@
 
 pub mod error;
 pub mod ports;
+pub mod relay;
 pub mod routes;
 pub mod service;
 pub mod state;
 
 pub use error::DevicesError;
 pub use ports::{BrowserDevices, BrowserFacts, DevicesEventSink, MyBrowserFacts, NoopDevicesEventSink};
-pub use routes::devices_routes;
+pub use routes::{devices_relay_routes, devices_routes};
 pub use service::DevicesService;
 pub use state::DevicesRouterState;
