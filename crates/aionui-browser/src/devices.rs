@@ -313,7 +313,8 @@ mod tests {
             "1.2.3.4.5",
             "1.2.3-",
             "1.2.3 <script>",
-            "1.2.3\n",
+            "1.2.3\\n",
+            "1.2\n.3",
             "9999999.1",
             "1.2.3-aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
         ] {
