@@ -100,6 +100,29 @@ async fn companion_apk(
     }
 }
 
+async fn relay_ws(
+    State(s): State<DevicesRouterState>,
+    headers: HeaderMap,
+    ws: Result<WebSocketUpgrade, axum::extract::ws::rejection::WebSocketUpgradeRejection>,
+) -> Response {
+    if headers.contains_key(axum::http::header::ORIGIN) {
+        return api_error(DevicesError::coded(
+            DeviceErrorCode::DeviceOriginRefused,
+            "the device relay does not accept browsers",
+        ))
+        .into_response();
+    }
+    let ws = match ws {
+        Ok(ws) => ws,
+        Err(rejection) => return rejection.into_response(),
+    };
+    let service = s.service.clone();
+    let source = client_source(&headers);
+    ws.max_message_size(RELAY_MAX_FRAME_BYTES)
+        .max_frame_size(RELAY_MAX_FRAME_BYTES)
+        .on_upgrade(move |socket| service.run_relay(socket, source))
+}
+
 /// The client address for per-source limits: the gateway and the web host
 /// forward it as `X-Forwarded-For` (AionCore itself only listens on loopback).
 pub fn client_source(headers: &HeaderMap) -> String {

@@ -160,6 +160,14 @@ pub struct AgentCall {
     pub args: Value,
 }
 
+/// Who did what, for the audit row of one call.
+struct Who<'a> {
+    user_id: &'a str,
+    device_id: &'a str,
+    verb: &'a str,
+    conversation_id: Option<&'a str>,
+}
+
 fn refused(message: &str) -> DevicesError {
     DevicesError::coded(DeviceErrorCode::DeviceVerbRefused, message)
 }
@@ -182,6 +190,28 @@ impl DevicesService {
         true
     }
 
+    async fn audit_call(
+        &self,
+        who: &Who<'_>,
+        outcome: DeviceAuditOutcome,
+        package: Option<&str>,
+        detail: Option<&str>,
+    ) {
+        self.record(
+            who.user_id,
+            who.device_id,
+            AuditNote {
+                verb: who.verb,
+                package,
+                origin: None,
+                outcome,
+                conversation_id: who.conversation_id,
+                detail,
+            },
+        )
+        .await;
+    }
+
     /// Run one agent call through every gate; see the module docs.
     pub async fn agent_call(&self, call: AgentCall) -> Result<Value, DevicesError> {
         let AgentCall {
@@ -201,47 +231,28 @@ impl DevicesService {
             "mac" => MAC_VERBS.contains(&verb.as_str()),
             _ => false,
         };
-        let note = |outcome, package: Option<&str>, detail: Option<&str>| {
-            // Borrowed pieces are copied into the audit row inside `record`.
-            (outcome, package.map(str::to_owned), detail.map(str::to_owned))
+        let who = Who {
+            user_id: &user_id,
+            device_id: &device_id,
+            verb: &verb,
+            conversation_id: conversation_id.as_deref(),
         };
-        let audit =
-            |svc: &DevicesService, (outcome, package, detail): (DeviceAuditOutcome, Option<String>, Option<String>)| {
-                let (user_id, device_id, verb) = (user_id.clone(), device_id.clone(), verb.clone());
-                let conv = conversation_id.clone();
-                async move {
-                    svc.record(
-                        &user_id,
-                        &device_id,
-                        AuditNote {
-                            verb: &verb,
-                            package: package.as_deref(),
-                            origin: None,
-                            outcome,
-                            conversation_id: conv.as_deref(),
-                            detail: detail.as_deref(),
-                        },
-                    )
-                    .await;
-                }
-            };
         if !allowed {
-            audit(
-                self,
-                note(DeviceAuditOutcome::Refused, None, Some("DEVICE_VERB_REFUSED")),
-            )
-            .await;
+            self.audit_call(&who, DeviceAuditOutcome::Refused, None, Some("DEVICE_VERB_REFUSED"))
+                .await;
             return Err(refused("this action is not available to agents"));
         }
         if !self.is_enabled(&user_id, &device_id).await? {
-            audit(self, note(DeviceAuditOutcome::Refused, None, Some("DEVICE_DISABLED"))).await;
+            self.audit_call(&who, DeviceAuditOutcome::Refused, None, Some("DEVICE_DISABLED"))
+                .await;
             return Err(DevicesError::coded(
                 DeviceErrorCode::DeviceDisabled,
                 "the owner has not enabled this device for agents",
             ));
         }
         if !self.rate_ok(&device_id) {
-            audit(self, note(DeviceAuditOutcome::Refused, None, Some("DEVICE_BUSY"))).await;
+            self.audit_call(&who, DeviceAuditOutcome::Refused, None, Some("DEVICE_BUSY"))
+                .await;
             return Err(DevicesError::coded(
                 DeviceErrorCode::DeviceBusy,
                 "too many actions on this device, slow down",
@@ -271,9 +282,11 @@ impl DevicesService {
             }
         }
         if reading && package.as_deref().is_some_and(is_secret_store) {
-            audit(
-                self,
-                note(DeviceAuditOutcome::Refused, package.as_deref(), Some("secret_store")),
+            self.audit_call(
+                &who,
+                DeviceAuditOutcome::Refused,
+                package.as_deref(),
+                Some("secret_store"),
             )
             .await;
             return Err(refused("a password manager is in front: its screen is never read"));
@@ -312,15 +325,17 @@ impl DevicesService {
                 } else {
                     DeviceAuditOutcome::Denied
                 };
-                audit(self, note(outcome, package.as_deref(), None)).await;
+                self.audit_call(&who, outcome, package.as_deref(), None).await;
                 return Err(error);
             }
             approved = true;
             // The switch may have gone off while the owner was asked.
             if !self.is_enabled(&user_id, &device_id).await? {
-                audit(
-                    self,
-                    note(DeviceAuditOutcome::Refused, package.as_deref(), Some("DEVICE_DISABLED")),
+                self.audit_call(
+                    &who,
+                    DeviceAuditOutcome::Refused,
+                    package.as_deref(),
+                    Some("DEVICE_DISABLED"),
                 )
                 .await;
                 return Err(DevicesError::coded(
@@ -336,7 +351,7 @@ impl DevicesService {
                 } else {
                     DeviceAuditOutcome::Ok
                 };
-                audit(self, note(outcome, package.as_deref(), None)).await;
+                self.audit_call(&who, outcome, package.as_deref(), None).await;
                 Ok(result)
             }
             Err(error) => {
@@ -344,11 +359,8 @@ impl DevicesService {
                     .code()
                     .and_then(|c| serde_json::to_value(c).ok())
                     .and_then(|v| v.as_str().map(str::to_owned));
-                audit(
-                    self,
-                    note(DeviceAuditOutcome::Error, package.as_deref(), code.as_deref()),
-                )
-                .await;
+                self.audit_call(&who, DeviceAuditOutcome::Error, package.as_deref(), code.as_deref())
+                    .await;
                 Err(error)
             }
         }
