@@ -73,6 +73,21 @@ End your reply with the risky steps you did not take and why, for example:
   and accessibility reads) waits for the owner's OK in AionUi: `BROWSER_APPROVAL_DENIED`
   or `BROWSER_APPROVAL_TIMEOUT` means stop and ask, never retry. Offline device:
   `BROWSER_UNAVAILABLE`; tell the owner instead of switching to a server profile.
+- Camoufox profiles: an entry of `$AIONUI_CDP_INSTANCES` with `"engine": "camoufox"` is a Firefox-based
+  browser driven over Playwright, not CDP. It has `"protocol": "playwright"` and an `"endpoint"`; attach
+  with the pinned client in `$AIONUI_CAMOUFOX_CLI` (the plain `playwright-cli` is refused: wrong
+  Playwright version), and `--endpoint`, never `--cdp`:
+  ```bash
+  endpoint=$(printf '%s' "$AIONUI_CDP_INSTANCES" | jq -r --arg n "Stealth" \
+    '.[] | select((.name | ascii_downcase) == ($n | ascii_downcase)) | .endpoint')
+  "$AIONUI_CAMOUFOX_CLI" -s=aionui-stealth attach --endpoint "$endpoint"
+  "$AIONUI_CAMOUFOX_CLI" -s=aionui-stealth snapshot
+  ```
+  Use the browser's existing context and tabs: new contexts, cookie and storage reads or writes,
+  tracing/HAR, requests made outside the page and uploads of server files are refused
+  (`AionUi refused: …`), same as on Chrome — do not work around it. `close` only detaches. Camoufox
+  hides that it is automated; that does not make bulk or automated use of a site acceptable, the rules
+  above apply unchanged.
 - Tabs: open what you need, up to the owner's limit per profile (`BROWSER_TAB_LIMIT`), and close
   the tabs you opened when you are done. Do not close the owner's own tabs.
 - `BROWSER_AGENTS_DISABLED`: the owner turned agent use off. Tell the owner; do not try another way.
