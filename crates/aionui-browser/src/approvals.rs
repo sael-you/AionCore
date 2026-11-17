@@ -1,7 +1,12 @@
 //! High-value-origin pause (C34 owner decision (a), TASK-125): in the owner's
-//! own browser, `Input.*`, `Runtime.evaluate` and `Runtime.callFunctionOn` on
-//! a high-value origin (Google account / mail / pay, PayPal, Apple ID,
-//! Microsoft account, `*.bank`, …) wait for the owner's OK in AionUi.
+//! own browser, on a tab where ANY frame is on a high-value origin (Google
+//! account / mail / pay, PayPal, Apple ID, Microsoft account, `*.bank`, …),
+//! every CDP method waits for the owner's OK in AionUi except a read-only
+//! allowlist ([`is_read_only_method`]: screenshots, DOM / accessibility / CSS
+//! getters, `*.enable` / `*.disable`). Default deny (train-9 review): script
+//! can run through many methods (`Runtime.compileScript` + `runScript`,
+//! `Page.addScriptToEvaluateOnNewDocument`, `Debugger.evaluateOnCallFrame`,
+//! `DOM.setOuterHTML` …), so a list of gated methods could never be complete.
 //!
 //! - A pending approval waits [`APPROVAL_TIMEOUT`] (120 s); no answer refuses
 //!   the command with `BROWSER_APPROVAL_TIMEOUT`.
@@ -67,9 +72,47 @@ impl BrowserEventSink for NoopEventSink {
     fn emit(&self, _: &str, _: &str, _: Value) {}
 }
 
-/// Methods that need an OK on a high-value origin.
-pub fn is_gated_method(method: &str) -> bool {
-    method.starts_with("Input.") || method == "Runtime.evaluate" || method == "Runtime.callFunctionOn"
+/// Read-only methods that pass on a high-value origin without asking. They
+/// observe the page (or switch event domains on and off) and cannot run
+/// script, change the DOM, type, click or navigate.
+const READ_ONLY_METHODS: &[&str] = &[
+    "Page.captureScreenshot",
+    "Page.getNavigationHistory",
+    "Page.getLayoutMetrics",
+    "Page.getFrameTree",
+    "Page.setLifecycleEventsEnabled",
+    "DOM.getDocument",
+    "DOM.getFlattenedDocument",
+    "DOM.querySelector",
+    "DOM.querySelectorAll",
+    "DOM.describeNode",
+    "DOM.getBoxModel",
+    "DOM.getContentQuads",
+    "DOM.getOuterHTML",
+    "DOM.getAttributes",
+    "DOM.requestChildNodes",
+    "DOM.getNodeForLocation",
+    "Accessibility.getFullAXTree",
+    "Accessibility.getPartialAXTree",
+    "Accessibility.queryAXTree",
+    "Accessibility.getRootAXNode",
+    "Accessibility.getChildAXNodes",
+    "Accessibility.getAXNodeAndAncestors",
+    "CSS.getComputedStyleForNode",
+    "CSS.getMatchedStylesForNode",
+    "CSS.getInlineStylesForNode",
+    "Runtime.getProperties",
+    "Runtime.releaseObject",
+    "Runtime.releaseObjectGroup",
+    "Runtime.runIfWaitingForDebugger",
+    "Target.getTargets",
+    "Target.getTargetInfo",
+];
+
+/// Whether `method` may run on a high-value origin without the owner's OK.
+/// Everything else (including methods unknown today) waits for it.
+pub fn is_read_only_method(method: &str) -> bool {
+    method.ends_with(".enable") || method.ends_with(".disable") || READ_ONLY_METHODS.contains(&method)
 }
 
 /// The origin (`scheme://host[:port]`) of a URL, lower-case.
@@ -189,7 +232,7 @@ impl ApprovalBroker {
 
     /// Whether `ask` needs the owner, without asking.
     pub fn needs_owner(ask_method: &str, url: &str) -> bool {
-        is_gated_method(ask_method) && is_high_value_url(url)
+        !is_read_only_method(ask_method) && is_high_value_url(url)
     }
 
     /// Wait for the owner when needed. `on_pause` runs once when the command
@@ -378,9 +421,8 @@ mod tests {
         assert!(is_high_value_url("https://online.example.bank/"));
         assert!(!is_high_value_url("https://google.com/"));
         assert!(!is_high_value_url("https://notpaypal.com/"));
-        assert!(is_gated_method("Input.dispatchKeyEvent"));
-        assert!(is_gated_method("Runtime.callFunctionOn"));
-        assert!(!is_gated_method("Page.navigate"));
+        assert!(!is_read_only_method("Input.dispatchKeyEvent"));
+        assert!(is_read_only_method("Page.captureScreenshot"));
         assert_eq!(
             summarize("Runtime.evaluate", &serde_json::json!({"expression": "x".repeat(300)})).len(),
             "Runtime.evaluate: ".len() + 120
@@ -481,5 +523,31 @@ mod tests {
         let events = rec.0.lock().unwrap().clone();
         assert_eq!(events.last().unwrap().1, EVENT_APPROVAL_RESOLVED);
         assert_eq!(events.last().unwrap().2["approved"], false);
+    }
+
+    /// Train-9 review fixture: the listed script / DOM-changing methods pause,
+    /// the read-only allowlist passes (default deny on high-value origins).
+    #[test]
+    fn high_value_gate_fixture() {
+        let fixture: Value =
+            serde_json::from_str(include_str!("../tests/fixtures/high_value_gate.cases.json")).unwrap();
+        for m in fixture["gated"].as_array().unwrap() {
+            let m = m.as_str().unwrap();
+            assert!(
+                ApprovalBroker::needs_owner(m, "https://mail.google.com/"),
+                "{m} must wait for the owner"
+            );
+            assert!(
+                !ApprovalBroker::needs_owner(m, "https://example.com/"),
+                "{m}: ordinary origins never ask"
+            );
+        }
+        for m in fixture["allowed"].as_array().unwrap() {
+            let m = m.as_str().unwrap();
+            assert!(
+                !ApprovalBroker::needs_owner(m, "https://mail.google.com/"),
+                "{m} is read-only"
+            );
+        }
     }
 }

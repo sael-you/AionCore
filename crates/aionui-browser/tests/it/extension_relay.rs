@@ -158,6 +158,14 @@ impl FakeExtension {
                                 Some(match method {
                                     // Tab 13 cannot be debugged (e.g. a chrome:// page).
                                     "Fetch.enable" if tab == 13 => json!({"type": "result", "id": frame["id"], "error": {"message": "Cannot access a chrome:// URL"}}),
+                                    // Tab 7: an ordinary page with a Google sign-in iframe.
+                                    "Page.getFrameTree" if tab == 7 => json!({"type": "result", "id": frame["id"], "result": {"frameTree": {
+                                        "frame": {"id": "MAIN7", "url": "https://shop.example.com/checkout"},
+                                        "childFrames": [{"frame": {"id": "F1", "parentId": "MAIN7", "url": "https://accounts.google.com/gsi/iframe"}}]
+                                    }}}),
+                                    "Page.getFrameTree" => json!({"type": "result", "id": frame["id"], "result": {"frameTree": {
+                                        "frame": {"id": format!("MAIN{tab}"), "url": "about:blank"}
+                                    }}}),
                                     "Target.getTargetInfo" => json!({"type": "result", "id": frame["id"], "result": {"targetInfo": {"targetId": format!("MAIN{tab}")}}}),
                                     "Runtime.evaluate" => json!({"type": "result", "id": frame["id"], "result": {"result": {"type": "number", "value": 2}}}),
                                     _ => json!({"type": "result", "id": frame["id"], "result": {}}),
@@ -553,15 +561,40 @@ async fn high_value_origins_pause_for_the_owner() {
         .await;
     let sid = attach["result"]["sessionId"].as_str().unwrap().to_owned();
 
-    // Navigation is not gated.
-    let nav = agent
-        .call(
-            "Page.navigate",
-            json!({"url": "https://mail.google.com/mail/u/0/#inbox"}),
-            Some(&sid),
-        )
-        .await;
-    assert!(nav.get("error").is_none());
+    // Read-only methods pass without asking (train-9 review allowlist).
+    let shot = agent.call("Page.captureScreenshot", json!({}), Some(&sid)).await;
+    assert!(shot.get("error").is_none(), "{shot}");
+    ext.expect(is_command("Page.captureScreenshot")).await;
+    assert!(h.svc.device_hub().approvals().list("u1").is_empty());
+
+    // Default deny: script through compileScript waits, and a deny refuses it.
+    let id = agent.next_id;
+    agent.next_id += 1;
+    send(
+        &mut agent.ws,
+        json!({"id": id, "method": "Runtime.compileScript", "params": {"expression": "1", "sourceURL": "", "persistScript": true}, "sessionId": sid}),
+    )
+    .await;
+    let approval = loop {
+        if let Some(a) = h.svc.device_hub().approvals().list("u1").into_iter().next() {
+            break a;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    assert_eq!(approval.method, "Runtime.compileScript");
+    h.svc
+        .device_hub()
+        .approvals()
+        .decide("u1", &approval.approval_id, false)
+        .unwrap();
+    let refused = loop {
+        let v = next_json(&mut agent.ws).await.unwrap();
+        if v["id"] == id {
+            break v;
+        }
+    };
+    assert!(error_message(&refused).starts_with("BROWSER_APPROVAL_DENIED"));
+    ext.none_within(150, is_command("Runtime.compileScript")).await;
 
     // Typing waits for the owner: deny refuses that command only.
     let id = agent.next_id;
@@ -622,8 +655,9 @@ async fn high_value_origins_pause_for_the_owner() {
 
     let requested = h.events.named("browser.approvalRequested");
     let resolved = h.events.named("browser.approvalResolved");
-    assert_eq!(requested.len(), 2);
-    assert_eq!(resolved.len(), 2);
+    // compileScript (denied), insertText (denied), evaluate (approved).
+    assert_eq!(requested.len(), 3);
+    assert_eq!(resolved.len(), 3);
     assert!(requested.iter().chain(resolved.iter()).all(|(u, _)| u == "u1"));
     let outcomes: Vec<_> = h
         .svc
@@ -797,4 +831,99 @@ async fn the_switches_and_the_token_gate_the_device_bridge() {
         .await
         .unwrap();
     assert_eq!(offline.status(), 503);
+}
+
+/// Train-9 review: a high-value IFRAME makes the whole tab high-value.
+#[tokio::test]
+async fn a_high_value_iframe_makes_the_tab_high_value() {
+    let h = harness().await;
+    let (mut ext, _token) = FakeExtension::pair(&h).await;
+    ext.state(
+        false,
+        &[(7, "https://shop.example.com/checkout"), (8, "https://example.com/")],
+    );
+    for _ in 0..2 {
+        ext.expect(is_command("Page.getFrameTree")).await;
+    }
+    wait_tabs(&h.svc, 2).await;
+    let mut agent = Agent::connect(&h.svc).await;
+    let s7 = agent
+        .call(
+            "Target.attachToTarget",
+            json!({"targetId": "tab-7", "flatten": true}),
+            None,
+        )
+        .await["result"]["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let s8 = agent
+        .call(
+            "Target.attachToTarget",
+            json!({"targetId": "tab-8", "flatten": true}),
+            None,
+        )
+        .await["result"]["sessionId"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    // The ordinary tab runs script without asking.
+    let ok = agent
+        .call("Runtime.evaluate", json!({"expression": "1+1"}), Some(&s8))
+        .await;
+    assert_eq!(ok["result"]["result"]["value"], 2);
+
+    // The tab with the Google iframe waits for the owner.
+    let id = agent.next_id;
+    agent.next_id += 1;
+    send(
+        &mut agent.ws,
+        json!({"id": id, "method": "Runtime.evaluate", "params": {"expression": "document.title"}, "sessionId": s7}),
+    )
+    .await;
+    let approval = loop {
+        if let Some(a) = h.svc.device_hub().approvals().list("u1").into_iter().next() {
+            break a;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    assert_eq!(approval.origin, "https://accounts.google.com");
+    assert_eq!(approval.tab_id, 7);
+    h.svc
+        .device_hub()
+        .approvals()
+        .decide("u1", &approval.approval_id, false)
+        .unwrap();
+    let refused = loop {
+        let v = next_json(&mut agent.ws).await.unwrap();
+        if v["id"] == id {
+            break v;
+        }
+    };
+    assert!(error_message(&refused).starts_with("BROWSER_APPROVAL_DENIED"));
+
+    // A high-value document paused in a subframe of tab 8 marks it too.
+    ext.send(json!({"type": "event", "tab_id": 8, "method": "Fetch.requestPaused", "params": {
+        "requestId": "d1", "request": {"url": "https://www.paypal.com/checkoutnow"}, "resourceType": "Document", "frameId": "PP"
+    }}));
+    assert_eq!(
+        ext.expect(is_command("Fetch.continueRequest")).await["params"]["requestId"],
+        "d1"
+    );
+    let id = agent.next_id;
+    agent.next_id += 1;
+    send(
+        &mut agent.ws,
+        json!({"id": id, "method": "Input.dispatchMouseEvent", "params": {"type": "mousePressed", "x": 1, "y": 1}, "sessionId": s8}),
+    )
+    .await;
+    let approval = loop {
+        if let Some(a) = h.svc.device_hub().approvals().list("u1").into_iter().next() {
+            break a;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    assert_eq!(approval.origin, "https://www.paypal.com");
+    assert_eq!(approval.tab_id, 8);
 }

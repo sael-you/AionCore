@@ -7,9 +7,13 @@
 //! - Pairing returns a fresh device token ONCE. Only its SHA-256 is stored, in
 //!   a root-only JSON file per user next to the settings (`0600`, atomic
 //!   write). Revoking deletes the row; the token then never matches again.
-//! - Failed pairing attempts are counted globally (the gateway hides client
-//!   addresses): more than [`MAX_FAILED_PAIRS`] per minute refuses every pair
-//!   attempt for the rest of that minute.
+//! - Failed pairing attempts are counted per pending code (train-9 review: a
+//!   global lock let anyone block pairing for every user). A wrong code could
+//!   be a guess at ANY pending code, so each failure counts against every
+//!   code pending at that moment; a code that has seen [`MAX_FAILED_PAIRS`]
+//!   failures is burned and its owner makes a new one. A code made later
+//!   starts at zero. With 32^8 codes, 10 guesses per code stay negligible; the
+//!   gateway also limits extension upgrades to 10 per minute per IP.
 //!
 //! Tokens and codes are never logged.
 
@@ -28,7 +32,6 @@ use crate::settings::write_private_json;
 
 pub const PAIRING_TTL: Duration = Duration::from_secs(5 * 60);
 pub const MAX_FAILED_PAIRS: u32 = 10;
-const FAILED_WINDOW: Duration = Duration::from_secs(60);
 const CODE_ALPHABET: &[u8; 32] = b"ABCDEFGHJKLMNPQRSTUVWXYZ23456789";
 const MAX_NAME: usize = 64;
 
@@ -61,12 +64,8 @@ pub struct Authenticated {
 struct PendingCode {
     code: String,
     expires: Instant,
-}
-
-#[derive(Default)]
-struct Failures {
-    window_start: Option<Instant>,
-    count: u32,
+    /// Wrong pair attempts seen while this code was pending.
+    failures: u32,
 }
 
 pub struct DeviceStore {
@@ -74,7 +73,6 @@ pub struct DeviceStore {
     /// user id → that user's devices (loaded from `dir` at construction).
     users: std::sync::Mutex<HashMap<String, Vec<StoredDevice>>>,
     codes: std::sync::Mutex<HashMap<String, PendingCode>>,
-    failures: std::sync::Mutex<Failures>,
 }
 
 impl std::fmt::Debug for DeviceStore {
@@ -179,7 +177,6 @@ impl DeviceStore {
             dir,
             users: std::sync::Mutex::new(users),
             codes: std::sync::Mutex::new(HashMap::new()),
-            failures: std::sync::Mutex::new(Failures::default()),
         }
     }
 
@@ -204,6 +201,7 @@ impl DeviceStore {
             PendingCode {
                 code: code.clone(),
                 expires: Instant::now() + PAIRING_TTL,
+                failures: 0,
             },
         );
         Ok(BrowserPairingCode {
@@ -212,27 +210,9 @@ impl DeviceStore {
         })
     }
 
-    /// Whether pairing is locked after too many failures (and count one more
-    /// attempt when `fail` is set).
-    fn too_many_failures(&self, fail: bool) -> bool {
-        let mut f = self.failures.lock().expect("failures lock");
-        let now = Instant::now();
-        if f.window_start.is_none_or(|s| now.duration_since(s) > FAILED_WINDOW) {
-            f.window_start = Some(now);
-            f.count = 0;
-        }
-        if fail {
-            f.count = f.count.saturating_add(1);
-        }
-        f.count >= MAX_FAILED_PAIRS
-    }
-
     /// Consume `code` and create a device. Returns the device and its token
     /// (the only time the token exists in clear outside the extension).
     pub fn pair(&self, code: &str, name: &str, browser: &str) -> Result<(Authenticated, String), BrowserError> {
-        if self.too_many_failures(false) {
-            return Err(pairing_invalid());
-        }
         let wanted = normalize_code(code);
         let user_id = {
             let mut codes = self.codes.lock().expect("codes lock");
@@ -242,13 +222,26 @@ impl DeviceStore {
                 .iter()
                 .find(|(_, p)| tokens_match(&p.code, &wanted))
                 .map(|(u, _)| u.clone());
-            if let Some(u) = &hit {
-                codes.remove(u);
+            match &hit {
+                Some(u) => {
+                    codes.remove(u);
+                }
+                None => {
+                    for p in codes.values_mut() {
+                        p.failures = p.failures.saturating_add(1);
+                    }
+                    codes.retain(|user_id, p| {
+                        let burned = p.failures >= MAX_FAILED_PAIRS;
+                        if burned {
+                            tracing::warn!(user_id, "browser pairing code burned after too many wrong attempts");
+                        }
+                        !burned
+                    });
+                }
             }
             hit
         };
         let Some(user_id) = user_id else {
-            self.too_many_failures(true);
             return Err(pairing_invalid());
         };
         let token = new_device_token();
@@ -411,18 +404,22 @@ mod tests {
     }
 
     #[test]
-    fn too_many_wrong_codes_lock_pairing() {
+    fn wrong_codes_burn_only_the_codes_pending_then_and_never_block_new_ones() {
         let t = tempfile::tempdir().unwrap();
         let store = DeviceStore::open(t.path());
-        for _ in 0..MAX_FAILED_PAIRS {
+        let u1 = store.pairing_code("u1").unwrap();
+        for _ in 0..MAX_FAILED_PAIRS - 1 {
             assert!(store.pair("WRONGXXX", "Mac", "Chrome").is_err());
         }
-        let code = store.pairing_code("u1").unwrap();
-        let err = store.pair(&code.code, "Mac", "Chrome").unwrap_err();
-        assert_eq!(
-            err.code(),
-            Some(BrowserErrorCode::BrowserPairingInvalid),
-            "locked for the minute"
-        );
+        // u2's code is made now: it has seen no failures yet.
+        let u2 = store.pairing_code("u2").unwrap();
+        assert!(store.pair("WRONGXXX", "Mac", "Chrome").is_err());
+        // u1's code saw 10 wrong attempts: burned, even the right value fails.
+        let err = store.pair(&u1.code, "Mac", "Chrome").unwrap_err();
+        assert_eq!(err.code(), Some(BrowserErrorCode::BrowserPairingInvalid));
+        // u2 is not blocked (1 failure), and u1 just makes a new code.
+        assert_eq!(store.pair(&u2.code, "Mac", "Chrome").unwrap().0.user_id, "u2");
+        let again = store.pairing_code("u1").unwrap();
+        assert_eq!(store.pair(&again.code, "Mac", "Chrome").unwrap().0.user_id, "u1");
     }
 }

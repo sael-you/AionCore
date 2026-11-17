@@ -33,7 +33,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio::sync::{broadcast, mpsc};
 
-use crate::approvals::{ApprovalAsk, GateOutcome, is_gated_method, summarize};
+use crate::approvals::{ApprovalAsk, GateOutcome, is_read_only_method, summarize};
 use crate::bridge::{TOKEN_HEADER, Verdict, judge};
 use crate::filter::tokens_match;
 use crate::guard::GuardDecision;
@@ -751,13 +751,16 @@ impl Link {
                 tokio::time::sleep(Duration::from_millis(20)).await;
             }
         }
-        if is_gated_method(method) {
+        // Default deny on a high-value tab (its URL or ANY frame's): only the
+        // read-only allowlist passes without the owner's OK.
+        let high_value = self.conn.high_value_url(tab_id, &tab.url);
+        if let Some(hv_url) = high_value.filter(|_| !is_read_only_method(method)) {
             let ask = ApprovalAsk {
                 user_id: self.ctx.user_id.to_string(),
                 device_id: device.to_string(),
                 device_name: self.conn.instance_name(),
                 tab_id,
-                url: tab.url.clone(),
+                url: hv_url,
                 method: method.to_owned(),
                 summary: summarize(method, &params),
             };

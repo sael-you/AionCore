@@ -31,7 +31,7 @@ use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio::sync::{broadcast, mpsc, oneshot, watch};
 
-use crate::approvals::{ApprovalBroker, EVENT_DEVICES_CHANGED, high_value_fetch_patterns};
+use crate::approvals::{ApprovalBroker, EVENT_DEVICES_CHANGED, high_value_fetch_patterns, is_high_value_url};
 use crate::devices::{Authenticated, DeviceStore, now_ms};
 use crate::error::BrowserError;
 use crate::guard::{GuardDecision, NavigationGuard};
@@ -82,6 +82,10 @@ pub struct DeviceConn {
     next_id: AtomicU64,
     pending: std::sync::Mutex<Pending>,
     track: std::sync::Mutex<TabTrack>,
+    /// tab → frame id → URL (from `Page.getFrameTree`, frame events and
+    /// paused document requests): a high-value IFRAME makes the tab
+    /// high-value too (train-9 review).
+    frames: std::sync::Mutex<HashMap<i64, HashMap<String, String>>>,
     shared: watch::Sender<SharedTabs>,
     events: broadcast::Sender<RelayEvent>,
     alive: watch::Sender<bool>,
@@ -113,6 +117,7 @@ impl DeviceConn {
             next_id: AtomicU64::new(1),
             pending: std::sync::Mutex::new(HashMap::new()),
             track: std::sync::Mutex::new(TabTrack::default()),
+            frames: std::sync::Mutex::new(HashMap::new()),
             shared: watch::channel(SharedTabs::default()).0,
             events: broadcast::channel(1024).0,
             alive: watch::channel(true).0,
@@ -297,6 +302,38 @@ impl DeviceConn {
             tab.url = url.to_owned();
         }
         self.publish(guard);
+    }
+
+    fn set_frame(&self, tab_id: i64, frame_id: &str, url: &str) {
+        self.frames
+            .lock()
+            .expect("frames lock")
+            .entry(tab_id)
+            .or_default()
+            .insert(frame_id.to_owned(), url.to_owned());
+    }
+
+    fn remove_frame(&self, tab_id: i64, frame_id: &str) {
+        if let Some(f) = self.frames.lock().expect("frames lock").get_mut(&tab_id) {
+            f.remove(frame_id);
+        }
+    }
+
+    fn replace_frames(&self, tab_id: i64, frames: HashMap<String, String>) {
+        self.frames.lock().expect("frames lock").insert(tab_id, frames);
+    }
+
+    /// The URL that makes this tab high-value: the tab's own, else any
+    /// frame's. `None` = an ordinary tab.
+    pub fn high_value_url(&self, tab_id: i64, tab_url: &str) -> Option<String> {
+        if is_high_value_url(tab_url) {
+            return Some(tab_url.to_owned());
+        }
+        self.frames
+            .lock()
+            .expect("frames lock")
+            .get(&tab_id)
+            .and_then(|f| f.values().find(|u| is_high_value_url(u)).cloned())
     }
 
     fn main_frame(&self, tab_id: i64) -> Option<String> {
@@ -599,9 +636,22 @@ impl DeviceHub {
     }
 
     fn on_state(self: &Arc<Self>, conn: &Arc<DeviceConn>, new_tabs: bool, tabs: Vec<ExtensionTab>) {
-        let to_guard: Vec<i64> = {
+        let (to_guard, moved): (Vec<i64>, Vec<i64>) = {
             let mut track = conn.track.lock().expect("track lock");
             let ids: HashSet<i64> = tabs.iter().map(|t| t.tab_id).collect();
+            // Guarded tabs whose URL changed: re-read their frames.
+            let moved: Vec<i64> = tabs
+                .iter()
+                .filter(|t| track.guarded.contains_key(&t.tab_id))
+                .filter(|t| {
+                    track
+                        .reported
+                        .iter()
+                        .find(|o| o.tab_id == t.tab_id)
+                        .is_none_or(|o| o.url != t.url)
+                })
+                .map(|t| t.tab_id)
+                .collect();
             track.guarded.retain(|id, _| ids.contains(id));
             track.guarding.retain(|id| ids.contains(id));
             track.reported = tabs;
@@ -612,10 +662,22 @@ impl DeviceHub {
                 .filter(|id| !track.guarded.contains_key(id) && !track.guarding.contains(id))
                 .collect();
             track.guarding.extend(fresh.iter().copied());
-            fresh
+            (fresh, moved)
         };
+        conn.frames.lock().expect("frames lock").retain(|id, _| {
+            conn.track
+                .lock()
+                .expect("track lock")
+                .reported
+                .iter()
+                .any(|t| t.tab_id == *id)
+        });
         conn.publish(&self.guard);
         self.devices_changed(&conn.user_id);
+        for tab_id in moved {
+            let conn = conn.clone();
+            tokio::spawn(async move { refresh_frames(&conn, tab_id).await });
+        }
         for tab_id in to_guard {
             let hub = self.clone();
             let conn = conn.clone();
@@ -644,6 +706,8 @@ impl DeviceHub {
             .await
             .ok()
             .and_then(|v| v["targetInfo"]["targetId"].as_str().map(str::to_owned));
+        // Know the frames (a high-value iframe) before agents see the tab.
+        refresh_frames(conn, tab_id).await;
         {
             let mut track = conn.track.lock().expect("track lock");
             if !track.guarding.remove(&tab_id) {
@@ -662,9 +726,23 @@ impl DeviceHub {
                 return;
             }
             m if m.starts_with("Fetch.") => return,
-            "Page.frameNavigated" if params["frame"].get("parentId").is_none() => {
-                if let Some(url) = params["frame"]["url"].as_str() {
-                    conn.set_url(tab_id, url, &self.guard);
+            "Page.frameNavigated" => {
+                let frame = &params["frame"];
+                if let (Some(id), Some(url)) = (frame["id"].as_str(), frame["url"].as_str()) {
+                    if frame.get("parentId").is_none() {
+                        // A new document: its old child frames are gone.
+                        let mut fresh = HashMap::new();
+                        fresh.insert(id.to_owned(), url.to_owned());
+                        conn.replace_frames(tab_id, fresh);
+                        conn.set_url(tab_id, url, &self.guard);
+                    } else {
+                        conn.set_frame(tab_id, id, url);
+                    }
+                }
+            }
+            "Page.frameDetached" => {
+                if let Some(id) = params["frameId"].as_str() {
+                    conn.remove_frame(tab_id, id);
                 }
             }
             _ => {}
@@ -700,7 +778,37 @@ impl DeviceHub {
                 .is_some_and(|f| params["frameId"].as_str() == Some(f.as_str()));
         if is_main {
             conn.set_url(tab_id, url, &self.guard);
+        } else if params["resourceType"].as_str() == Some("Document")
+            && let Some(frame_id) = params["frameId"].as_str()
+            && is_high_value_url(url)
+        {
+            // A high-value document loading in a (sub)frame: the tab is
+            // high-value from now on (conservative; the next frame-tree
+            // read corrects it).
+            conn.set_frame(tab_id, frame_id, url);
         }
         conn.notify(tab_id, "Fetch.continueRequest", json!({"requestId": request_id}));
+    }
+}
+
+/// Re-read a tab's frames (`Page.getFrameTree`); keeps the old ones when the
+/// call fails.
+async fn refresh_frames(conn: &Arc<DeviceConn>, tab_id: i64) {
+    let Ok(tree) = conn.call(tab_id, "Page.getFrameTree", json!({})).await else {
+        return;
+    };
+    let mut frames = HashMap::new();
+    collect_frames(&tree["frameTree"], &mut frames);
+    conn.replace_frames(tab_id, frames);
+}
+
+fn collect_frames(node: &Value, out: &mut HashMap<String, String>) {
+    if let (Some(id), Some(url)) = (node["frame"]["id"].as_str(), node["frame"]["url"].as_str()) {
+        out.insert(id.to_owned(), url.to_owned());
+    }
+    if let Some(children) = node["childFrames"].as_array() {
+        for c in children {
+            collect_frames(c, out);
+        }
     }
 }
