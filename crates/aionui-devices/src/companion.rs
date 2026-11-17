@@ -46,7 +46,8 @@ impl CompanionDownloads {
     }
 
     pub fn version(&self) -> Option<String> {
-        read_trimmed(&self.dir.join(VERSION_FILE))
+        // Line 1 = versionName, line 2 = versionCode (the Android build script).
+        read_trimmed(&self.dir.join(VERSION_FILE)).and_then(|s| s.lines().next().map(|l| l.trim().to_owned()))
     }
 
     pub fn sha256(&self) -> Option<String> {
@@ -104,7 +105,7 @@ mod tests {
         assert!(downloads.link(Some("y.talkseeds.com")).is_none(), "no APK yet");
         std::fs::write(dir.join(APK_FILE), b"PK\x03\x04apk").unwrap();
         std::fs::write(dir.join(SHA_FILE), "abc123  aionui-companion.apk\n").unwrap();
-        std::fs::write(dir.join(VERSION_FILE), "0.1.0\n").unwrap();
+        std::fs::write(dir.join(VERSION_FILE), "0.1.0\n1\n").unwrap();
         assert!(downloads.link(None).is_none(), "no host, no link");
         let link = downloads.link(Some("y.talkseeds.com")).unwrap();
         let token = link.split("?t=").nth(1).unwrap();
