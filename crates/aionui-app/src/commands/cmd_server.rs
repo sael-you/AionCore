@@ -31,8 +31,13 @@ const DYNAMIC_BACKEND_BIND_MAX_ATTEMPTS: usize = 50;
 const WORKER_TASK_SHUTDOWN_TIMEOUT: Duration = Duration::from_secs(5);
 /// TASK-44: how long running turns may finish by themselves before the
 /// worker tasks are cleared (turns waiting for an approval are not waited
-/// for: nobody can answer during a shutdown).
+/// for: nobody can answer during a shutdown). 20 s = owner decision
+/// (2026-11-17). The whole shutdown must end before the web host's SIGKILL
+/// after SIGTERM (`ui/packages/web-host/src/backend-launcher.ts` stop(),
+/// 45 s): the stage bounds below add up to 39 s and the watchdog fires at 40 s.
 const SHUTDOWN_TURN_DRAIN_TIMEOUT: Duration = Duration::from_secs(20);
+/// The web host's hard kill after SIGTERM; the watchdog must fire before it.
+const WEB_HOST_STOP_KILL_AFTER: Duration = Duration::from_secs(45);
 const SHUTDOWN_TURN_DRAIN_POLL: Duration = Duration::from_millis(250);
 
 // Bounded graceful-shutdown tail (AIONUI-16). The data-dir instance flock is
@@ -53,9 +58,9 @@ const SHUTDOWN_TURN_DRAIN_POLL: Duration = Duration::from_millis(250);
 // the runtime; see `bootstrap::shutdown_watchdog`.)
 const SHUTDOWN_KEEP_AWAKE_TIMEOUT: Duration = Duration::from_secs(5);
 const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
-const SHUTDOWN_IDLE_SCANNER_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
-const SHUTDOWN_DB_CLOSE_TIMEOUT: Duration = Duration::from_secs(5);
-const SHUTDOWN_WATCHDOG_TIMEOUT: Duration = Duration::from_secs(50);
+const SHUTDOWN_IDLE_SCANNER_JOIN_TIMEOUT: Duration = Duration::from_secs(2);
+const SHUTDOWN_DB_CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
+const SHUTDOWN_WATCHDOG_TIMEOUT: Duration = Duration::from_secs(40);
 
 // The watchdog must outlast the sum of every bounded stage, otherwise it can
 // force-exit a shutdown that is still making progress within its per-stage
@@ -70,6 +75,7 @@ const _: () = assert!(
             + SHUTDOWN_IDLE_SCANNER_JOIN_TIMEOUT.as_secs()
             + SHUTDOWN_DB_CLOSE_TIMEOUT.as_secs()
 );
+const _: () = assert!(SHUTDOWN_WATCHDOG_TIMEOUT.as_secs() < WEB_HOST_STOP_KILL_AFTER.as_secs());
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ShutdownReason {
