@@ -204,6 +204,31 @@ pub struct SendMessageRequest {
     pub hidden: bool,
 }
 
+/// Body for `POST /api/conversations/:id/notices` (TASK-137): a visible system
+/// notice in the conversation (e.g. the Token Pool switched accounts). Stored
+/// as a `tips` message and pushed live; it never starts a turn.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PostConversationNoticeRequest {
+    /// English text (≤ 500 chars); the frontend shows it when it has no
+    /// translation for `code`.
+    pub content: String,
+    /// `info` | `warning`.
+    pub tip_type: String,
+    /// Translation key under `conversation.agentTip.codes` (`[A-Z0-9_]`, ≤ 64).
+    #[serde(default)]
+    pub code: Option<String>,
+    /// Interpolation values for the translation (a JSON object, ≤ 2 KB).
+    #[serde(default)]
+    pub params: Option<serde_json::Value>,
+}
+
+/// Response for `POST /api/conversations/:id/notices`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PostConversationNoticeResponse {
+    pub msg_id: String,
+}
+
 /// Response for `POST /api/conversations/:id/messages`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SendMessageResponse {

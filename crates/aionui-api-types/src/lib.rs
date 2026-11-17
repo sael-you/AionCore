@@ -134,8 +134,9 @@ pub use conversation::{
     ConversationRuntimeSummary, CreateConversationRequest, EnsureConversationRuntimeResponse, ForkCapabilityView,
     ForkConversationRequest, ListConversationsQuery, ListMessagesQuery, McpRuntimeSnapshot, MessageListResponse,
     MessageResponse, MessageSearchItem, MessageSearchResponse, MessageStatusChangedPayload, OutcomeSeenResponse,
-    PromptCapabilityView, ReparentConversationRequest, SearchMessagesQuery, SendMessageRequest, SendMessageResponse,
-    SessionRef, UpdateConversationArtifactRequest, UpdateConversationRequest,
+    PostConversationNoticeRequest, PostConversationNoticeResponse, PromptCapabilityView, ReparentConversationRequest,
+    SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SessionRef, UpdateConversationArtifactRequest,
+    UpdateConversationRequest,
 };
 pub use conversation_tools::{
     CONVERSATION_TOOLS_SCHEMA_VERSION, ConversationCliEnvelope, ConversationCliMeta, ConversationCreateAssistant,

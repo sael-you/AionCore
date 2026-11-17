@@ -145,6 +145,7 @@ pub fn conversation_routes(state: ConversationRouterState) -> Router {
         .route("/api/conversations/{id}/artifacts/{artifactId}", patch(update_artifact))
         .route("/api/conversations/{id}/cancel", post(cancel))
         .route("/api/conversations/{id}/outcome-seen", post(outcome_seen))
+        .route("/api/conversations/{id}/notices", post(post_notice))
         .route(
             "/api/conversations/{id}/terminals/{terminalId}/kill",
             post(kill_terminal),
@@ -422,6 +423,29 @@ async fn cancel(
 }
 
 /// The owner opened the conversation: its last turn's outcome is seen (C21).
+/// A visible system notice in the conversation (TASK-137). Same router (auth,
+/// CSRF, Origin) as the other conversation writes.
+async fn post_notice(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    body: Result<Json<aionui_api_types::PostConversationNoticeRequest>, JsonRejection>,
+) -> Result<
+    (
+        StatusCode,
+        Json<ApiResponse<aionui_api_types::PostConversationNoticeResponse>>,
+    ),
+    ApiError,
+> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    let response = state
+        .service
+        .post_notice(&user.id, &id, req)
+        .await
+        .map_err(ApiError::from)?;
+    Ok((StatusCode::CREATED, Json(ApiResponse::ok(response))))
+}
+
 async fn outcome_seen(
     State(state): State<ConversationRouterState>,
     Extension(user): Extension<CurrentUser>,
