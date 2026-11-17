@@ -50,6 +50,22 @@ fn internal(what: &str) -> BrowserError {
     BrowserError::Internal(what.to_owned())
 }
 
+/// apt's rule for a multi-signed InRelease: trusted when a pinned key made a
+/// `VALIDSIG` and no signature is bad, expired or revoked. A signature by a
+/// key we do not hold (`NO_PUBKEY`/`ERRSIG`, e.g. a newer archive key Debian
+/// adds) does not count either way; gpgv then exits 2.
+pub fn release_trusted(status: &str, exit_code: Option<i32>) -> bool {
+    let bad = status.lines().any(|l| {
+        ["BADSIG", "EXPSIG", "EXPKEYSIG", "REVKEYSIG"]
+            .iter()
+            .any(|k| l.starts_with(&format!("[GNUPG:] {k} ")))
+    });
+    let pinned = valid_signers(status)
+        .iter()
+        .any(|f| f == ARCHIVE_FPR || f == RELEASE_FPR);
+    matches!(exit_code, Some(0 | 2)) && pinned && !bad
+}
+
 /// `VALIDSIG` lines of `gpgv --status-fd`: the primary-key fingerprint is
 /// the last field.
 pub fn valid_signers(status: &str) -> Vec<String> {
@@ -79,7 +95,12 @@ async fn pinned_keyring(staging: &Path) -> Result<std::path::PathBuf, BrowserErr
         std::fs::DirBuilder::new().mode(0o700).create(&home)?;
     }
     for keyring in KEYRINGS {
-        if !gpg(&home, &["--import", keyring]).await?.status.success() {
+        // gpg exits 2 after a successful import when it cannot reach an
+        // agent (`--no-autostart`, or a staging path too long for its
+        // socket); the keys are in. The pinned-fingerprint check below is
+        // what decides.
+        let out = gpg(&home, &["--import", keyring]).await?;
+        if !matches!(out.status.code(), Some(0 | 2)) {
             return Err(internal("Debian keyring import failed"));
         }
     }
@@ -146,8 +167,7 @@ pub async fn install_vnc(http: &reqwest::Client, staging: &Path, dest: &Path) ->
         .arg(&release_path)
         .arg(&signed);
     let out = cmd.output().await?;
-    let signers = valid_signers(&String::from_utf8_lossy(&out.stdout));
-    if !out.status.success() || !signers.iter().any(|f| f == ARCHIVE_FPR || f == RELEASE_FPR) {
+    if !release_trusted(&String::from_utf8_lossy(&out.stdout), out.status.code()) || !release_path.exists() {
         return Err(internal("Debian InRelease signature did not verify"));
     }
     let release = std::fs::read_to_string(&release_path)?;
@@ -214,5 +234,28 @@ mod tests {
             vec![ARCHIVE_FPR.to_owned(), RELEASE_FPR.to_owned()]
         );
         assert!(valid_signers("[GNUPG:] BADSIG x").is_empty());
+    }
+
+    // Real gpgv output on Debian's bookworm InRelease, 2026-11-17: two pinned
+    // signatures and one by a key the image does not carry.
+    const STATUS: &str = "[GNUPG:] VALIDSIG 4CB50190207B4758A3F73A796ED0E7B82643E131 2026-07-11 1783765031 0 4 0 1 8 01 B8B80B5B623EAB6AD8775C45B7C5D7D6350947F8\n\
+        [GNUPG:] ERRSIG 78DBA3BC47EF2265 1 8 01 1783765032 9 B8E5F13176D2A7A75220028078DBA3BC47EF2265\n\
+        [GNUPG:] NO_PUBKEY 78DBA3BC47EF2265\n\
+        [GNUPG:] VALIDSIG 4D64FEC119C2029067D6E791F8D2585B8783D481 2026-07-11 1783765141 0 4 0 22 8 01 4D64FEC119C2029067D6E791F8D2585B8783D481\n";
+
+    #[test]
+    fn a_pinned_good_signature_is_enough_but_a_bad_one_is_fatal() {
+        assert!(release_trusted(STATUS, Some(2)), "unknown extra signer tolerated");
+        assert!(release_trusted(STATUS, Some(0)));
+        assert!(!release_trusted(STATUS, Some(1)), "gpgv error");
+        assert!(!release_trusted(STATUS, None));
+        let bad = format!("{STATUS}[GNUPG:] BADSIG 6ED0E7B82643E131 Debian\n");
+        assert!(!release_trusted(&bad, Some(2)), "a bad signature is fatal");
+        let expired = format!("{STATUS}[GNUPG:] EXPKEYSIG F8D2585B8783D481 Debian\n");
+        assert!(!release_trusted(&expired, Some(2)));
+        assert!(
+            !release_trusted("[GNUPG:] NO_PUBKEY 78DBA3BC47EF2265\n", Some(2)),
+            "no pinned signature"
+        );
     }
 }

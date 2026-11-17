@@ -6,7 +6,7 @@
 //!   sidecar sets Firefox's prefs so every connection, loopback included,
 //!   goes through it ([`crate::camoufox`], `sidecar.mjs`).
 //! - x11vnc: the panel's view, on a Unix socket inside the instance HOME
-//!   (`-rfbport 0`: no TCP port at all); only AionCore connects to it.
+//!   (`-rfbport 0 -rfbportv6 -1`: no TCP port at all); only AionCore connects.
 //! - Sidecar: `node sidecar.mjs` launches Camoufox with the persistent
 //!   profile and serves it on a loopback WebSocket with a random path; the
 //!   endpoint is read from its first stdout line and only ever used by the
@@ -202,7 +202,10 @@ impl JugglerInstance {
             .args([
                 "-rfbport",
                 "0",
-                "-localhost",
+                // `-rfbport 0` closes IPv4 only; without this x11vnc still
+                // listens on [::1]:5900 (checked live 2026-11-17).
+                "-rfbportv6",
+                "-1",
                 "-forever",
                 "-shared",
                 "-nopw",
