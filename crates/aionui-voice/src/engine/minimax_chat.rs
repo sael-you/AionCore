@@ -125,6 +125,9 @@ impl ChatStream {
             delta.error = Some(format!("minimax status {code}"));
         }
         if let Some(message) = chunk["error"]["message"].as_str() {
+            // Provider messages may echo the key: redact first, then cut, so a
+            // truncated key can never survive (it is logged by the cascade).
+            let message = aionui_common::redact_secrets(message, &[]);
             delta.error = Some(message.chars().take(120).collect());
         }
         if let Some(usage) = chunk.get("usage").filter(|u| u.is_object()) {
@@ -300,6 +303,17 @@ data: [DONE]
             (usage.input_tokens, usage.output_tokens, usage.cached_text),
             (120, 9, 100)
         );
+    }
+
+    #[test]
+    fn provider_error_messages_never_carry_the_key() {
+        let mut s = ChatStream::default();
+        let out = s.feed(
+            b"data: {\"error\":{\"message\":\"invalid api key sk-cp-FAKEKEY0123456789abcdefghijklmnopqrstuvwxyzFAKE provided\"}}\n",
+        );
+        let error = out[0].error.as_deref().unwrap();
+        assert!(!error.contains("FAKEKEY"), "{error}");
+        assert_eq!(error, "invalid api key [REDACTED] provided");
     }
 
     #[test]
