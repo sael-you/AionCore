@@ -41,6 +41,7 @@ pub fn browser_routes(state: BrowserRouterState) -> Router {
         .route("/api/browser/instances/{n}/stop", post(stop_instance))
         .route("/api/browser/engines/{engine}/install", post(install_engine))
         .route("/api/browser/ws", get(panel_ws))
+        .route("/api/browser/instances/{n}/vnc", get(vnc_ws))
         .route("/api/browser/devices/pairing-code", post(pairing_code))
         .route("/api/browser/devices", get(list_devices))
         .route("/api/browser/devices/{device_id}", delete(revoke_device))
@@ -249,6 +250,38 @@ async fn panel_ws(
     Ok(ws
         .max_message_size(1024 * 1024)
         .on_upgrade(move |socket| run_panel(socket, backend, user_id, instance)))
+}
+
+/// `WS /api/browser/instances/{n}/vnc` (Camoufox panel, see [`crate::vnc`]).
+async fn vnc_ws(
+    State(s): State<BrowserRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(n): Path<u8>,
+    headers: HeaderMap,
+    ws: WebSocketUpgrade,
+) -> Result<Response, ApiError> {
+    learn_host(&s, &headers);
+    if !s.service.instance_exists(&user.id, n) {
+        return Err(api_error(BrowserError::coded(
+            BrowserErrorCode::BrowserInstanceNotFound,
+            "no such instance",
+        )));
+    }
+    let service = s.service.clone();
+    let user_id = user.id.clone();
+    Ok(ws.max_message_size(1024 * 1024).on_upgrade(move |socket| async move {
+        if !service.is_juggler_instance(&user_id, n) {
+            crate::vnc::close_with(socket, crate::vnc::CLOSE_NOT_CAMOUFOX, "not a Camoufox instance").await;
+            return;
+        }
+        match service.start_juggler(&user_id, n).await {
+            Ok(inst) => crate::vnc::relay(socket, inst).await,
+            Err(e) => {
+                let (code, reason) = crate::vnc::start_failure(&e);
+                crate::vnc::close_with(socket, code, &reason).await;
+            }
+        }
+    }))
 }
 
 async fn pairing_code(

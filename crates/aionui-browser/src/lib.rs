@@ -4,7 +4,9 @@
 
 pub mod approvals;
 pub mod bridge;
+pub mod camoufox;
 pub mod cdp;
+pub mod debian;
 pub mod device_bridge;
 pub mod devices;
 pub mod engine;
@@ -14,14 +16,18 @@ pub mod guard;
 pub mod host;
 pub mod install;
 pub mod instance;
+pub mod juggler;
 pub mod layout;
 pub mod mux;
 pub mod panel;
 pub mod proxy;
+pub mod pwbridge;
+pub mod pwfilter;
 pub mod relay;
 pub mod routes;
 pub mod service;
 pub mod settings;
+pub mod vnc;
 
 pub use approvals::BrowserEventSink;
 pub use error::BrowserError;

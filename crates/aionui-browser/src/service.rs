@@ -2,7 +2,7 @@
 //! lifecycle (start on demand, idle stop, clear), and the agents' bridges.
 //! Sole place for business logic; `routes.rs` only translates.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
@@ -15,9 +15,10 @@ use dashmap::DashMap;
 use tokio::sync::Mutex;
 
 use crate::approvals::{ApprovalBroker, BrowserEventSink};
-use crate::bridge::{AgentBridge, BridgeBackend};
+use crate::bridge::{AgentBridge, BridgeBackend, ENV_CAMOUFOX_CLI};
 use crate::device_bridge::{DeviceBackend, DeviceListener, ENV_DEVICES, start_listener};
 use crate::devices::DeviceStore;
+use crate::engine::EngineProtocol;
 use crate::error::BrowserError;
 use crate::guard::NavigationGuard;
 use crate::host::{
@@ -25,6 +26,7 @@ use crate::host::{
 };
 use crate::install::{EngineInstaller, installed_version};
 use crate::instance::{ChromeInstance, LaunchSpec};
+use crate::juggler::{JugglerInstance, JugglerSpec};
 use crate::layout::BrowserLayout;
 use crate::panel::PanelBackend;
 use crate::relay::{DeviceHub, instance_name};
@@ -63,6 +65,8 @@ pub struct BrowserService {
     settings: SettingsStore,
     installer: EngineInstaller,
     instances: DashMap<Key, Arc<ChromeInstance>>,
+    /// Camoufox instances (TASK-136 K6): Playwright sidecar, VNC panel.
+    juggler: DashMap<Key, Arc<JugglerInstance>>,
     start_locks: DashMap<Key, Arc<Mutex<()>>>,
     max_tabs: DashMap<String, Arc<AtomicU8>>,
     bridges: DashMap<String, AgentBridge>,
@@ -96,6 +100,7 @@ impl BrowserService {
             settings,
             installer,
             instances: DashMap::new(),
+            juggler: DashMap::new(),
             start_locks: DashMap::new(),
             max_tabs: DashMap::new(),
             bridges: DashMap::new(),
@@ -204,6 +209,7 @@ impl BrowserService {
                     error: state.error,
                     verification: spec.verification(),
                     agents_only: spec.agents_only(),
+                    panel: spec.panel(),
                 }
             })
             .collect()
@@ -225,17 +231,19 @@ impl BrowserService {
             .iter()
             .map(|row| {
                 let inst = self.running(user_id, row.instance);
+                let jug = self.running_juggler(user_id, row.instance);
                 BrowserInstanceStatus {
                     instance: row.instance,
                     name: row.name.clone(),
                     color: row.color.clone(),
                     emoji: row.emoji.clone(),
-                    running: inst.is_some(),
+                    running: inst.is_some() || jug.is_some(),
                     tabs: inst.as_ref().map(|i| i.tab_count() as u16).unwrap_or(0),
-                    agent_active: inst.as_ref().is_some_and(|i| i.agent_active()),
+                    agent_active: inst.as_ref().is_some_and(|i| i.agent_active())
+                        || jug.as_ref().is_some_and(|j| j.agent_active()),
                     hide_automation_active: inst.as_ref().is_some_and(|i| i.hide_automation),
                     engine: row.engine,
-                    engine_active: inst.as_ref().map(|i| i.engine),
+                    engine_active: inst.as_ref().map(|i| i.engine).or(jug.as_ref().map(|j| j.engine)),
                 }
             })
             .collect();
@@ -282,7 +290,8 @@ impl BrowserService {
             let release = self.installer.latest(engine).await?;
             let version = self.installer.install(engine, &release).await?;
             let current = installed_version(&self.cfg.layout, engine);
-            let in_use = self.instances.iter().any(|e| e.value().engine == engine);
+            let in_use = self.instances.iter().any(|e| e.value().engine == engine)
+                || self.juggler.iter().any(|e| e.value().engine == engine);
             if current.as_deref() != Some(version.as_str()) && (current.is_none() || !in_use) {
                 self.installer.activate(engine, &version)?;
                 tracing::info!(engine = engine.id(), %version, verification = ?crate::engine::spec(engine).verification(), "server browser engine installed");
@@ -349,8 +358,10 @@ impl BrowserService {
         let Some((uid, gid)) = self.cfg.run_as_override.or_else(existing_browser_user) else {
             return 0;
         };
-        let keep: Vec<u32> = self.instances.iter().flat_map(|e| e.value().process_groups()).collect();
-        let profiles: Vec<PathBuf> = self.instances.iter().map(|e| e.value().profile.clone()).collect();
+        let mut keep: Vec<u32> = self.instances.iter().flat_map(|e| e.value().process_groups()).collect();
+        keep.extend(self.juggler.iter().flat_map(|e| e.value().process_groups()));
+        let mut profiles: Vec<PathBuf> = self.instances.iter().map(|e| e.value().profile.clone()).collect();
+        profiles.extend(self.juggler.iter().map(|e| e.value().profile.clone()));
         reap_strays(uid, gid, &keep, &profiles).await
     }
 
@@ -416,6 +427,7 @@ impl BrowserService {
                 "the profile is busy",
             ));
         };
+        self.stop_juggler(user_id, n).await;
         if let Some(inst) = self.running(user_id, n) {
             inst.stop().await;
             self.instances.remove(&key);
@@ -449,6 +461,12 @@ impl BrowserService {
             return Ok(i);
         }
         let engine = self.settings.engine(user_id, n)?;
+        if crate::engine::spec(engine).protocol == EngineProtocol::Juggler {
+            return Err(BrowserError::coded(
+                BrowserErrorCode::BrowserStartFailed,
+                "this instance runs Camoufox: use its VNC panel and Playwright endpoint",
+            ));
+        }
         let chrome = self.ensure_engine(engine).await?;
         if let Some(host) = &self.cfg.host {
             harden_and_verify(host)?;
@@ -488,7 +506,103 @@ impl BrowserService {
         Ok(inst)
     }
 
+    /// Whether instance `n` runs a Juggler engine (Camoufox).
+    pub fn is_juggler_instance(&self, user_id: &str, n: u8) -> bool {
+        self.settings
+            .engine(user_id, n)
+            .is_ok_and(|e| crate::engine::spec(e).protocol == EngineProtocol::Juggler)
+    }
+
+    /// The running Camoufox instance `n`, if any.
+    pub fn running_juggler(&self, user_id: &str, n: u8) -> Option<Arc<JugglerInstance>> {
+        let key = (user_id.to_owned(), n);
+        let inst = self.juggler.get(&key)?.clone();
+        if inst.is_running() {
+            Some(inst)
+        } else {
+            self.juggler.remove(&key);
+            None
+        }
+    }
+
+    /// Start Camoufox instance `n` (or return the running one): the VNC
+    /// panel and the agents' Playwright endpoint start it (TASK-136 K6).
+    pub async fn start_juggler(self: &Arc<Self>, user_id: &str, n: u8) -> Result<Arc<JugglerInstance>, BrowserError> {
+        self.start_juggler_inner(user_id, n)
+            .await
+            .map_err(|e| start_failure(user_id, n, e))
+    }
+
+    async fn start_juggler_inner(self: &Arc<Self>, user_id: &str, n: u8) -> Result<Arc<JugglerInstance>, BrowserError> {
+        self.check_instance(user_id, n)?;
+        if let Some(i) = self.running_juggler(user_id, n) {
+            return Ok(i);
+        }
+        let key = (user_id.to_owned(), n);
+        let lock = self.start_locks.entry(key.clone()).or_default().clone();
+        let _held = lock.lock().await;
+        if let Some(i) = self.running_juggler(user_id, n) {
+            return Ok(i);
+        }
+        let engine = self.settings.engine(user_id, n)?;
+        if crate::engine::spec(engine).protocol != EngineProtocol::Juggler {
+            return Err(BrowserError::coded(
+                BrowserErrorCode::BrowserStartFailed,
+                "this instance is not a Camoufox instance",
+            ));
+        }
+        let binary = self.ensure_engine(engine).await?;
+        let version_dir = binary
+            .parent()
+            .map(Path::to_path_buf)
+            .ok_or_else(|| BrowserError::Internal("engine path".into()))?;
+        if let Some(host) = &self.cfg.host {
+            harden_and_verify(host)?;
+        }
+        let (uid, gid) = match self.cfg.run_as_override {
+            Some(ids) => ids,
+            None => ensure_browser_user().await?,
+        };
+        let profile = prepare_dirs(&self.cfg.layout, user_id, n, uid, gid).await?;
+        let launching = self.launch_lock.lock().await;
+        self.reap_orphans().await;
+        let inst = JugglerInstance::launch(JugglerSpec {
+            user_id: user_id.to_owned(),
+            instance: n,
+            version_dir,
+            home: crate::host::instance_home(&profile),
+            profile,
+            uid,
+            gid,
+            max_tabs: self.max_tabs_cell(user_id),
+            guard: self.guard.clone(),
+        })
+        .await?;
+        self.juggler.insert(key.clone(), inst.clone());
+        drop(launching);
+        let weak = Arc::downgrade(self);
+        let watched = inst.clone();
+        tokio::spawn(async move {
+            watched.exited().await;
+            if let Some(svc) = weak.upgrade() {
+                svc.juggler.remove_if(&key, |_, v| Arc::ptr_eq(v, &watched));
+            }
+        });
+        Ok(inst)
+    }
+
+    /// Stop a running Camoufox instance `n`; true when one ran.
+    async fn stop_juggler(&self, user_id: &str, n: u8) -> bool {
+        let key = (user_id.to_owned(), n);
+        let Some((_, inst)) = self.juggler.remove(&key) else {
+            return false;
+        };
+        inst.stop().await;
+        true
+    }
+
     pub async fn stop(self: &Arc<Self>, user_id: &str, n: u8) -> Result<BrowserStatusResponse, BrowserError> {
+        self.stop_juggler(user_id, n).await;
         if let Some(inst) = self.running(user_id, n) {
             inst.stop().await;
             self.instances.remove(&(user_id.to_owned(), n));
@@ -507,6 +621,7 @@ impl BrowserService {
                 "the profile is busy",
             ));
         };
+        let was_juggler = self.stop_juggler(user_id, n).await;
         let was_running = match self.running(user_id, n) {
             Some(inst) => {
                 inst.stop().await;
@@ -526,6 +641,9 @@ impl BrowserService {
         if was_running {
             self.start(user_id, n).await?;
         }
+        if was_juggler {
+            self.start_juggler(user_id, n).await?;
+        }
         self.status(user_id)
     }
 
@@ -540,6 +658,18 @@ impl BrowserService {
             tracing::info!(user_id = %inst.user_id, instance = inst.instance, "server browser idle; stopping");
             inst.stop().await;
             self.instances
+                .remove_if(&(inst.user_id.clone(), inst.instance), |_, v| Arc::ptr_eq(v, &inst));
+        }
+        let idle: Vec<Arc<JugglerInstance>> = self
+            .juggler
+            .iter()
+            .filter(|e| e.value().idle_ms() > self.cfg.idle_timeout.as_millis() as i64)
+            .map(|e| e.value().clone())
+            .collect();
+        for inst in idle {
+            tracing::info!(user_id = %inst.user_id, instance = inst.instance, "camoufox idle; stopping");
+            inst.stop().await;
+            self.juggler
                 .remove_if(&(inst.user_id.clone(), inst.instance), |_, v| Arc::ptr_eq(v, &inst));
         }
     }
@@ -564,9 +694,17 @@ impl BrowserService {
             .unwrap_or_default()
             .iter()
             .filter_map(|row| {
-                bridge
-                    .port_of(row.instance)
-                    .map(|port| serde_json::json!({"instance": row.instance, "name": row.name, "port": port}))
+                bridge.port_of(row.instance).map(|port| {
+                    let mut entry = serde_json::json!({
+                        "instance": row.instance, "name": row.name, "port": port, "engine": row.engine.id(),
+                    });
+                    // Camoufox: playwright-cli `attach --endpoint` (pinned client), not `--cdp`.
+                    if crate::engine::spec(row.engine).protocol == EngineProtocol::Juggler {
+                        entry["protocol"] = "playwright".into();
+                        entry["endpoint"] = format!("ws://127.0.0.1:{port}{}", crate::bridge::PLAYWRIGHT_PATH).into();
+                    }
+                    entry
+                })
             })
             .collect();
         // C34: the owner's own browser is one more entry next to the named
@@ -584,6 +722,19 @@ impl BrowserService {
             crate::bridge::ENV_INSTANCES.to_owned(),
             serde_json::Value::Array(instances).to_string(),
         ));
+        if installed_version(&self.cfg.layout, BrowserEngine::Camoufox).is_some() {
+            // The client pinned to Camoufox's Playwright (a newer playwright-cli is refused).
+            env.push((
+                ENV_CAMOUFOX_CLI.to_owned(),
+                self.cfg
+                    .layout
+                    .engine_current(BrowserEngine::Camoufox)
+                    .join(crate::camoufox::SIDECAR_DIR)
+                    .join("node_modules/.bin/playwright-cli")
+                    .to_string_lossy()
+                    .into_owned(),
+            ));
+        }
         if !devices.is_empty() {
             env.push((ENV_DEVICES.to_owned(), serde_json::Value::Array(devices).to_string()));
         }
@@ -695,6 +846,19 @@ impl BridgeBackend for BrowserService {
 
     fn agents_enabled(&self, user_id: &str) -> bool {
         self.agents_enabled_now(user_id)
+    }
+
+    async fn agent_juggler(&self, user_id: &str, instance: u8) -> Result<Arc<JugglerInstance>, BrowserError> {
+        if !self.agents_enabled_now(user_id) {
+            return Err(BrowserError::coded(
+                BrowserErrorCode::BrowserAgentsDisabled,
+                "agents may not use the browser",
+            ));
+        }
+        let me = self
+            .self_arc()
+            .ok_or_else(|| BrowserError::Internal("browser service gone".into()))?;
+        me.start_juggler(user_id, instance).await
     }
 }
 

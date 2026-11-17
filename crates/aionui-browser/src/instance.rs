@@ -119,7 +119,7 @@ fn now_ms() -> i64 {
 /// Displays in use by this process (X server numbers).
 static DISPLAYS: std::sync::Mutex<Vec<u16>> = std::sync::Mutex::new(Vec::new());
 
-fn allocate_display() -> Option<u16> {
+pub(crate) fn allocate_display() -> Option<u16> {
     let mut used = DISPLAYS.lock().unwrap_or_else(|e| e.into_inner());
     let n = (110..400).find(|n| {
         !used.contains(n)
@@ -130,7 +130,7 @@ fn allocate_display() -> Option<u16> {
     Some(n)
 }
 
-fn release_display(n: u16) {
+pub(crate) fn release_display(n: u16) {
     DISPLAYS.lock().unwrap_or_else(|e| e.into_inner()).retain(|d| *d != n);
 }
 
@@ -177,7 +177,7 @@ pub fn chrome_args(profile: &Path, hide_automation: bool, proxy_port: u16) -> Ve
     args
 }
 
-async fn wait_for(path: &Path, timeout: Duration) -> bool {
+pub(crate) async fn wait_for(path: &Path, timeout: Duration) -> bool {
     let deadline = tokio::time::Instant::now() + timeout;
     while tokio::time::Instant::now() < deadline {
         if path.exists() {
