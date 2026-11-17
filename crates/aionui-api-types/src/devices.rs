@@ -384,6 +384,11 @@ pub struct RelayPhone {
     /// The peer's own switch for this phone (defence in depth).
     #[serde(default)]
     pub enabled: bool,
+    /// Mac helper: the `client_id` of the companion app installed on this
+    /// phone (read over adb from the app's pairing provider), so AionCore
+    /// shows ONE card for a phone reached both ways. Omitted when unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub companion_client_id: Option<String>,
 }
 
 /// The Mac the helper runs on (M3).
