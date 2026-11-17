@@ -50,6 +50,8 @@ pub const ADDON_INSTALL_TIMEOUT: Duration = Duration::from_secs(21 * 60);
 pub fn request_timeout(verb: &str) -> Duration {
     match verb {
         "addon_install" | "addon_remove" => ADDON_INSTALL_TIMEOUT,
+        // Download (helper cap 10 min) + adb install (5 min).
+        "install_apk" => Duration::from_secs(16 * 60),
         _ => REQUEST_TIMEOUT,
     }
 }
