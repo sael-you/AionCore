@@ -351,7 +351,8 @@ pub mod relay_event {
     pub const FOREGROUND: &str = "foreground";
     /// data: `{run_id, state: running|done|failed|stopped, message?, trace_url?}`.
     pub const ADDON_PROGRESS: &str = "addon_progress";
-    /// data: `{session, message}`: a CDP frame from the phone's Chrome.
+    /// data: `{session, message}`: a CDP frame from the phone's Chrome;
+    /// `message` is the frame as a JSON-encoded string (exact bytes).
     pub const CDP_FRAME: &str = "cdp_frame";
     /// data: `{session}`: the phone's Chrome closed the session.
     pub const CDP_CLOSED: &str = "cdp_closed";
@@ -500,7 +501,7 @@ pub enum RelayOutbound {
 ///   `text{value}` · `key{code}` · `launch{package}` · `foreground` → `{package}` ·
 ///   `install_apk{url, sha256}` · `logcat{package, lines}` → `{lines}` · `stop`
 /// - phone Chrome (Mac helper only, over `adb forward localabstract:chrome_devtools_remote`):
-///   `cdp_open` → `{session}` · `cdp_frame{session, message}` · `cdp_close{session}`;
+///   `cdp_open` → `{session}` · `cdp_frame{session, message: string}` · `cdp_close{session}`;
 ///   Chrome → AionCore frames arrive as `cdp_frame` events.
 /// - Mac (device `mac`): `mac_screenshot` · `mac_ax_tree` · `mac_click{x,y}` ·
 ///   `mac_type{value}` · `mac_key{code}` · `mac_open_app{bundle_id}`
