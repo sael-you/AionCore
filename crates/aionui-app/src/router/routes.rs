@@ -114,7 +114,9 @@ async fn websocket_origin_except_extension(
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    if request.uri().path() == "/api/browser/extension" {
+    // C34 extension socket (pinned extension origin, checked by its handler)
+    // and the C38 device relay (refuses every Origin, checked by its handler).
+    if matches!(request.uri().path(), "/api/browser/extension" | "/api/devices/relay") {
         return next.run(request).await;
     }
     websocket_origin_middleware(state, request, next)
@@ -599,6 +601,14 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     .merge(aionui_browser::browser_extension_routes(
         aionui_browser::BrowserRouterState {
             service: services.browser_service.clone(),
+        },
+    ))
+    // C38 (TASK-136): the device relay for the Mac helper and the companion
+    // app. No session (the first frame authenticates with a pairing code or
+    // device token); any browser Origin is refused by its handler.
+    .merge(aionui_devices::devices_relay_routes(
+        aionui_devices::DevicesRouterState {
+            service: services.devices_service.clone(),
         },
     ))
     .merge(runtime_team_tools)
