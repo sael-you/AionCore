@@ -25,7 +25,8 @@ pub struct ReplayConfig {
     pub max_age: Duration,
     /// Serialized bytes kept per user (memory bound).
     pub max_bytes: usize,
-    /// A stream with no connection and no frame for this long is dropped.
+    /// A stream whose user has had no connected socket for this long is
+    /// dropped, however many frames still arrive for it.
     pub idle_expiry: Duration,
 }
 
@@ -51,7 +52,8 @@ pub(crate) struct UserStream {
     last_seq: u64,
     ring: VecDeque<Entry>,
     bytes: usize,
-    last_active: Instant,
+    /// Last moment the user had a connected socket (frames do not count).
+    last_connected: Instant,
 }
 
 impl UserStream {
@@ -60,12 +62,17 @@ impl UserStream {
             last_seq: 0,
             ring: VecDeque::new(),
             bytes: 0,
-            last_active: now,
+            last_connected: now,
         }
     }
 
     pub(crate) fn last_seq(&self) -> u64 {
         self.last_seq
+    }
+
+    /// The user has a connected socket right now.
+    pub(crate) fn mark_connected(&mut self) {
+        self.last_connected = Instant::now();
     }
 
     fn trim(&mut self, cfg: &ReplayConfig, now: Instant) {
@@ -159,7 +166,6 @@ impl ReplayLog {
             at: now,
             text: text.clone(),
         });
-        stream.last_active = now;
         stream.trim(&self.cfg, now);
         text
     }
@@ -168,7 +174,8 @@ impl ReplayLog {
     pub(crate) fn resume(&self, stream: &mut UserStream, epoch: &str, last_seq: u64) -> ResumeOutcome {
         let now = Instant::now();
         stream.trim(&self.cfg, now);
-        stream.last_active = now;
+        // Only a connected socket can resume.
+        stream.last_connected = now;
         let current = stream.last_seq;
         if epoch != self.epoch || last_seq > current {
             return ResumeOutcome::Resync {
@@ -202,17 +209,24 @@ impl ReplayLog {
         }
     }
 
-    /// Drop streams of users without a connection that went quiet.
+    /// Drop the streams of users without a connected socket for longer than
+    /// `idle_expiry` — broadcasts still landing in their ring do not keep them.
     pub(crate) fn sweep(&self, connected: impl Fn(&str) -> bool) {
         let now = Instant::now();
         let expiry = self.cfg.idle_expiry;
         self.streams.retain(|user, stream| {
+            let stream = stream.get_mut().unwrap_or_else(|poisoned| poisoned.into_inner());
             if connected(user) {
+                stream.last_connected = now;
                 return true;
             }
-            let stream = stream.get_mut().unwrap_or_else(|poisoned| poisoned.into_inner());
-            now.duration_since(stream.last_active) <= expiry
+            now.duration_since(stream.last_connected) <= expiry
         });
+    }
+
+    /// Whether the user has a stream (a ring that may still be replayed).
+    pub(crate) fn has_stream(&self, user_id: &str) -> bool {
+        self.streams.contains_key(user_id)
     }
 
     /// Bytes held across all users (tests, diagnostics).
@@ -381,6 +395,40 @@ mod tests {
             log.with_stream("a", |s| log.resume(s, log.epoch(), 1)),
             ResumeOutcome::Resync { reason: "too_old", .. }
         ));
+    }
+
+    #[test]
+    fn broadcasts_do_not_keep_a_disconnected_users_ring_alive() {
+        let log = log(ReplayConfig {
+            idle_expiry: Duration::from_millis(30),
+            ..ReplayConfig::default()
+        });
+        push(&log, "gone", 1);
+        // Frames keep arriving for the user (global broadcasts), but no socket.
+        // Like the manager, frames only land in a ring that still exists.
+        for _ in 0..6 {
+            std::thread::sleep(Duration::from_millis(10));
+            if log.has_stream("gone") {
+                push(&log, "gone", 1);
+            }
+            log.sweep(|_| false);
+        }
+        assert_eq!(log.held_frames("gone"), 0, "expired despite steady frames");
+        assert!(!log.has_stream("gone"));
+    }
+
+    #[test]
+    fn a_connected_user_is_never_swept() {
+        let log = log(ReplayConfig {
+            idle_expiry: Duration::ZERO,
+            ..ReplayConfig::default()
+        });
+        push(&log, "here", 2);
+        std::thread::sleep(Duration::from_millis(5));
+        log.sweep(|user| user == "here");
+        std::thread::sleep(Duration::from_millis(5));
+        log.sweep(|user| user == "here");
+        assert_eq!(log.held_frames("here"), 2);
     }
 
     #[test]
