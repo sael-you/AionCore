@@ -46,12 +46,18 @@ pub(crate) fn build_browser_service(
 
 pub(crate) struct BrowserConversationPort {
     pub service: Arc<BrowserService>,
+    /// C38: users with a paired phone / Mac also get the devices MCP marker.
+    pub devices: Arc<aionui_devices::DevicesService>,
 }
 
 #[async_trait::async_trait]
 impl ConversationBrowserPort for BrowserConversationPort {
     async fn agent_env(&self, user_id: &str) -> Vec<(String, String)> {
-        self.service.agent_env(user_id).await
+        let mut env = self.service.agent_env(user_id).await;
+        if self.devices.has_agent_devices(user_id).await {
+            env.push(("AIONUI_DEVICES_MCP".to_owned(), "1".to_owned()));
+        }
+        env
     }
 
     fn agents_enabled(&self, user_id: &str) -> bool {

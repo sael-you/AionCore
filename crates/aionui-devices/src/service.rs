@@ -672,6 +672,15 @@ impl DevicesService {
         self.relay_call(user_id, id, verb, args).await
     }
 
+    /// Whether the user has a phone or Mac at all (paired relay client): the
+    /// `aionui-devices` MCP is only given to conversations of such users.
+    pub async fn has_agent_devices(&self, user_id: &str) -> bool {
+        let Ok(pairings) = self.repo.list_pairings(user_id).await else {
+            return false;
+        };
+        !pairings.is_empty()
+    }
+
     /// Whether agents may use the device right now (switch on, not expired).
     pub async fn is_enabled(&self, user_id: &str, id: &str) -> Result<bool, DevicesError> {
         let row = self

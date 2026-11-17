@@ -138,6 +138,8 @@ pub(crate) enum Command {
     /// Stdio ↔ TCP bridge for the team MCP server (spawned by the ACP agent CLI).
     /// MCP stdio server for team tools (spawned by the ACP agent CLI).
     McpTeamStdio,
+    /// MCP stdio server for the owner's phones and Macs (C38; spawned by the agent CLI).
+    McpDevicesStdio,
     /// Self-check: hydrate the agent registry, probe every CLI on `$PATH`,
     /// and print a per-agent availability table. Useful when the user
     /// reports "no agent works" — running this from the same shell the
@@ -182,6 +184,7 @@ impl Command {
             Self::Skills(_) => "skills",
             Self::AntigravityHook => "antigravity-hook",
             Self::McpTeamStdio => "mcp-team-stdio",
+            Self::McpDevicesStdio => "mcp-devices-stdio",
             Self::Doctor => "doctor",
             Self::PrepareManagedResources(_) => "prepare-managed-resources",
             Self::User(_) => "user",
@@ -1248,6 +1251,7 @@ mod tests {
                 "config",
             ),
             (Command::McpTeamStdio, "mcp-team-stdio"),
+            (Command::McpDevicesStdio, "mcp-devices-stdio"),
             (Command::AntigravityHook, "antigravity-hook"),
             (Command::Doctor, "doctor"),
             (
