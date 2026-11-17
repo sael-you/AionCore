@@ -223,7 +223,8 @@ pub use runtime::{
     RuntimeStatusPhase, RuntimeStatusScope, RuntimeStatusScopeKind,
 };
 pub use server_pool::{
-    CreateServerRequest, ListServerAuditQuery, SERVER_TIER_NOTE, ServerAuditResponse, ServerResponse,
+    ClassifyServerCommandRequest, ClassifyServerCommandResponse, CreateServerRequest, ListServerAuditQuery,
+    SERVER_TIER_NOTE, ScanHostKeyRequest, ScanHostKeyResponse, ServerAuditResponse, ServerResponse, ServerTestResponse,
     UpdateServerRequest,
 };
 pub use session_tools::{

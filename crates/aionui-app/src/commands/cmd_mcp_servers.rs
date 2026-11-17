@@ -192,6 +192,7 @@ impl ServersMcp {
 impl rmcp::ServerHandler for ServersMcp {}
 
 impl ServersMcp {
+    /// `run` = (exit code, duration ms) of a command that was started.
     async fn audit(
         &self,
         server_id: &str,
@@ -199,8 +200,7 @@ impl ServersMcp {
         decision: &str,
         reason: &str,
         command: &str,
-        exit: Option<i64>,
-        ms: Option<i64>,
+        run: Option<(Option<i64>, i64)>,
     ) {
         let redacted = redact_command(command);
         let result = self
@@ -215,8 +215,8 @@ impl ServersMcp {
                 decision,
                 reason,
                 command: &redacted,
-                exit_code: exit,
-                duration_ms: ms,
+                exit_code: run.and_then(|(exit, _)| exit),
+                duration_ms: run.map(|(_, ms)| ms),
             })
             .await;
         if let Err(e) = result {
@@ -260,16 +260,8 @@ impl ServersMcp {
         let crucial = match decision {
             ExecDecision::Run { crucial } => crucial,
             ExecDecision::NeedsApproval(ref msg) | ExecDecision::Refuse(ref msg) => {
-                self.audit(
-                    &server_id,
-                    &server_name,
-                    decision.audit_label(),
-                    msg,
-                    &p.command,
-                    None,
-                    None,
-                )
-                .await;
+                self.audit(&server_id, &server_name, decision.audit_label(), msg, &p.command, None)
+                    .await;
                 return error(msg.clone());
             }
         };
@@ -286,7 +278,6 @@ impl ServersMcp {
                     "failed",
                     "cannot decrypt the server key",
                     &p.command,
-                    None,
                     None,
                 )
                 .await;
@@ -321,8 +312,7 @@ impl ServersMcp {
                     label,
                     &audit_reason,
                     &p.command,
-                    out.exit_code.map(i64::from),
-                    Some(out.duration_ms),
+                    Some((out.exit_code.map(i64::from), out.duration_ms)),
                 )
                 .await;
                 let exit = out.exit_code.map(|c| c.to_string()).unwrap_or_else(|| {
@@ -344,7 +334,6 @@ impl ServersMcp {
                     "failed",
                     "ssh could not be started",
                     &p.command,
-                    None,
                     None,
                 )
                 .await;

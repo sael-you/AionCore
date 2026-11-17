@@ -11,6 +11,7 @@
 //! | `SERVER_INVALID` | 400 | a field fails validation (name, host, port, user, key, environment, tier, labels) |
 //! | `SERVER_NAME_TAKEN` | 409 | another live server of the user has this name |
 //! | `SERVER_NOT_FOUND` | 404 | no live server with this id |
+//! | `SERVER_UNREACHABLE` | 502 | a host-key scan got no key from the host |
 //! | `MCP_MARKET_SESSION_REQUIRED` | 403 | a write from an agent (runtime token) or `--local` caller |
 
 use aionui_common::TimestampMs;
@@ -104,6 +105,65 @@ pub struct UpdateServerRequest {
     pub notes: Option<String>,
     #[serde(default)]
     pub enabled: Option<bool>,
+}
+
+/// `POST /api/servers/{id}/test`: connect with the stored key and run `true`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ServerTestResponse {
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latency_ms: Option<i64>,
+    /// `auth_failed` | `host_key_mismatch` | `host_key_unknown` |
+    /// `unreachable` | `timeout` | `failed`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub message: Option<String>,
+    /// The key(s) the host presents now, for `host_key_mismatch` /
+    /// `host_key_unknown` (same format as [`ServerResponse::host_key`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub seen_host_key: Option<String>,
+}
+
+/// `POST /api/servers/scan-host-key`: read a host's public key(s) so the
+/// owner can check the fingerprint before saving.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ScanHostKeyRequest {
+    pub host: String,
+    #[serde(default)]
+    pub port: Option<u16>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScanHostKeyResponse {
+    /// Lines of `<type> <base64>`.
+    pub host_key: String,
+}
+
+/// `POST /api/servers/classify`: what the crucial-command rules say about a
+/// command (for the confirmation card). Runs nothing.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ClassifyServerCommandRequest {
+    /// Server name (as in the `run_command` tool call).
+    pub server: String,
+    pub command: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ClassifyServerCommandResponse {
+    pub crucial: bool,
+    /// The rule that matched.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// Absent when no live server has this name.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub environment: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tier: Option<String>,
 }
 
 /// Query of `GET /api/servers/audit`.

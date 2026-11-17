@@ -175,6 +175,59 @@ pub async fn run_ssh(
     }
 }
 
+/// Why an ssh run failed, from its stderr (messages of OpenSSH 9.2p1:
+/// "Host key verification failed.", "REMOTE HOST IDENTIFICATION HAS CHANGED",
+/// "No ... host key is known for", "Permission denied (", "Connection
+/// refused", "Could not resolve hostname", "Connection timed out").
+pub fn failure_code(out: &SshOutput) -> &'static str {
+    let err = out.stderr.as_str();
+    if out.timed_out || err.contains("Connection timed out") || err.contains("Operation timed out") {
+        "timeout"
+    } else if err.contains("HOST IDENTIFICATION HAS CHANGED") || err.contains("Host key for") {
+        "host_key_mismatch"
+    } else if err.contains("host key is known") || err.contains("Host key verification failed") {
+        "host_key_unknown"
+    } else if err.contains("Permission denied") || err.contains("Too many authentication failures") {
+        "auth_failed"
+    } else if err.contains("Connection refused")
+        || err.contains("Could not resolve hostname")
+        || err.contains("No route to host")
+        || err.contains("Network is unreachable")
+        || err.contains("Connection closed")
+        || err.contains("Connection reset")
+    {
+        "unreachable"
+    } else {
+        "failed"
+    }
+}
+
+/// The public host key(s) `host:port` presents, as `<type> <base64>` lines
+/// (`ssh-keyscan`, 10 s). Empty when the host gave none.
+pub async fn scan_host_key(host: &str, port: u16) -> std::io::Result<String> {
+    let mut builder = aionui_runtime::Builder::clean_cli("ssh-keyscan");
+    builder.env_clear();
+    if let Some(path) = std::env::var_os("PATH") {
+        builder.env("PATH", path);
+    }
+    builder.args(["-T", "10", "-p", &port.to_string(), "--", host]);
+    let output = tokio::time::timeout(Duration::from_secs(20), builder.output())
+        .await
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "ssh-keyscan timed out"))??;
+    let mut lines: Vec<String> = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        // "<host> <type> <base64>"; comment lines start with '#'.
+        if fields.len() >= 3 && !fields[0].starts_with('#') {
+            let entry = format!("{} {}", fields[1], fields[2]);
+            if !lines.contains(&entry) {
+                lines.push(entry);
+            }
+        }
+    }
+    Ok(lines.join("\n"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -198,6 +251,38 @@ mod tests {
             updated_at: 0,
             deleted_at: None,
         }
+    }
+
+    #[test]
+    fn failures_are_classified_from_stderr() {
+        let out = |stderr: &str, timed_out| SshOutput {
+            exit_code: Some(255),
+            stdout: String::new(),
+            stderr: stderr.into(),
+            timed_out,
+            duration_ms: 1,
+        };
+        assert_eq!(
+            failure_code(&out("deploy@h: Permission denied (publickey).", false)),
+            "auth_failed"
+        );
+        assert_eq!(
+            failure_code(&out("@ WARNING: REMOTE HOST IDENTIFICATION HAS CHANGED! @", false)),
+            "host_key_mismatch"
+        );
+        assert_eq!(
+            failure_code(&out(
+                "No ED25519 host key is known for h and you have requested strict checking.\nHost key verification failed.",
+                false
+            )),
+            "host_key_unknown"
+        );
+        assert_eq!(
+            failure_code(&out("ssh: connect to host h port 22: Connection refused", false)),
+            "unreachable"
+        );
+        assert_eq!(failure_code(&out("", true)), "timeout");
+        assert_eq!(failure_code(&out("something else", false)), "failed");
     }
 
     #[test]
