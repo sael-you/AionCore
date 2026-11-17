@@ -123,19 +123,41 @@ fn command_name(command: &BoardCommand) -> &'static str {
 /// missing).
 fn read_stdin_if_needed(command: &BoardCommand) -> Result<Value, ExitCode> {
     let name = command_name(command);
-    if stdin_tool(command).is_none() || io::stdin().is_terminal() {
+    if stdin_tool(command).is_none() {
         return Ok(json!({}));
     }
-    let mut input = String::new();
-    io::stdin().read_to_string(&mut input).map_err(|error| {
-        print_failure(
-            name,
-            "BOARD_CLI_STDIN_READ_FAILED",
-            SCHEMA_VALIDATION_FAILED,
-            error.to_string(),
-            None,
-        )
-    })?;
+    let wait = if stdin_optional(command) {
+        OPTIONAL_STDIN_WAIT
+    } else {
+        REQUIRED_STDIN_WAIT
+    };
+    let input = match read_stdin_bounded(io::stdin(), io::stdin().is_terminal(), wait) {
+        StdinRead::Text(input) => input,
+        // An inherited pipe nobody writes to (a background script, TASK-157):
+        // an optional stdin is simply absent; a required one fails, never hangs.
+        StdinRead::NothingArrived if stdin_optional(command) => return Ok(json!({})),
+        StdinRead::NothingArrived => {
+            return Err(print_failure(
+                name,
+                "BOARD_CLI_STDIN_TIMEOUT",
+                SCHEMA_VALIDATION_FAILED,
+                format!(
+                    "no stdin JSON arrived within {} s; pipe it in (e.g. a heredoc) or redirect </dev/null",
+                    wait.as_secs()
+                ),
+                None,
+            ));
+        }
+        StdinRead::Failed(error) => {
+            return Err(print_failure(
+                name,
+                "BOARD_CLI_STDIN_READ_FAILED",
+                SCHEMA_VALIDATION_FAILED,
+                error,
+                None,
+            ));
+        }
+    };
     if input.trim().is_empty() {
         return Ok(json!({}));
     }
@@ -148,6 +170,55 @@ fn read_stdin_if_needed(command: &BoardCommand) -> Result<Value, ExitCode> {
             None,
         )
     })
+}
+
+/// Commands whose stdin is optional: they must never wait for it.
+fn stdin_optional(command: &BoardCommand) -> bool {
+    match command {
+        BoardCommand::Move(_) | BoardCommand::Wip(_) => true,
+        BoardCommand::Update(args) => args.assignee_conversation.is_some(),
+        _ => false,
+    }
+}
+
+/// An optional stdin (move/wip) is given this long to arrive.
+const OPTIONAL_STDIN_WAIT: std::time::Duration = std::time::Duration::from_secs(2);
+/// A required stdin (create/update/review/comment) fails after this long.
+const REQUIRED_STDIN_WAIT: std::time::Duration = std::time::Duration::from_secs(60);
+
+#[derive(Debug, PartialEq)]
+pub(crate) enum StdinRead {
+    /// Everything up to EOF (empty for a closed stdin or a terminal).
+    Text(String),
+    /// The pipe stayed open and silent for the whole wait.
+    NothingArrived,
+    Failed(String),
+}
+
+/// Read `reader` to EOF on a helper thread, giving up after `wait` (TASK-157:
+/// an inherited, never-closed stdin pipe made `board move` hang forever). A
+/// terminal is never read. The helper thread is left behind on a timeout; the
+/// process exits without waiting for it.
+pub(crate) fn read_stdin_bounded<R: Read + Send + 'static>(
+    reader: R,
+    is_terminal: bool,
+    wait: std::time::Duration,
+) -> StdinRead {
+    if is_terminal {
+        return StdinRead::Text(String::new());
+    }
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut reader = reader;
+        let mut input = String::new();
+        let result = reader.read_to_string(&mut input).map(|_| input);
+        let _ = tx.send(result);
+    });
+    match rx.recv_timeout(wait) {
+        Ok(Ok(input)) => StdinRead::Text(input),
+        Ok(Err(error)) => StdinRead::Failed(error.to_string()),
+        Err(_) => StdinRead::NothingArrived,
+    }
 }
 
 /// Validate stdin against the registry descriptor: an object, no unknown
@@ -523,6 +594,68 @@ mod tests {
             Some(crate::cli::Command::Board(board)) => board.command,
             other => panic!("not a board command: {other:?}"),
         }
+    }
+
+    /// A stdin pipe that is open but never written to or closed (TASK-157:
+    /// a background script's inherited stdin).
+    struct NeverCloses(std::sync::mpsc::Receiver<()>);
+
+    impl Read for NeverCloses {
+        fn read(&mut self, _buf: &mut [u8]) -> io::Result<usize> {
+            let _ = self.0.recv(); // blocks until the test ends
+            Ok(0)
+        }
+    }
+
+    fn never_closes() -> (NeverCloses, std::sync::mpsc::Sender<()>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        (NeverCloses(rx), tx)
+    }
+
+    #[test]
+    fn a_silent_open_stdin_never_hangs_the_cli() {
+        let wait = std::time::Duration::from_millis(200);
+        let started = std::time::Instant::now();
+        let (reader, _keep_open) = never_closes();
+        assert_eq!(read_stdin_bounded(reader, false, wait), StdinRead::NothingArrived);
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(2),
+            "returned after the wait"
+        );
+    }
+
+    #[test]
+    fn stdin_from_a_terminal_a_closed_pipe_or_a_heredoc() {
+        let wait = std::time::Duration::from_secs(2);
+        // A terminal is never read (it would wait for the user).
+        let (reader, _keep_open) = never_closes();
+        assert_eq!(read_stdin_bounded(reader, true, wait), StdinRead::Text(String::new()));
+        // Closed stdin (</dev/null): empty at once.
+        assert_eq!(
+            read_stdin_bounded(io::empty(), false, wait),
+            StdinRead::Text(String::new())
+        );
+        // Piped JSON is read to EOF.
+        let piped = io::Cursor::new(br#"{"after": 2}"#.to_vec());
+        assert_eq!(
+            read_stdin_bounded(piped, false, wait),
+            StdinRead::Text(r#"{"after": 2}"#.to_owned())
+        );
+    }
+
+    #[test]
+    fn only_move_wip_and_flag_updates_have_an_optional_stdin() {
+        assert!(stdin_optional(&parse(&["move", "4", "done"])));
+        assert!(stdin_optional(&parse(&["wip", "--set", "building=3"])));
+        assert!(stdin_optional(&parse(&[
+            "update",
+            "4",
+            "--assignee-conversation",
+            "c1"
+        ])));
+        assert!(!stdin_optional(&parse(&["update", "4"])));
+        assert!(!stdin_optional(&parse(&["create"])));
+        assert!(!stdin_optional(&parse(&["comment", "4"])));
     }
 
     #[test]
