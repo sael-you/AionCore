@@ -621,7 +621,8 @@ impl IConversationRepository for MockRepo {
             .filter(|message| {
                 message.position.as_deref() == Some("left")
                     && matches!(message.status.as_deref(), Some("work" | "pending"))
-                    && matches!(message.r#type.as_str(), "text" | "thinking")
+                    // Same types as the real query (sqlite_conversation.rs).
+                    && matches!(message.r#type.as_str(), "text" | "thinking" | "tool_call" | "tool_group")
             })
             .filter_map(|message| {
                 let user_id = rows
