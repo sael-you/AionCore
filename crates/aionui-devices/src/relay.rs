@@ -57,6 +57,12 @@ pub fn request_timeout(verb: &str) -> Duration {
 }
 pub const PAIRING_TTL: Duration = Duration::from_secs(5 * 60);
 const MAX_LABEL: usize = 64;
+/// Sockets that have not sent a valid first frame yet (each lives at most
+/// [`FIRST_FRAME_TIMEOUT`]); more are closed at once.
+pub const MAX_UNAUTHENTICATED: usize = 32;
+/// Entries of one inventory that are kept (the rest is ignored).
+pub const MAX_INVENTORY_PHONES: usize = 32;
+pub const MAX_INVENTORY_ADDONS: usize = 16;
 
 /// One event from a relay client: `(device, name, data)`.
 #[derive(Debug, Clone)]
@@ -184,6 +190,7 @@ pub struct RelayState {
     codes: PairingCodes<(String, DevicePairingKind)>,
     clients: dashmap::DashMap<String, Arc<RelayClient>>,
     events: broadcast::Sender<RelayEvent>,
+    unauthenticated: std::sync::atomic::AtomicUsize,
 }
 
 impl Default for RelayState {
@@ -192,6 +199,7 @@ impl Default for RelayState {
             codes: PairingCodes::new(PAIRING_TTL),
             clients: dashmap::DashMap::new(),
             events: broadcast::channel(1024).0,
+            unauthenticated: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 }
@@ -315,10 +323,19 @@ impl DevicesService {
     /// Serve one relay connection until it closes.
     pub async fn run_relay(self: Arc<Self>, socket: WebSocket, source: String) {
         let (mut sink, mut stream) = socket.split();
+        // Bounded: at most MAX_UNAUTHENTICATED sockets wait for a first frame.
+        let waiting = self.relay().unauthenticated.fetch_add(1, Ordering::SeqCst);
+        if waiting >= MAX_UNAUTHENTICATED {
+            self.relay().unauthenticated.fetch_sub(1, Ordering::SeqCst);
+            warn!(source, "device relay: too many unauthenticated sockets; closed");
+            let _ = sink.close().await;
+            return;
+        }
         let first = match tokio::time::timeout(FIRST_FRAME_TIMEOUT, stream.next()).await {
             Ok(Some(Ok(Message::Text(t)))) => serde_json::from_str::<RelayInbound>(&t).ok(),
             _ => None,
         };
+        self.relay().unauthenticated.fetch_sub(1, Ordering::SeqCst);
         let auth = match first {
             Some(frame) => self.authenticate(frame, &source).await,
             None => Err(DeviceErrorCode::DeviceBadMessage),
@@ -359,6 +376,17 @@ impl DevicesService {
         });
         if let Some(old) = self.relay().clients.insert(pairing.id.clone(), client.clone()) {
             old.shutdown();
+        }
+        // A revoke may have run between the token check and the insert above
+        // (it found no client to close): check again now that this client is
+        // registered, so a revoked token never keeps a live socket.
+        let still_paired = self
+            .repo()
+            .list_pairings(&pairing.user_id)
+            .await
+            .is_ok_and(|rows| rows.iter().any(|p| p.id == pairing.id));
+        if !still_paired {
+            self.relay_disconnect(&pairing.id);
         }
         self.set_pairing_online(&pairing.id, true);
         info!(user_id = %pairing.user_id, pairing_id = %pairing.id, kind = %pairing.kind, "device relay client connected");
@@ -589,6 +617,13 @@ impl DevicesService {
         addons: Vec<RelayAddon>,
     ) {
         let now = now_ms();
+        let mut phones = phones;
+        let mut addons = addons;
+        if phones.len() > MAX_INVENTORY_PHONES || addons.len() > MAX_INVENTORY_ADDONS {
+            warn!(pairing_id = %client.pairing_id, phones = phones.len(), addons = addons.len(), "device inventory too large; truncated");
+            phones.truncate(MAX_INVENTORY_PHONES);
+            addons.truncate(MAX_INVENTORY_ADDONS);
+        }
         let mut present = HashSet::new();
         let upsert = |kind: &'static str, source: String, name: String, meta: Value| async move {
             let id = relay_device_id(kind, &client.pairing_id, &source);

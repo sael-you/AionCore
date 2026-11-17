@@ -55,7 +55,11 @@ struct ApkQuery {
     t: String,
 }
 
-async fn companion_apk(State(s): State<DevicesRouterState>, Query(q): Query<ApkQuery>) -> Response {
+async fn companion_apk(
+    State(s): State<DevicesRouterState>,
+    Query(q): Query<ApkQuery>,
+    request: axum::extract::Request,
+) -> Response {
     let Some(downloads) = s.service.companion_downloads() else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -66,50 +70,36 @@ async fn companion_apk(State(s): State<DevicesRouterState>, Query(q): Query<ApkQ
         ))
         .into_response();
     }
-    match downloads.read_apk().await {
-        Ok(bytes) => (
-            [
-                (
-                    axum::http::header::CONTENT_TYPE,
-                    "application/vnd.android.package-archive",
-                ),
-                (
-                    axum::http::header::CONTENT_DISPOSITION,
-                    "attachment; filename=\"aionui-companion.apk\"",
-                ),
-                (axum::http::header::CACHE_CONTROL, "no-store"),
-            ],
-            bytes,
-        )
-            .into_response(),
+    let Some(path) = downloads.servable_apk().await else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    // Streamed from disk (a release APK is tens of MB).
+    use tower::ServiceExt;
+    match tower_http::services::ServeFile::new_with_mime(
+        path,
+        &"application/vnd.android.package-archive".parse().expect("static mime"),
+    )
+    .oneshot(request)
+    .await
+    {
+        Ok(response) => {
+            let mut response = response.into_response();
+            let headers = response.headers_mut();
+            headers.insert(
+                axum::http::header::CONTENT_DISPOSITION,
+                axum::http::HeaderValue::from_static("attachment; filename=\"aionui-companion.apk\""),
+            );
+            headers.insert(
+                axum::http::header::CACHE_CONTROL,
+                axum::http::HeaderValue::from_static("no-store"),
+            );
+            response
+        }
         Err(error) => {
             tracing::warn!(error = %error, "companion APK not readable");
             StatusCode::NOT_FOUND.into_response()
         }
     }
-}
-
-async fn relay_ws(
-    State(s): State<DevicesRouterState>,
-    headers: HeaderMap,
-    ws: Result<WebSocketUpgrade, axum::extract::ws::rejection::WebSocketUpgradeRejection>,
-) -> Response {
-    if headers.contains_key(axum::http::header::ORIGIN) {
-        return api_error(DevicesError::coded(
-            DeviceErrorCode::DeviceOriginRefused,
-            "the device relay does not accept browsers",
-        ))
-        .into_response();
-    }
-    let ws = match ws {
-        Ok(ws) => ws,
-        Err(rejection) => return rejection.into_response(),
-    };
-    let service = s.service.clone();
-    let source = client_source(&headers);
-    ws.max_message_size(RELAY_MAX_FRAME_BYTES)
-        .max_frame_size(RELAY_MAX_FRAME_BYTES)
-        .on_upgrade(move |socket| service.run_relay(socket, source))
 }
 
 /// The client address for per-source limits: the gateway and the web host
