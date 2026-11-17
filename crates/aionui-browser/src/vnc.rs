@@ -76,11 +76,8 @@ pub async fn relay(socket: WebSocket, inst: Arc<JugglerInstance>) {
     let from_panel = async move {
         while let Some(Ok(msg)) = rx.next().await {
             match msg {
-                Message::Binary(bytes) => {
-                    if wr.write_all(&bytes).await.is_err() {
-                        break;
-                    }
-                }
+                Message::Binary(bytes) if wr.write_all(&bytes).await.is_err() => break,
+                Message::Binary(_) => {}
                 Message::Close(_) => break,
                 // RFB is binary only; text frames are ignored.
                 _ => {}

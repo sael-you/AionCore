@@ -639,7 +639,11 @@ async fn live_every_engine_installs_starts_and_renders() {
         String::from_utf8_lossy(&out.stdout).into_owned()
     };
 
-    for engine in BROWSER_ENGINES {
+    // Camoufox is not a CDP engine: `live_camoufox` covers it.
+    for engine in BROWSER_ENGINES
+        .into_iter()
+        .filter(|e| aionui_browser::engine::spec(*e).protocol == aionui_browser::engine::EngineProtocol::Cdp)
+    {
         if only.as_deref().is_some_and(|o| o != engine.id()) {
             continue;
         }
@@ -681,6 +685,7 @@ async fn live_every_engine_installs_starts_and_renders() {
         let want = match spec.verification() {
             BrowserEngineVerification::SignedRepository => "signed-repository",
             BrowserEngineVerification::TlsOnly => "tls-only",
+            BrowserEngineVerification::PinnedSha256 => "pinned-sha256",
         };
         assert_eq!(record["verification"], want, "{engine:?}");
         assert_eq!(record["sha256"].as_str().map(str::len), Some(64));
