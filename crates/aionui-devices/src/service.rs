@@ -212,6 +212,7 @@ impl DevicesService {
                     if let Some(p) = &row.pairing_id {
                         self.relay_stop(p, &row.source_id);
                     }
+                    self.drop_device_approvals(&row.user_id, &row.id);
                     self.changed(&row.user_id, Some(&row.id));
                 }
                 rows.len()
@@ -513,11 +514,14 @@ impl DevicesService {
                 {
                     return Err(DevicesError::not_found());
                 }
-                if !update.enabled
-                    && let Some(row) = self.repo.get_device(user_id, id).await?
-                    && let Some(p) = &row.pairing_id
-                {
-                    self.relay_stop(p, &row.source_id);
+                if !update.enabled {
+                    // Off: stop the device and refuse what waits for an OK.
+                    if let Some(row) = self.repo.get_device(user_id, id).await?
+                        && let Some(p) = &row.pairing_id
+                    {
+                        self.relay_stop(p, &row.source_id);
+                    }
+                    self.drop_device_approvals(user_id, id);
                 }
             }
         }
@@ -710,6 +714,7 @@ impl DevicesService {
             self.relay_stop(&pairing_id, &row.source_id);
             self.repo.delete_device(user_id, id).await?;
         }
+        self.drop_device_approvals(user_id, id);
         let job_id = format!("job_{}", uuid::Uuid::new_v4().simple());
         self.jobs.insert(
             job_id.clone(),
