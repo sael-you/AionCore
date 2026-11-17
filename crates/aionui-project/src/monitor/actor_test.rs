@@ -779,6 +779,23 @@ async fn wait_until(push: &RecordingPush, within: Duration, pred: impl Fn(&[(Str
     .unwrap_or(false)
 }
 
+/// Wait for the reply to request `id`: `fs/subscribe` answers only after its
+/// targets are mounted, and mounting arms the OS watch (dispatch.rs phase 2), so
+/// the reply is the readiness signal. A fixed sleep here failed under load
+/// (TASK-122): the file was written before the watch existed.
+async fn replied(push: &RecordingPush, session: &str, id: i64) {
+    assert!(
+        wait_until(push, READY_WITHIN, |frames| {
+            frames.iter().any(|(s, f)| s == session && f["id"] == id)
+        })
+        .await,
+        "request {id} of session {session} was never answered"
+    );
+}
+
+/// Upper bound for a readiness wait (returns as soon as the condition holds).
+const READY_WITHIN: Duration = Duration::from_secs(30);
+
 fn has_delta_adding(frames: &[(String, Value)], session: &str, name: &str) -> bool {
     frames.iter().any(|(s, f)| {
         s == session
@@ -814,13 +831,13 @@ async fn live_change_fans_delta_to_subscriber_only() {
         frame: request(1, "fs/subscribe", json!({"targets":[dir_ref(&pe, "")]})),
     })
     .unwrap();
-    // Let subscribe mount + arm the watch.
-    tokio::time::sleep(Duration::from_millis(250)).await;
+    // Subscribe has mounted and armed the watch once it answers.
+    replied(&push, "1", 1).await;
 
     std::fs::write(dir.path().join("live.ts"), b"x").unwrap();
 
     assert!(
-        wait_until(&push, Duration::from_secs(5), |f| has_delta_adding(f, "1", "live.ts")).await,
+        wait_until(&push, READY_WITHIN, |f| has_delta_adding(f, "1", "live.ts")).await,
         "subscriber 1 must receive an fs/delta adding live.ts"
     );
     // Scoped push: session 2 (never subscribed) must have received nothing.
@@ -866,8 +883,8 @@ async fn live_content_edit_fans_modified_delta_to_subscriber() {
         frame: request(1, "fs/subscribe", json!({"targets":[dir_ref(&pe, "")]})),
     })
     .unwrap();
-    // Let subscribe mount + arm the watch.
-    tokio::time::sleep(Duration::from_millis(250)).await;
+    // Subscribe has mounted and armed the watch once it answers.
+    replied(&push, "1", 1).await;
 
     std::fs::write(&file, b"after").unwrap();
     let bumped = std::time::SystemTime::now() + Duration::from_secs(5);
@@ -914,7 +931,7 @@ async fn noise_file_change_produces_no_delta() {
         frame: request(1, "fs/subscribe", json!({"targets":[dir_ref(&pe, "")]})),
     })
     .unwrap();
-    tokio::time::sleep(Duration::from_millis(250)).await;
+    replied(&push, "1", 1).await;
 
     // A noise file and a real file land together.
     std::fs::write(dir.path().join(".DS_Store"), b"x").unwrap();
@@ -922,7 +939,7 @@ async fn noise_file_change_produces_no_delta() {
 
     // The real file's delta arrives (control) — proving the watch is live.
     assert!(
-        wait_until(&push, Duration::from_secs(5), |f| has_delta_adding(f, "1", "real.ts")).await,
+        wait_until(&push, READY_WITHIN, |f| has_delta_adding(f, "1", "real.ts")).await,
         "the real file must fan a delta"
     );
     // The noise file must never appear in any pushed frame.
@@ -950,7 +967,7 @@ async fn overflow_fans_full_snapshot_through_event_loop() {
         frame: request(1, "fs/subscribe", json!({"targets":[dir_ref(&pe, "")]})),
     })
     .unwrap();
-    tokio::time::sleep(Duration::from_millis(250)).await;
+    replied(&push, "1", 1).await;
 
     // Files a rescan (apply All) will pick up.
     std::fs::write(dir.path().join("x.ts"), b"x").unwrap();
@@ -1036,7 +1053,7 @@ async fn disconnect_drops_session_subscriptions() {
         frame: request(1, "fs/subscribe", json!({"targets":[dir_ref(&pe, "")]})),
     })
     .unwrap();
-    tokio::time::sleep(Duration::from_millis(250)).await;
+    replied(&push, "1", 1).await;
 
     // Disconnect drops all of session 1's subscriptions (node enters grace).
     tx.send(FsInbound::Disconnect {

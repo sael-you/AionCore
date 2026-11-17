@@ -214,11 +214,18 @@ async fn tap_confirmed_draft_is_sent_once_after_the_hold() {
     let committing = c.draft_in("committing").await;
     assert!(committing["holdRemainingMs"].as_u64().is_some());
     assert!(c.h.conversations.sends().is_empty(), "nothing sent during the hold");
-    let row = c.wait_state(&id, version, "sending").await;
-    assert_eq!(
-        row.outcome_msg_id.as_deref(),
-        Some(format!("msg-{id}:{version}").as_str())
-    );
+    // `sending` is written before the send and its outcome (TASK-122): wait
+    // for the send and the stored message id, not for the state alone.
+    c.wait_state(&id, version, "sending").await;
+    c.wait_sends(1).await;
+    let expected_msg = format!("msg-{id}:{version}");
+    let row = wait_for(Duration::from_secs(30), || async {
+        let row = c.draft_row(&id, version).await;
+        (row.outcome_msg_id.as_deref() == Some(expected_msg.as_str())).then_some(row)
+    })
+    .await
+    .expect("the send outcome is stored on the draft");
+    assert_eq!(row.state, "sending");
     let sends = c.h.conversations.sends();
     assert_eq!(sends.len(), 1);
     assert_eq!(sends[0].conversation_id, "c-build");
@@ -403,19 +410,27 @@ async fn busy_target_queues_then_the_worker_delivers() {
     .await;
     let row = c.wait_state(&id, version, "queued").await;
     assert_eq!(row.queued_reason.as_deref(), Some("busy"));
-    assert!(
-        c.h.speech
+    // The outcome line is spoken after the state is written (TASK-122): wait for it.
+    let speech = c.h.speech.clone();
+    wait_for(Duration::from_secs(30), || async {
+        speech
             .lines()
             .iter()
             .any(|l| l.starts_with("Queued for Kanban build"))
-    );
+            .then_some(())
+    })
+    .await
+    .expect("the queued line is spoken");
     c.h.service.run_draft_sweep(false, 0).await;
     c.wait_state(&id, version, "sending").await;
-    assert_eq!(
-        c.h.conversations.delivered_keys(),
-        vec![format!("{id}:{version}")],
-        "same key on retry"
-    );
+    // `sending` precedes the retry's send: wait until the worker delivered.
+    let (conversations, key) = (c.h.conversations.clone(), format!("{id}:{version}"));
+    wait_for(Duration::from_secs(30), || async {
+        (conversations.sends().iter().filter(|s| s.key == key).count() >= 2).then_some(())
+    })
+    .await
+    .expect("the worker re-sent the queued draft");
+    assert_eq!(c.h.conversations.delivered_keys(), vec![key], "same key on retry");
 }
 
 #[tokio::test]
