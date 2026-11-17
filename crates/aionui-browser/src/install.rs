@@ -223,14 +223,18 @@ impl EngineInstaller {
         }
     }
 
-    async fn latest_apt(&self, apt: &AptSource, staging: &Path) -> Result<PackageEntry, BrowserError> {
+    /// The signed chain for one apt package (steps 1–3); also used by other
+    /// engine lanes for their own pinned repositories.
+    pub(crate) async fn latest_apt(&self, apt: &AptSource, staging: &Path) -> Result<PackageEntry, BrowserError> {
         let key = self.get(apt.key_url).await?;
         let keyring = pinned_keyring(staging, &key, apt.primary_fpr).await?;
-        let in_release = self.get(&format!("{}/dists/stable/InRelease", apt.repo)).await?;
+        let in_release = self.get(&format!("{}/dists/{}/InRelease", apt.repo, apt.suite)).await?;
         let release = gpgv_verify(staging, &keyring, &in_release).await?;
         let want = release_sha256(&release, PACKAGES_PATH)
             .ok_or_else(|| BrowserError::Internal("Release has no Packages hash".into()))?;
-        let packages = self.get(&format!("{}/dists/stable/{PACKAGES_PATH}", apt.repo)).await?;
+        let packages = self
+            .get(&format!("{}/dists/{}/{PACKAGES_PATH}", apt.repo, apt.suite))
+            .await?;
         if sha256_hex(&packages) != want {
             return Err(BrowserError::Internal(
                 "Packages hash does not match the signed Release".into(),
@@ -446,6 +450,10 @@ async fn pinned_keyring(staging: &Path, key: &[u8], fpr: &str) -> Result<PathBuf
             .arg(&home)
             .arg("--batch")
             .arg("--no-tty")
+            // Public keys only: no gpg-agent. With a long staging path the
+            // agent's socket path is too long, it fails to start and
+            // `--import` exits 2 although the key was imported.
+            .arg("--no-autostart")
             .args(args);
         cmd
     };
