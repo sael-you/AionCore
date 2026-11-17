@@ -4,12 +4,15 @@
 //! 1. only the constrained verbs (no raw shell, no `cdp_*`, no add-on verbs);
 //! 2. the device's switch is on and its timeout has not passed;
 //! 3. a per-device rate limit;
-//! 4. **ask before crucial**: an action (`tap`, `swipe`, `text`, `key`,
-//!    `launch`, the `mac_*` input verbs) while a crucial app is in front —
-//!    banking / payment / wallet, messaging / email, app stores, system
-//!    settings — or any `install_apk` waits for the owner's OK. One OK
-//!    covers the same device + app for 60 s (typing is many actions);
-//!    `install_apk` asks every time;
+//! 4. **ask before crucial** (owner decisions 2026-11-17): while a crucial
+//!    app is in front — banking / payment / wallet, messaging / email, app
+//!    stores, system settings, password managers — every action (`tap`,
+//!    `swipe`, `text`, `key`, `launch`, the `mac_*` input verbs) AND every
+//!    read (`screenshot`, `ui_tree`, `logcat`, `mac_screenshot`,
+//!    `mac_ax_tree`: the screen would go to a model provider) waits for the
+//!    owner's OK. One OK covers reads and actions on the same device + app
+//!    for 5 minutes. Reads of a password manager are always refused (no OK
+//!    possible); `install_apk` asks every time;
 //! 5. the relay call, and one audit row whatever the outcome (verb, app
 //!    package, outcome; never screenshots, typed text or results).
 
@@ -57,6 +60,29 @@ const ACTING_VERBS: &[&str] = &[
     "mac_key",
     "mac_open_app",
 ];
+/// Verbs that show the screen or app data to the agent.
+const READING_VERBS: &[&str] = &["screenshot", "ui_tree", "logcat", "mac_screenshot", "mac_ax_tree"];
+/// Password managers and authenticators: their screens are never read.
+const SECRET_STORE_MARKERS: &[&str] = &[
+    "keychain",
+    "password",
+    "authenticator",
+    "1password",
+    "bitwarden",
+    "lastpass",
+    "keepass",
+    "dashlane",
+    "enpass",
+    "nordpass",
+    "protonpass",
+];
+
+/// Whether `package` is a password manager / authenticator.
+pub fn is_secret_store(package: &str) -> bool {
+    let p = package.to_ascii_lowercase();
+    SECRET_STORE_MARKERS.iter().any(|m| p.contains(m))
+}
+
 /// Calls per device and minute.
 pub const CALLS_PER_MINUTE: usize = 120;
 
@@ -224,13 +250,14 @@ impl DevicesService {
 
         // Which app would this act on?
         let acting = ACTING_VERBS.contains(&verb.as_str());
+        let reading = READING_VERBS.contains(&verb.as_str());
         let target = args
             .get("package")
             .or_else(|| args.get("bundle_id"))
             .and_then(Value::as_str)
             .map(str::to_owned);
         let mut package = target.clone();
-        if acting && package.is_none() && row.kind == "phone" {
+        if (acting || reading) && package.is_none() && row.kind == "phone" {
             // The app in front decides. Ask the phone (cheap) every time: the
             // owner may have switched apps since the last event.
             package = self
@@ -243,8 +270,16 @@ impl DevicesService {
                 package = Some("unknown".to_owned());
             }
         }
+        if reading && package.as_deref().is_some_and(is_secret_store) {
+            audit(
+                self,
+                note(DeviceAuditOutcome::Refused, package.as_deref(), Some("secret_store")),
+            )
+            .await;
+            return Err(refused("a password manager is in front: its screen is never read"));
+        }
         let crucial = verb == "install_apk"
-            || (acting
+            || ((acting || reading)
                 && package
                     .as_deref()
                     .is_some_and(|p| p == "unknown" || is_crucial_package(p)));
@@ -347,6 +382,14 @@ mod tests {
         ] {
             assert!(!is_crucial_package(p), "{p}");
         }
+        for p in [
+            "com.x8bit.bitwarden",
+            "com.1password.1password",
+            "com.google.android.apps.authenticator2",
+        ] {
+            assert!(is_secret_store(p) && is_crucial_package(p), "{p}");
+        }
+        assert!(!is_secret_store("com.whatsapp"));
         assert!(!PHONE_VERBS.contains(&"cdp_frame") && !PHONE_VERBS.contains(&"addon_run"));
         assert!(!PHONE_VERBS.contains(&"stop"));
     }

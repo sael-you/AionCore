@@ -6,7 +6,8 @@
 //! A question waits [`APPROVAL_TIMEOUT`]; no answer = refused
 //! (`DEVICE_APPROVAL_TIMEOUT`); a deny refuses that action only
 //! (`DEVICE_APPROVAL_DENIED`). With a `grant_key`, one allow covers the same
-//! key for [`GRANT_TTL`] (typing sends one action per key press).
+//! key for [`GRANT_TTL`] (5 minutes, owner decision 2026-11-17: reads and
+//! actions on the same device + app; the prompt says "allow for 5 min").
 
 use std::time::Duration;
 
@@ -21,7 +22,7 @@ use crate::error::DevicesError;
 use crate::service::DevicesService;
 
 pub const APPROVAL_TIMEOUT: Duration = Duration::from_secs(120);
-pub const GRANT_TTL: Duration = Duration::from_secs(60);
+pub const GRANT_TTL: Duration = Duration::from_secs(5 * 60);
 const SUMMARY_CHARS: usize = 200;
 
 /// One question for the owner.
@@ -92,6 +93,10 @@ impl DevicesService {
             conversation_id: q.conversation_id.clone(),
             created_at,
             expires_at: created_at + i64::try_from(timeout.as_millis()).unwrap_or(0),
+            grant_minutes: q
+                .grant_key
+                .is_some()
+                .then(|| u32::try_from(GRANT_TTL.as_secs() / 60).unwrap_or(0)),
         };
         info!(user_id = %q.user_id, device_id = %q.device_id, approval_id = %approval.id, verb = %q.verb, "device action paused for the owner");
         self.approval_event(&q.user_id, &approval, DeviceApprovalState::Requested, None);

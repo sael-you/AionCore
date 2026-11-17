@@ -226,6 +226,10 @@ pub struct DeviceApproval {
     pub conversation_id: Option<String>,
     pub created_at: i64,
     pub expires_at: i64,
+    /// When set, an allow also covers reads and actions on the same device
+    /// and app for this many minutes ("allow for 5 min").
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub grant_minutes: Option<u32>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -588,6 +592,7 @@ mod tests {
             conversation_id: None,
             created_at: 1,
             expires_at: 2,
+            grant_minutes: Some(5),
         };
         let v = serde_json::to_value(DeviceApprovalEvent {
             approval,
