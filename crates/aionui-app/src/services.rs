@@ -535,6 +535,8 @@ impl AppServices {
             }),
         );
         devices_service.spawn_background();
+        // Add-ons (K5): install / remove through the Mac helper.
+        aionui_devices::addons::register(&devices_service);
         devices_service.set_companion_downloads(Arc::new(aionui_devices::companion::CompanionDownloads::new(
             data_dir.join("devices").join("companion"),
         )));
