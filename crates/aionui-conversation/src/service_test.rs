@@ -6107,6 +6107,7 @@ async fn send_message_persists_openclaw_gateway_unreachable_tip_when_turn_build_
             SendMessageRequest {
                 content: "hello".into(),
                 hidden: false,
+                idempotency_key: None,
                 files: vec![],
                 sessions: vec![],
                 inject_skills: vec![],

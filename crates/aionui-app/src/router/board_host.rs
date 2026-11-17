@@ -223,6 +223,7 @@ impl BoardHostPort for BoardHostAdapter {
                     sessions: Vec::new(),
                     inject_skills: Vec::new(),
                     hidden: false,
+                    idempotency_key: None,
                 },
                 &self.task_manager,
             )
