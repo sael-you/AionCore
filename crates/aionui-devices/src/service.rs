@@ -80,6 +80,8 @@ pub struct DevicesService {
     relay: RelayState,
     companion: std::sync::RwLock<Option<Arc<crate::companion::CompanionDownloads>>>,
     approvals: aionui_common::approval_queue::ApprovalQueue<aionui_api_types::devices::DeviceApproval>,
+    /// Agent calls per device in the last minute.
+    rate: std::sync::Mutex<HashMap<String, std::collections::VecDeque<std::time::Instant>>>,
 }
 
 impl std::fmt::Debug for DevicesService {
@@ -113,7 +115,14 @@ impl DevicesService {
             relay: RelayState::default(),
             companion: std::sync::RwLock::new(None),
             approvals: Default::default(),
+            rate: std::sync::Mutex::new(HashMap::new()),
         })
+    }
+
+    pub(crate) fn rate_windows(
+        &self,
+    ) -> &std::sync::Mutex<HashMap<String, std::collections::VecDeque<std::time::Instant>>> {
+        &self.rate
     }
 
     pub(crate) fn approval_queue(
