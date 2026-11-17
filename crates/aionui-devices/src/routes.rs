@@ -75,16 +75,14 @@ async fn companion_apk(
     };
     // Streamed from disk (a release APK is tens of MB).
     use tower::ServiceExt;
-    match tower_http::services::ServeFile::new_with_mime(
-        path,
-        &"application/vnd.android.package-archive".parse().expect("static mime"),
-    )
-    .oneshot(request)
-    .await
-    {
+    match tower_http::services::ServeFile::new(path).oneshot(request).await {
         Ok(response) => {
             let mut response = response.into_response();
             let headers = response.headers_mut();
+            headers.insert(
+                axum::http::header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_static("application/vnd.android.package-archive"),
+            );
             headers.insert(
                 axum::http::header::CONTENT_DISPOSITION,
                 axum::http::HeaderValue::from_static("attachment; filename=\"aionui-companion.apk\""),
