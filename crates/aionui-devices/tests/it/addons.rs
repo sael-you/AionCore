@@ -357,10 +357,10 @@ async fn switching_the_phone_off_stops_a_running_task() {
         (outcome.state.as_str(), outcome.message.as_deref()),
         ("stopped", Some("switched off"))
     );
-    assert!(
-        seen.iter().any(|f| f["type"] == "stop" && f["device"] == "R5CX"),
-        "the phone itself is stopped too: {seen:?}"
-    );
+    // The phone itself is told to stop as well; that frame may come before or after `addon_stop`.
+    while !seen.iter().any(|f| f["type"] == "stop" && f["device"] == "R5CX") {
+        seen.push(next(&mut ws).await.expect("the phone's stop frame"));
+    }
     let rows = audit(&svc, &addon).await;
     assert_eq!(
         (rows[0].0, rows[0].1["state"].as_str()),

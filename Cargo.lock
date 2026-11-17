@@ -715,6 +715,7 @@ dependencies = [
 name = "aionui-devices"
 version = "0.2.2"
 dependencies = [
+ "aionui-ai-agent",
  "aionui-api-types",
  "aionui-auth",
  "aionui-common",
