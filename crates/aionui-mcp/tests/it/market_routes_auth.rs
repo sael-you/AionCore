@@ -60,6 +60,11 @@ async fn fx() -> Fx {
         .with_server_pool(aionui_mcp::server_pool::ServerPoolService::new(
             Arc::new(aionui_db::SqliteServerPoolRepository::new(db.pool().clone())),
             [9u8; 32],
+        ))
+        .with_rules(aionui_mcp::rules::RuleService::new(
+            Arc::new(aionui_db::SqliteRuleRepository::new(db.pool().clone())),
+            Arc::new(aionui_db::SqliteKitRepository::new(db.pool().clone())),
+            None,
         ));
     Fx {
         db: db.clone(),
@@ -787,4 +792,124 @@ async fn server_routes_use_the_market_auth_stacks_and_never_echo_the_key() {
         (status, resp["code"].as_str()),
         (StatusCode::NOT_FOUND, Some("SERVER_NOT_FOUND"))
     );
+}
+
+/// C37: `/api/rules` rides the market stacks. An agent can read the rules it
+/// is bound by but never write them; the import preview needs the session too.
+#[tokio::test]
+async fn rule_routes_use_the_market_auth_stacks() {
+    let f = fx().await;
+    let app = app(&f);
+    let (status, body) = send(&app, Request::get("/api/rules").body(Body::empty()).unwrap()).await;
+    assert_eq!((status, body["data"].clone()), (StatusCode::OK, json!([])));
+
+    let rule = json!({"name": "Be brief", "body": "Answer in five lines."});
+    let (status, _) = send(
+        &app,
+        post("/api/rules", &rule).body(Body::from(rule.to_string())).unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::UNAUTHORIZED, "no session");
+    let (status, _) = send(
+        &app,
+        Request::get("/api/rules/import/preview?scope=global")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::UNAUTHORIZED,
+        "the preview reads files: session only"
+    );
+
+    let runtime = mcp_market_write_routes(f.state.clone()).route_layer(from_fn_with_state(
+        auth(&f, AuthIdentityMode::UserSession, Some(Arc::new(AlwaysValid))),
+        auth_middleware,
+    ));
+    let (status, resp) = send(
+        &runtime,
+        post("/api/rules", &rule)
+            .header(aionui_auth::RUNTIME_TOKEN_HEADER, "tok")
+            .header(aionui_auth::RUNTIME_USER_ID_HEADER, USER)
+            .header(aionui_auth::RUNTIME_CONVERSATION_ID_HEADER, "conv-1")
+            .body(Body::from(rule.to_string()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        (status, resp["code"].as_str()),
+        (StatusCode::FORBIDDEN, Some("MCP_MARKET_SESSION_REQUIRED")),
+        "agents cannot write rules"
+    );
+
+    let token = f.jwt.sign(USER, USER).unwrap();
+    let (status, _) = send_raw(
+        &app,
+        post("/api/rules", &rule)
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::from(rule.to_string()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "session without Origin");
+
+    let (status, created) = send(
+        &app,
+        post("/api/rules", &rule)
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::from(rule.to_string()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CREATED, "{created}");
+    let id = created["data"]["id"].as_str().unwrap().to_owned();
+    let (status, resp) = send(
+        &app,
+        post("/api/rules", &rule)
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::from(rule.to_string()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        (status, resp["code"].as_str()),
+        (StatusCode::CONFLICT, Some("RULE_NAME_TAKEN"))
+    );
+
+    let import = json!({"scope": "global", "confirm": false});
+    let (status, resp) = send(
+        &app,
+        post("/api/rules/import", &import)
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::from(import.to_string()))
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        (status, resp["code"].as_str()),
+        (StatusCode::BAD_REQUEST, Some("RULE_CONFIRM_REQUIRED"))
+    );
+
+    let (status, resp) = send(
+        &app,
+        Request::get("/api/rules/effective?conversation_id=nope")
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(
+        (status, resp["code"].as_str()),
+        (StatusCode::NOT_FOUND, Some("RULE_NOT_FOUND"))
+    );
+
+    let (status, resp) = send(
+        &app,
+        Request::delete(format!("/api/rules/{id}"))
+            .header(header::AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap(),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{resp}");
 }

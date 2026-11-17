@@ -207,19 +207,6 @@ async fn build_agent(deps: Arc<AgentFactoryDeps>, options: BuildTaskOptions) -> 
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn factory_deps_can_be_constructed() {
-        // Verify types compile — actual construction requires DB
-        let _: fn() -> AgentFactoryDeps = || {
-            panic!("compile-time check only");
-        };
-    }
-}
-
 /// `preset_context` with the conversation's owner rules block in front
 /// (C37). Read at session start, so a rule change applies to the next
 /// session of a running conversation.
@@ -234,4 +221,17 @@ pub(crate) async fn with_owner_rules(
     };
     let block = rules.conversation_block(user_id, conversation_id).await;
     aionui_mcp::rules::compose::prepend_rules(&block, preset_context)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn factory_deps_can_be_constructed() {
+        // Verify types compile — actual construction requires DB
+        let _: fn() -> AgentFactoryDeps = || {
+            panic!("compile-time check only");
+        };
+    }
 }

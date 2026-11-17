@@ -651,10 +651,11 @@ impl McpMarketService {
             .into_iter()
             .map(|k| (k.id, k.name))
             .collect();
-        if req.item_kind == KitItemKind::Rule && req.level == KitLevel::Global {
-            if let Some(rules) = self.rules.as_ref() {
-                rules.sync_global_file(user_id).await;
-            }
+        if req.item_kind == KitItemKind::Rule
+            && req.level == KitLevel::Global
+            && let Some(rules) = self.rules.as_ref()
+        {
+            rules.sync_global_file(user_id).await;
         }
         let server_names = self.server_names(user_id).await?;
         Ok(attachment_response(row, &kit_names, &instances, &server_names))
@@ -696,10 +697,11 @@ impl McpMarketService {
             )
         })?;
         kits.delete_attachment(user_id, id).await?;
-        if row.item_kind == "rule" && row.level == KitLevel::Global.as_str() {
-            if let Some(rules) = self.rules.as_ref() {
-                rules.sync_global_file(user_id).await;
-            }
+        if row.item_kind == "rule"
+            && row.level == KitLevel::Global.as_str()
+            && let Some(rules) = self.rules.as_ref()
+        {
+            rules.sync_global_file(user_id).await;
         }
         info!(level = %row.level, target = %row.target_id, kind = %row.item_kind, "kits: detached");
         if row.level == KitLevel::Conversation.as_str() {
