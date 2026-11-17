@@ -83,6 +83,78 @@ pub fn browser_instance_default_name(n: u8) -> String {
 // HTTP
 // ---------------------------------------------------------------------------
 
+/// The browser engines an instance can run (C35, all of the Chromium family:
+/// same CDP bridge, filters, guard and panel). Wire ids are kebab-case.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BrowserEngine {
+    /// Google Chrome stable (the default; installed on first use).
+    #[default]
+    Chrome,
+    ChromeForTesting,
+    Brave,
+    Edge,
+    /// `chrome-headless-shell`: no window, lighter; its User-Agent says
+    /// HeadlessChrome, so it is for agent work, not for sign-ins.
+    HeadlessShell,
+}
+
+/// Every engine, in display order.
+pub const BROWSER_ENGINES: [BrowserEngine; 5] = [
+    BrowserEngine::Chrome,
+    BrowserEngine::ChromeForTesting,
+    BrowserEngine::Brave,
+    BrowserEngine::Edge,
+    BrowserEngine::HeadlessShell,
+];
+
+impl BrowserEngine {
+    /// The wire id (also a safe directory name).
+    pub fn id(self) -> &'static str {
+        match self {
+            Self::Chrome => "chrome",
+            Self::ChromeForTesting => "chrome-for-testing",
+            Self::Brave => "brave",
+            Self::Edge => "edge",
+            Self::HeadlessShell => "headless-shell",
+        }
+    }
+
+    pub fn from_id(id: &str) -> Option<Self> {
+        BROWSER_ENGINES.into_iter().find(|e| e.id() == id)
+    }
+}
+
+/// What AionCore could verify about an engine download.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum BrowserEngineVerification {
+    /// Pinned vendor key → signed apt `InRelease` → `Packages` sha256 →
+    /// package sha256 + size.
+    SignedRepository,
+    /// The vendor publishes no signature or checksum: HTTPS from the vendor's
+    /// hosts and the version from the vendor's JSON only. The sha256 of what
+    /// was downloaded is recorded next to the install.
+    TlsOnly,
+}
+
+/// One engine in `BrowserStatusResponse.engines`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BrowserEngineStatus {
+    pub engine: BrowserEngine,
+    /// The installed version; `None` = not downloaded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installed_version: Option<String>,
+    /// A download or update of this engine is running.
+    pub installing: bool,
+    /// Why the last download failed (cleared by the next success).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    pub verification: BrowserEngineVerification,
+    /// No window and a headless User-Agent: meant for agent-only instances.
+    pub agents_only: bool,
+}
+
 /// `GET /api/browser/settings` and the answer of `PUT`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct BrowserSettings {
@@ -117,6 +189,10 @@ pub struct BrowserInstanceSettings {
     /// "Hide that the browser is automated" (default false): launches with
     /// `--disable-blink-features=AutomationControlled`, nothing else changes.
     pub hide_automation: bool,
+    /// The engine this instance runs (default Chrome). A change applies at
+    /// the instance's next start; the profile directory is kept.
+    #[serde(default)]
+    pub engine: BrowserEngine,
 }
 
 impl Default for BrowserSettings {
@@ -134,6 +210,7 @@ impl Default for BrowserSettings {
                     color: None,
                     emoji: None,
                     hide_automation: false,
+                    engine: BrowserEngine::default(),
                 })
                 .collect(),
         }
@@ -173,6 +250,9 @@ pub struct BrowserInstanceUpdate {
     pub emoji: Option<String>,
     #[serde(default)]
     pub hide_automation: Option<bool>,
+    /// Unknown id → 400 (serde); applies at the next start.
+    #[serde(default)]
+    pub engine: Option<BrowserEngine>,
 }
 
 /// `PATCH /api/browser/instances/{n}`: absent = unchanged; `""` clears
@@ -188,6 +268,9 @@ pub struct BrowserInstancePatch {
     pub emoji: Option<String>,
     #[serde(default)]
     pub hide_automation: Option<bool>,
+    /// Unknown id → 400 (serde); applies at the next start.
+    #[serde(default)]
+    pub engine: Option<BrowserEngine>,
 }
 
 /// `POST /api/browser/instances`: a new instance at the lowest free number
@@ -202,6 +285,9 @@ pub struct BrowserInstanceCreate {
     pub emoji: Option<String>,
     #[serde(default)]
     pub hide_automation: Option<bool>,
+    /// Unknown id → 400 (serde); applies at the next start.
+    #[serde(default)]
+    pub engine: Option<BrowserEngine>,
 }
 
 /// `GET /api/browser/status`, also the answer of
@@ -216,6 +302,9 @@ pub struct BrowserStatusResponse {
     /// One row per existing instance, ascending.
     pub instances: Vec<BrowserInstanceStatus>,
     pub idle_timeout_secs: u64,
+    /// Every engine with its install state (C35), in display order.
+    #[serde(default)]
+    pub engines: Vec<BrowserEngineStatus>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -232,6 +321,12 @@ pub struct BrowserInstanceStatus {
     pub agent_active: bool,
     /// The value the running instance was launched with (false when stopped).
     pub hide_automation_active: bool,
+    /// The configured engine of this instance.
+    #[serde(default)]
+    pub engine: BrowserEngine,
+    /// The engine the running instance was launched with (`None` when stopped).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine_active: Option<BrowserEngine>,
 }
 
 /// Query of `WS /api/browser/ws?instance=<n>` (default 1).

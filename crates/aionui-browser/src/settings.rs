@@ -9,8 +9,8 @@ use std::path::{Path, PathBuf};
 
 use aionui_api_types::{
     BROWSER_INSTANCE_COLORS, BROWSER_INSTANCE_EMOJI_MAX_BYTES, BROWSER_INSTANCE_NAME_MAX, BROWSER_MAX_INSTANCES_LIMIT,
-    BROWSER_MAX_TABS_LIMIT, BrowserErrorCode, BrowserInstanceCreate, BrowserInstancePatch, BrowserInstanceSettings,
-    BrowserSettings, BrowserSettingsUpdate, browser_instance_default_name,
+    BROWSER_MAX_TABS_LIMIT, BrowserEngine, BrowserErrorCode, BrowserInstanceCreate, BrowserInstancePatch,
+    BrowserInstanceSettings, BrowserSettings, BrowserSettingsUpdate, browser_instance_default_name,
 };
 use serde::{Deserialize, Serialize};
 
@@ -27,6 +27,9 @@ struct StoredInstance {
     emoji: Option<String>,
     #[serde(default)]
     hide_automation: bool,
+    /// C35: the engine of this instance (absent in older files = Chrome).
+    #[serde(default)]
+    engine: BrowserEngine,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -115,6 +118,7 @@ impl StoredSettings {
                     color: None,
                     emoji: None,
                     hide_automation: self.hide_automation.contains(&n),
+                    engine: BrowserEngine::default(),
                 })
                 .collect(),
         };
@@ -130,6 +134,7 @@ impl StoredSettings {
                     color: None,
                     emoji: None,
                     hide_automation: false,
+                    engine: BrowserEngine::default(),
                 },
             );
         }
@@ -161,6 +166,7 @@ impl StoredSettings {
                     color: r.color,
                     emoji: r.emoji,
                     hide_automation: r.hide_automation,
+                    engine: r.engine,
                 })
                 .collect(),
         }
@@ -193,6 +199,7 @@ fn patch_row(
     color: Option<&str>,
     emoji: Option<&str>,
     hide_automation: Option<bool>,
+    engine: Option<BrowserEngine>,
 ) -> Result<(), BrowserError> {
     let name = name.map(validate_name).transpose()?;
     if let Some(name) = &name
@@ -219,6 +226,9 @@ fn patch_row(
     }
     if let Some(h) = hide_automation {
         row.hide_automation = h;
+    }
+    if let Some(e) = engine {
+        row.engine = e;
     }
     Ok(())
 }
@@ -293,6 +303,7 @@ impl SettingsStore {
                 row.color.as_deref(),
                 row.emoji.as_deref(),
                 row.hide_automation,
+                row.engine,
             )?;
         }
         self.save(user_id, stored.with_rows(rows))
@@ -317,6 +328,7 @@ impl SettingsStore {
             color: None,
             emoji: None,
             hide_automation: false,
+            engine: BrowserEngine::default(),
         });
         rows.sort_by_key(|r| r.instance);
         patch_row(
@@ -326,6 +338,7 @@ impl SettingsStore {
             req.color.as_deref(),
             req.emoji.as_deref(),
             req.hide_automation,
+            req.engine,
         )?;
         Ok((self.save(user_id, stored.with_rows(rows))?, n))
     }
@@ -340,6 +353,7 @@ impl SettingsStore {
             req.color.as_deref(),
             req.emoji.as_deref(),
             req.hide_automation,
+            req.engine,
         )?;
         self.save(user_id, stored.with_rows(rows))
     }
@@ -364,6 +378,17 @@ impl SettingsStore {
     /// Whether instance `n` exists for `user_id`.
     pub fn exists(&self, user_id: &str, n: u8) -> Result<bool, BrowserError> {
         Ok(self.load_stored(user_id)?.rows().iter().any(|r| r.instance == n))
+    }
+
+    /// The engine `instance` launches with.
+    pub fn engine(&self, user_id: &str, instance: u8) -> Result<BrowserEngine, BrowserError> {
+        Ok(self
+            .load_stored(user_id)?
+            .rows()
+            .iter()
+            .find(|r| r.instance == instance)
+            .map(|r| r.engine)
+            .unwrap_or_default())
     }
 
     /// Whether `instance` launches with the automation flag hidden.
@@ -444,6 +469,7 @@ mod tests {
                         color: Some("indigo".into()),
                         emoji: Some("🎮".into()),
                         hide_automation: Some(true),
+                        engine: Some(BrowserEngine::Brave),
                     }]),
                     ..Default::default()
                 },
@@ -455,6 +481,9 @@ mod tests {
         assert_eq!(saved.instances[1].emoji.as_deref(), Some("🎮"));
         assert_eq!(s.load("u1").unwrap(), saved, "read back from disk");
         assert!(s.hide_automation("u1", 2).unwrap());
+        assert_eq!(s.engine("u1", 2).unwrap(), BrowserEngine::Brave);
+        assert_eq!(s.engine("u1", 1).unwrap(), BrowserEngine::Chrome, "others keep Chrome");
+        assert_eq!(saved.instances[1].engine, BrowserEngine::Brave);
         assert_eq!(
             s.load("u2").unwrap(),
             BrowserSettings::default(),
@@ -626,5 +655,46 @@ mod tests {
         let (_d, s) = store();
         assert!(s.load("../etc").is_err());
         assert!(s.load("").is_err());
+    }
+
+    /// C35: a file written before engines existed has no `engine` key; every
+    /// instance reads as Chrome, and a patch changes only the engine.
+    #[test]
+    fn engine_defaults_to_chrome_for_older_files_and_is_patchable() {
+        let (_d, s) = store();
+        std::fs::create_dir_all(s.dir.clone()).unwrap();
+        std::fs::write(
+            s.path("u1").unwrap(),
+            r#"{"agents_enabled":true,"max_instances":3,"max_tabs":10,"instances":[{"instance":1,"name":"Main","hide_automation":true}]}"#,
+        )
+        .unwrap();
+        assert_eq!(s.engine("u1", 1).unwrap(), BrowserEngine::Chrome);
+        let patched = s
+            .patch(
+                "u1",
+                1,
+                &BrowserInstancePatch {
+                    engine: Some(BrowserEngine::HeadlessShell),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(patched.instances[0].engine, BrowserEngine::HeadlessShell);
+        assert!(patched.instances[0].hide_automation, "other fields untouched");
+        assert_eq!(patched.instances[0].name, "Main");
+        let (_, n) = s
+            .create(
+                "u1",
+                &BrowserInstanceCreate {
+                    name: "Edge work".into(),
+                    engine: Some(BrowserEngine::Edge),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(s.engine("u1", n).unwrap(), BrowserEngine::Edge);
+        let wire = serde_json::to_value(s.load("u1").unwrap()).unwrap();
+        assert_eq!(wire["instances"][0]["engine"], "headless-shell");
+        assert!(serde_json::from_str::<BrowserInstancePatch>(r#"{"engine":"firefox"}"#).is_err());
     }
 }
