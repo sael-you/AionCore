@@ -243,3 +243,143 @@ async fn a_card_is_assigned_to_one_of_the_users_conversations() {
         .unwrap();
     assert_eq!(again.assignee_ref.as_deref(), Some(CONV), "unchanged, still assigned");
 }
+
+const CLOSING_COLUMNS: [&str; 4] = ["deployed", "done", "parked", "rejected"];
+
+#[tokio::test]
+async fn with_full_access_the_keeper_records_shipped_and_closed_cards_in_every_terminal_column() {
+    let env = env_with_host(true).await;
+    let (keeper, settings) = keeper(&env).await;
+    set_access(&env, settings.version, "full").await.unwrap();
+    for column in CLOSING_COLUMNS {
+        // From work in progress (past Ready to deploy and deploying) …
+        let card = env
+            .service
+            .create_card(&owner(), PROJECT, create_in(column, "local_test"))
+            .await
+            .unwrap();
+        let moved = env
+            .service
+            .move_card(&keeper, &card.id, mv(column, "local_test"))
+            .await
+            .unwrap_or_else(|error| panic!("local_test → {column}: {error:?}"));
+        assert_eq!(moved.column_key, column);
+        let event = last_event(&env, &card.id).await;
+        assert_eq!(event.kind, "gate_crossed", "{column}");
+        assert_eq!(event.payload["gate"], "ready_to_deploy", "{column}");
+        assert_eq!(event.payload["to"], column);
+    }
+    // … and between the closing columns (deployed → done passes nothing but
+    // still sits after deploying).
+    let card = env
+        .service
+        .create_card(&owner(), PROJECT, create_in("shipped", "deployed"))
+        .await
+        .unwrap();
+    let moved = env
+        .service
+        .move_card(&keeper, &card.id, mv("done", "deployed"))
+        .await
+        .unwrap();
+    assert_eq!(moved.column_key, "done");
+    let event = last_event(&env, &card.id).await;
+    assert_eq!(
+        (event.kind.as_str(), event.payload["gate"].as_str()),
+        ("gate_crossed", Some("deploying"))
+    );
+
+    // Never INTO deploying itself: only the ship flow enters it.
+    let card = env
+        .service
+        .create_card(&owner(), PROJECT, create_in("x", "local_test"))
+        .await
+        .unwrap();
+    let error = env
+        .service
+        .move_card(&keeper, &card.id, mv("deploying", "local_test"))
+        .await
+        .unwrap_err();
+    assert_eq!(code(error), "board_agent_move_denied");
+}
+
+#[tokio::test]
+async fn with_approval_access_closing_moves_need_the_owners_note() {
+    let env = env_with_host(true).await;
+    let (keeper, _) = keeper(&env).await; // proj-1 defaults to approval
+    for column in CLOSING_COLUMNS {
+        let card = env
+            .service
+            .create_card(&owner(), PROJECT, create_in(column, "local_test"))
+            .await
+            .unwrap();
+        let error = env
+            .service
+            .move_card(&keeper, &card.id, mv(column, "local_test"))
+            .await
+            .unwrap_err();
+        assert_eq!(code(error.clone()), "board_agent_move_denied", "{column}");
+        assert_eq!(error.details().unwrap()["approval_required"], true, "{column}");
+        let approved = aionui_board::MoveCard {
+            approval_note: Some(format!("owner: {column} it")),
+            ..mv(column, "local_test")
+        };
+        let moved = env.service.move_card(&keeper, &card.id, approved).await.unwrap();
+        assert_eq!(moved.column_key, column);
+        let event = last_event(&env, &card.id).await;
+        assert_eq!(event.kind, "gate_crossed");
+        assert_eq!(event.payload["approval"]["via"], format!("owner: {column} it"));
+    }
+}
+
+#[tokio::test]
+async fn the_keeper_sets_wip_limits_only_under_full_access_within_bounds() {
+    let env = env_with_host(true).await;
+    let (keeper, settings) = keeper(&env).await;
+    let limits = |pairs: &[(&str, i64)]| {
+        pairs
+            .iter()
+            .map(|(k, v)| ((*k).to_owned(), *v))
+            .collect::<std::collections::BTreeMap<String, i64>>()
+    };
+    let wanted = limits(&[("building", 3), ("local_test", 3)]);
+
+    // proj-1 defaults to approval: refused.
+    let error = env.service.set_wip_limits(&keeper, PROJECT, &wanted).await.unwrap_err();
+    assert_eq!(code(error), "board_agent_move_denied");
+
+    let settings = set_access(&env, settings.version, "full").await.unwrap();
+    let changed = env.service.set_wip_limits(&keeper, PROJECT, &wanted).await.unwrap();
+    assert_eq!(changed.version, settings.version + 1);
+    let wip = |key: &str| changed.columns.iter().find(|c| c.key == key).unwrap().wip_limit;
+    assert_eq!(
+        (wip("building"), wip("local_test"), wip("review")),
+        (Some(3), Some(3), Some(4))
+    );
+    let page = env
+        .service
+        .project_events(&owner(), PROJECT, None, Some(100))
+        .await
+        .unwrap();
+    let event = page.items.last().unwrap();
+    assert_eq!(event.kind, "columns_changed");
+    assert_eq!(event.actor_ref, keeper.actor_ref());
+    assert_eq!(event.payload["wip"], json!({ "building": 3, "local_test": 3 }));
+
+    for bad in [
+        limits(&[("building", 0)]),
+        limits(&[("building", 21)]),
+        limits(&[("nowhere", 2)]),
+        limits(&[]),
+    ] {
+        let error = env.service.set_wip_limits(&keeper, PROJECT, &bad).await.unwrap_err();
+        assert_eq!(code(error), "board_invalid", "{bad:?}");
+    }
+    // A department agent is not the Keeper.
+    let department = BoardActor::Agent(env.service.resolve_agent(USER, CONV).await.unwrap());
+    let error = env
+        .service
+        .set_wip_limits(&department, PROJECT, &wanted)
+        .await
+        .unwrap_err();
+    assert_eq!(code(error), "board_agent_move_denied");
+}

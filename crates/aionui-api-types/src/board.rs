@@ -846,6 +846,15 @@ pub struct AgentMoveBoardCardRequest {
     pub approval_note: Option<String>,
 }
 
+/// Agent `wip --set <column>=<n>` (TASK-116 hotfix): the Board Keeper of a
+/// board with `agent_access: full` sets column WIP limits (1–20).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentSetWipLimitsRequest {
+    /// Column key → WIP limit.
+    pub limits: std::collections::BTreeMap<String, i64>,
+}
+
 /// Agent `block <N>`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]

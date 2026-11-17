@@ -91,17 +91,17 @@ pub use auth::{
 };
 pub use board::{
     AgentAccess, AgentBlockBoardCardRequest, AgentLinkBoardCardRequest, AgentMove, AgentMoveBoardCardRequest,
-    AgentShowBoardCardQuery, AgentUpdateBoardCardRequest, AssigneeKind, BOARD_ACTOR_HEADER, BOARD_ACTOR_SUPERVISOR,
-    BOARD_CHANGED_EVENT, BOARD_TOOLS_SCHEMA_VERSION, BoardActorKind, BoardAssignRequest, BoardAssignResponse,
-    BoardBrainstormRequest, BoardCardDetail, BoardCardDto, BoardCardListQuery, BoardCardPage, BoardCardSummaryDto,
-    BoardChangedPayload, BoardCliEnvelope, BoardCliError, BoardCliMeta, BoardColumnDto, BoardColumnInput,
-    BoardColumnsResponse, BoardCommentRequest, BoardDependencyDto, BoardEmptyRequest, BoardEventDto, BoardEventPage,
-    BoardEventsQuery, BoardFinding, BoardGateRequest, BoardKeeperResponse, BoardLinkDto, BoardLinkRequest,
-    BoardLinkStatus, BoardPacketDto, BoardQuestionDto, BoardReviewDto, BoardReviewRequest, BoardReviewResult,
-    BoardSettingsDto, BoardStatusResponse, BoardTemplate, BoardVerdictQuestion, BoardView, BoardViewQuery,
-    CardPriority, CardSize, CardTier, CardType, ColumnCategory, ColumnKind, ColumnResolution, CreateBoardCardRequest,
-    FindingSeverity, GateDecision, LinkRole, MoveBoardCardRequest, ParentFallback, ReviewVerdict,
-    UpdateBoardCardRequest, UpdateBoardColumnsRequest, UpdateBoardSettingsRequest,
+    AgentSetWipLimitsRequest, AgentShowBoardCardQuery, AgentUpdateBoardCardRequest, AssigneeKind, BOARD_ACTOR_HEADER,
+    BOARD_ACTOR_SUPERVISOR, BOARD_CHANGED_EVENT, BOARD_TOOLS_SCHEMA_VERSION, BoardActorKind, BoardAssignRequest,
+    BoardAssignResponse, BoardBrainstormRequest, BoardCardDetail, BoardCardDto, BoardCardListQuery, BoardCardPage,
+    BoardCardSummaryDto, BoardChangedPayload, BoardCliEnvelope, BoardCliError, BoardCliMeta, BoardColumnDto,
+    BoardColumnInput, BoardColumnsResponse, BoardCommentRequest, BoardDependencyDto, BoardEmptyRequest, BoardEventDto,
+    BoardEventPage, BoardEventsQuery, BoardFinding, BoardGateRequest, BoardKeeperResponse, BoardLinkDto,
+    BoardLinkRequest, BoardLinkStatus, BoardPacketDto, BoardQuestionDto, BoardReviewDto, BoardReviewRequest,
+    BoardReviewResult, BoardSettingsDto, BoardStatusResponse, BoardTemplate, BoardVerdictQuestion, BoardView,
+    BoardViewQuery, CardPriority, CardSize, CardTier, CardType, ColumnCategory, ColumnKind, ColumnResolution,
+    CreateBoardCardRequest, FindingSeverity, GateDecision, LinkRole, MoveBoardCardRequest, ParentFallback,
+    ReviewVerdict, UpdateBoardCardRequest, UpdateBoardColumnsRequest, UpdateBoardSettingsRequest,
 };
 pub use board_tools::{BoardToolDescriptor, board_tool_descriptors, board_tool_for_cli_command};
 pub use browser::{

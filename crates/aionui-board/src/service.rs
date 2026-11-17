@@ -55,6 +55,10 @@ pub(crate) struct Inner {
 
 /// Default first page of the board GET.
 pub const BOARD_VIEW_PAGE: usize = 500;
+/// WIP limits the Board Keeper may set (`board wip`); the owner's column
+/// editor allows 1–999.
+pub const WIP_MIN: i64 = 1;
+pub const WIP_MAX: i64 = 20;
 
 /// What a committed write publishes.
 pub(crate) struct Committed {
@@ -643,6 +647,89 @@ impl BoardService {
             )
             .await?;
             self.commit(tx, user_id, &Committed::event(event)).await?;
+            Ok(BoardColumnsResponse {
+                columns: dtos,
+                version: settings.version,
+            })
+        }
+        .instrument(write_span(COLUMNS_CHANGED, actor, None))
+        .await
+    }
+
+    /// Column WIP limits (TASK-116 hotfix): the owner, or the project's
+    /// Board Keeper on a board with `agent_access: full` (agent `board wip`).
+    /// Each limit 1–20 on an existing column; one `columns_changed` event
+    /// records the change with `wip`.
+    pub async fn set_wip_limits(
+        &self,
+        actor: &BoardActor,
+        project_id: &str,
+        limits: &std::collections::BTreeMap<String, i64>,
+    ) -> BoardResult<BoardColumnsResponse> {
+        match actor {
+            BoardActor::User { .. } => {}
+            BoardActor::System { .. } => return Err(require_owner(actor).unwrap_err()),
+            BoardActor::Agent(agent) => {
+                let access = self.agent_access(actor.user_id(), project_id).await?;
+                if !agent.keeper || agent.project_id != project_id || access != AgentAccess::Full {
+                    return Err(BoardError::new(
+                        BoardErrorCode::AgentMoveDenied,
+                        "only the Board Keeper of a board with agent_access full may change WIP limits",
+                    )
+                    .with_details(json!({ "agent_access": access.as_str(), "keeper": agent.keeper })));
+                }
+            }
+        }
+        if limits.is_empty() {
+            return Err(BoardError::invalid("limits", "name at least one column=limit"));
+        }
+        if let Some((key, limit)) = limits.iter().find(|(_, limit)| !(WIP_MIN..=WIP_MAX).contains(*limit)) {
+            return Err(BoardError::invalid(
+                "limits",
+                format!("WIP limit of `{key}` must be {WIP_MIN}-{WIP_MAX}, got {limit}"),
+            ));
+        }
+        let user_id = actor.user_id();
+        self.user_project(user_id, project_id).await?;
+        self.refresh_archive(actor, project_id).await?;
+        async {
+            let mut tx = self.store().begin().await?;
+            let mut settings = Self::tx_settings(tx.as_mut(), actor, project_id).await?;
+            Self::check_writable(&settings, actor)?;
+            let mut rows = tx.columns(user_id, project_id).await?;
+            for key in limits.keys() {
+                if !rows.iter().any(|c| &c.key == key && !c.archived) {
+                    return Err(BoardError::invalid("limits", format!("unknown column `{key}`")));
+                }
+            }
+            for row in rows.iter_mut() {
+                if let Some(limit) = limits.get(&row.key) {
+                    row.wip_limit = Some(*limit);
+                }
+            }
+            tx.upsert_columns(&rows).await?;
+            let expected = settings.version;
+            settings.version += 1;
+            settings.updated_at = now_ms();
+            if !tx.update_settings(&settings, expected).await? {
+                return Err(version_conflict(expected));
+            }
+            let mut dtos = Vec::with_capacity(rows.len());
+            for row in &rows {
+                let count = tx.count_column_cards(user_id, project_id, &row.key, None).await?;
+                dtos.push(column_dto(row, count));
+            }
+            let event = Self::append_event(
+                tx.as_mut(),
+                actor,
+                project_id,
+                None,
+                COLUMNS_CHANGED,
+                json!({ "columns": dtos, "version": settings.version, "wip": limits }),
+            )
+            .await?;
+            self.commit(tx, user_id, &Committed::event(event)).await?;
+            info!(project_id = %project_id, actor = actor.actor_ref(), limits = ?limits, "board WIP limits changed");
             Ok(BoardColumnsResponse {
                 columns: dtos,
                 version: settings.version,
