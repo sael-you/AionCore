@@ -45,6 +45,8 @@ pub const ASSET: &str = "camoufox-159.0-beta.42-lin.x86_64.zip";
 pub const ASSET_SHA256: &str = "a79ad1ef1a4575e3e0d2c1c66b13ad79ebcad15a898a7c070075e6dd849533d4";
 /// The asset is ~1.3 GB (2.4 GB unpacked).
 pub const ASSET_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+/// Total time allowed for the asset download.
+pub const DOWNLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90 * 60);
 /// The Playwright pinned for the sidecar and the agents' client.
 pub const PLAYWRIGHT_PIN: &str = "@playwright/cli 0.1.17 (playwright-core 1.62.0-alpha-1783623505000)";
 
@@ -101,6 +103,9 @@ pub async fn download_to(
 ) -> Result<(String, u64), BrowserError> {
     let mut resp = http
         .get(url)
+        // The installer client's 10-minute total timeout is too short for
+        // ~1.3 GB on a busy host: this request gets its own.
+        .timeout(DOWNLOAD_TIMEOUT)
         .send()
         .await
         .map_err(|e| BrowserError::Internal(format!("download failed: {e}")))?;
@@ -126,10 +131,32 @@ pub async fn download_to(
     Ok((hex::encode(hasher.finalize()), size))
 }
 
-/// Build the engine tree for [`VERSION`] in `x` (staging): the zip, the
-/// sidecar runtime and x11vnc. Returns the tree and its verification record.
-pub async fn build_tree(http: &reqwest::Client, staging: &Path, x: &Path) -> Result<(PathBuf, Value), BrowserError> {
-    // 1. The release entry: pinned sha256 == GitHub's digest.
+/// sha256 of a file, streamed.
+pub fn file_sha256(path: &Path) -> std::io::Result<String> {
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    std::io::copy(&mut file, &mut hasher)?;
+    Ok(hex::encode(hasher.finalize()))
+}
+
+/// The verified zip in `cache` (root-only, 0700): reused when its sha256
+/// still equals the pin, else downloaded (release entry checked first) and
+/// kept. A mismatching cached file is deleted and fetched again.
+pub async fn cached_asset(http: &reqwest::Client, cache: &Path) -> Result<(PathBuf, bool), BrowserError> {
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        let mut b = std::fs::DirBuilder::new();
+        b.recursive(true).mode(0o700);
+        b.create(cache)?;
+    }
+    let path = cache.join(ASSET);
+    if path.exists() {
+        if file_sha256(&path)? == ASSET_SHA256 {
+            return Ok((path, true));
+        }
+        tracing::warn!("camoufox: cached archive does not match the pinned sha256; downloading again");
+        std::fs::remove_file(&path)?;
+    }
     let api: Value = http
         .get(release_api_url())
         .header("Accept", "application/vnd.github+json")
@@ -140,14 +167,53 @@ pub async fn build_tree(http: &reqwest::Client, staging: &Path, x: &Path) -> Res
         .await
         .map_err(|e| BrowserError::Internal(format!("release lookup failed: {e}")))?;
     check_release(&api)?;
-    // 2. The zip, streamed, checked against the pin.
-    let zip = staging.join(ASSET);
-    let (sha, size) = download_to(http, &expected_download_url(), &zip, ASSET_MAX_BYTES).await?;
-    if sha != ASSET_SHA256 {
-        return Err(BrowserError::Internal(
-            "Camoufox download does not match the pinned sha256".into(),
-        ));
+    let partial = cache.join(format!(".{ASSET}.part"));
+    match download_to(http, &expected_download_url(), &partial, ASSET_MAX_BYTES).await {
+        Ok((sha, _)) if sha == ASSET_SHA256 => {
+            std::fs::rename(&partial, &path)?;
+            Ok((path, false))
+        }
+        Ok(_) => {
+            let _ = std::fs::remove_file(&partial);
+            Err(BrowserError::Internal(
+                "Camoufox download does not match the pinned sha256".into(),
+            ))
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(&partial);
+            Err(e)
+        }
     }
+}
+
+/// Remove the cached archives (the engine's "clear cache", used by remove).
+pub fn clear_cache(cache: &Path) -> std::io::Result<u64> {
+    let mut freed = 0;
+    for name in [ASSET.to_owned(), format!(".{ASSET}.part")] {
+        let p = cache.join(name);
+        if let Ok(meta) = std::fs::metadata(&p) {
+            freed += meta.len();
+            std::fs::remove_file(&p)?;
+        }
+    }
+    Ok(freed)
+}
+
+/// Build the engine tree for [`VERSION`] in `x` (staging): the zip (the
+/// verified cached copy when there is one), the sidecar runtime and x11vnc.
+/// Returns the tree and its verification record.
+pub async fn build_tree(
+    http: &reqwest::Client,
+    staging: &Path,
+    x: &Path,
+    cache: &Path,
+) -> Result<(PathBuf, Value), BrowserError> {
+    // 1–2. The zip: release entry checked (pinned sha256 == GitHub's
+    // digest), streamed and checked against the pin — or the cached copy,
+    // re-checked against the pin.
+    let (zip, reused) = cached_asset(http, cache).await?;
+    let size = std::fs::metadata(&zip)?.len();
+    let sha = ASSET_SHA256.to_owned();
     let tree = x.join("camoufox");
     std::fs::create_dir_all(&tree)?;
     let mut cmd = aionui_runtime::Builder::clean_cli("unzip");
@@ -155,7 +221,6 @@ pub async fn build_tree(http: &reqwest::Client, staging: &Path, x: &Path) -> Res
     if !cmd.output().await?.status.success() {
         return Err(BrowserError::Internal("unzip failed".into()));
     }
-    let _ = std::fs::remove_file(&zip);
     // 3. The sidecar runtime.
     let lock = install_sidecar(staging, &tree.join(SIDECAR_DIR)).await?;
     // 4. x11vnc for the panel.
@@ -167,6 +232,7 @@ pub async fn build_tree(http: &reqwest::Client, staging: &Path, x: &Path) -> Res
         "checked": "sha256 pinned in AionCore == GitHub release API digest == sha256 of the download; URL = the release's browser_download_url",
         "not_checked": "Camoufox publishes no signature",
         "source": expected_download_url(),
+        "from_cache": reused,
         "sha256": sha,
         "size": size,
         "sidecar": { "pin": PLAYWRIGHT_PIN, "packages": lock },
@@ -281,6 +347,38 @@ mod tests {
             assert!(p["integrity"].as_str().unwrap_or("").starts_with("sha512-"), "{name}");
         }
         assert!(SIDECAR_JS.contains("allow_hijacking_localhost") && SIDECAR_JS.contains("browser.bind("));
+    }
+
+    #[test]
+    fn the_cache_is_clearable() {
+        let t = tempfile::tempdir().unwrap();
+        let cache = t.path().join("cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(cache.join(ASSET), b"0123456789").unwrap();
+        std::fs::write(cache.join(format!(".{ASSET}.part")), b"01234").unwrap();
+        assert_eq!(clear_cache(&cache).unwrap(), 15);
+        assert!(!cache.join(ASSET).exists());
+        assert_eq!(clear_cache(&cache).unwrap(), 0, "nothing left");
+    }
+
+    #[tokio::test]
+    async fn a_cached_archive_with_the_wrong_sha_is_dropped_and_the_dir_is_root_only() {
+        use std::os::unix::fs::PermissionsExt;
+        let t = tempfile::tempdir().unwrap();
+        let cache = t.path().join("cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(cache.join(ASSET), b"tampered").unwrap();
+        // The re-download cannot succeed here (no route); the tampered file
+        // must be gone before it is attempted.
+        let http = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_millis(200))
+            .build()
+            .unwrap();
+        let _ = cached_asset(&http, &cache).await;
+        assert!(!cache.join(ASSET).exists());
+        let fresh = t.path().join("fresh");
+        let _ = cached_asset(&http, &fresh).await;
+        assert_eq!(std::fs::metadata(&fresh).unwrap().permissions().mode() & 0o777, 0o700);
     }
 
     #[test]

@@ -338,7 +338,7 @@ impl EngineInstaller {
                     (x.join(zip_dir), record)
                 }
                 (EngineSource::GithubRelease { .. }, EngineRelease::Pinned { .. }) => {
-                    crate::camoufox::build_tree(&self.http, &staging, &x).await?
+                    crate::camoufox::build_tree(&self.http, &staging, &x, &self.layout.cache_dir()).await?
                 }
                 _ => return Err(BrowserError::Internal("release does not match the engine".into())),
             };

@@ -27,7 +27,7 @@ pub const DEFAULT_BROWSER_ROOT: &str = "/root/.clauterm/aionui-browser";
 /// The unprivileged account Chrome and Xvfb run as.
 pub const BROWSER_USER: &str = "aionui-browser";
 /// Directory names under the root that are not user ids.
-const RESERVED: &[&str] = &["chrome", "engines", "home", "staging"];
+const RESERVED: &[&str] = &["cache", "chrome", "engines", "home", "staging"];
 
 #[derive(Debug, Clone)]
 pub struct BrowserLayout {
@@ -70,6 +70,12 @@ impl BrowserLayout {
 
     pub fn engine_binary(&self, engine: BrowserEngine) -> PathBuf {
         self.engine_current(engine).join(crate::engine::spec(engine).binary)
+    }
+
+    /// Verified engine archives kept for reinstalling without a new download
+    /// (root-only; TASK-136 K6).
+    pub fn cache_dir(&self) -> PathBuf {
+        self.root.join("cache")
     }
 
     pub fn home_dir(&self) -> PathBuf {
