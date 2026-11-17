@@ -611,6 +611,14 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
             service: services.devices_service.clone(),
         },
     ))
+    // C38 W3: the aionui-devices MCP bridge calls these with the
+    // conversation's runtime token (validated by the handlers themselves).
+    .merge(aionui_devices::devices_runtime_routes(
+        aionui_devices::DevicesRuntimeRouterState {
+            service: services.devices_service.clone(),
+            runtime_token_service: services.runtime_token_service.clone(),
+        },
+    ))
     .merge(runtime_team_tools)
     .merge(session_message_runtime)
     .merge(conversation_runtime)

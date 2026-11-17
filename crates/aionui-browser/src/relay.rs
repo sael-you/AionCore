@@ -497,10 +497,10 @@ impl DeviceHub {
     // -- the extension socket ---------------------------------------------
 
     /// Serve one extension connection until it closes.
-    pub async fn run_extension(self: Arc<Self>, socket: WebSocket) {
+    pub async fn run_extension(self: Arc<Self>, socket: WebSocket, source: String) {
         let (mut sink, mut stream) = socket.split();
         let auth = match tokio::time::timeout(FIRST_FRAME_TIMEOUT, stream.next()).await {
-            Ok(Some(Ok(Message::Text(t)))) => self.authenticate_first(&t),
+            Ok(Some(Ok(Message::Text(t)))) => self.authenticate_first(&t, &source),
             _ => Err((BrowserErrorCode::BrowserBadMessage, None)),
         };
         let (auth, token) = match auth {
@@ -592,6 +592,7 @@ impl DeviceHub {
     fn authenticate_first(
         &self,
         text: &str,
+        source: &str,
     ) -> Result<(Authenticated, Option<String>), (BrowserErrorCode, Option<String>)> {
         let (result, version) = match serde_json::from_str::<ExtensionInbound>(text) {
             Ok(ExtensionInbound::Pair {
@@ -601,7 +602,7 @@ impl DeviceHub {
                 extension_version,
             }) => (
                 self.store
-                    .pair(&code, &device_name, &browser)
+                    .pair(&code, &device_name, &browser, source)
                     .map(|(auth, token)| (auth, Some(token)))
                     .map_err(|e| (e.code().unwrap_or(BrowserErrorCode::BrowserPairingInvalid), None)),
                 extension_version,

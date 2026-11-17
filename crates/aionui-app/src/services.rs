@@ -522,9 +522,6 @@ impl AppServices {
         // only the idle reaper and the daily update timer.
         let browser_service = crate::router::browser::build_browser_service(&data_dir, &origin_policy)?;
         browser_service.spawn_background();
-        conversation_service.with_browser_port(Arc::new(crate::router::browser::BrowserConversationPort {
-            service: browser_service.clone(),
-        }));
         // Devices registry (C38): reads the browser through a port; phones,
         // the Mac and add-ons live in migration 911. Expired switches go off
         // now and every few seconds.
@@ -537,6 +534,10 @@ impl AppServices {
         devices_service.spawn_background();
         // Add-ons (K5): install / remove through the Mac helper.
         aionui_devices::addons::register(&devices_service);
+        conversation_service.with_browser_port(Arc::new(crate::router::browser::BrowserConversationPort {
+            service: browser_service.clone(),
+            devices: devices_service.clone(),
+        }));
         devices_service.set_companion_downloads(Arc::new(aionui_devices::companion::CompanionDownloads::new(
             data_dir.join("devices").join("companion"),
         )));

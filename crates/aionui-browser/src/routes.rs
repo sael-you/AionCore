@@ -59,6 +59,18 @@ pub fn browser_extension_routes(state: BrowserRouterState) -> Router {
         .with_state(state)
 }
 
+/// The client address for per-source limits: the gateway and the web host
+/// forward it as `X-Forwarded-For` (AionCore itself only listens on loopback).
+pub fn client_source(headers: &HeaderMap) -> String {
+    headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next())
+        .map(|v| v.trim().to_owned())
+        .filter(|v| !v.is_empty() && v.len() <= 64)
+        .unwrap_or_else(|| "unknown".to_owned())
+}
+
 pub fn extension_origin() -> String {
     format!("chrome-extension://{BROWSER_EXTENSION_ID}")
 }
@@ -314,8 +326,9 @@ async fn extension_ws(
     };
     learn_host(&s, &headers);
     let hub = s.service.device_hub().clone();
+    let source = client_source(&headers);
     ws.max_message_size(crate::relay::MAX_EXTENSION_FRAME)
-        .on_upgrade(move |socket| hub.run_extension(socket))
+        .on_upgrade(move |socket| hub.run_extension(socket, source))
 }
 
 #[cfg(test)]

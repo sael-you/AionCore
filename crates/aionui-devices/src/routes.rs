@@ -55,7 +55,11 @@ struct ApkQuery {
     t: String,
 }
 
-async fn companion_apk(State(s): State<DevicesRouterState>, Query(q): Query<ApkQuery>) -> Response {
+async fn companion_apk(
+    State(s): State<DevicesRouterState>,
+    Query(q): Query<ApkQuery>,
+    request: axum::extract::Request,
+) -> Response {
     let Some(downloads) = s.service.companion_downloads() else {
         return StatusCode::NOT_FOUND.into_response();
     };
@@ -66,22 +70,29 @@ async fn companion_apk(State(s): State<DevicesRouterState>, Query(q): Query<ApkQ
         ))
         .into_response();
     }
-    match downloads.read_apk().await {
-        Ok(bytes) => (
-            [
-                (
-                    axum::http::header::CONTENT_TYPE,
-                    "application/vnd.android.package-archive",
-                ),
-                (
-                    axum::http::header::CONTENT_DISPOSITION,
-                    "attachment; filename=\"aionui-companion.apk\"",
-                ),
-                (axum::http::header::CACHE_CONTROL, "no-store"),
-            ],
-            bytes,
-        )
-            .into_response(),
+    let Some(path) = downloads.servable_apk().await else {
+        return StatusCode::NOT_FOUND.into_response();
+    };
+    // Streamed from disk (a release APK is tens of MB).
+    use tower::ServiceExt;
+    match tower_http::services::ServeFile::new(path).oneshot(request).await {
+        Ok(response) => {
+            let mut response = response.into_response();
+            let headers = response.headers_mut();
+            headers.insert(
+                axum::http::header::CONTENT_TYPE,
+                axum::http::HeaderValue::from_static("application/vnd.android.package-archive"),
+            );
+            headers.insert(
+                axum::http::header::CONTENT_DISPOSITION,
+                axum::http::HeaderValue::from_static("attachment; filename=\"aionui-companion.apk\""),
+            );
+            headers.insert(
+                axum::http::header::CACHE_CONTROL,
+                axum::http::HeaderValue::from_static("no-store"),
+            );
+            response
+        }
         Err(error) => {
             tracing::warn!(error = %error, "companion APK not readable");
             StatusCode::NOT_FOUND.into_response()
@@ -106,9 +117,22 @@ async fn relay_ws(
         Err(rejection) => return rejection.into_response(),
     };
     let service = s.service.clone();
+    let source = client_source(&headers);
     ws.max_message_size(RELAY_MAX_FRAME_BYTES)
         .max_frame_size(RELAY_MAX_FRAME_BYTES)
-        .on_upgrade(move |socket| service.run_relay(socket))
+        .on_upgrade(move |socket| service.run_relay(socket, source))
+}
+
+/// The client address for per-source limits: the gateway and the web host
+/// forward it as `X-Forwarded-For` (AionCore itself only listens on loopback).
+pub fn client_source(headers: &HeaderMap) -> String {
+    headers
+        .get("x-forwarded-for")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.split(',').next())
+        .map(|v| v.trim().to_owned())
+        .filter(|v| !v.is_empty() && v.len() <= 64)
+        .unwrap_or_else(|| "unknown".to_owned())
 }
 
 /// The host the owner reaches AionUi under: the web host forwards it as

@@ -75,13 +75,12 @@ impl CompanionDownloads {
             .any(|e| *e.value() > now && constant_time_eq(e.key(), token))
     }
 
-    pub async fn read_apk(&self) -> std::io::Result<Vec<u8>> {
+    /// The APK path when it is a regular file of sane size (it is streamed
+    /// from disk by the route, never loaded into memory).
+    pub async fn servable_apk(&self) -> Option<PathBuf> {
         let path = self.apk_path();
-        let meta = tokio::fs::metadata(&path).await?;
-        if !meta.is_file() || meta.len() > APK_MAX_BYTES {
-            return Err(std::io::Error::other("no usable APK"));
-        }
-        tokio::fs::read(path).await
+        let meta = tokio::fs::symlink_metadata(&path).await.ok()?;
+        (meta.is_file() && meta.len() <= APK_MAX_BYTES).then_some(path)
     }
 }
 
@@ -114,7 +113,7 @@ mod tests {
         assert!(!downloads.check("nope") && !downloads.check(""));
         assert_eq!(downloads.sha256().as_deref(), Some("abc123"));
         assert_eq!(downloads.version().as_deref(), Some("0.1.0"));
-        assert_eq!(downloads.read_apk().await.unwrap(), b"PK\x03\x04apk");
+        assert_eq!(downloads.servable_apk().await, Some(dir.join(APK_FILE)));
         downloads
             .tokens
             .insert(token.to_owned(), Instant::now() - Duration::from_secs(1));

@@ -8,6 +8,7 @@ aionui-api-types.workspace = true
 aionui-common.workspace = true
 aionui-auth.workspace = true
 aionui-db.workspace = true
+aionui-ai-agent.workspace = true
 axum.workspace = true
 tokio.workspace = true
 serde.workspace = true
@@ -15,6 +16,8 @@ serde_json.workspace = true
 uuid = { workspace = true, features = ["v4"] }
 dashmap.workspace = true
 futures-util.workspace = true
+tower = { workspace = true, features = ["util"] }
+tower-http.workspace = true
 tracing.workspace = true
 thiserror.workspace = true
 async-trait.workspace = true

@@ -92,7 +92,7 @@ async fn pair_mac(svc: &Arc<DevicesService>, port: u16) -> (Ws, String, String) 
     send(
         &mut ws,
         json!({"type": "pair", "code": code, "kind": "mac_helper", "name": "MacBook", "version": "0.1.0",
-               "capabilities": ["tap", "screenshot", "stop"]}),
+               "capabilities": ["tap", "screenshot", "foreground", "text", "ui_tree", "stop"]}),
     )
     .await;
     let welcome = next(&mut ws).await.unwrap();
@@ -310,4 +310,404 @@ async fn pair_inventory_requests_stop_and_revoke() {
         list.iter().all(|d| d.id != phone && d.id != mac),
         "revoked devices leave the page"
     );
+}
+
+/// Answer the helper side of agent calls: `foreground` says which app is in
+/// front; every other verb succeeds. Returns the verbs that reached the phone.
+fn serve_phone(mut ws: Ws, front: &'static str) -> tokio::sync::mpsc::UnboundedReceiver<String> {
+    let (tx, rx) = tokio::sync::mpsc::unbounded_channel();
+    tokio::spawn(async move {
+        while let Some(frame) = next(&mut ws).await {
+            if frame["type"] != "request" {
+                continue;
+            }
+            let verb = frame["verb"].as_str().unwrap_or_default().to_owned();
+            let result = if verb == "foreground" {
+                json!({"package": front})
+            } else {
+                json!({"ok": true})
+            };
+            send(
+                &mut ws,
+                json!({"type": "response", "id": frame["id"], "ok": true, "result": result}),
+            )
+            .await;
+            if verb != "foreground" {
+                let _ = tx.send(verb);
+            }
+        }
+    });
+    rx
+}
+
+fn agent(device: &str, verb: &str) -> aionui_devices::AgentCall {
+    aionui_devices::AgentCall {
+        user_id: "u1".into(),
+        conversation_id: Some("c1".into()),
+        device_id: device.into(),
+        verb: verb.into(),
+        args: json!({}),
+    }
+}
+
+async fn pending(svc: &Arc<DevicesService>) -> aionui_api_types::devices::DeviceApproval {
+    for _ in 0..300 {
+        if let Some(a) = svc.approvals("u1").into_iter().next() {
+            return a;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    panic!("no approval was requested");
+}
+
+/// K3: switch, verb allowlist, and no prompt on an ordinary app.
+#[tokio::test]
+async fn agent_calls_need_the_switch_and_an_allowed_verb() {
+    let (svc, port) = harness().await;
+    let (ws, _token, client_id) = pair_mac(&svc, port).await;
+    let phone = format!("phone:{client_id}:R5CX");
+    wait_status(&svc, &phone, DeviceStatus::Off).await;
+    let mut reached = serve_phone(ws, "com.android.chrome");
+
+    assert_eq!(
+        svc.agent_call(agent(&phone, "tap")).await.unwrap_err().code(),
+        Some(DeviceErrorCode::DeviceDisabled),
+        "switch off"
+    );
+    svc.update(
+        "u1",
+        &phone,
+        &DeviceUpdate {
+            enabled: true,
+            timeout_minutes: Some(15),
+        },
+    )
+    .await
+    .unwrap();
+    for verb in ["stop", "cdp_frame", "addon_run", "shell", "mac_click"] {
+        assert_eq!(
+            svc.agent_call(agent(&phone, verb)).await.unwrap_err().code(),
+            Some(DeviceErrorCode::DeviceVerbRefused),
+            "{verb}"
+        );
+    }
+    let mut other = agent(&phone, "tap");
+    other.user_id = "u2".into();
+    assert_eq!(
+        svc.agent_call(other).await.unwrap_err().code(),
+        Some(DeviceErrorCode::DeviceNotFound)
+    );
+
+    // An ordinary app: actions and reads pass without a prompt.
+    svc.agent_call(agent(&phone, "tap")).await.unwrap();
+    svc.agent_call(agent(&phone, "screenshot")).await.unwrap();
+    assert!(svc.approvals("u1").is_empty());
+    assert_eq!(reached.recv().await.as_deref(), Some("tap"));
+    assert_eq!(reached.recv().await.as_deref(), Some("screenshot"));
+
+    let audit = svc.audit("u1", &phone, None, Some(50)).await.unwrap().rows;
+    assert!(audit.iter().any(|r| r.verb == "tap"
+        && r.outcome == aionui_api_types::devices::DeviceAuditOutcome::Ok
+        && r.package.as_deref() == Some("com.android.chrome")
+        && r.conversation_id.as_deref() == Some("c1")));
+    assert!(
+        audit
+            .iter()
+            .any(|r| r.verb == "shell" && r.outcome == aionui_api_types::devices::DeviceAuditOutcome::Refused)
+    );
+}
+
+/// Owner decision 2026-11-17: on a crucial app reads are gated like actions,
+/// and one OK covers reads and actions on that device + app for 5 minutes.
+#[tokio::test]
+async fn a_crucial_app_gates_reads_and_actions_and_one_ok_covers_both() {
+    let (svc, port) = harness().await;
+    let (ws, _token, client_id) = pair_mac(&svc, port).await;
+    let phone = format!("phone:{client_id}:R5CX");
+    wait_status(&svc, &phone, DeviceStatus::Off).await;
+    let mut reached = serve_phone(ws, "com.whatsapp");
+    svc.update(
+        "u1",
+        &phone,
+        &DeviceUpdate {
+            enabled: true,
+            timeout_minutes: Some(15),
+        },
+    )
+    .await
+    .unwrap();
+
+    // A READ waits for the owner; a deny refuses it and nothing reaches the phone.
+    let svc2 = svc.clone();
+    let phone2 = phone.clone();
+    let read = tokio::spawn(async move { svc2.agent_call(agent(&phone2, "screenshot")).await });
+    let ask = pending(&svc).await;
+    assert_eq!(
+        (ask.verb.as_str(), ask.package.as_deref()),
+        ("screenshot", Some("com.whatsapp"))
+    );
+    assert_eq!(ask.grant_minutes, Some(5));
+    assert!(svc.approvals("u2").is_empty());
+    svc.decide_approval("u1", &ask.id, false).unwrap();
+    assert_eq!(
+        read.await.unwrap().unwrap_err().code(),
+        Some(DeviceErrorCode::DeviceApprovalDenied)
+    );
+    assert!(reached.try_recv().is_err(), "a denied read never reaches the phone");
+
+    // Allow an ACTION: it runs, and the following read needs no new prompt.
+    let svc2 = svc.clone();
+    let phone2 = phone.clone();
+    let act = tokio::spawn(async move { svc2.agent_call(agent(&phone2, "text")).await });
+    let ask = pending(&svc).await;
+    assert_eq!(ask.verb, "text");
+    svc.decide_approval("u1", &ask.id, true).unwrap();
+    act.await.unwrap().unwrap();
+    assert_eq!(reached.recv().await.as_deref(), Some("text"));
+    svc.agent_call(agent(&phone, "ui_tree")).await.unwrap();
+    assert!(svc.approvals("u1").is_empty(), "covered by the 5-minute OK");
+    assert_eq!(reached.recv().await.as_deref(), Some("ui_tree"));
+    assert_eq!(
+        svc.decide_approval("u1", &ask.id, true).unwrap_err().code(),
+        Some(DeviceErrorCode::DeviceApprovalExpired)
+    );
+
+    let outcomes: Vec<_> = svc
+        .audit("u1", &phone, None, Some(50))
+        .await
+        .unwrap()
+        .rows
+        .into_iter()
+        .map(|r| r.outcome)
+        .collect();
+    use aionui_api_types::devices::DeviceAuditOutcome as O;
+    // The denied read, then the allowed action and the read its OK covered.
+    assert_eq!(outcomes.iter().filter(|o| **o == O::Denied).count(), 1);
+    assert_eq!(outcomes.iter().filter(|o| **o == O::Approved).count(), 2);
+}
+
+/// Password managers: their screen is never read (no prompt); actions ask.
+#[tokio::test]
+async fn a_password_manager_is_never_read() {
+    let (svc, port) = harness().await;
+    let (ws, _token, client_id) = pair_mac(&svc, port).await;
+    let phone = format!("phone:{client_id}:R5CX");
+    wait_status(&svc, &phone, DeviceStatus::Off).await;
+    let mut reached = serve_phone(ws, "com.x8bit.bitwarden");
+    svc.update(
+        "u1",
+        &phone,
+        &DeviceUpdate {
+            enabled: true,
+            timeout_minutes: Some(15),
+        },
+    )
+    .await
+    .unwrap();
+    for verb in ["screenshot", "ui_tree"] {
+        assert_eq!(
+            svc.agent_call(agent(&phone, verb)).await.unwrap_err().code(),
+            Some(DeviceErrorCode::DeviceVerbRefused),
+            "{verb}"
+        );
+    }
+    assert!(svc.approvals("u1").is_empty(), "no OK is possible for a read");
+    assert!(reached.try_recv().is_err());
+
+    // An action asks; allowed, it runs, but a read stays refused afterwards.
+    let svc2 = svc.clone();
+    let phone2 = phone.clone();
+    let act = tokio::spawn(async move { svc2.agent_call(agent(&phone2, "tap")).await });
+    let ask = pending(&svc).await;
+    svc.decide_approval("u1", &ask.id, true).unwrap();
+    act.await.unwrap().unwrap();
+    assert_eq!(reached.recv().await.as_deref(), Some("tap"));
+    assert_eq!(
+        svc.agent_call(agent(&phone, "screenshot")).await.unwrap_err().code(),
+        Some(DeviceErrorCode::DeviceVerbRefused),
+        "the OK for actions never unlocks reading a password manager"
+    );
+}
+
+/// A pending question is refused when the device is switched off.
+#[tokio::test]
+async fn switching_off_refuses_what_waits_for_an_ok() {
+    let (svc, port) = harness().await;
+    let (ws, _token, client_id) = pair_mac(&svc, port).await;
+    let phone = format!("phone:{client_id}:R5CX");
+    wait_status(&svc, &phone, DeviceStatus::Off).await;
+    let _reached = serve_phone(ws, "com.paypal.android.p2pmobile");
+    svc.update(
+        "u1",
+        &phone,
+        &DeviceUpdate {
+            enabled: true,
+            timeout_minutes: Some(15),
+        },
+    )
+    .await
+    .unwrap();
+    let svc2 = svc.clone();
+    let phone2 = phone.clone();
+    let act = tokio::spawn(async move { svc2.agent_call(agent(&phone2, "tap")).await });
+    pending(&svc).await;
+    svc.update(
+        "u1",
+        &phone,
+        &DeviceUpdate {
+            enabled: false,
+            timeout_minutes: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(svc.approvals("u1").is_empty());
+    let err = tokio::time::timeout(Duration::from_secs(5), act)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap_err();
+    assert_eq!(err.code(), Some(DeviceErrorCode::DeviceApprovalTimeout));
+}
+
+/// Director 2026-11-17: a phone reached via the Mac relay AND the companion
+/// app is ONE card with both routes; calls go over the route that serves them.
+#[tokio::test]
+async fn a_phone_reached_both_ways_is_one_card() {
+    let (svc, port) = harness().await;
+    // The companion app pairs first.
+    let code = svc
+        .pairing_code("u1", DevicePairingKind::Companion, Some("h"))
+        .unwrap()
+        .code;
+    let mut app = open(port, None).await.unwrap();
+    send(
+        &mut app,
+        json!({"type": "pair", "code": code, "kind": "companion", "name": "Pixel", "version": "0.1.0",
+               "capabilities": ["tap", "key", "foreground"]}),
+    )
+    .await;
+    let companion_id = next(&mut app).await.unwrap()["client_id"].as_str().unwrap().to_owned();
+    send(
+        &mut app,
+        json!({"type": "inventory", "phones": [{"serial": "self", "name": "Pixel", "transport": "self", "enabled": true}]}),
+    )
+    .await;
+    let card = format!("phone:{companion_id}:self");
+    wait_status(&svc, &card, DeviceStatus::Off).await;
+
+    // The Mac helper sees the same phone over adb and names its companion.
+    let code = svc.pairing_code("u1", DevicePairingKind::MacHelper, None).unwrap().code;
+    let mut mac = open(port, None).await.unwrap();
+    send(
+        &mut mac,
+        json!({"type": "pair", "code": code, "kind": "mac_helper", "name": "MacBook", "version": "0.1.0",
+               "capabilities": ["tap", "foreground", "logcat"]}),
+    )
+    .await;
+    let mac_id = next(&mut mac).await.unwrap()["client_id"].as_str().unwrap().to_owned();
+    send(
+        &mut mac,
+        json!({"type": "inventory", "phones": [
+            {"serial": "R5CX", "name": "Pixel 9", "transport": "usb", "enabled": true, "companion_client_id": companion_id},
+            {"serial": "OTHER", "name": "Tablet", "transport": "usb", "enabled": true, "companion_client_id": "pair_someone_else"}
+        ]}),
+    )
+    .await;
+    let hidden = format!("phone:{mac_id}:R5CX");
+    let tablet = format!("phone:{mac_id}:OTHER");
+    wait_status(&svc, &tablet, DeviceStatus::Off).await;
+
+    let list = svc.list("u1").await.unwrap();
+    let phones: Vec<&str> = list
+        .iter()
+        .filter(|d| d.kind == DeviceKind::Phone)
+        .map(|d| d.id.as_str())
+        .collect();
+    assert_eq!(phones.len(), 2, "{phones:?}");
+    assert!(phones.contains(&card.as_str()) && phones.contains(&tablet.as_str()));
+    assert!(
+        !phones.contains(&hidden.as_str()),
+        "the Mac-relay row is inside the companion card"
+    );
+    let merged = list.iter().find(|d| d.id == card).unwrap();
+    let routes: Vec<_> = merged.routes.as_ref().unwrap().iter().map(|r| r.route).collect();
+    assert_eq!(
+        routes,
+        [
+            aionui_api_types::devices::DeviceRouteKind::MacRelay,
+            aionui_api_types::devices::DeviceRouteKind::Companion,
+            aionui_api_types::devices::DeviceRouteKind::WifiDirect
+        ]
+    );
+    // An id that is not one of this user's companion pairings merges nothing.
+    assert_eq!(
+        list.iter()
+            .find(|d| d.id == tablet)
+            .unwrap()
+            .routes
+            .as_ref()
+            .unwrap()
+            .len(),
+        2
+    );
+
+    // One switch for the card: the hidden row follows it.
+    svc.update(
+        "u1",
+        &card,
+        &DeviceUpdate {
+            enabled: true,
+            timeout_minutes: Some(15),
+        },
+    )
+    .await
+    .unwrap();
+    assert!(svc.is_enabled("u1", &hidden).await.unwrap());
+
+    // `tap` is served by both: it goes over the Mac relay. `key` only by the app.
+    let svc2 = svc.clone();
+    let card2 = card.clone();
+    let tap = tokio::spawn(async move { svc2.routed_call("u1", &card2, "tap", json!({})).await });
+    let req = next(&mut mac).await.unwrap();
+    assert_eq!(
+        (req["verb"].as_str(), req["device"].as_str()),
+        (Some("tap"), Some("R5CX"))
+    );
+    send(
+        &mut mac,
+        json!({"type": "response", "id": req["id"], "ok": true, "result": {}}),
+    )
+    .await;
+    tap.await.unwrap().unwrap();
+
+    let svc2 = svc.clone();
+    let card2 = card.clone();
+    let key = tokio::spawn(async move { svc2.routed_call("u1", &card2, "key", json!({"code": 4})).await });
+    let req = next(&mut app).await.unwrap();
+    assert_eq!(
+        (req["verb"].as_str(), req["device"].as_str()),
+        (Some("key"), Some("self"))
+    );
+    send(
+        &mut app,
+        json!({"type": "response", "id": req["id"], "ok": true, "result": {}}),
+    )
+    .await;
+    key.await.unwrap().unwrap();
+
+    // Off: both routes are told to stop.
+    svc.update(
+        "u1",
+        &card,
+        &DeviceUpdate {
+            enabled: false,
+            timeout_minutes: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(next(&mut mac).await.unwrap(), json!({"type": "stop", "device": "R5CX"}));
+    assert_eq!(next(&mut app).await.unwrap(), json!({"type": "stop", "device": "self"}));
+    assert!(!svc.is_enabled("u1", &hidden).await.unwrap());
 }
