@@ -32,6 +32,8 @@ use aionui_api_types::{BrowserEngine, BrowserEngineVerification, BrowserPanelKin
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AptSource {
     pub repo: &'static str,
+    /// The suite under `dists/` (`stable` for the browser vendors).
+    pub suite: &'static str,
     pub key_url: &'static str,
     /// The pinned PRIMARY key fingerprint that must sign `InRelease`.
     pub primary_fpr: &'static str,
@@ -96,6 +98,7 @@ const SPECS: [EngineSpec; 6] = [
             repo: "https://dl.google.com/linux/chrome/deb",
             key_url: "https://dl.google.com/linux/linux_signing_key.pub",
             primary_fpr: GOOGLE_PRIMARY_FPR,
+            suite: "stable",
             package: "google-chrome-stable",
             tree: "opt/google/chrome",
         }),
@@ -119,6 +122,7 @@ const SPECS: [EngineSpec; 6] = [
             repo: "https://brave-browser-apt-release.s3.brave.com",
             key_url: "https://brave-browser-apt-release.s3.brave.com/brave-browser-archive-keyring.gpg",
             primary_fpr: BRAVE_PRIMARY_FPR,
+            suite: "stable",
             package: "brave-browser",
             tree: "opt/brave.com/brave",
         }),
@@ -132,6 +136,7 @@ const SPECS: [EngineSpec; 6] = [
             repo: "https://packages.microsoft.com/repos/edge",
             key_url: "https://packages.microsoft.com/keys/microsoft.asc",
             primary_fpr: MICROSOFT_PRIMARY_FPR,
+            suite: "stable",
             package: "microsoft-edge-stable",
             tree: "opt/microsoft/msedge",
         }),
