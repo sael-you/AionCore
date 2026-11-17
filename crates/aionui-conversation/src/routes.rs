@@ -145,6 +145,8 @@ pub fn conversation_routes(state: ConversationRouterState) -> Router {
         .route("/api/conversations/{id}/artifacts/{artifactId}", patch(update_artifact))
         .route("/api/conversations/{id}/cancel", post(cancel))
         .route("/api/conversations/{id}/outcome-seen", post(outcome_seen))
+        .route("/api/conversations/{id}/restart-resume", post(restart_resume))
+        .route("/api/conversations/{id}/auto-continue", put(set_auto_continue))
         .route(
             "/api/conversations/{id}/terminals/{terminalId}/kill",
             post(kill_terminal),
@@ -427,6 +429,38 @@ async fn cancel(
     let response = state
         .service
         .cancel(&user.id, &id, &req.turn_id, &state.task_manager)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(response)))
+}
+
+/// TASK-44: Continue / Dismiss on the "Interrupted by a restart" notice.
+async fn restart_resume(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    body: Result<Json<aionui_api_types::RestartResumeRequest>, JsonRejection>,
+) -> Result<Json<ApiResponse<aionui_api_types::RestartResumeResponse>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    let response = state
+        .service
+        .restart_resume(&user.id, &id, req.action, &state.task_manager)
+        .await
+        .map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(response)))
+}
+
+/// TASK-44: the per-conversation "continue by itself after a restart" switch.
+async fn set_auto_continue(
+    State(state): State<ConversationRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    body: Result<Json<aionui_api_types::AutoContinueSetting>, JsonRejection>,
+) -> Result<Json<ApiResponse<aionui_api_types::AutoContinueSetting>>, ApiError> {
+    let Json(req) = body.map_err(ApiError::from)?;
+    let response = state
+        .service
+        .set_auto_continue_after_restart(&user.id, &id, req.enabled)
         .await
         .map_err(ApiError::from)?;
     Ok(Json(ApiResponse::ok(response)))

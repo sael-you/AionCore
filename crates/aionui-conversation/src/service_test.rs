@@ -10244,3 +10244,269 @@ async fn list_rows_carry_live_state_for_conversations_waiting_on_the_owner() {
     let json = serde_json::to_value(by_id(&waiting.id)).unwrap();
     assert!(json["live"]["pending_confirmations"].as_u64().unwrap() > 0, "{json}");
 }
+
+// ---------------------------------------------------------------------------
+// TASK-44: turns interrupted by a restart
+// ---------------------------------------------------------------------------
+
+async fn insert_stale_tool_row(repo: &MockRepo, conversation_id: &str, id: &str, name: &str, command: &str) {
+    repo.insert_message(
+        "user_1",
+        &MessageRow {
+            id: id.into(),
+            conversation_id: conversation_id.into(),
+            msg_id: Some(id.into()),
+            r#type: "tool_call".into(),
+            content: json!({"call_id": id, "name": name, "args": {"command": command}, "status": "running"})
+                .to_string(),
+            position: Some("left".into()),
+            status: Some("work".into()),
+            hidden: false,
+            created_at: 1,
+            backend_turn_id: None,
+        },
+    )
+    .await
+    .unwrap();
+}
+
+async fn restart_record_of(repo: &MockRepo, conversation_id: &str) -> aionui_api_types::RestartInterrupted {
+    let row = repo.get("user_1", conversation_id).await.unwrap().unwrap();
+    let extra: serde_json::Value = serde_json::from_str(&row.extra).unwrap();
+    serde_json::from_value(extra[aionui_api_types::EXTRA_RESTART_INTERRUPTED].clone()).expect("record")
+}
+
+async fn message_texts(repo: &MockRepo, conversation_id: &str) -> Vec<String> {
+    repo.list_messages_page(
+        "user_1",
+        conversation_id,
+        &MessagePageParams {
+            limit: 50,
+            direction: MessagePageDirection::InitialLatest,
+        },
+    )
+    .await
+    .unwrap()
+    .items
+    .into_iter()
+    .map(|m| m.content)
+    .collect()
+}
+
+/// A tool row left running proves an interrupted turn: the conversation gets
+/// a waiting notice; Continue sends ONE resume message that names the step;
+/// a second Continue is refused; other users see nothing.
+#[tokio::test]
+async fn restart_interruption_is_recorded_and_continued_exactly_once() {
+    use aionui_api_types::{RestartInterruptedKind, RestartInterruptedState, RestartResumeAction};
+    let (svc, broadcaster, repo, _task_mgr) = make_service();
+    let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let untouched = svc.create("user_1", make_create_req()).await.unwrap();
+    insert_stale_tool_row(&repo, &conv.id, "tool-1", "Bash", "cargo test -p aionui-conversation").await;
+
+    let stale = svc.recover_stale_runtime_state_on_startup().await;
+    assert_eq!(stale.len(), 1);
+    broadcaster.take_events();
+    let candidates = svc
+        .record_restart_interruptions(crate::restart_resume::ShutdownSnapshot::default(), stale)
+        .await;
+    assert!(
+        candidates.is_empty(),
+        "the switch is off by default: nothing continues by itself"
+    );
+
+    let record = restart_record_of(&repo, &conv.id).await;
+    assert_eq!(record.kind, RestartInterruptedKind::Tool);
+    assert_eq!(record.tool.as_deref(), Some("Bash"));
+    assert_eq!(record.summary.as_deref(), Some("cargo test -p aionui-conversation"));
+    assert_eq!(record.state, RestartInterruptedState::Waiting);
+    assert_eq!((record.repeat, record.auto_blocked), (0, None));
+    let row = repo.get("user_1", &untouched.id).await.unwrap().unwrap();
+    assert!(
+        !row.extra.contains("restart_interrupted"),
+        "idle conversations get no notice"
+    );
+    assert!(
+        !broadcaster.take_events().is_empty(),
+        "the list-changed event tells the UI about the notice"
+    );
+
+    // Another user cannot act on it; an idle conversation has nothing to continue.
+    let foreign = svc
+        .restart_resume("user_2", &conv.id, RestartResumeAction::Continue, &task_mgr)
+        .await
+        .unwrap_err();
+    assert!(matches!(foreign, ConversationError::NotFound { .. }), "{foreign:?}");
+    let idle = svc
+        .restart_resume("user_1", &untouched.id, RestartResumeAction::Continue, &task_mgr)
+        .await
+        .unwrap_err();
+    assert!(matches!(idle, ConversationError::BadRequest { .. }), "{idle:?}");
+    assert_eq!(
+        restart_record_of(&repo, &conv.id).await.state,
+        RestartInterruptedState::Waiting
+    );
+
+    let continued = svc
+        .restart_resume("user_1", &conv.id, RestartResumeAction::Continue, &task_mgr)
+        .await
+        .unwrap();
+    assert_eq!(continued.restart_interrupted.state, RestartInterruptedState::Continued);
+    assert!(continued.msg_id.is_some() && continued.turn_id.is_some());
+    let resume: Vec<String> = message_texts(&repo, &conv.id)
+        .await
+        .into_iter()
+        .filter(|c| c.contains("AionUi restarted"))
+        .collect();
+    assert_eq!(resume.len(), 1, "{resume:?}");
+    assert!(resume[0].contains("Bash: cargo test -p aionui-conversation"));
+    assert!(resume[0].contains("check the real state"));
+
+    wait_for_turn_released(&svc, &conv.id).await;
+    let again = svc
+        .restart_resume("user_1", &conv.id, RestartResumeAction::Continue, &task_mgr)
+        .await
+        .unwrap_err();
+    assert!(matches!(again, ConversationError::BadRequest { .. }), "{again:?}");
+    let dismissed = svc
+        .restart_resume("user_1", &conv.id, RestartResumeAction::Dismiss, &task_mgr)
+        .await
+        .unwrap();
+    assert_eq!(
+        dismissed.restart_interrupted.state,
+        RestartInterruptedState::Continued,
+        "dismiss only applies to a waiting notice"
+    );
+    let count = message_texts(&repo, &conv.id)
+        .await
+        .into_iter()
+        .filter(|c| c.contains("AionUi restarted"))
+        .count();
+    assert_eq!(count, 1, "never a second resume message");
+}
+
+/// The opt-in switch: a safe step continues by itself; a push never does;
+/// the same step interrupted again after a continue stops and waits.
+#[tokio::test]
+async fn auto_continue_is_opt_in_skips_sensitive_steps_and_stops_on_repeat() {
+    use aionui_api_types::{RestartAutoBlocked, RestartInterruptedState};
+    let (svc, _broadcaster, repo, _task_mgr) = make_service();
+    let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
+    let safe = svc.create("user_1", make_create_req()).await.unwrap();
+    let push = svc.create("user_1", make_create_req()).await.unwrap();
+    let off = svc.create("user_1", make_create_req()).await.unwrap();
+    for id in [&safe.id, &push.id] {
+        assert!(
+            svc.set_auto_continue_after_restart("user_1", id, true)
+                .await
+                .unwrap()
+                .enabled
+        );
+    }
+    let missing = svc
+        .set_auto_continue_after_restart("user_2", &safe.id, true)
+        .await
+        .unwrap_err();
+    assert!(matches!(missing, ConversationError::NotFound { .. }));
+    insert_stale_tool_row(&repo, &safe.id, "t-safe", "Bash", "cargo build").await;
+    insert_stale_tool_row(&repo, &push.id, "t-push", "Bash", "git push origin youssef").await;
+    insert_stale_tool_row(&repo, &off.id, "t-off", "Bash", "cargo build").await;
+
+    let stale = svc.recover_stale_runtime_state_on_startup().await;
+    let candidates = svc
+        .record_restart_interruptions(crate::restart_resume::ShutdownSnapshot::default(), stale)
+        .await;
+    assert_eq!(
+        candidates
+            .iter()
+            .map(|c| c.conversation_id.as_str())
+            .collect::<Vec<_>>(),
+        vec![safe.id.as_str()]
+    );
+    assert_eq!(
+        restart_record_of(&repo, &push.id).await.auto_blocked,
+        Some(RestartAutoBlocked::Sensitive)
+    );
+    assert_eq!(restart_record_of(&repo, &off.id).await.auto_blocked, None);
+
+    svc.auto_continue_after_restart(candidates, task_mgr.clone(), Duration::ZERO)
+        .await;
+    assert_eq!(
+        restart_record_of(&repo, &safe.id).await.state,
+        RestartInterruptedState::AutoContinued
+    );
+    for id in [&push.id, &off.id] {
+        assert_eq!(
+            restart_record_of(&repo, id).await.state,
+            RestartInterruptedState::Waiting
+        );
+        assert!(
+            message_texts(&repo, id)
+                .await
+                .iter()
+                .all(|c| !c.contains("AionUi restarted")),
+            "nothing was sent"
+        );
+    }
+
+    // The next restart interrupts the SAME step again: no second automatic try.
+    wait_for_turn_released(&svc, &safe.id).await;
+    insert_stale_tool_row(&repo, &safe.id, "t-safe-2", "Bash", "cargo build").await;
+    let stale = svc.recover_stale_runtime_state_on_startup().await;
+    let candidates = svc
+        .record_restart_interruptions(crate::restart_resume::ShutdownSnapshot::default(), stale)
+        .await;
+    assert!(candidates.is_empty());
+    let record = restart_record_of(&repo, &safe.id).await;
+    assert_eq!(
+        (record.repeat, record.auto_blocked, record.state),
+        (1, Some(RestartAutoBlocked::Repeat), RestartInterruptedState::Waiting)
+    );
+}
+
+/// A turn that waited for an approval: the approval is never given by
+/// AionCore; the resume message says it was NOT approved.
+#[tokio::test]
+async fn an_interrupted_approval_is_never_approved_only_re_asked() {
+    use crate::restart_resume::{ShutdownSnapshot, SnapshotApproval, SnapshotTurn};
+    use aionui_api_types::{RestartInterruptedKind, RestartResumeAction};
+    let (svc, _broadcaster, repo, _task_mgr) = make_service();
+    let task_mgr: Arc<dyn IWorkerTaskManager> = Arc::new(MockTaskManager::new());
+    let conv = svc.create("user_1", make_create_req()).await.unwrap();
+    let snapshot = ShutdownSnapshot {
+        at: 1,
+        turns: vec![
+            SnapshotTurn {
+                conversation_id: conv.id.clone(),
+                turn_id: "turn_1".into(),
+                approvals: vec![SnapshotApproval {
+                    title: "Bash".into(),
+                    summary: "rm -r target/tmp".into(),
+                }],
+            },
+            // A conversation that no longer exists is skipped.
+            SnapshotTurn {
+                conversation_id: "gone".into(),
+                turn_id: "turn_2".into(),
+                approvals: Vec::new(),
+            },
+        ],
+    };
+    let candidates = svc.record_restart_interruptions(snapshot, Vec::new()).await;
+    assert!(candidates.is_empty());
+    let record = restart_record_of(&repo, &conv.id).await;
+    assert_eq!(record.kind, RestartInterruptedKind::Approval);
+    assert_eq!(record.summary.as_deref(), Some("rm -r target/tmp"));
+
+    svc.restart_resume("user_1", &conv.id, RestartResumeAction::Continue, &task_mgr)
+        .await
+        .unwrap();
+    let texts = message_texts(&repo, &conv.id).await;
+    let resume = texts
+        .iter()
+        .find(|c| c.contains("AionUi restarted"))
+        .expect("resume message");
+    assert!(resume.contains("NOT approved"), "{resume}");
+    assert!(resume.contains("ask for it again"));
+}

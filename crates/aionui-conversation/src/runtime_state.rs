@@ -189,6 +189,15 @@ impl ConversationRuntimeStateService {
         self.try_claim_turn(conversation_id, turn_id).ok()
     }
 
+    /// Every running turn as `(conversation_id, turn_id)` (TASK-44: the
+    /// shutdown snapshot and the drain).
+    pub fn active_turns(&self) -> Vec<(String, String)> {
+        self.state
+            .lock()
+            .map(|state| state.active_turns.iter().map(|(c, t)| (c.clone(), t.clone())).collect())
+            .unwrap_or_default()
+    }
+
     pub fn is_claimed(&self, conversation_id: &str) -> bool {
         self.state
             .lock()

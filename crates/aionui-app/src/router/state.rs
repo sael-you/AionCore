@@ -413,11 +413,35 @@ pub async fn build_module_states(
             task_manager: services.worker_task_manager.clone(),
             team: states.team.service.clone(),
         }));
-    states
+    let stale_steps = states
         .conversation
         .service
         .recover_stale_runtime_state_on_startup()
         .await;
+    // TASK-44: what the previous run's restart interrupted becomes a notice
+    // on each conversation; the ones whose owner switched it on continue by
+    // themselves (a few at a time, after the rest of the startup).
+    let snapshot = aionui_conversation::restart_resume::take_snapshot(
+        &aionui_conversation::restart_resume::snapshot_path(&services.data_dir),
+    );
+    let auto_candidates = states
+        .conversation
+        .service
+        .record_restart_interruptions(snapshot, stale_steps)
+        .await;
+    if !auto_candidates.is_empty() {
+        let service = states.conversation.service.clone();
+        let task_manager = services.worker_task_manager.clone();
+        tokio::spawn(async move {
+            service
+                .auto_continue_after_restart(
+                    auto_candidates,
+                    task_manager,
+                    aionui_conversation::restart_resume::AUTO_CONTINUE_START_DELAY,
+                )
+                .await;
+        });
+    }
 
     Ok((states, channel_components))
 }
