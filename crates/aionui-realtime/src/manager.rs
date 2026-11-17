@@ -72,6 +72,7 @@ impl WebSocketManager {
         // Registered and greeted under the stream lock: no live frame can be
         // stamped between the hello's seq and the connection seeing frames.
         replay.with_stream(&user_id.clone(), |stream| {
+            stream.mark_connected();
             let _ = tx.try_send(WsOutbound::Text(hello_text(replay.epoch(), stream.last_seq())));
             self.connections.insert(
                 id,
@@ -149,6 +150,11 @@ impl WebSocketManager {
 
     /// Stamp `msg` for `user_id`, record it and deliver it, atomically.
     fn stamp_and_deliver(&self, replay: &ReplayLog, user_id: &str, name: &str, data_json: &str) {
+        // No ring and no socket: nobody to deliver to and nothing to replay
+        // into — never (re)create a ring for an absent user.
+        if !replay.has_stream(user_id) && !self.connections.iter().any(|c| c.value().user_id == user_id) {
+            return;
+        }
         replay.with_stream(user_id, |stream| {
             let text = replay.stamp(stream, name, data_json);
             self.deliver_to_user(user_id, &text);
@@ -634,6 +640,11 @@ mod tests {
     fn concurrent_live_frames_never_overtake_or_duplicate_a_replay() {
         let mgr = Arc::new(WebSocketManager::with_replay(ReplayConfig::default()));
         let epoch = mgr.replay().unwrap().epoch().to_owned();
+        // alice was connected once (frames for a user who never connected are
+        // not kept), then missed 50 frames.
+        let (gone_tx, _gone_rx) = new_client_tx();
+        let gone = mgr.add_client_for_user("alice".into(), "t".into(), gone_tx);
+        mgr.remove_client(gone);
         for i in 0..50 {
             mgr.broadcast_to_user("alice", ev("m", i));
         }
@@ -674,6 +685,15 @@ mod tests {
         applied.sort_unstable();
         let expected: Vec<u64> = (11..=550).collect();
         assert_eq!(applied, expected, "every missed and live frame exactly once");
+    }
+
+    #[test]
+    fn frames_for_a_user_who_never_connected_create_no_ring() {
+        let mgr = WebSocketManager::with_replay(ReplayConfig::default());
+        mgr.broadcast_to_user("ghost", ev("m", 1));
+        mgr.broadcast_all(ev("global", 2));
+        assert_eq!(mgr.replay().unwrap().held_frames("ghost"), 0);
+        assert_eq!(mgr.replay().unwrap().held_bytes(), 0);
     }
 
     #[test]
