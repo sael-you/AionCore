@@ -4793,6 +4793,54 @@ mod build_mapping_tests {
     //! suite), adapted to the port's decomposed `spec_mode_model` inputs (AcpBuildExtra +
     //! PersistedSessionState) instead of a `ConversationRow`. Same assertions.
     use super::*;
+
+    /// C38: the devices MCP is added only with the marker AND the full helper
+    /// env; it carries exactly the conversation's helper env.
+    #[test]
+    fn devices_mcp_spec_needs_the_marker_and_the_helper_env() {
+        let env = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+            pairs.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect()
+        };
+        let full = env(&[
+            (DEVICES_MCP_ENV, "1"),
+            ("AIONUI_HELPER_BIN", "/opt/aioncore"),
+            ("AIONUI_BASE_URL", "http://127.0.0.1:4000"),
+            ("AIONUI_USER_ID", "u1"),
+            ("AIONUI_CONVERSATION_ID", "c1"),
+            ("AIONUI_RUNTIME_TOKEN", "tok"),
+        ]);
+        let spec = devices_mcp_server_spec(&full).expect("spec");
+        assert_eq!(spec.name, "aionui-devices");
+        let aionui_session::McpTransport::Stdio {
+            command,
+            args,
+            env: spec_env,
+        } = &spec.transport
+        else {
+            panic!("stdio expected");
+        };
+        assert_eq!(command, "/opt/aioncore");
+        assert_eq!(args, &["mcp-devices-stdio".to_owned()]);
+        assert_eq!(spec_env.len(), 4);
+        assert!(spec_env.iter().any(|(k, v)| k == "AIONUI_CONVERSATION_ID" && v == "c1"));
+        assert!(spec_env.iter().all(|(k, _)| k != DEVICES_MCP_ENV));
+
+        let no_marker: Vec<_> = full.iter().filter(|(k, _)| k != DEVICES_MCP_ENV).cloned().collect();
+        assert!(
+            devices_mcp_server_spec(&no_marker).is_none(),
+            "users without devices get no MCP"
+        );
+        let no_token: Vec<_> = full
+            .iter()
+            .filter(|(k, _)| k != "AIONUI_RUNTIME_TOKEN")
+            .cloned()
+            .collect();
+        assert!(
+            devices_mcp_server_spec(&no_token).is_none(),
+            "never without a runtime token"
+        );
+    }
+
     use crate::shared_kernel::{ModeId, ModelId};
     use aionui_session::SessionSpec;
 

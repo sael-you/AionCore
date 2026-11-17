@@ -149,3 +149,95 @@ async fn devices_need_a_session_writes_need_a_trusted_origin() {
     assert_eq!(job.status(), StatusCode::NOT_FOUND);
     assert_eq!(body_json(job).await["code"], "DEVICE_JOB_NOT_FOUND");
 }
+
+/// C38 W3: the agent bridge's routes take ONLY a valid conversation runtime
+/// token (no session), and the token's user + conversation are the caller.
+#[tokio::test]
+async fn runtime_device_routes_need_a_conversation_runtime_token() {
+    use aionui_ai_agent::{RuntimeTokenScope, TEAM_RUNTIME_TOKEN_SESSION_GENERATION};
+    let (app, services) = app().await;
+    let runtime = |token: Option<&str>, user: &str, method: &str, path: &str, body: &str| {
+        let mut b = Request::builder()
+            .method(method)
+            .uri(path)
+            .header("content-type", "application/json")
+            .header("x-aionui-user-id", user)
+            .header("x-aionui-conversation-id", "conv-1");
+        if let Some(t) = token {
+            b = b.header("x-aionui-runtime-token", t);
+        }
+        b.body(Body::from(body.to_owned())).unwrap()
+    };
+    let user = "system_default_user";
+    for token in [None, Some("forged")] {
+        let r = app
+            .clone()
+            .oneshot(runtime(token, user, "GET", "/api/runtime/devices", ""))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::UNAUTHORIZED, "{token:?}");
+    }
+    // A browser session is not a runtime token.
+    let session = login(&app, &services).await;
+    let r = app
+        .clone()
+        .oneshot(req("GET", "/api/runtime/devices", Some(&session), Some(ORIGIN), ""))
+        .await
+        .unwrap();
+    assert_eq!(r.status(), StatusCode::UNAUTHORIZED);
+
+    let issued = services.runtime_token_service.issue(
+        user,
+        "conv-1",
+        TEAM_RUNTIME_TOKEN_SESSION_GENERATION,
+        [RuntimeTokenScope::ConversationHelper],
+    );
+    let list = app
+        .clone()
+        .oneshot(runtime(Some(&issued.token), user, "GET", "/api/runtime/devices", ""))
+        .await
+        .unwrap();
+    assert_eq!(list.status(), StatusCode::OK);
+    let json = body_json(list).await;
+    assert_eq!(json["ok"], true);
+    assert_eq!(json["devices"], serde_json::json!([]), "no phone or Mac paired");
+    // The token is bound to its user: another user id with it is refused.
+    let other = app
+        .clone()
+        .oneshot(runtime(
+            Some(&issued.token),
+            "someone_else",
+            "GET",
+            "/api/runtime/devices",
+            "",
+        ))
+        .await
+        .unwrap();
+    assert_eq!(other.status(), StatusCode::UNAUTHORIZED);
+
+    let call = app
+        .clone()
+        .oneshot(runtime(
+            Some(&issued.token),
+            user,
+            "POST",
+            "/api/runtime/devices/call",
+            r#"{"device_id": "phone:nope", "verb": "tap", "args": {}}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(call.status(), StatusCode::NOT_FOUND);
+    assert_eq!(body_json(call).await["code"], "DEVICE_NOT_FOUND");
+    let bad = app
+        .clone()
+        .oneshot(runtime(
+            Some(&issued.token),
+            user,
+            "POST",
+            "/api/runtime/devices/call",
+            r#"{"x": 1}"#,
+        ))
+        .await
+        .unwrap();
+    assert!(bad.status().is_client_error());
+}
