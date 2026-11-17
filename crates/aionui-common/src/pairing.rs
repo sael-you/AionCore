@@ -4,11 +4,9 @@
 //! - A pairing code: 8 characters from `A–Z2–9` without `I`/`O`, shown as
 //!   `ABCD-2345`, one use, a few minutes, and a new code for the same key
 //!   replaces the old one. Dashes, spaces and case are ignored.
-//! - Wrong attempts count against every code pending at that moment (a wrong
-//!   code could be a guess at any of them); a code that has seen
-//!   [`MAX_FAILED_PAIRS`] wrong attempts is burned and its owner makes a new
-//!   one. A code made later starts at zero, so nobody can block pairing for
-//!   everyone (train-9 review).
+//! - Wrong attempts are counted per source address; a source with
+//!   [`MAX_FAILED_PAIRS`] misses in ten minutes is refused for the rest of the
+//!   window. A miss never touches a pending code.
 //! - A device token: 32 random bytes (hex). Only its SHA-256 is stored;
 //!   compare hashes with [`crate::tokens_match`]-style constant time.
 
@@ -85,13 +83,26 @@ pub fn constant_time_eq(a: &str, b: &str) -> bool {
 struct Pending {
     code: String,
     expires: Instant,
-    failures: u32,
+}
+
+#[derive(Default)]
+struct SourceFailures {
+    window_start: Option<Instant>,
+    count: u32,
 }
 
 /// In-memory pending codes, one per key (a user, or a user + client kind).
+///
+/// Wrong attempts are counted per SOURCE (the client address the gateway
+/// forwards): a source with [`MAX_FAILED_PAIRS`] misses within
+/// [`FAILED_WINDOW`] is refused for the rest of that window, right code or
+/// not. A miss never touches anyone's pending code (train-10 review: with
+/// "a miss counts against every pending code", ten wrong guesses from anyone
+/// burned every owner's code).
 pub struct PairingCodes<K> {
     ttl: Duration,
     codes: std::sync::Mutex<HashMap<K, Pending>>,
+    failures: std::sync::Mutex<HashMap<String, SourceFailures>>,
 }
 
 impl<K> std::fmt::Debug for PairingCodes<K> {
@@ -100,18 +111,23 @@ impl<K> std::fmt::Debug for PairingCodes<K> {
     }
 }
 
-/// A burned code (for the caller's log line; never the code itself).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RedeemOutcome<K> {
     Paired(K),
-    Invalid { burned: Vec<K> },
+    Invalid,
+    /// This source made too many wrong attempts; try again later.
+    Throttled,
 }
+
+pub const FAILED_WINDOW: Duration = Duration::from_secs(10 * 60);
+const MAX_TRACKED_SOURCES: usize = 10_000;
 
 impl<K: Clone + Eq + Hash> PairingCodes<K> {
     pub fn new(ttl: Duration) -> Self {
         Self {
             ttl,
             codes: std::sync::Mutex::new(HashMap::new()),
+            failures: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -127,38 +143,57 @@ impl<K: Clone + Eq + Hash> PairingCodes<K> {
             Pending {
                 code: code.clone(),
                 expires: Instant::now() + self.ttl,
-                failures: 0,
             },
         );
         display_pairing_code(&code)
     }
 
-    /// Consume `raw` (any spelling). A miss counts against every pending code.
-    pub fn redeem(&self, raw: &str) -> RedeemOutcome<K> {
-        let wanted = normalize_pairing_code(raw);
-        let mut codes = self.codes.lock().expect("pairing codes lock");
+    fn source_blocked(&self, source: &str, record_miss: bool) -> bool {
+        let mut failures = self.failures.lock().expect("pairing failures lock");
         let now = Instant::now();
-        codes.retain(|_, p| p.expires > now);
-        let hit = codes
-            .iter()
-            .find(|(_, p)| constant_time_eq(&p.code, &wanted))
-            .map(|(k, _)| k.clone());
-        if let Some(key) = hit {
-            codes.remove(&key);
-            return RedeemOutcome::Paired(key);
+        if failures.len() > MAX_TRACKED_SOURCES {
+            failures.retain(|_, f| f.window_start.is_some_and(|s| now.duration_since(s) < FAILED_WINDOW));
         }
-        for p in codes.values_mut() {
-            p.failures = p.failures.saturating_add(1);
+        let entry = failures.entry(source.to_owned()).or_default();
+        if entry
+            .window_start
+            .is_none_or(|s| now.duration_since(s) >= FAILED_WINDOW)
+        {
+            entry.window_start = Some(now);
+            entry.count = 0;
         }
-        let burned: Vec<K> = codes
-            .iter()
-            .filter(|(_, p)| p.failures >= MAX_FAILED_PAIRS)
-            .map(|(k, _)| k.clone())
-            .collect();
-        for k in &burned {
-            codes.remove(k);
+        if record_miss {
+            entry.count = entry.count.saturating_add(1);
         }
-        RedeemOutcome::Invalid { burned }
+        entry.count >= MAX_FAILED_PAIRS
+    }
+
+    /// Consume `raw` (any spelling) for the client at `source`.
+    pub fn redeem(&self, raw: &str, source: &str) -> RedeemOutcome<K> {
+        if self.source_blocked(source, false) {
+            return RedeemOutcome::Throttled;
+        }
+        let wanted = normalize_pairing_code(raw);
+        let hit = {
+            let mut codes = self.codes.lock().expect("pairing codes lock");
+            let now = Instant::now();
+            codes.retain(|_, p| p.expires > now);
+            let hit = codes
+                .iter()
+                .find(|(_, p)| constant_time_eq(&p.code, &wanted))
+                .map(|(k, _)| k.clone());
+            if let Some(key) = &hit {
+                codes.remove(key);
+            }
+            hit
+        };
+        match hit {
+            Some(key) => RedeemOutcome::Paired(key),
+            None => {
+                self.source_blocked(source, true);
+                RedeemOutcome::Invalid
+            }
+        }
     }
 }
 
@@ -174,37 +209,40 @@ mod tests {
         assert!(first.chars().all(|c| c == '-' || CODE_ALPHABET.contains(&(c as u8))));
         let second = codes.issue("u1");
         if normalize_pairing_code(&first) != normalize_pairing_code(&second) {
-            assert!(
-                matches!(codes.redeem(&first), RedeemOutcome::Invalid { .. }),
-                "replaced"
-            );
+            assert_eq!(codes.redeem(&first, "a"), RedeemOutcome::Invalid, "replaced");
         }
         let spelled = second.to_lowercase().replace('-', " ");
-        assert_eq!(codes.redeem(&spelled), RedeemOutcome::Paired("u1"));
-        assert!(
-            matches!(codes.redeem(&second), RedeemOutcome::Invalid { .. }),
-            "one use"
-        );
+        assert_eq!(codes.redeem(&spelled, "a"), RedeemOutcome::Paired("u1"));
+        assert_eq!(codes.redeem(&second, "a"), RedeemOutcome::Invalid, "one use");
     }
 
+    /// Train-10 review: wrong guesses throttle their SOURCE only; nobody's
+    /// pending code is burned and another source still pairs.
     #[test]
-    fn misses_burn_only_codes_pending_then() {
+    fn misses_throttle_the_source_and_never_burn_codes() {
         let codes: PairingCodes<&str> = PairingCodes::new(Duration::from_secs(60));
         let u1 = codes.issue("u1");
-        for _ in 0..MAX_FAILED_PAIRS - 1 {
-            assert_eq!(codes.redeem("WRONGXXX"), RedeemOutcome::Invalid { burned: vec![] });
+        for _ in 0..MAX_FAILED_PAIRS {
+            assert_eq!(codes.redeem("WRONGXXX", "attacker"), RedeemOutcome::Invalid);
         }
-        let u2 = codes.issue("u2");
-        assert_eq!(codes.redeem("WRONGXXX"), RedeemOutcome::Invalid { burned: vec!["u1"] });
-        assert!(matches!(codes.redeem(&u1), RedeemOutcome::Invalid { .. }));
-        assert_eq!(codes.redeem(&u2), RedeemOutcome::Paired("u2"));
+        assert_eq!(codes.redeem("WRONGXXX", "attacker"), RedeemOutcome::Throttled);
+        assert_eq!(
+            codes.redeem(&u1, "attacker"),
+            RedeemOutcome::Throttled,
+            "a throttled source is refused even with a right code"
+        );
+        assert_eq!(
+            codes.redeem(&u1, "owner"),
+            RedeemOutcome::Paired("u1"),
+            "the code survived"
+        );
     }
 
     #[test]
     fn expired_codes_do_not_pair() {
         let codes: PairingCodes<&str> = PairingCodes::new(Duration::from_millis(0));
         let code = codes.issue("u1");
-        assert!(matches!(codes.redeem(&code), RedeemOutcome::Invalid { .. }));
+        assert_eq!(codes.redeem(&code, "a"), RedeemOutcome::Invalid);
     }
 
     #[test]

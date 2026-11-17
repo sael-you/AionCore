@@ -313,14 +313,14 @@ impl DevicesService {
     }
 
     /// Serve one relay connection until it closes.
-    pub async fn run_relay(self: Arc<Self>, socket: WebSocket) {
+    pub async fn run_relay(self: Arc<Self>, socket: WebSocket, source: String) {
         let (mut sink, mut stream) = socket.split();
         let first = match tokio::time::timeout(FIRST_FRAME_TIMEOUT, stream.next()).await {
             Ok(Some(Ok(Message::Text(t)))) => serde_json::from_str::<RelayInbound>(&t).ok(),
             _ => None,
         };
         let auth = match first {
-            Some(frame) => self.authenticate(frame).await,
+            Some(frame) => self.authenticate(frame, &source).await,
             None => Err(DeviceErrorCode::DeviceBadMessage),
         };
         let (pairing, token) = match auth {
@@ -431,7 +431,11 @@ impl DevicesService {
         info!(user_id = %client.user_id, pairing_id = %client.pairing_id, "device relay client disconnected");
     }
 
-    async fn authenticate(&self, frame: RelayInbound) -> Result<(DevicePairingRow, Option<String>), DeviceErrorCode> {
+    async fn authenticate(
+        &self,
+        frame: RelayInbound,
+        source: &str,
+    ) -> Result<(DevicePairingRow, Option<String>), DeviceErrorCode> {
         match frame {
             RelayInbound::Pair {
                 code,
@@ -440,12 +444,11 @@ impl DevicesService {
                 version,
                 capabilities,
             } => {
-                let (user_id, issued_kind) = match self.relay().codes.redeem(&code) {
+                let (user_id, issued_kind) = match self.relay().codes.redeem(&code, source) {
                     RedeemOutcome::Paired(key) => key,
-                    RedeemOutcome::Invalid { burned } => {
-                        for (user_id, _) in burned {
-                            warn!(user_id, "device pairing code burned after too many wrong attempts");
-                        }
+                    RedeemOutcome::Invalid => return Err(DeviceErrorCode::DevicePairingInvalid),
+                    RedeemOutcome::Throttled => {
+                        warn!(source, "device pairing refused: too many wrong codes from this source");
                         return Err(DeviceErrorCode::DevicePairingInvalid);
                     }
                 };

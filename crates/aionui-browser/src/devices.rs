@@ -7,7 +7,7 @@
 //! - Pairing returns a fresh device token ONCE. Only its SHA-256 is stored, in
 //!   a root-only JSON file per user next to the settings (`0600`, atomic
 //!   write). Revoking deletes the row; the token then never matches again.
-//! - Codes, tokens, hashing and the per-code failure burn are the shared
+//! - Codes, tokens, hashing and the per-source failure limit are the shared
 //!   [`aionui_common::pairing`] (also used by the C38 device relay). With 32^8
 //!   codes, 10 guesses per code stay negligible; the gateway also limits
 //!   extension upgrades to 10 per minute per IP.
@@ -145,13 +145,18 @@ impl DeviceStore {
 
     /// Consume `code` and create a device. Returns the device and its token
     /// (the only time the token exists in clear outside the extension).
-    pub fn pair(&self, code: &str, name: &str, browser: &str) -> Result<(Authenticated, String), BrowserError> {
-        let user_id = match self.codes.redeem(code) {
+    pub fn pair(
+        &self,
+        code: &str,
+        name: &str,
+        browser: &str,
+        source: &str,
+    ) -> Result<(Authenticated, String), BrowserError> {
+        let user_id = match self.codes.redeem(code, source) {
             RedeemOutcome::Paired(user_id) => Some(user_id),
-            RedeemOutcome::Invalid { burned } => {
-                for user_id in burned {
-                    tracing::warn!(user_id, "browser pairing code burned after too many wrong attempts");
-                }
+            RedeemOutcome::Invalid => None,
+            RedeemOutcome::Throttled => {
+                tracing::warn!(source, "browser pairing refused: too many wrong codes from this source");
                 None
             }
         };
@@ -323,7 +328,7 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let store = DeviceStore::open(t.path());
         let code = store.pairing_code("u1").unwrap();
-        let (auth, _token) = store.pair(&code.code, "Mac", "Chrome 157").unwrap();
+        let (auth, _token) = store.pair(&code.code, "Mac", "Chrome 157", "src").unwrap();
         let id = auth.device.device_id;
         assert_eq!(store.device("u1", &id).unwrap().extension_version, None);
         store.set_extension_version("u1", &id, "<img src=x>");
@@ -359,14 +364,14 @@ mod tests {
         let second = store.pairing_code("u1").unwrap();
         // The first code no longer works (unless both draws collide).
         if normalize_code(&first.code) != normalize_code(&second.code) {
-            let err = store.pair(&first.code, "Mac", "Chrome 157").unwrap_err();
+            let err = store.pair(&first.code, "Mac", "Chrome 157", "src").unwrap_err();
             assert_eq!(err.code(), Some(BrowserErrorCode::BrowserPairingInvalid));
         }
         let lower = second.code.to_lowercase().replace('-', " ");
-        let (auth, token) = store.pair(&lower, "Mac", "Chrome 157").unwrap();
+        let (auth, token) = store.pair(&lower, "Mac", "Chrome 157", "src").unwrap();
         assert_eq!(auth.user_id, "u1");
         assert_eq!(token.len(), 64);
-        let again = store.pair(&second.code, "Mac", "Chrome 157").unwrap_err();
+        let again = store.pair(&second.code, "Mac", "Chrome 157", "src").unwrap_err();
         assert_eq!(again.code(), Some(BrowserErrorCode::BrowserPairingInvalid));
     }
 
@@ -375,7 +380,7 @@ mod tests {
         let t = tempfile::tempdir().unwrap();
         let store = DeviceStore::open(t.path());
         let code = store.pairing_code("u1").unwrap();
-        let (auth, token) = store.pair(&code.code, "My\u{7}Mac", "").unwrap();
+        let (auth, token) = store.pair(&code.code, "My\u{7}Mac", "", "src").unwrap();
         assert_eq!(auth.device.name, "MyMac");
         assert_eq!(auth.device.browser, "Chrome");
         let raw = std::fs::read_to_string(t.path().join("u1.json")).unwrap();
@@ -413,22 +418,19 @@ mod tests {
     }
 
     #[test]
-    fn wrong_codes_burn_only_the_codes_pending_then_and_never_block_new_ones() {
+    fn wrong_codes_throttle_their_source_and_never_burn_a_code() {
         let t = tempfile::tempdir().unwrap();
         let store = DeviceStore::open(t.path());
         let u1 = store.pairing_code("u1").unwrap();
-        for _ in 0..MAX_FAILED_PAIRS - 1 {
-            assert!(store.pair("WRONGXXX", "Mac", "Chrome").is_err());
+        for _ in 0..MAX_FAILED_PAIRS {
+            assert!(store.pair("WRONGXXX", "Mac", "Chrome", "attacker").is_err());
         }
-        // u2's code is made now: it has seen no failures yet.
-        let u2 = store.pairing_code("u2").unwrap();
-        assert!(store.pair("WRONGXXX", "Mac", "Chrome").is_err());
-        // u1's code saw 10 wrong attempts: burned, even the right value fails.
-        let err = store.pair(&u1.code, "Mac", "Chrome").unwrap_err();
-        assert_eq!(err.code(), Some(BrowserErrorCode::BrowserPairingInvalid));
-        // u2 is not blocked (1 failure), and u1 just makes a new code.
-        assert_eq!(store.pair(&u2.code, "Mac", "Chrome").unwrap().0.user_id, "u2");
-        let again = store.pairing_code("u1").unwrap();
-        assert_eq!(store.pair(&again.code, "Mac", "Chrome").unwrap().0.user_id, "u1");
+        let err = store.pair(&u1.code, "Mac", "Chrome", "attacker").unwrap_err();
+        assert_eq!(
+            err.code(),
+            Some(BrowserErrorCode::BrowserPairingInvalid),
+            "source throttled"
+        );
+        assert_eq!(store.pair(&u1.code, "Mac", "Chrome", "owner").unwrap().0.user_id, "u1");
     }
 }
