@@ -775,10 +775,28 @@ mod tests {
         assert_eq!(
             serde_json::to_value(BrowserSettings::default()).unwrap(),
             json!({"agents_enabled": true, "max_instances": 3, "max_tabs": 10, "devices_agents_enabled": false, "instances": [
-                {"instance": 1, "name": "Main", "hide_automation": false},
-                {"instance": 2, "name": "Instance 2", "hide_automation": false},
-                {"instance": 3, "name": "Instance 3", "hide_automation": false}
+                {"instance": 1, "name": "Main", "hide_automation": false, "engine": "chrome"},
+                {"instance": 2, "name": "Instance 2", "hide_automation": false, "engine": "chrome"},
+                {"instance": 3, "name": "Instance 3", "hide_automation": false, "engine": "chrome"}
             ]})
+        );
+        // C35: engine ids are kebab-case; a pre-C35 row reads as Chrome.
+        for (engine, id) in [
+            (BrowserEngine::Chrome, "chrome"),
+            (BrowserEngine::ChromeForTesting, "chrome-for-testing"),
+            (BrowserEngine::Brave, "brave"),
+            (BrowserEngine::Edge, "edge"),
+            (BrowserEngine::HeadlessShell, "headless-shell"),
+        ] {
+            assert_eq!(serde_json::to_value(engine).unwrap(), json!(id));
+            assert_eq!(engine.id(), id);
+        }
+        let old_row: BrowserInstanceSettings =
+            serde_json::from_value(json!({"instance": 1, "name": "Main", "hide_automation": false})).unwrap();
+        assert_eq!(old_row.engine, BrowserEngine::Chrome);
+        assert_eq!(
+            serde_json::to_value(BrowserEngineVerification::TlsOnly).unwrap(),
+            json!("tls-only")
         );
     }
 
