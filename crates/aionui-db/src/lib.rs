@@ -57,6 +57,10 @@ pub use repository::mcp_server::{
 pub use repository::oauth_token::UpsertOAuthTokenParams;
 pub use repository::provider::{CreateProviderParams, UpdateProviderParams};
 pub use repository::remote_agent::{CreateRemoteAgentParams, UpdateRemoteAgentParams};
+pub use repository::rule::{
+    CreateRuleParams, EffectiveRule, ImportRulesParams, ImportedRule, RULE_NAME_TAKEN_MSG, RULE_SOURCE_EXISTS_MSG,
+    UpdateRuleParams,
+};
 pub use repository::server_pool::{CreateServerParams, SERVER_NAME_TAKEN_MSG, ServerAuditParams, UpdateServerParams};
 pub use repository::skill::{CreateSkillImportRecordParams, UpsertSkillParams};
 pub use repository::sqlite_board_recover::{
@@ -75,18 +79,18 @@ pub use repository::{
     IAssistantOverlayRepository, IAssistantOverrideRepository, IAssistantPreferenceRepository, IAssistantRepository,
     IBoardStore, IBoardTx, IChannelRepository, IClientPreferenceRepository, IConversationRepository, ICronRepository,
     IFeedbackDiagnosticsRepository, IKitRepository, IMcpMarketRepository, IMcpServerRepository, IOAuthTokenRepository,
-    IProjectStore, IProviderRepository, IRemoteAgentRepository, IServerPoolRepository, ISettingsRepository,
-    ISidebarStore, ISkillRepository, ITeamRepository, IUserOrderStore, IUserRepository, IVoiceAuditRepository,
-    IVoiceSessionRepository, IVoiceSettingsRepository, MoveOutcome, NewBoardEvent, OrderItemRef, PageDirection,
-    PersistedSessionState, PinOutcome, PinnedCursor, SaveRuntimeStateParams, SidebarConversationThin,
+    IProjectStore, IProviderRepository, IRemoteAgentRepository, IRuleRepository, IServerPoolRepository,
+    ISettingsRepository, ISidebarStore, ISkillRepository, ITeamRepository, IUserOrderStore, IUserRepository,
+    IVoiceAuditRepository, IVoiceSessionRepository, IVoiceSettingsRepository, MoveOutcome, NewBoardEvent, OrderItemRef,
+    PageDirection, PersistedSessionState, PinOutcome, PinnedCursor, SaveRuntimeStateParams, SidebarConversationThin,
     SidebarProjectMeta, SidebarTeamThin, SqliteAcpSessionRepository, SqliteAgentMetadataRepository,
     SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository, SqliteAssistantOverrideRepository,
     SqliteAssistantPreferenceRepository, SqliteAssistantRepository, SqliteBoardStore, SqliteChannelRepository,
     SqliteClientPreferenceRepository, SqliteConversationRepository, SqliteCronRepository,
     SqliteFeedbackDiagnosticsRepository, SqliteKitRepository, SqliteMcpMarketRepository, SqliteMcpServerRepository,
     SqliteOAuthTokenRepository, SqliteProjectStore, SqliteProviderRepository, SqliteRemoteAgentRepository,
-    SqliteServerPoolRepository, SqliteSettingsRepository, SqliteSidebarStore, SqliteSkillRepository,
-    SqliteTeamRepository, SqliteUserOrderStore, SqliteUserRepository, SqliteVoiceRepository,
+    SqliteRuleRepository, SqliteServerPoolRepository, SqliteSettingsRepository, SqliteSidebarStore,
+    SqliteSkillRepository, SqliteTeamRepository, SqliteUserOrderStore, SqliteUserRepository, SqliteVoiceRepository,
     count_live_voice_calls_read_only,
 };
 

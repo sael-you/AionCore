@@ -42,6 +42,9 @@ pub struct AgentFactoryDeps {
     /// inject enabled servers into `session/new` (ELECTRON-1JG fix).
     /// `None` for tests/composition paths that do not need MCP injection.
     pub mcp_server_repo: Option<Arc<dyn IMcpServerRepository>>,
+    /// Owner rules (C37): the conversation's effective rules are prepended
+    /// to the preset context at session start. `None` = no rules.
+    pub rules: Option<aionui_mcp::rules::RuleService>,
     /// Subprocess spawner for the clean-slate session model. claude/codex always
     /// run through `SessionAgentTask` (direct-CLI) instead of the ACP manager, so
     /// the spawner is unconditionally wired — there is no fallback to the ACP path.
@@ -215,4 +218,20 @@ mod tests {
             panic!("compile-time check only");
         };
     }
+}
+
+/// `preset_context` with the conversation's owner rules block in front
+/// (C37). Read at session start, so a rule change applies to the next
+/// session of a running conversation.
+pub(crate) async fn with_owner_rules(
+    deps: &AgentFactoryDeps,
+    user_id: &str,
+    conversation_id: &str,
+    preset_context: Option<String>,
+) -> Option<String> {
+    let Some(rules) = deps.rules.as_ref() else {
+        return preset_context;
+    };
+    let block = rules.conversation_block(user_id, conversation_id).await;
+    aionui_mcp::rules::compose::prepend_rules(&block, preset_context)
 }

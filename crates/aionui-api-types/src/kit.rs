@@ -64,6 +64,8 @@ pub enum KitItemKind {
     Mcp,
     /// One SSH server of the server pool (C36, `item_ref` = `servers.id`).
     Server,
+    /// One owner rule (C37, `item_ref` = `rules.id`).
+    Rule,
 }
 
 impl KitItemKind {
@@ -73,6 +75,7 @@ impl KitItemKind {
             KitItemKind::Skill => "skill",
             KitItemKind::Mcp => "mcp",
             KitItemKind::Server => "server",
+            KitItemKind::Rule => "rule",
         }
     }
 
@@ -82,6 +85,7 @@ impl KitItemKind {
             KitItemKind::Skill,
             KitItemKind::Mcp,
             KitItemKind::Server,
+            KitItemKind::Rule,
         ]
         .into_iter()
         .find(|k| k.as_str() == value)
@@ -401,6 +405,9 @@ pub struct KitEffectiveSetResponse {
     /// = server id. A server reaches a conversation only through an `add`.
     #[serde(default)]
     pub servers: Vec<KitEffectiveItem>,
+    /// Rules decided by attachments (C37, sorted by rule id).
+    #[serde(default)]
+    pub rules: Vec<KitEffectiveItem>,
     /// The conversation's frozen skill snapshot (`extra.skills`, base + kits
     /// applied at creation); `None` for a project/assistant preview.
     #[serde(default, skip_serializing_if = "Option::is_none")]

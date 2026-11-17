@@ -10,6 +10,8 @@ pub mod market;
 pub mod market_routes;
 pub mod oauth_service;
 pub mod routes;
+pub mod rule_routes;
+pub mod rules;
 pub mod secret_mask;
 pub mod server_pool;
 pub mod server_routes;

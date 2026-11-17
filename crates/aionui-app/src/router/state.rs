@@ -813,7 +813,9 @@ pub fn build_mcp_state(
                 services.database.pool().clone(),
             )),
             derive_encryption_key(&services.encryption_secret_raw),
-        ));
+        ))
+        // Rules (C37).
+        .with_rules(crate::rules::rule_service(&services.database));
 
     let adapters: Vec<Arc<dyn McpAgentAdapter>> = vec![
         Arc::new(ClaudeAdapter),

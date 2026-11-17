@@ -80,6 +80,16 @@ pub(super) async fn build(
         config.backend.clone_from(&meta.backend);
     }
 
+    // C37: owner rules ride in front of the preset context on every lane
+    // below (antigravity, direct CLI, ACP manager).
+    config.preset_context = crate::factory::with_owner_rules(
+        deps.as_ref(),
+        &ctx.user_id,
+        &ctx.conversation_id,
+        config.preset_context.take(),
+    )
+    .await;
+
     if matches!(route_for_backend(config.backend.as_deref()), BackendRoute::Antigravity) {
         // Product decision: antigravity has no fork surface. The fork API's
         // capability gate already refuses agy; this is defense in depth so a

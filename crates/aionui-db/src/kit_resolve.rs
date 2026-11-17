@@ -72,6 +72,8 @@ pub struct KitResolution {
     /// Servers (C36, `servers.id`). A server has no base state: it reaches a
     /// conversation only through an `add` that is still standing.
     pub servers: BTreeMap<String, KitDecision>,
+    /// Rules (C37, `rules.id`). Like servers, a rule has no base state.
+    pub rules: BTreeMap<String, KitDecision>,
     /// (template id, kit id) wanted by a kit attached with `add` and still
     /// contributing at the end (at least one level adds it).
     pub templates: Vec<(String, String)>,
@@ -153,6 +155,7 @@ pub fn resolve(scope: &KitScope, layers: &KitLayers) -> KitResolution {
                 "skill" => put("skill", &a.item_ref, None),
                 "mcp" => put("mcp", &a.item_ref, None),
                 "server" => put("server", &a.item_ref, None),
+                "rule" => put("rule", &a.item_ref, None),
                 "kit" => {
                     let Some(kit) = layers.kits.get(&a.item_ref) else {
                         continue;
@@ -166,6 +169,7 @@ pub fn resolve(scope: &KitScope, layers: &KitLayers) -> KitResolution {
                             "skill" => put("skill", &m.item_ref, Some(&a.item_ref)),
                             "mcp" => put("mcp", &m.item_ref, Some(&a.item_ref)),
                             "server" => put("server", &m.item_ref, Some(&a.item_ref)),
+                            "rule" => put("rule", &m.item_ref, Some(&a.item_ref)),
                             "template" if a.op == "add" => {
                                 templates.insert((m.item_ref.clone(), a.item_ref.clone()), ());
                             }
@@ -210,6 +214,7 @@ fn target_map<'a>(out: &'a mut KitResolution, kind: &str) -> &'a mut BTreeMap<St
     match kind {
         "skill" => &mut out.skills,
         "server" => &mut out.servers,
+        "rule" => &mut out.rules,
         _ => &mut out.mcps,
     }
 }

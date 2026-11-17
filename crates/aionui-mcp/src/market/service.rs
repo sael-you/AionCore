@@ -44,6 +44,8 @@ pub struct McpMarketService {
     pub(crate) kit_applier: Option<Arc<dyn super::kits::IKitConversationApplier>>,
     /// Server pool (C36): validates `server` attachments and names them.
     pub(crate) server_pool: Option<crate::server_pool::ServerPoolService>,
+    /// Rules (C37): validates `rule` attachments, names them, serves `/api/rules`.
+    pub(crate) rules: Option<crate::rules::RuleService>,
 }
 
 impl McpMarketService {
@@ -62,7 +64,18 @@ impl McpMarketService {
             kits: None,
             kit_applier: None,
             server_pool: None,
+            rules: None,
         }
+    }
+
+    pub fn with_rules(mut self, rules: crate::rules::RuleService) -> Self {
+        self.rules = Some(rules);
+        self
+    }
+
+    /// The rules service (C37); `None` = `/api/rules` answers 503.
+    pub fn rules(&self) -> Option<&crate::rules::RuleService> {
+        self.rules.as_ref()
     }
 
     pub fn with_server_pool(mut self, pool: crate::server_pool::ServerPoolService) -> Self {

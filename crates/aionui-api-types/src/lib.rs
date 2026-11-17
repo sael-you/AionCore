@@ -33,6 +33,7 @@ mod project;
 mod provider;
 mod remote_agent;
 mod response;
+mod rule;
 mod runtime;
 mod server_pool;
 mod session_tools;
@@ -211,6 +212,12 @@ pub use remote_agent::{
     TestRemoteAgentConnectionRequest, UpdateRemoteAgentRequest,
 };
 pub use response::{ApiResponse, ErrorResponse};
+pub use rule::{
+    CreateRuleRequest, RULE_BODY_MAX_BYTES, RULES_EFFECTIVE_MAX_BYTES, RuleEffectiveItem, RuleEffectiveQuery,
+    RuleEffectiveResponse, RuleImportFile, RuleImportPreviewResponse, RuleImportProposal, RuleImportQuery,
+    RuleImportRequest, RuleImportResponse, RuleManageFilesRequest, RuleManageFilesResponse, RuleResponse,
+    RuleSourceResponse, UpdateRuleRequest,
+};
 pub use runtime::{
     EnsureNodeRuntimeRequest, EnsureNodeRuntimeResponse, RuntimeFailureKind, RuntimeResourceKind, RuntimeStatusPayload,
     RuntimeStatusPhase, RuntimeStatusScope, RuntimeStatusScopeKind,

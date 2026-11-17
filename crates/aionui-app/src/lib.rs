@@ -7,6 +7,7 @@
 
 mod config;
 mod router;
+mod rules;
 mod services;
 
 pub use config::{AppConfig, IdentityMode, derive_encryption_key};
