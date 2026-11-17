@@ -10483,6 +10483,7 @@ async fn an_interrupted_approval_is_never_approved_only_re_asked() {
                 approvals: vec![SnapshotApproval {
                     title: "Bash".into(),
                     summary: "rm -r target/tmp".into(),
+                    sensitive: false,
                 }],
             },
             // A conversation that no longer exists is skipped.
@@ -10509,4 +10510,28 @@ async fn an_interrupted_approval_is_never_approved_only_re_asked() {
         .expect("resume message");
     assert!(resume.contains("NOT approved"), "{resume}");
     assert!(resume.contains("ask for it again"));
+
+    // An approval judged sensitive at shutdown (full text) never continues by
+    // itself, even with the switch on.
+    let deploy = svc.create("user_1", make_create_req()).await.unwrap();
+    svc.set_auto_continue_after_restart("user_1", &deploy.id, true)
+        .await
+        .unwrap();
+    let snapshot = ShutdownSnapshot {
+        at: 2,
+        turns: vec![SnapshotTurn {
+            conversation_id: deploy.id.clone(),
+            turn_id: "turn_3".into(),
+            approvals: vec![SnapshotApproval {
+                title: "Bash".into(),
+                summary: "a long command".into(),
+                sensitive: true,
+            }],
+        }],
+    };
+    assert!(svc.record_restart_interruptions(snapshot, Vec::new()).await.is_empty());
+    assert_eq!(
+        restart_record_of(&repo, &deploy.id).await.auto_blocked,
+        Some(aionui_api_types::RestartAutoBlocked::Sensitive)
+    );
 }
