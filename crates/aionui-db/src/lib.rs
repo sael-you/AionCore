@@ -37,6 +37,8 @@ pub use models::{
     UpsertAssistantPreferenceParams, UpsertConversationAssistantSnapshotParams, UpsertOverrideParams, UserOrderRow,
     UserStatus, UserType, VoiceAuditRow, VoiceDraftRow, VoiceSessionRow, VoiceSettingsRow,
 };
+pub use models::{DeviceAuditRow, DevicePairingRow, DeviceRow};
+pub use repository::SqliteDeviceRepository;
 pub use repository::channel::UpdatePluginStatusParams;
 pub use repository::conversation::{
     ConversationFilters, ConversationRowUpdate, IdempotentInsert, MentionableCandidatesParams, MessagePageCursor,
@@ -46,6 +48,7 @@ pub use repository::conversation::{
 pub use repository::cron::{
     ClaimCronRunParams, CronRunClaimResult, FinishCronRunParams, RecoverableCronRun, UpdateCronJobParams,
 };
+pub use repository::devices::{IDeviceRepository, NewDeviceAuditEntry, UpsertDeviceParams};
 pub use repository::kit::{
     AttachParams, ConversationSkills, CreateKitParams, GlobalKitStep, KIT_NAME_TAKEN_MSG, KIT_PROJECT_HAS_KIT_MSG,
     KIT_STALE_MSG, KitMembers, KitProjectInfo, SeedKit, UpdateKitParams,
