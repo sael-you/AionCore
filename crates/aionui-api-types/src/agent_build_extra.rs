@@ -126,6 +126,11 @@ pub struct AcpBuildExtra {
     /// the first session open when no backend session id is bound yet.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub fork: Option<ForkSpec>,
+    /// The conversation's auto-compact setting (TASK-158): an
+    /// `AutoCompactMode` wire string (`auto` | `50`..`80` | `off`); absent = auto.
+    /// Applied at agent start where the backend has such a setting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_compact: Option<String>,
 }
 
 /// Aionrs-specific fields extracted from `extra` in build task options.

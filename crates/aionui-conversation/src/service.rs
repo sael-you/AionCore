@@ -1751,6 +1751,7 @@ impl ConversationService {
                 current_model_id: model.map(Some),
                 config_selections_json: None,
                 context_usage_json: None,
+                context_report_json: None,
             };
             self.acp_session_repo
                 .save_runtime_state_for_user(user_id, conversation_id, &params)
@@ -3142,6 +3143,7 @@ impl ConversationService {
                     current_model_id: state.current_model_id.as_deref().map(Some),
                     config_selections_json: None,
                     context_usage_json: None,
+                    context_report_json: None,
                 };
                 if (seed.current_mode_id.is_some() || seed.current_model_id.is_some())
                     && let Err(err) = self

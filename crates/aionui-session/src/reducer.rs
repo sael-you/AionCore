@@ -1130,6 +1130,7 @@ mod tests {
             SessionEvent::SessionInfo {
                 context_usage: None,
                 cost_text: Some("Total cost: $0".into()),
+                context_report: None,
             },
             // SubagentDetail: the rich background-plane fill (all fields None-able);
             // reducer no-op (read only by the orchestrator's workflow_roster).
@@ -1290,6 +1291,7 @@ mod tests {
             SessionEvent::SessionInfo {
                 context_usage: None,
                 cost_text: Some("Total cost: $0".into()),
+                context_report: None,
             },
             SessionEvent::Snapshot {
                 state_repr: "Idle".into(),
@@ -2313,6 +2315,7 @@ mod proptest_totality {
             Just(SessionEvent::SessionInfo {
                 context_usage: None,
                 cost_text: Some("Total cost: $0".into()),
+                context_report: None,
             }),
         ]
     }

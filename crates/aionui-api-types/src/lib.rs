@@ -18,6 +18,7 @@ mod chat_file;
 mod confirmation;
 mod connection_test;
 mod conversation;
+mod conversation_context;
 mod conversation_tools;
 mod cron;
 mod custom_agent;
@@ -144,6 +145,11 @@ pub use conversation::{
     ReparentConversationRequest, RestartAutoBlocked, RestartInterrupted, RestartInterruptedKind,
     RestartInterruptedState, RestartResumeAction, RestartResumeRequest, RestartResumeResponse, SearchMessagesQuery,
     SendMessageRequest, SendMessageResponse, SessionRef, UpdateConversationArtifactRequest, UpdateConversationRequest,
+};
+pub use conversation_context::{
+    AutoCompactMode, AutoCompactView, CompactConversationResponse, ContextCategory, ContextCost, ContextItems,
+    ContextMcpToolItem, ContextMemoryFileItem, ContextNamedItem, ContextSource, ConversationContextResponse,
+    EXTRA_AUTO_COMPACT, SetAutoCompactRequest,
 };
 pub use conversation_tools::{
     CONVERSATION_TOOLS_SCHEMA_VERSION, ConversationCliEnvelope, ConversationCliMeta, ConversationCreateAssistant,

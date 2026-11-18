@@ -769,6 +769,40 @@ impl TitleGenState {
         });
     }
 
+    /// TASK-158: ask claude for its context breakdown after a finished turn —
+    /// `control_request{get_context_usage, detail:"summary"}` (verified in the
+    /// claude 2.1.325 binary: `detail` is `'summary' | 'full'`; summary answers
+    /// from the last response's usage and local estimates, without the
+    /// per-category token-count API calls of `full`). Rides the same stdin as the
+    /// title request, on a detached task (the reader must not block on the stdin
+    /// lock), keyed `ctl-qsi-usage-N` so `sniff_session_info` turns the reply
+    /// into `SessionEvent::SessionInfo`. Best effort: a failed write or a missing
+    /// reply only leaves the panel on its previous report.
+    fn query_context_usage(self: &Arc<Self>, session_id: &str) {
+        use std::sync::atomic::Ordering;
+        let request_id = format!(
+            "{QSI_USAGE_PREFIX}{}",
+            self.control_seq.fetch_add(1, Ordering::SeqCst) + 1
+        );
+        let this = self.clone();
+        let session_id = session_id.to_string();
+        tokio::spawn(async move {
+            let frame = serde_json::json!({
+                "type": "control_request",
+                "request_id": request_id,
+                "request": { "subtype": "get_context_usage", "detail": "summary" },
+            });
+            let mut guard = this.stdin.lock().await;
+            let Some(stdin) = guard.as_mut() else {
+                tracing::debug!(session_id, "get_context_usage not sent: stdin unavailable");
+                return;
+            };
+            if let Err(e) = this.adapter.write_control_response(stdin, &frame).await {
+                tracing::warn!(session_id, error = %e, "get_context_usage control_request write failed");
+            }
+        });
+    }
+
     /// Clear `inflight` iff it still holds `request_id`; true when this call
     /// cleared it (reply and watchdog race benignly through this guard).
     fn clear_inflight(&self, request_id: &str) -> bool {
@@ -1992,6 +2026,10 @@ async fn reader_task(
                     {
                         title_gen.fire(&session_id, result_text);
                     }
+                    // TASK-158: refresh the context breakdown once per finished
+                    // turn (also after a `/compact` turn). Fire-and-forget; the
+                    // reply is sniffed by `sniff_session_info`.
+                    title_gen.query_context_usage(&session_id);
                 }
                 // Bug-A: a TurnResult is stamped with the OPEN turn's locked epoch
                 // (set at this turn's system/init), NOT the read-time turn_gen — so a
@@ -2963,15 +3001,23 @@ fn sniff_session_info(
                     .collect()
             })
             .unwrap_or_default();
+        // The whole reply rides along for the Context panel (TASK-158); the
+        // render grid is dropped (hundreds of cells the panel never reads).
+        let mut report = inner.clone();
+        if let Some(obj) = report.as_object_mut() {
+            obj.remove("gridRows");
+        }
         SessionEvent::SessionInfo {
             context_usage: Some(crate::event::ContextUsage { used, max, categories }),
             cost_text: None,
+            context_report: report.is_object().then_some(report),
         }
     } else if request_id.starts_with(QSI_COST_PREFIX) {
         let text = inner.get("text").and_then(Value::as_str).unwrap_or("").to_string();
         SessionEvent::SessionInfo {
             context_usage: None,
             cost_text: Some(text),
+            context_report: None,
         }
     } else {
         return; // not a QuerySessionInfo reply (initialize / set_mode / can_use_tool ack)
@@ -8046,6 +8092,68 @@ mod tests {
         assert_eq!(u.categories.len(), 2);
         assert_eq!(u.categories[0].name, "System prompt");
         assert_eq!(u.categories[0].tokens, 1460);
+    }
+
+    #[tokio::test]
+    async fn sniff_session_info_carries_the_full_context_report_without_the_grid() {
+        // TASK-158: the Context panel needs the whole reply (ids, deferred flags,
+        // item lists, auto-compact threshold), not just (name, tokens). Field
+        // names from the get_context_usage response schema in the claude
+        // 2.1.325 binary. gridRows (render cells) is dropped.
+        let frame = format!(
+            r#"{{"type":"control_response","response":{{"subtype":"success","request_id":"{QSI_USAGE_PREFIX}4","response":{{"totalTokens":3025,"maxTokens":200000,"percentage":2,"gridRows":[[{{"color":"x"}}]],"categories":[{{"id":"mcp_tools_deferred","name":"MCP tools (deferred)","tokens":900,"color":"inactive","isDeferred":true}}],"mcpTools":[{{"name":"search","serverName":"docs","tokens":900,"isLoaded":false}}],"autoCompactThreshold":167000,"isAutoCompactEnabled":true}}}}}}"#
+        );
+        let bytes = format!("{frame}\n").into_bytes();
+        let backend = ClaudeSessionBackend::build_with_io("s", Box::new(FakeAgentIo::never_exits(bytes))).await;
+        let mut events = backend.events();
+
+        let mut got: Option<serde_json::Value> = None;
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while let Some(env) = events.next().await {
+                if let SessionEvent::SessionInfo {
+                    context_report: Some(r),
+                    ..
+                } = env.event
+                {
+                    got = Some(r);
+                    return;
+                }
+            }
+        })
+        .await;
+        let r = got.expect("get_context_usage → SessionInfo{context_report}");
+        assert_eq!(r["categories"][0]["id"], "mcp_tools_deferred");
+        assert_eq!(r["categories"][0]["isDeferred"], true);
+        assert_eq!(r["mcpTools"][0]["serverName"], "docs");
+        assert_eq!(r["autoCompactThreshold"], 167000);
+        assert!(r.get("gridRows").is_none(), "the render grid is not kept");
+    }
+
+    #[tokio::test]
+    async fn every_finished_turn_asks_for_the_context_breakdown_once() {
+        // TASK-158: one summary get_context_usage per TurnResult (also for a
+        // resumed session — no Fresh latch), keyed so sniff_session_info routes
+        // the reply.
+        let frames = "\
+{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"hi\"}\n\
+{\"type\":\"result\",\"subtype\":\"success\",\"is_error\":false,\"result\":\"again\"}\n";
+        let fake = FakeAgentIo::never_exits(frames.as_bytes().to_vec());
+        let captured = fake.captured_stdin();
+        let _backend = ClaudeSessionBackend::build_with_io("s-resumed", Box::new(fake)).await;
+
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        let written = String::from_utf8_lossy(&captured.lock().await.clone()).to_string();
+        let asks: Vec<serde_json::Value> = written
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .filter(|v| v["request"]["subtype"] == "get_context_usage")
+            .collect();
+        assert_eq!(asks.len(), 2, "one per finished turn, got wire: {written:?}");
+        for ask in &asks {
+            assert_eq!(ask["type"], "control_request");
+            assert_eq!(ask["request"]["detail"], "summary");
+            assert!(ask["request_id"].as_str().unwrap().starts_with(QSI_USAGE_PREFIX));
+        }
     }
 
     #[tokio::test]

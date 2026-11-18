@@ -168,6 +168,7 @@ impl PendingUpdate {
             current_model_id: self.current_model_id.as_ref().map(Option::as_deref),
             config_selections_json: self.config_selections_json.as_ref().map(Option::as_deref),
             context_usage_json: self.context_usage_json.as_ref().map(Option::as_deref),
+            context_report_json: None,
         }
     }
 
