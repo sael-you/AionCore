@@ -35,7 +35,12 @@ pub(crate) async fn record_usage_turn(pool: &SqlitePool, p: &UsageTurnParams<'_>
     if p.is_empty() {
         return Ok(false);
     }
-    let mut tx = pool.begin().await?;
+    // BEGIN IMMEDIATE: the transaction reads and then writes. A deferred one
+    // takes a read snapshot first, and SQLite refuses to upgrade it at once
+    // ("database is locked", busy_timeout not applied) when another
+    // connection commits in between — a turn was dropped that way on staging.
+    // Taking the write lock up front waits (busy_timeout) instead.
+    let mut tx = pool.begin_with("BEGIN IMMEDIATE").await?;
     // Project, backend and model as they are now, in one read; no row = not
     // the user's conversation.
     let context: Option<(Option<String>, Option<String>, Option<String>)> = sqlx::query_as(

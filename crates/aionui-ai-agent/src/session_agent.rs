@@ -6703,6 +6703,65 @@ mod persist_tests {
         assert_eq!(stored_usage(repo.as_ref()).await["used"], 60_000);
     }
 
+    /// Staging finding (TASK-169): two turns and a `/compact` in one
+    /// conversation. Every turn that reports usage is recorded with the tokens
+    /// it consumed (input + output + cache read/write of THAT turn), whatever
+    /// the context occupancy does: occupancy falling after a compaction drops
+    /// nothing. The compact turn itself reports all-zero usage (claude
+    /// 2.1.220, see `informative_usage`), so it adds no row; its cost shows up
+    /// in the next turn's difference.
+    #[tokio::test]
+    async fn turns_around_a_compaction_are_all_recorded() {
+        let (repo, db) = seeded_repo().await;
+        let turn = |occupancy: u64, cache_read: u64, cache_write: u64, cost: f64| SessionEvent::UsageDelta {
+            input_tokens: 2,
+            output_tokens: 4,
+            total_tokens: occupancy,
+            cost_usd: Some(cost),
+            context_window: Some(1_000_000),
+            breakdown: aionui_session::UsageBreakdown {
+                cached_read_tokens: cache_read,
+                cached_write_tokens: cache_write,
+                thought_tokens: 0,
+            },
+        };
+        persist_side_effects(repo.as_ref(), "user-1", "conv-1", &turn(33_196, 13_029, 20_161, 0.16)).await;
+        persist_side_effects(repo.as_ref(), "user-1", "conv-1", &turn(53_105, 33_190, 0, 0.17)).await;
+        // `/compact`: all-zero usage, discarded by the occupancy gate.
+        persist_side_effects(repo.as_ref(), "user-1", "conv-1", &usage(0, Some(0.18), None)).await;
+        // After the compaction the context is SMALLER than before.
+        persist_side_effects(repo.as_ref(), "user-1", "conv-1", &turn(27_238, 25_000, 2_000, 0.20)).await;
+
+        let rows: Vec<(i64, i64, i64, i64, Option<i64>)> = sqlx::query_as(
+            "SELECT input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_micro_usd \
+             FROM usage_turns WHERE conversation_id = 'conv-1' ORDER BY rowid",
+        )
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                (2, 4, 13_029, 20_161, Some(160_000)),
+                (2, 4, 33_190, 0, Some(10_000)),
+                (2, 4, 25_000, 2_000, Some(30_000)),
+            ],
+            "three turns; the last one carries the compaction's cost"
+        );
+        let (turns, consumed): (i64, i64) = sqlx::query_as(
+            "SELECT SUM(turns), SUM(input_tokens + output_tokens + cache_read_tokens + cache_write_tokens) \
+             FROM usage_daily",
+        )
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            (turns, consumed),
+            (3, 93_398),
+            "consumed tokens, not the 27_238 context fill"
+        );
+    }
+
     async fn stored_usage(repo: &dyn IAcpSessionRepository) -> serde_json::Value {
         let state = repo
             .load_runtime_state_for_user("user-1", "conv-1")
