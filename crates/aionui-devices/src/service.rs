@@ -720,7 +720,12 @@ impl DevicesService {
     /// `POST /api/devices/{id}/install|remove`.
     pub async fn start_job(self: &Arc<Self>, user_id: &str, id: &str, remove: bool) -> Result<String, DevicesError> {
         let device = self.get(user_id, id).await?;
-        if remove && let Some(job_id) = self.remove_relay_device(user_id, id).await? {
+        // An installed add-on is removed by its installer (the Mac frees the
+        // disk, K5); phones and the helper's own card are forgotten / revoked.
+        if remove
+            && !crate::addons::removes_through_installer(device.kind)
+            && let Some(job_id) = self.remove_relay_device(user_id, id).await?
+        {
             return Ok(job_id);
         }
         if device.available == DeviceAvailability::Later {

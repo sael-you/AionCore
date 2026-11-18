@@ -532,6 +532,8 @@ impl AppServices {
             }),
         );
         devices_service.spawn_background();
+        // Add-ons (K5): install / remove through the Mac helper.
+        aionui_devices::addons::register(&devices_service);
         conversation_service.with_browser_port(Arc::new(crate::router::browser::BrowserConversationPort {
             service: browser_service.clone(),
             devices: devices_service.clone(),

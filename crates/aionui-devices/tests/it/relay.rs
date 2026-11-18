@@ -18,8 +18,8 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 use tokio_tungstenite::{MaybeTlsStream, WebSocketStream};
 
-type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
-const WAIT: Duration = Duration::from_secs(5);
+pub(crate) type Ws = WebSocketStream<MaybeTlsStream<TcpStream>>;
+pub(crate) const WAIT: Duration = Duration::from_secs(5);
 
 #[derive(Default)]
 struct NoBrowser(AtomicBool);
@@ -49,7 +49,7 @@ impl BrowserDevices for NoBrowser {
     }
 }
 
-async fn harness() -> (Arc<DevicesService>, u16) {
+pub(crate) async fn harness() -> (Arc<DevicesService>, u16) {
     let db = init_database_memory().await.unwrap();
     let repo: Arc<dyn IDeviceRepository> = Arc::new(SqliteDeviceRepository::new(db.pool().clone()));
     std::mem::forget(db);
@@ -61,7 +61,7 @@ async fn harness() -> (Arc<DevicesService>, u16) {
     (svc, port)
 }
 
-async fn open(port: u16, origin: Option<&str>) -> Result<Ws, tokio_tungstenite::tungstenite::Error> {
+pub(crate) async fn open(port: u16, origin: Option<&str>) -> Result<Ws, tokio_tungstenite::tungstenite::Error> {
     let mut req = format!("ws://127.0.0.1:{port}/api/devices/relay")
         .into_client_request()
         .unwrap();
@@ -71,7 +71,7 @@ async fn open(port: u16, origin: Option<&str>) -> Result<Ws, tokio_tungstenite::
     tokio_tungstenite::connect_async(req).await.map(|(ws, _)| ws)
 }
 
-async fn next(ws: &mut Ws) -> Option<Value> {
+pub(crate) async fn next(ws: &mut Ws) -> Option<Value> {
     loop {
         match tokio::time::timeout(WAIT, ws.next()).await {
             Ok(Some(Ok(Message::Text(t)))) => return serde_json::from_str(&t).ok(),
@@ -81,7 +81,7 @@ async fn next(ws: &mut Ws) -> Option<Value> {
     }
 }
 
-async fn send(ws: &mut Ws, v: Value) {
+pub(crate) async fn send(ws: &mut Ws, v: Value) {
     ws.send(Message::Text(v.to_string().into())).await.unwrap();
 }
 
