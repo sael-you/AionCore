@@ -16,6 +16,9 @@
 //!   20 s for screen reads, 60 s otherwise; 21 min for add-on installs).
 //! - A switch going off (owner, timeout, revoke) sends `stop {device}`.
 //! - A client silent for 60 s is closed; `ping` → `pong`.
+//! - The companion app is told about a newer published build of itself with
+//!   `update_available` (TASK-177): after its first frame, on its
+//!   `update_check` event and when the published files change.
 //!
 //! Tokens and codes are never logged.
 
@@ -109,6 +112,9 @@ pub struct RelayClient {
     health: std::sync::Mutex<Option<DeviceHealth>>,
     /// The client's own version (`pair` / `hello`), shown on its card.
     version: Option<String>,
+    /// Companion 0.2.2+: its Android `versionCode`. Without it AionCore
+    /// cannot tell whether a published build is newer, and offers nothing.
+    version_code: Option<u64>,
 }
 
 impl std::fmt::Debug for RelayClient {
@@ -263,6 +269,23 @@ pub(crate) fn health_of(value: &Value) -> Option<DeviceHealth> {
     })
 }
 
+/// How often the companion folder is looked at for a new release.
+pub const UPDATE_WATCH_EVERY: Duration = Duration::from_secs(30);
+
+/// A peer's `version_code`, read leniently: a positive whole number.
+fn version_code_of(value: Option<&Value>) -> Option<u64> {
+    value.and_then(Value::as_u64).filter(|code| *code >= 1)
+}
+
+/// What a first frame established.
+struct Authenticated {
+    pairing: DevicePairingRow,
+    /// Only after `pair`.
+    token: Option<String>,
+    health: Option<DeviceHealth>,
+    version_code: Option<u64>,
+}
+
 fn pairing_kind_of(kind: RelayClientKind) -> DevicePairingKind {
     match kind {
         RelayClientKind::MacHelper => DevicePairingKind::MacHelper,
@@ -382,6 +405,99 @@ impl DevicesService {
             });
             c.shutdown();
         }
+        // A revoked app's update link is dead with its token.
+        if let Some(downloads) = self.companion_downloads() {
+            downloads.forget_pairing(pairing_id);
+        }
+    }
+
+    // -- companion self-update (TASK-177) ---------------------------------------
+
+    /// Tell `client` about the published companion build when it is newer
+    /// than the one the app reported. Returns whether a frame was sent.
+    async fn offer_update(&self, client: &RelayClient) -> bool {
+        if client.kind != RelayClientKind::Companion {
+            return false;
+        }
+        let Some(own) = client.version_code else { return false };
+        let Some(downloads) = self.companion_downloads() else {
+            return false;
+        };
+        let Some(published) = downloads.published().await.filter(|p| p.version_code > own) else {
+            return false;
+        };
+        let link = downloads.update_link(&client.pairing_id);
+        let sent = client.send(RelayOutbound::UpdateAvailable {
+            version: published.version.clone(),
+            version_code: published.version_code,
+            sha256: published.sha256,
+            url: link.url,
+            size: published.size,
+            expires_at: link.expires_at,
+        });
+        if sent {
+            info!(
+                pairing_id = %client.pairing_id,
+                app_version_code = own,
+                published_version = %published.version,
+                published_version_code = published.version_code,
+                "companion update offered"
+            );
+        }
+        sent
+    }
+
+    /// Offer the published build to every connected companion app it is newer
+    /// for. Returns how many were told.
+    pub async fn offer_update_to_all(&self) -> usize {
+        let clients: Vec<Arc<RelayClient>> = self
+            .relay()
+            .clients
+            .iter()
+            .filter(|c| c.kind == RelayClientKind::Companion && c.is_alive())
+            .map(|c| c.clone())
+            .collect();
+        let mut told = 0;
+        for client in clients {
+            if self.offer_update(&client).await {
+                told += 1;
+            }
+        }
+        told
+    }
+
+    /// Watch the companion folder: when the published build changes, the
+    /// connected apps hear about it (within [`UPDATE_WATCH_EVERY`]).
+    pub fn spawn_companion_update_watch(self: &Arc<Self>) {
+        self.spawn_companion_update_watch_every(UPDATE_WATCH_EVERY);
+    }
+
+    /// [`Self::spawn_companion_update_watch`] with its own interval.
+    pub fn spawn_companion_update_watch_every(self: &Arc<Self>, every: Duration) {
+        let weak = Arc::downgrade(self);
+        tokio::spawn(async move {
+            let mut last = None;
+            let mut first = true;
+            loop {
+                let Some(svc) = weak.upgrade() else { return };
+                if let Some(downloads) = svc.companion_downloads() {
+                    let now = downloads.published().await;
+                    // The build found at startup is offered at each `hello`;
+                    // only a change after that is announced here.
+                    if !first && now != last && now.is_some() {
+                        let told = svc.offer_update_to_all().await;
+                        info!(
+                            version_code = now.as_ref().map(|p| p.version_code),
+                            told, "companion release changed"
+                        );
+                    }
+                    last = now;
+                    first = false;
+                }
+                drop(svc);
+                tokio::time::sleep(every).await;
+            }
+        });
     }
 
     /// Serve one relay connection until it closes.
@@ -404,7 +520,12 @@ impl DevicesService {
             Some(frame) => self.authenticate(frame, &source).await,
             None => Err(DeviceErrorCode::DeviceBadMessage),
         };
-        let (pairing, token, health) = match auth {
+        let Authenticated {
+            pairing,
+            token,
+            health,
+            version_code,
+        } = match auth {
             Ok(a) => a,
             Err(code) => {
                 let text = serde_json::to_string(&RelayOutbound::Error { code }).unwrap_or_default();
@@ -435,6 +556,7 @@ impl DevicesService {
             foreground: std::sync::Mutex::new(HashMap::new()),
             health: std::sync::Mutex::new(health),
             version: pairing.version.clone().filter(|v| !v.is_empty()),
+            version_code,
         });
         let _ = client.out.send(RelayOutbound::Welcome {
             client_id: pairing.id.clone(),
@@ -458,6 +580,9 @@ impl DevicesService {
         self.relay().last_frame.insert(pairing.id.clone(), now_ms());
         info!(user_id = %pairing.user_id, pairing_id = %pairing.id, kind = %pairing.kind, "device relay client connected");
         self.changed(&pairing.user_id, None);
+        if client.is_alive() {
+            self.offer_update(&client).await;
+        }
 
         let writer_client = client.clone();
         let writer = tokio::spawn(async move {
@@ -527,17 +652,14 @@ impl DevicesService {
         info!(user_id = %client.user_id, pairing_id = %client.pairing_id, "device relay client disconnected");
     }
 
-    async fn authenticate(
-        &self,
-        frame: RelayInbound,
-        source: &str,
-    ) -> Result<(DevicePairingRow, Option<String>, Option<DeviceHealth>), DeviceErrorCode> {
+    async fn authenticate(&self, frame: RelayInbound, source: &str) -> Result<Authenticated, DeviceErrorCode> {
         match frame {
             RelayInbound::Pair {
                 code,
                 kind,
                 name,
                 version,
+                version_code,
                 capabilities,
                 health,
             } => {
@@ -596,12 +718,18 @@ impl DevicesService {
                     })
                     .await;
                 info!(user_id, pairing_id = %row.id, kind = %row.kind, "device relay client paired");
-                Ok((row, Some(token), health.as_ref().and_then(health_of)))
+                Ok(Authenticated {
+                    pairing: row,
+                    token: Some(token),
+                    health: health.as_ref().and_then(health_of),
+                    version_code: version_code_of(version_code.as_ref()),
+                })
             }
             RelayInbound::Hello {
                 token,
                 kind,
                 version,
+                version_code,
                 capabilities,
                 health,
             } => {
@@ -619,15 +747,16 @@ impl DevicesService {
                 let caps = serde_json::to_string(&capabilities).unwrap_or_else(|_| "[]".into());
                 let version = clean_label(&version, "");
                 let _ = self.repo().touch_pairing(&row.id, &version, &caps, now_ms()).await;
-                Ok((
-                    DevicePairingRow {
+                Ok(Authenticated {
+                    pairing: DevicePairingRow {
                         version: Some(version),
                         capabilities: caps,
                         ..row
                     },
-                    None,
-                    health.as_ref().and_then(health_of),
-                ))
+                    token: None,
+                    health: health.as_ref().and_then(health_of),
+                    version_code: version_code_of(version_code.as_ref()),
+                })
             }
             _ => Err(DeviceErrorCode::DeviceBadMessage),
         }
@@ -700,6 +829,36 @@ impl DevicesService {
                     && let Some(health) = health_of(&data)
                 {
                     self.store_health(client, health).await;
+                }
+                if client.kind == RelayClientKind::Companion && device == RELAY_DEVICE_SELF {
+                    if name == relay_event::UPDATE_CHECK {
+                        // "Check now", or the app's link expired: a fresh
+                        // link when there is something newer, else silence.
+                        self.offer_update(client).await;
+                    }
+                    if name == relay_event::UPDATE {
+                        // Where the app's self-update stands. Peer text is
+                        // cut to short labels before it reaches the log.
+                        let label = |key: &str| {
+                            data.get(key)
+                                .and_then(Value::as_str)
+                                .map(|s| {
+                                    s.chars()
+                                        .filter(|c| c.is_ascii_alphanumeric() || *c == '_')
+                                        .take(32)
+                                        .collect::<String>()
+                                })
+                                .unwrap_or_default()
+                        };
+                        let reported_code = data.get("version_code").and_then(Value::as_u64);
+                        info!(
+                            pairing_id = %client.pairing_id,
+                            state = %label("state"),
+                            version_code = reported_code,
+                            error = %label("error"),
+                            "companion update progress"
+                        );
+                    }
                 }
                 let _ = self.relay().events.send(RelayEvent {
                     pairing_id: client.pairing_id.clone(),

@@ -2,3 +2,4 @@
 
 mod addons;
 mod relay;
+mod update;
