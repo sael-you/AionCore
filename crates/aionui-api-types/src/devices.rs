@@ -461,6 +461,12 @@ pub mod relay_event {
     pub const CDP_FRAME: &str = "cdp_frame";
     /// data: `{session}`: the phone's Chrome closed the session.
     pub const CDP_CLOSED: &str = "cdp_closed";
+    /// data: `{}` (companion 0.2.2+): "check now", or its download link
+    /// expired. AionCore answers with a fresh `update_available`, or not at all.
+    pub const UPDATE_CHECK: &str = "update_check";
+    /// data: `{state, version_code, error?}` (companion 0.2.2+): where its
+    /// self-update stands. AionCore only logs it.
+    pub const UPDATE: &str = "update";
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -549,6 +555,10 @@ pub enum RelayInbound {
         kind: RelayClientKind,
         name: String,
         version: String,
+        /// Companion 0.2.2+: its Android `versionCode` (read leniently), so
+        /// AionCore can tell whether the published build is newer.
+        #[serde(default)]
+        version_code: Option<serde_json::Value>,
         #[serde(default)]
         capabilities: Vec<String>,
         /// Companion 0.2+: a [`DeviceHealth`] object (read leniently).
@@ -560,6 +570,8 @@ pub enum RelayInbound {
         token: String,
         kind: RelayClientKind,
         version: String,
+        #[serde(default)]
+        version_code: Option<serde_json::Value>,
         #[serde(default)]
         capabilities: Vec<String>,
         #[serde(default)]
@@ -628,6 +640,24 @@ pub enum RelayOutbound {
     Access {
         device: String,
         mode: DeviceAccessMode,
+    },
+    /// A newer build of the companion app is published on this AionUi
+    /// (companion app only, TASK-177). Sent after its `hello` / `pair`, on its
+    /// `update_check` event and when the published files change, and only
+    /// when `version_code` is higher than the one the app reported. The app
+    /// checks hash, signer and version itself before it installs.
+    UpdateAvailable {
+        version: String,
+        version_code: u64,
+        /// Lower-case hex SHA-256 of the APK.
+        sha256: String,
+        /// A path on this host: `/api/devices/companion.apk?t=<token>`. The
+        /// token is short-lived and belongs to this pairing.
+        url: String,
+        /// Bytes.
+        size: u64,
+        /// Unix ms: the link is dead after this.
+        expires_at: i64,
     },
     Pong,
 }
@@ -792,6 +822,70 @@ mod tests {
             .unwrap(),
             json!({"type": "error", "code": "DEVICE_REVOKED"})
         );
+    }
+
+    /// TASK-177: `update_available` exactly as the companion app expects it.
+    /// The string is the app's own fixture, byte for byte (ui
+    /// `packages/android-companion/app/src/test/resources/wire/update-available.json`,
+    /// read there by `UpdateOffer.parse`).
+    #[test]
+    fn update_available_is_the_agreed_frame() {
+        const FIXTURE: &str = r#"{"type":"update_available","version":"0.2.2","version_code":5,"sha256":"1224da5cbc9294dc019eb836eed3cf46813af5be7842e530024c4be90586a804","url":"/api/devices/companion.apk?t=TOKEN","size":7340032,"expires_at":1795000000000}"#;
+        let frame = RelayOutbound::UpdateAvailable {
+            version: "0.2.2".into(),
+            version_code: 5,
+            sha256: "1224da5cbc9294dc019eb836eed3cf46813af5be7842e530024c4be90586a804".into(),
+            url: "/api/devices/companion.apk?t=TOKEN".into(),
+            size: 7_340_032,
+            expires_at: 1_795_000_000_000,
+        };
+        assert_eq!(serde_json::to_string(&frame).unwrap(), FIXTURE);
+        assert_eq!(serde_json::from_str::<RelayOutbound>(FIXTURE).unwrap(), frame);
+
+        // What 0.2.2 sends: its version code in `hello` / `pair`, and the two
+        // update events. An older app sends no `version_code`.
+        for (text, code) in [
+            (
+                r#"{"type":"hello","token":"t","kind":"companion","version":"0.2.2","version_code":4,"capabilities":[]}"#,
+                Some(json!(4)),
+            ),
+            (
+                r#"{"type":"hello","token":"t","kind":"companion","version":"0.2.1","capabilities":[]}"#,
+                None,
+            ),
+        ] {
+            let RelayInbound::Hello { version_code, .. } = serde_json::from_str(text).unwrap() else {
+                panic!("not a hello: {text}");
+            };
+            assert_eq!(version_code, code);
+        }
+        let pair: RelayInbound = serde_json::from_str(
+            r#"{"type":"pair","code":"c","kind":"companion","name":"Pixel","version":"0.2.2","version_code":4,"capabilities":[]}"#,
+        )
+        .unwrap();
+        assert!(matches!(
+            pair,
+            RelayInbound::Pair {
+                version_code: Some(_),
+                ..
+            }
+        ));
+        for (text, name) in [
+            (
+                r#"{"type":"event","device":"self","name":"update_check","data":{}}"#,
+                relay_event::UPDATE_CHECK,
+            ),
+            (
+                r#"{"type":"event","device":"self","name":"update","data":{"state":"failed","version_code":5,"error":"signature_mismatch"}}"#,
+                relay_event::UPDATE,
+            ),
+        ] {
+            let frame: RelayInbound = serde_json::from_str(text).unwrap();
+            assert!(
+                matches!(frame, RelayInbound::Event { name: ref n, .. } if n == name),
+                "{text}"
+            );
+        }
     }
 
     /// TASK-172: every frame kind the Android companion sends, as its
