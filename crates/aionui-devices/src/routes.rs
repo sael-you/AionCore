@@ -30,6 +30,8 @@ pub fn devices_routes(state: DevicesRouterState) -> Router {
         .route("/api/devices/approvals", get(list_approvals))
         .route("/api/devices/approvals/{approval_id}", post(decide_approval))
         .route("/api/devices/{id}", put(update))
+        .route("/api/devices/{id}/access", put(update_access))
+        .route("/api/devices/{id}/access/trusted-apps", put(update_trusted_apps))
         .route("/api/devices/{id}/routes/{route}", put(update_route))
         .route("/api/devices/{id}/install", post(install))
         .route("/api/devices/{id}/remove", post(remove))
@@ -226,10 +228,46 @@ async fn decide_approval(
 ) -> Result<Json<ApiResponse<()>>, ApiError> {
     let Json(body) = body.map_err(ApiError::from)?;
     let allow = body.decision == aionui_api_types::devices::DeviceApprovalVerdict::Allow;
-    s.service
-        .decide_approval(&user.id, &approval_id, allow)
-        .map_err(api_error)?;
+    if allow && body.always {
+        s.service
+            .decide_approval_always(&user.id, &approval_id)
+            .await
+            .map_err(api_error)?;
+    } else {
+        s.service
+            .decide_approval(&user.id, &approval_id, allow)
+            .map_err(api_error)?;
+    }
     Ok(Json(ApiResponse::ok(())))
+}
+
+/// The access mode of a phone / Mac. Like every route here: the owner's
+/// browser session and a trusted Origin; there is no agent-side equivalent.
+async fn update_access(
+    State(s): State<DevicesRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    body: Result<Json<aionui_api_types::devices::DeviceAccessUpdate>, JsonRejection>,
+) -> Result<Json<ApiResponse<Device>>, ApiError> {
+    let Json(body) = body.map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(
+        s.service.set_access(&user.id, &id, &body).await.map_err(api_error)?,
+    )))
+}
+
+async fn update_trusted_apps(
+    State(s): State<DevicesRouterState>,
+    Extension(user): Extension<CurrentUser>,
+    Path(id): Path<String>,
+    body: Result<Json<aionui_api_types::devices::DeviceTrustedApps>, JsonRejection>,
+) -> Result<Json<ApiResponse<Device>>, ApiError> {
+    let Json(body) = body.map_err(ApiError::from)?;
+    Ok(Json(ApiResponse::ok(
+        s.service
+            .set_trusted_apps(&user.id, &id, &body.apps)
+            .await
+            .map_err(api_error)?,
+    )))
 }
 
 async fn list(

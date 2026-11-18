@@ -363,6 +363,17 @@ impl DevicesService {
         }
     }
 
+    /// Send `frame` to the pairing's client when it is the companion app
+    /// (it ignores frame types it does not know; the Mac helper is not sent
+    /// frames it was not built for).
+    pub(crate) fn relay_send_to_companion(&self, pairing_id: &str, frame: RelayOutbound) {
+        if let Some(c) = self.relay().clients.get(pairing_id)
+            && c.kind == RelayClientKind::Companion
+        {
+            c.send(frame);
+        }
+    }
+
     /// Close a client's socket (revoke).
     pub(crate) fn relay_disconnect(&self, pairing_id: &str) {
         if let Some((_, c)) = self.relay().clients.remove(pairing_id) {
@@ -823,6 +834,10 @@ impl DevicesService {
             upsert("addon", name.clone(), name, meta).await;
         }
         *client.present.lock().expect("present lock") = present;
+        if client.kind == RelayClientKind::Companion {
+            let id = relay_device_id("phone", &client.pairing_id, RELAY_DEVICE_SELF);
+            self.push_access_mode(&client.user_id, &id).await;
+        }
         self.changed(&client.user_id, None);
     }
 }

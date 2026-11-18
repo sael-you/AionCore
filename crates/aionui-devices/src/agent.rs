@@ -22,13 +22,16 @@
 //!    addition. Unknown front app = crucial, and that OK is single-use. The
 //!    OK is per conversation; the front app is checked again right before
 //!    the call runs;
+//!    The owner can loosen step 4 per device (`access.rs`: `trusted` apps
+//!    never ask, `full` shows no approval cards); steps 1-3 and 5 hold in
+//!    every mode;
 //! 5. the relay call, and one audit row whatever the outcome (verb, app
 //!    package, outcome; never screenshots, typed text or results).
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
-use aionui_api_types::devices::{DeviceAuditOutcome, DeviceErrorCode};
+use aionui_api_types::devices::{DeviceAccessMode, DeviceAuditOutcome, DeviceErrorCode};
 use serde_json::Value;
 
 use crate::approvals::OwnerQuestion;
@@ -98,6 +101,36 @@ const SECRET_STORE_MARKERS: &[&str] = &[
 pub fn is_secret_store(package: &str) -> bool {
     let p = package.to_ascii_lowercase();
     SECRET_STORE_MARKERS.iter().any(|m| p.contains(m))
+}
+
+/// Banking, payment and wallet apps: with password managers the "sensitive"
+/// class that `trusted` / `full` access only covers with `include_sensitive`.
+const MONEY_MARKERS: &[&str] = &[
+    "bank",
+    "pay",
+    "wallet",
+    "revolut",
+    "wise",
+    "n26",
+    "monzo",
+    "stripe",
+    "venmo",
+    "cashapp",
+    "klarna",
+    "coinbase",
+    "binance",
+    "kraken",
+    "crypto",
+    "broker",
+    "trading",
+    "finanz",
+    "sparkasse",
+];
+
+/// Whether `package` is a banking / payment app or a password manager.
+pub fn is_sensitive_package(package: &str) -> bool {
+    let p = package.to_ascii_lowercase();
+    MONEY_MARKERS.iter().any(|m| p.contains(m)) || is_secret_store(package)
 }
 
 /// Calls per device and minute.
@@ -191,6 +224,9 @@ struct Who<'a> {
     device_id: &'a str,
     verb: &'a str,
     conversation_id: Option<&'a str>,
+    /// The device's access mode during the call (in the audit row when it
+    /// is not the default).
+    mode: DeviceAccessMode,
 }
 
 fn refused(message: &str) -> DevicesError {
@@ -279,6 +315,11 @@ impl DevicesService {
         package: Option<&str>,
         detail: Option<&str>,
     ) {
+        let with_mode = match (detail, who.mode) {
+            (_, DeviceAccessMode::Ask) => None,
+            (None, mode) => Some(format!("mode={}", crate::access::mode_str(mode))),
+            (Some(d), mode) => Some(format!("{d}; mode={}", crate::access::mode_str(mode))),
+        };
         self.record(
             who.user_id,
             who.device_id,
@@ -288,7 +329,7 @@ impl DevicesService {
                 origin: None,
                 outcome,
                 conversation_id: who.conversation_id,
-                detail,
+                detail: with_mode.as_deref().or(detail),
             },
         )
         .await;
@@ -308,6 +349,8 @@ impl DevicesService {
             .get_device(&user_id, &device_id)
             .await?
             .ok_or_else(DevicesError::not_found)?;
+        // The owner's access mode for this device (TASK-175); see `access.rs`.
+        let access = crate::access::effective_access(&row);
         let allowed = match row.kind.as_str() {
             "phone" => PHONE_VERBS.contains(&verb.as_str()),
             "mac" => MAC_VERBS.contains(&verb.as_str()),
@@ -318,6 +361,7 @@ impl DevicesService {
             device_id: &device_id,
             verb: &verb,
             conversation_id: conversation_id.as_deref(),
+            mode: access.mode,
         };
         if !allowed {
             self.audit_call(&who, DeviceAuditOutcome::Refused, None, Some("DEVICE_VERB_REFUSED"))
@@ -398,7 +442,16 @@ impl DevicesService {
             .or_else(|| gated.then(|| "unknown".to_owned()));
         let checked: Vec<&str> = front.as_deref().into_iter().chain(named.as_deref()).collect();
 
-        if reading && checked.iter().any(|p| is_secret_store(p)) {
+        // What the access mode waives. `full`: every approval card, except
+        // for sensitive apps unless `include_sensitive`. `trusted`: the apps
+        // on the owner's list (a sensitive one only with `include_sensitive`).
+        let sensitive = checked.iter().any(|p| is_sensitive_package(p));
+        let full = access.mode == DeviceAccessMode::Full && (!sensitive || access.include_sensitive);
+        let waived = |p: &str| {
+            full || (crate::access::is_trusted(&access, p) && (!is_sensitive_package(p) || access.include_sensitive))
+        };
+
+        if reading && checked.iter().any(|p| is_secret_store(p) && !waived(p)) {
             self.audit_call(
                 &who,
                 DeviceAuditOutcome::Refused,
@@ -408,9 +461,10 @@ impl DevicesService {
             .await;
             return Err(refused("a password manager is in front: its screen is never read"));
         }
-        let crucial = verb == "install_apk"
-            || always_crucial
-            || (gated && (!front_known || checked.iter().any(|p| is_crucial_package(p))));
+        let crucial = !full
+            && (verb == "install_apk"
+                || always_crucial
+                || (gated && (!front_known || checked.iter().any(|p| is_crucial_package(p) && !waived(p)))));
         let mut approved = false;
         if crucial {
             let summary = match (verb.as_str(), package.as_deref()) {
@@ -462,6 +516,7 @@ impl DevicesService {
                 origin: None,
                 conversation_id: conversation_id.clone(),
                 grant_key,
+                sensitive,
             };
             if let Err(error) = self.ask_owner(question).await {
                 let outcome = if error.code() == Some(DeviceErrorCode::DeviceApprovalTimeout) {

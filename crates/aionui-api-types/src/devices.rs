@@ -135,7 +135,73 @@ pub struct Device {
     /// itself. Absent when it never did.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub health: Option<DeviceHealth>,
+    /// Phones and Macs: how much the owner lets agents do without asking.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub access: Option<DeviceAccess>,
 }
+
+/// The access mode of a phone / Mac (owner decision 2026-11-18). Only the
+/// owner's session sets it; the hard stops (device switch, verb allow-list,
+/// rate limit, audit) hold in every mode.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DeviceAccessMode {
+    /// Ask before crucial apps (the default).
+    #[default]
+    Ask,
+    /// Apps on the owner's list never ask; everything else as `ask`.
+    Trusted,
+    /// No approval cards for this device while it lasts.
+    Full,
+}
+
+/// `Device.access`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceAccess {
+    /// The mode in effect now (a `full` that ended reads `ask`).
+    pub mode: DeviceAccessMode,
+    /// `full`: epoch ms when it ends; null = until the owner turns it off.
+    pub full_until: Option<i64>,
+    /// Banking / payment apps and password managers are covered by
+    /// `trusted` / `full` too (off: they keep asking, their screens are not read).
+    pub include_sensitive: bool,
+    /// Android packages / macOS bundle ids that never ask in `trusted`.
+    pub trusted_apps: Vec<String>,
+}
+
+/// How long `full` lasts; the device switch stays on for the same time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DeviceFullDuration {
+    #[serde(rename = "1h")]
+    OneHour,
+    #[serde(rename = "8h")]
+    EightHours,
+    #[serde(rename = "until_off")]
+    UntilOff,
+}
+
+/// `PUT /api/devices/{id}/access`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeviceAccessUpdate {
+    pub mode: DeviceAccessMode,
+    /// Required with `full`, refused with the other modes.
+    #[serde(default)]
+    pub full_duration: Option<DeviceFullDuration>,
+    #[serde(default)]
+    pub include_sensitive: bool,
+}
+
+/// `PUT /api/devices/{id}/access/trusted-apps`: replaces the list.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DeviceTrustedApps {
+    pub apps: Vec<String>,
+}
+
+/// Entries a trusted list may hold, and the length of one.
+pub const DEVICE_TRUSTED_APPS_MAX: usize = 100;
+pub const DEVICE_TRUSTED_APP_CHARS: usize = 200;
 
 /// What a phone reports about itself (`health` in `pair` / `hello` and the
 /// `health` event). Stored on the device row.
@@ -255,6 +321,10 @@ pub struct DeviceApproval {
     /// and app for this many minutes ("allow for 5 min").
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub grant_minutes: Option<u32>,
+    /// The app is a banking / payment app or a password manager: "always
+    /// allow" keeps asking unless the device's `include_sensitive` is on.
+    #[serde(default)]
+    pub sensitive: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -269,6 +339,10 @@ pub enum DeviceApprovalVerdict {
 #[serde(deny_unknown_fields)]
 pub struct DeviceApprovalDecision {
     pub decision: DeviceApprovalVerdict,
+    /// With `allow`: also put the approval's app on the device's trusted
+    /// list ("Always allow this app"); `ask` becomes `trusted`.
+    #[serde(default)]
+    pub always: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -549,6 +623,12 @@ pub enum RelayOutbound {
     Stop {
         device: String,
     },
+    /// The access mode in effect for `device` (companion app only; it shows
+    /// it on its chip). Sent after an inventory and when the owner changes it.
+    Access {
+        device: String,
+        mode: DeviceAccessMode,
+    },
     Pong,
 }
 
@@ -629,6 +709,7 @@ mod tests {
             }]),
             addon_host: None,
             health: None,
+            access: None,
         };
         assert_eq!(
             serde_json::to_value(&d).unwrap(),
@@ -651,6 +732,7 @@ mod tests {
             created_at: 1,
             expires_at: 2,
             grant_minutes: Some(5),
+            sensitive: true,
         };
         let v = serde_json::to_value(DeviceApprovalEvent {
             approval,

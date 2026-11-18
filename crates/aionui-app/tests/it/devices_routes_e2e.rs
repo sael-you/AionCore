@@ -261,6 +261,75 @@ async fn runtime_device_routes_need_a_conversation_runtime_token() {
         .unwrap();
     assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
     assert_eq!(body_json(bad).await["code"], "DEVICE_BAD_MESSAGE");
+    // TASK-175: a conversation cannot set a device's access mode. The owner
+    // routes do not take a runtime token, and the runtime router has none.
+    let access_body = r#"{"mode": "full", "full_duration": "until_off", "include_sensitive": true}"#;
+    for (method, path, body) in [
+        ("PUT", "/api/devices/phone:nope:x/access", access_body),
+        (
+            "PUT",
+            "/api/devices/phone:nope:x/access/trusted-apps",
+            r#"{"apps": ["com.android.settings"]}"#,
+        ),
+        (
+            "POST",
+            "/api/devices/approvals/apr_x",
+            r#"{"decision": "allow", "always": true}"#,
+        ),
+    ] {
+        let r = app
+            .clone()
+            .oneshot(runtime(Some(&issued.token), user, method, path, body))
+            .await
+            .unwrap();
+        assert_eq!(
+            r.status(),
+            StatusCode::UNAUTHORIZED,
+            "{method} {path} with a runtime token only"
+        );
+    }
+    for path in [
+        "/api/runtime/devices/access",
+        "/api/runtime/devices/phone:nope:x/access",
+    ] {
+        let r = app
+            .clone()
+            .oneshot(runtime(Some(&issued.token), user, "PUT", path, access_body))
+            .await
+            .unwrap();
+        assert!(
+            matches!(r.status(), StatusCode::NOT_FOUND | StatusCode::METHOD_NOT_ALLOWED),
+            "{path}: {}",
+            r.status()
+        );
+    }
+    // The owner's session reaches the route (no such device here: coded 404),
+    // and only with a trusted Origin.
+    let owner = app
+        .clone()
+        .oneshot(req(
+            "PUT",
+            "/api/devices/phone:nope:x/access",
+            Some(&session),
+            Some(ORIGIN),
+            access_body,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(owner.status(), StatusCode::NOT_FOUND);
+    assert_eq!(body_json(owner).await["code"], "DEVICE_NOT_FOUND");
+    let no_origin = app
+        .clone()
+        .oneshot(req(
+            "PUT",
+            "/api/devices/phone:nope:x/access",
+            Some(&session),
+            Some("https://evil.example"),
+            access_body,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(no_origin.status(), StatusCode::FORBIDDEN);
     // A bad body without a token is still 401: the token is checked first.
     let anon_bad = app
         .clone()

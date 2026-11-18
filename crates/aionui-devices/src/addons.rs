@@ -221,6 +221,7 @@ impl DevicesService {
             origin: None,
             conversation_id: t.conversation_id.clone(),
             grant_key: None,
+            sensitive: false,
         };
         if let Err(error) = self.ask_owner(question).await {
             let outcome = match error.code() {
