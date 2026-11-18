@@ -321,7 +321,9 @@ impl DeviceStore {
     /// is not a short dotted version is ignored (the value comes from the
     /// device and is only ever displayed).
     pub fn set_extension_version(&self, user_id: &str, device_id: &str, reported: &str) {
-        let Some(version) = valid_extension_version(reported) else {
+        // Padding around the reported value is dropped here; the validator
+        // itself accepts only an exact version string.
+        let Some(version) = valid_extension_version(reported.trim()) else {
             tracing::warn!(
                 user_id,
                 device_id,
@@ -358,9 +360,11 @@ impl DeviceStore {
 }
 
 /// A dotted numeric version with an optional `-pre` / `+build` tail, at most
-/// 32 characters: `1.2`, `0.1.2`, `1.0.0-beta.1`.
+/// 32 characters: `1.2`, `0.1.2`, `1.0.0-beta.1`. The WHOLE string must be
+/// that: surrounding whitespace or a newline is refused (callers trim what
+/// they accept; the stored value is shown as is).
 pub fn valid_extension_version(raw: &str) -> Option<&str> {
-    let v = raw.trim();
+    let v = raw;
     if v.is_empty() || v.len() > 32 {
         return None;
     }
