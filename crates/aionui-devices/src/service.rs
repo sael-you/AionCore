@@ -32,6 +32,11 @@ use crate::relay::{RelayState, relay_error_code};
 
 pub const SERVER_BROWSER_ID: &str = "server_browser:chrome";
 pub const CAMOUFOX_ID: &str = "server_browser:camoufox";
+
+/// The registry id of a server-browser engine (`server_browser:<engine id>`).
+pub fn server_browser_id(engine_id: &str) -> String {
+    format!("server_browser:{engine_id}")
+}
 pub const MAC_LATER_ID: &str = "mac:later";
 /// Add-ons the Library offers (C38 §5).
 pub const LIBRARY_ADDONS: &[(&str, &str)] = &[("artemis", "Artemis"), ("mobilerun", "Mobilerun")];
@@ -57,6 +62,11 @@ pub trait DeviceInstaller: Send + Sync {
     /// Whether this installer handles `device_id`.
     fn handles(&self, device_id: &str) -> bool;
     async fn install(&self, user_id: &str, device_id: &str, progress: &ProgressFn) -> Result<(), DevicesError>;
+    /// Asked before a remove job is created, so the request itself answers
+    /// 409 `DEVICE_IN_USE` (K7 engines). Default: no objection.
+    async fn check_remove(&self, _user_id: &str, _device_id: &str) -> Result<(), DevicesError> {
+        Ok(())
+    }
     /// `DEVICE_IN_USE` when something still needs it.
     async fn remove(&self, user_id: &str, device_id: &str, progress: &ProgressFn) -> Result<(), DevicesError>;
 }
@@ -242,24 +252,29 @@ impl DevicesService {
 
     pub async fn list(&self, user_id: &str) -> Result<Vec<Device>, DevicesError> {
         let mut out = Vec::new();
-        out.push(self.server_browser_card(user_id));
-        out.push(Device {
-            id: CAMOUFOX_ID.to_owned(),
-            kind: DeviceKind::ServerBrowser,
-            source_id: Some("camoufox".to_owned()),
-            name: "Camoufox".to_owned(),
-            status: DeviceStatus::Off,
-            available: DeviceAvailability::Later,
-            enabled: false,
-            enabled_until: None,
-            installed: false,
-            disk_bytes: None,
-            version: None,
-            job_id: None,
-            last_seen_at: None,
-            routes: None,
-            addon_host: None,
-        });
+        let engines = self.server_browser_cards(user_id);
+        // Camoufox: a placeholder until its engine (K6) reports itself.
+        let camoufox_listed = engines.iter().any(|d| d.id == CAMOUFOX_ID);
+        out.extend(engines);
+        if !camoufox_listed {
+            out.push(Device {
+                id: CAMOUFOX_ID.to_owned(),
+                kind: DeviceKind::ServerBrowser,
+                source_id: Some("camoufox".to_owned()),
+                name: "Camoufox".to_owned(),
+                status: DeviceStatus::Off,
+                available: DeviceAvailability::Later,
+                enabled: false,
+                enabled_until: None,
+                installed: false,
+                disk_bytes: None,
+                version: None,
+                job_id: None,
+                last_seen_at: None,
+                routes: None,
+                addon_host: None,
+            });
+        }
         out.extend(self.my_browser_cards(user_id));
         let rows = self.repo.list_devices(user_id).await?;
         let pairings: HashMap<String, String> = self
@@ -370,34 +385,45 @@ impl DevicesService {
             .ok_or_else(DevicesError::not_found)
     }
 
-    fn server_browser_card(&self, user_id: &str) -> Device {
-        let f = self.browser.server_browser(user_id);
-        let status = if let Some(status) = self.job_status(SERVER_BROWSER_ID) {
-            status
-        } else if !f.installed {
-            DeviceStatus::Off
-        } else if f.agents_enabled {
-            DeviceStatus::On
-        } else {
-            DeviceStatus::Off
-        };
-        Device {
-            id: SERVER_BROWSER_ID.to_owned(),
-            kind: DeviceKind::ServerBrowser,
-            source_id: Some("chrome".to_owned()),
-            name: "Chrome".to_owned(),
-            status,
-            available: DeviceAvailability::Now,
-            enabled: f.agents_enabled,
-            enabled_until: None,
-            installed: f.installed,
-            disk_bytes: None,
-            version: f.version,
-            job_id: self.job_for(SERVER_BROWSER_ID),
-            last_seen_at: None,
-            routes: None,
-            addon_host: None,
-        }
+    /// One card per engine of the server browser (K7): `server_browser:<id>`.
+    /// They share the one "agents can use the browser" switch.
+    fn server_browser_cards(&self, user_id: &str) -> Vec<Device> {
+        let agents_enabled = self.browser.server_browser(user_id).agents_enabled;
+        self.browser
+            .server_engines(user_id)
+            .into_iter()
+            .map(|e| {
+                let id = server_browser_id(&e.engine_id);
+                let status = if let Some(status) = self.job_status(&id) {
+                    status
+                } else if e.installing {
+                    DeviceStatus::Installing
+                } else if !e.installed && e.error.is_some() {
+                    DeviceStatus::Error
+                } else if e.installed && agents_enabled {
+                    DeviceStatus::On
+                } else {
+                    DeviceStatus::Off
+                };
+                Device {
+                    job_id: self.job_for(&id),
+                    id,
+                    kind: DeviceKind::ServerBrowser,
+                    source_id: Some(e.engine_id),
+                    name: e.name,
+                    status,
+                    available: DeviceAvailability::Now,
+                    enabled: agents_enabled,
+                    enabled_until: None,
+                    installed: e.installed,
+                    disk_bytes: e.disk_bytes,
+                    version: e.version,
+                    last_seen_at: None,
+                    routes: None,
+                    addon_host: None,
+                }
+            })
+            .collect()
     }
 
     fn my_browser_cards(&self, user_id: &str) -> Vec<Device> {
@@ -753,6 +779,9 @@ impl DevicesService {
                     "this device cannot be installed here",
                 )
             })?;
+        if remove {
+            installer.check_remove(user_id, id).await?;
+        }
         let job_id = format!("job_{}", uuid::Uuid::new_v4().simple());
         self.jobs.insert(
             job_id.clone(),

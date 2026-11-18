@@ -19,7 +19,7 @@ pub use addons::{AddonRunOutcome, AddonTask};
 pub use agent::AgentCall;
 pub use approvals::OwnerQuestion;
 pub use error::DevicesError;
-pub use ports::{BrowserDevices, BrowserFacts, DevicesEventSink, MyBrowserFacts, NoopDevicesEventSink};
+pub use ports::{BrowserDevices, BrowserFacts, DevicesEventSink, EngineFacts, MyBrowserFacts, NoopDevicesEventSink};
 pub use routes::{devices_relay_routes, devices_routes};
 pub use runtime_routes::{DevicesRuntimeRouterState, devices_runtime_routes};
 pub use service::DevicesService;

@@ -91,6 +91,7 @@ pub fn code_str(code: BrowserErrorCode) -> &'static str {
         BrowserErrorCode::BrowserTabNotFound => "BROWSER_TAB_NOT_FOUND",
         BrowserErrorCode::BrowserBadMessage => "BROWSER_BAD_MESSAGE",
         BrowserErrorCode::BrowserBusy => "BROWSER_BUSY",
+        BrowserErrorCode::BrowserEngineInUse => "BROWSER_ENGINE_IN_USE",
         BrowserErrorCode::BrowserPairingInvalid => "BROWSER_PAIRING_INVALID",
         BrowserErrorCode::BrowserDeviceRevoked => "BROWSER_DEVICE_REVOKED",
         BrowserErrorCode::BrowserDeviceNotFound => "BROWSER_DEVICE_NOT_FOUND",
@@ -126,7 +127,8 @@ fn api_error(e: BrowserError) -> ApiError {
                 BrowserErrorCode::BrowserInstanceProtected => StatusCode::BAD_REQUEST,
                 BrowserErrorCode::BrowserInstanceLimit
                 | BrowserErrorCode::BrowserProfileNameTaken
-                | BrowserErrorCode::BrowserBusy => StatusCode::CONFLICT,
+                | BrowserErrorCode::BrowserBusy
+                | BrowserErrorCode::BrowserEngineInUse => StatusCode::CONFLICT,
                 BrowserErrorCode::BrowserTabNotFound | BrowserErrorCode::BrowserInstanceNotFound => {
                     StatusCode::NOT_FOUND
                 }

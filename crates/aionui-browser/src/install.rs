@@ -197,6 +197,27 @@ pub fn installed_version(layout: &BrowserLayout, engine: BrowserEngine) -> Optio
     layout.engine_binary(engine).exists().then_some(name)
 }
 
+/// Bytes on disk of everything installed for `engine` (apparent file sizes,
+/// symlinks not followed); `None` when nothing is installed.
+pub fn disk_bytes(layout: &BrowserLayout, engine: BrowserEngine) -> Option<u64> {
+    fn walk(path: &Path) -> u64 {
+        let Ok(meta) = std::fs::symlink_metadata(path) else {
+            return 0;
+        };
+        if meta.is_dir() {
+            std::fs::read_dir(path)
+                .map(|entries| entries.flatten().map(|e| walk(&e.path())).sum())
+                .unwrap_or(0)
+        } else if meta.is_file() {
+            meta.len()
+        } else {
+            0
+        }
+    }
+    let dir = layout.engine_dir(engine);
+    dir.is_dir().then(|| walk(&dir))
+}
+
 /// Whether `url` is HTTPS on one of `hosts`.
 fn url_on_hosts(url: &reqwest::Url, hosts: &[&str]) -> bool {
     url.scheme() == "https" && url.host_str().is_some_and(|h| hosts.contains(&h))
@@ -663,6 +684,24 @@ impl EngineInstaller {
         Ok(())
     }
 
+    /// Remove every version of `engine` (K7). The directory is renamed first
+    /// so a half-removed engine never looks installed. Callers make sure
+    /// nothing runs on it. Returns whether anything was removed.
+    pub fn remove(&self, engine: BrowserEngine) -> Result<bool, BrowserError> {
+        let dir = self.layout.engine_dir(engine);
+        let Some(parent) = dir.parent() else {
+            return Err(BrowserError::Internal("engine directory has no parent".into()));
+        };
+        let trash = parent.join(format!(".removing-{}-{}", engine.id(), uuid::Uuid::new_v4().simple()));
+        match std::fs::rename(&dir, &trash) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(e) => return Err(e.into()),
+        }
+        std::fs::remove_dir_all(&trash)?;
+        Ok(true)
+    }
+
     fn fresh_staging(&self, what: &str) -> Result<PathBuf, BrowserError> {
         let dir = self
             .layout
@@ -1086,6 +1125,38 @@ mod tests {
             check_tree_contained(&ok, &outside).is_err(),
             "a tree outside the extraction dir"
         );
+    }
+
+    #[test]
+    fn remove_deletes_every_version_and_disk_bytes_counts_files() {
+        let t = tempfile::tempdir().unwrap();
+        let layout = BrowserLayout::new(t.path().join("b"), t.path().join("d"));
+        assert_eq!(disk_bytes(&layout, BrowserEngine::Brave), None);
+        let d = layout.engine_dir(BrowserEngine::Brave).join("1.99.57");
+        std::fs::create_dir_all(d.join("locales")).unwrap();
+        std::fs::write(d.join("brave"), vec![0u8; 1000]).unwrap();
+        std::fs::write(d.join("locales/en.pak"), vec![0u8; 234]).unwrap();
+        let chrome = layout.chrome_dir().join("157.0.1.1");
+        std::fs::create_dir_all(&chrome).unwrap();
+        std::fs::write(chrome.join("chrome"), "#!").unwrap();
+        let inst = EngineInstaller::new(layout.clone()).unwrap();
+        inst.activate(BrowserEngine::Brave, "1.99.57").unwrap();
+        inst.activate(BrowserEngine::Chrome, "157.0.1.1").unwrap();
+        assert_eq!(disk_bytes(&layout, BrowserEngine::Brave), Some(1234));
+        assert!(inst.remove(BrowserEngine::Brave).unwrap());
+        assert_eq!(installed_version(&layout, BrowserEngine::Brave), None);
+        assert_eq!(disk_bytes(&layout, BrowserEngine::Brave), None);
+        assert!(!layout.engine_dir(BrowserEngine::Brave).exists());
+        assert!(!inst.remove(BrowserEngine::Brave).unwrap(), "removing twice is a no-op");
+        assert!(
+            installed_version(&layout, BrowserEngine::Chrome).is_some(),
+            "other engines untouched"
+        );
+        let left: Vec<_> = std::fs::read_dir(layout.root.join("engines"))
+            .unwrap()
+            .flatten()
+            .collect();
+        assert!(left.is_empty(), "no trash left behind: {left:?}");
     }
 
     #[test]

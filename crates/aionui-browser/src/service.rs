@@ -77,6 +77,8 @@ pub struct BrowserService {
     launch_lock: Mutex<()>,
     /// Per engine: a download is running / why the last one failed.
     install_state: std::sync::Mutex<std::collections::HashMap<BrowserEngine, InstallState>>,
+    /// Per engine: (installed version, bytes on disk).
+    disk_cache: std::sync::Mutex<std::collections::HashMap<BrowserEngine, (String, u64)>>,
     guard: Arc<NavigationGuard>,
     /// C34: paired devices of the owner's own browser.
     devices: Arc<DeviceHub>,
@@ -108,6 +110,7 @@ impl BrowserService {
             install_lock: Mutex::new(()),
             launch_lock: Mutex::new(()),
             install_state: std::sync::Mutex::new(std::collections::HashMap::new()),
+            disk_cache: std::sync::Mutex::new(std::collections::HashMap::new()),
             guard,
             devices,
             device_listeners: DashMap::new(),
@@ -195,6 +198,77 @@ impl BrowserService {
         change(states.entry(engine).or_default());
     }
 
+    /// Bytes on disk of `engine`, cached per installed version (the tree
+    /// only changes on install, update or remove).
+    fn engine_disk_bytes(&self, engine: BrowserEngine) -> Option<u64> {
+        if self.cfg.chrome_override.is_some() {
+            return None;
+        }
+        let version = installed_version(&self.cfg.layout, engine)?;
+        let mut cache = self.disk_cache.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some((v, bytes)) = cache.get(&engine)
+            && *v == version
+        {
+            return Some(*bytes);
+        }
+        let bytes = crate::install::disk_bytes(&self.cfg.layout, engine)?;
+        cache.insert(engine, (version, bytes));
+        Some(bytes)
+    }
+
+    /// An instance runs on `engine`, or an instance row of any user selects it.
+    pub fn engine_in_use(&self, engine: BrowserEngine) -> bool {
+        self.instances
+            .iter()
+            .any(|e| e.value().engine == engine && e.value().is_running())
+            || self.settings.engine_selected_by_anyone(engine)
+    }
+
+    /// The same list the status carries (K7: one registry row per engine).
+    pub fn engines(&self) -> Vec<BrowserEngineStatus> {
+        self.engine_statuses()
+    }
+
+    /// Download or update `engine` and wait for it (K7 install jobs).
+    pub async fn install_engine_now(&self, engine: BrowserEngine) -> Result<(), BrowserError> {
+        if self.cfg.chrome_override.is_some() {
+            return Ok(());
+        }
+        let _guard = self.install_lock.lock().await;
+        self.install_latest(engine).await
+    }
+
+    /// Whether `engine` may be removed now (409 `BROWSER_ENGINE_IN_USE`).
+    pub fn check_engine_removable(&self, engine: BrowserEngine) -> Result<(), BrowserError> {
+        if self.engine_in_use(engine) {
+            return Err(BrowserError::coded(
+                BrowserErrorCode::BrowserEngineInUse,
+                format!(
+                    "the {} engine is in use: switch its instances to another engine first",
+                    engine.id()
+                ),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Remove every installed version of `engine` (K7). Refused while an
+    /// instance runs on it or an instance row selects it. Holds the install
+    /// lock (no download of it runs) and the launch lock (no start races).
+    pub async fn remove_engine(&self, engine: BrowserEngine) -> Result<(), BrowserError> {
+        let _installing = self.install_lock.lock().await;
+        let _launching = self.launch_lock.lock().await;
+        self.check_engine_removable(engine)?;
+        let removed = self.installer.remove(engine)?;
+        self.disk_cache
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&engine);
+        self.set_install_state(engine, |s| *s = InstallState::default());
+        tracing::info!(engine = engine.id(), removed, "server browser engine removed");
+        Ok(())
+    }
+
     fn engine_statuses(&self) -> Vec<BrowserEngineStatus> {
         let states = self.install_state.lock().unwrap_or_else(|p| p.into_inner()).clone();
         BROWSER_ENGINES
@@ -210,6 +284,8 @@ impl BrowserService {
                     verification: spec.verification(),
                     agents_only: spec.agents_only(),
                     panel: spec.panel(),
+                    disk_bytes: self.engine_disk_bytes(engine),
+                    in_use: self.engine_in_use(engine),
                 }
             })
             .collect()
@@ -219,7 +295,9 @@ impl BrowserService {
         let s = self.settings(user_id)?;
         // `available` is about the default engine (Chrome), as before C35.
         let version = self.engine_available(BrowserEngine::Chrome);
-        if version.is_none() {
+        // Chrome installs itself on first use, but only for someone who uses
+        // it: after a remove (K7) no row selects it and it stays removed.
+        if version.is_none() && s.instances.iter().any(|i| i.engine == BrowserEngine::Chrome) {
             // First use: install in the background; the UI polls status.
             let svc = self.clone();
             tokio::spawn(async move {
@@ -1070,5 +1148,108 @@ mod tests {
             .filter_map(|p| p.split_once(':').map(|(n, port)| (n.to_owned(), port.to_owned())))
             .collect();
         assert_eq!(rows[1]["port"].to_string(), ports["2"]);
+    }
+
+    /// A service on managed installs (no dev binary) with `engine` "installed".
+    fn managed_service(dir: &std::path::Path, engines: &[(BrowserEngine, &str)]) -> Arc<BrowserService> {
+        let svc = BrowserService::new(BrowserServiceConfig {
+            layout: BrowserLayout::new(dir.join("b"), dir.join("d")),
+            host: None,
+            idle_timeout: DEFAULT_IDLE_TIMEOUT,
+            guard: NavigationGuard::default(),
+            chrome_override: None,
+            run_as_override: None,
+        })
+        .unwrap();
+        for (engine, version) in engines {
+            let d = svc.cfg.layout.engine_dir(*engine).join(version);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join(crate::engine::spec(*engine).binary), vec![0u8; 4096]).unwrap();
+            svc.installer.activate(*engine, version).unwrap();
+        }
+        svc
+    }
+
+    /// K7: remove is refused while an instance row selects the engine, works
+    /// once nothing does, and the engine then reads as not installed.
+    #[tokio::test]
+    async fn an_engine_is_removed_only_when_no_instance_selects_it() {
+        let t = tempfile::tempdir().unwrap();
+        let svc = managed_service(
+            t.path(),
+            &[(BrowserEngine::Chrome, "157.0.1.1"), (BrowserEngine::Brave, "1.99.57")],
+        );
+        let row = |svc: &BrowserService, engine| svc.engines().into_iter().find(|e| e.engine == engine).unwrap();
+        let brave = row(&svc, BrowserEngine::Brave);
+        assert_eq!(brave.installed_version.as_deref(), Some("1.99.57"));
+        assert_eq!(brave.disk_bytes, Some(4096));
+        assert!(!brave.in_use);
+        assert!(
+            row(&svc, BrowserEngine::Chrome).in_use,
+            "the default rows select Chrome"
+        );
+        assert_eq!(row(&svc, BrowserEngine::Edge).disk_bytes, None);
+
+        // Chrome is selected by the default rows → 409, nothing deleted.
+        let refused = svc.remove_engine(BrowserEngine::Chrome).await.unwrap_err();
+        assert_eq!(refused.code(), Some(BrowserErrorCode::BrowserEngineInUse));
+        assert!(svc.cfg.layout.chrome_binary().exists());
+
+        // A row picks Brave → Brave is in use too.
+        let patch = |engine| BrowserInstancePatch {
+            engine: Some(engine),
+            ..Default::default()
+        };
+        svc.patch_instance("u1", 2, &patch(BrowserEngine::Brave)).unwrap();
+        assert_eq!(
+            svc.remove_engine(BrowserEngine::Brave).await.unwrap_err().code(),
+            Some(BrowserErrorCode::BrowserEngineInUse)
+        );
+        assert!(svc.cfg.layout.engine_binary(BrowserEngine::Brave).exists());
+
+        // The row goes back to Chrome → Brave is removed completely.
+        svc.patch_instance("u1", 2, &patch(BrowserEngine::Chrome)).unwrap();
+        svc.remove_engine(BrowserEngine::Brave).await.unwrap();
+        let brave = row(&svc, BrowserEngine::Brave);
+        assert_eq!((brave.installed_version, brave.disk_bytes), (None, None));
+        assert!(!svc.cfg.layout.engine_dir(BrowserEngine::Brave).exists());
+        assert!(svc.cfg.layout.chrome_binary().exists(), "other engines untouched");
+        svc.remove_engine(BrowserEngine::Brave).await.unwrap();
+    }
+
+    /// K7: a removed Chrome is not downloaded again by a status poll (nobody
+    /// selects it any more).
+    #[tokio::test]
+    async fn status_does_not_reinstall_a_chrome_nobody_selects() {
+        let t = tempfile::tempdir().unwrap();
+        let svc = managed_service(
+            t.path(),
+            &[
+                (BrowserEngine::Chrome, "157.0.1.1"),
+                (BrowserEngine::Edge, "157.0.4341.60"),
+            ],
+        );
+        for n in 1..=3 {
+            svc.patch_instance(
+                "u1",
+                n,
+                &BrowserInstancePatch {
+                    engine: Some(BrowserEngine::Edge),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        }
+        svc.remove_engine(BrowserEngine::Chrome).await.unwrap();
+        let status = svc.status("u1").unwrap();
+        assert!(!status.available);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        let chrome = svc
+            .engines()
+            .into_iter()
+            .find(|e| e.engine == BrowserEngine::Chrome)
+            .unwrap();
+        assert!(!chrome.installing, "no download was started");
+        assert_eq!(chrome.error, None);
     }
 }
