@@ -2285,16 +2285,6 @@ fn resolve_session_cli_program(
     aionui_runtime::resolve_command_path(backend_label)
 }
 
-/// Assemble the direct-CLI spawn env (legacy spawn-surface parity; order
-/// matters — later entries win in `ManagedProcess::spawn`):
-///  1. per-agent env overrides (`AgentMetadata.env`, repair panel) — the legacy
-///     path injected these via `resolve_agent_command_spec`; `AIONUI_*`/`PATH`/…
-///     keys are already filtered at the registry (`is_blocked_override_env_key`),
-///     so they cannot shadow the runtime context below.
-///  2. the `AIONUI_*` conversation runtime context (`AIONUI_USER_ID` /
-///     `AIONUI_CONVERSATION_ID` / `AIONUI_HELPER_BIN` / `AIONUI_BASE_URL` /
-///     `AIONUI_RUNTIME_TOKEN`) — the legacy path appended these via
-///     `apply_acp_launch_policy` for every agent spawn.
 /// The claude env for a conversation's auto-compact setting (TASK-158).
 /// Documented variables (code.claude.com/docs/en/env-vars, read 2026-11-18, and
 /// present in the claude 2.1.325 binary): `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` =
@@ -2317,6 +2307,16 @@ fn claude_auto_compact_env(setting: Option<&str>) -> Vec<aionui_common::EnvVar> 
     }]
 }
 
+/// Assemble the direct-CLI spawn env (legacy spawn-surface parity; order
+/// matters — later entries win in `ManagedProcess::spawn`):
+///  1. per-agent env overrides (`AgentMetadata.env`, repair panel) — the legacy
+///     path injected these via `resolve_agent_command_spec`; `AIONUI_*`/`PATH`/…
+///     keys are already filtered at the registry (`is_blocked_override_env_key`),
+///     so they cannot shadow the runtime context below.
+///  2. the `AIONUI_*` conversation runtime context (`AIONUI_USER_ID` /
+///     `AIONUI_CONVERSATION_ID` / `AIONUI_HELPER_BIN` / `AIONUI_BASE_URL` /
+///     `AIONUI_RUNTIME_TOKEN`) — the legacy path appended these via
+///     `apply_acp_launch_policy` for every agent spawn.
 fn assemble_spawn_env(
     agent_env: &[aionui_api_types::AgentEnvEntry],
     runtime_env: &[(String, String)],

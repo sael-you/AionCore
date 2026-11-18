@@ -153,6 +153,9 @@ impl ConversationError {
             Self::RuntimeRestarting { conversation_id } => {
                 AgentError::conflict(format!("conversation {conversation_id} runtime is restarting"))
             }
+            Self::TurnRunning { .. } | Self::CompactUnsupported { .. } | Self::AutoCompactUnsupported { .. } => {
+                AgentError::conflict(self.to_string())
+            }
             Self::TeamRuntimeRequired { .. } => {
                 AgentError::conflict("This conversation belongs to a team; use the team runtime session")
             }
@@ -194,6 +197,9 @@ impl ConversationError {
             Self::ConfigConfirmationTimeout { .. } => "confirmation_timeout",
             Self::ConfigUpdateInProgress { .. } => "config_update_in_progress",
             Self::RuntimeRestarting { .. } => "runtime_restarting",
+            Self::TurnRunning { .. } => "TURN_RUNNING",
+            Self::CompactUnsupported { .. } => "COMPACT_UNSUPPORTED",
+            Self::AutoCompactUnsupported { .. } => "AUTO_COMPACT_UNSUPPORTED",
             Self::TeamRuntimeRequired { .. } => "TEAM_RUNTIME_REQUIRED",
             Self::Unprocessable { .. } => "UNPROCESSABLE_ENTITY",
             Self::Archived { .. } => "CONVERSATION_ARCHIVED",

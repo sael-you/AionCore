@@ -565,3 +565,249 @@ async fn a_notice_is_validated_and_owner_only() {
     assert_eq!(resp.status(), StatusCode::FORBIDDEN);
     assert_eq!(body_json(resp).await["code"], "CSRF_INVALID");
 }
+
+// ── TASK-158: Context panel ─────────────────────────────────────
+
+/// Put the conversation on `backend` (and optionally mark a turn running),
+/// straight in the DB — the routes under test only read these.
+async fn set_backend(services: &aionui_app::AppServices, conv_id: &str, backend: &str, status: &str) {
+    sqlx::query("UPDATE conversations SET extra = json_set(extra, '$.backend', ?), status = ? WHERE id = ?")
+        .bind(backend)
+        .bind(status)
+        .bind(conv_id)
+        .execute(services.database.pool())
+        .await
+        .unwrap();
+}
+
+/// Store a usage snapshot (and optionally a claude context report) the way the
+/// agent pump does.
+async fn seed_runtime(
+    services: &aionui_app::AppServices,
+    conv_id: &str,
+    usage: &serde_json::Value,
+    report: Option<&serde_json::Value>,
+) {
+    use aionui_db::{CreateAcpSessionParams, IAcpSessionRepository, SaveRuntimeStateParams};
+    let (user_id,): (String,) = sqlx::query_as("SELECT user_id FROM conversations WHERE id = ?")
+        .bind(conv_id)
+        .fetch_one(services.database.pool())
+        .await
+        .unwrap();
+    let repo = aionui_db::SqliteAcpSessionRepository::new(services.database.pool().clone());
+    if repo.get_for_user(&user_id, conv_id).await.unwrap().is_none() {
+        repo.create(&CreateAcpSessionParams {
+            user_id: &user_id,
+            conversation_id: conv_id,
+            agent_source: "builtin",
+            agent_id: "claude",
+        })
+        .await
+        .unwrap();
+    }
+    let usage = usage.to_string();
+    let report = report.map(|r| json!({ "report": r, "updated_at": 1_795_000_000_000_i64 }).to_string());
+    let params = SaveRuntimeStateParams {
+        context_usage_json: Some(Some(&usage)),
+        context_report_json: report.as_deref().map(Some),
+        ..Default::default()
+    };
+    assert!(
+        repo.save_runtime_state_for_user(&user_id, conv_id, &params)
+            .await
+            .unwrap()
+    );
+}
+
+#[tokio::test]
+async fn the_context_panel_serves_null_then_estimated_then_the_cli_report() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass123").await;
+    let conv_id = create_conversation(&mut app, &token, &csrf, "Context", "acp").await;
+    let uri = format!("/api/conversations/{conv_id}/context");
+
+    // Before the first usage: 200 with null, like /usage.
+    let resp = app.clone().oneshot(get_with_token(&uri, &token)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    assert!(body_json(resp).await["data"].is_null());
+
+    // A backend that reports totals only: an estimated split, no select.
+    set_backend(&services, &conv_id, "codex", "finished").await;
+    seed_runtime(&services, &conv_id, &json!({"used": 50_000, "size": 258_400}), None).await;
+    let resp = app.clone().oneshot(get_with_token(&uri, &token)).await.unwrap();
+    let data = body_json(resp).await["data"].clone();
+    assert_eq!(data["source"], "estimated");
+    assert_eq!(data["used"], 50_000);
+    assert_eq!(data["size"], 258_400);
+    assert_eq!(data["percent"], 19.3);
+    assert_eq!(data["auto_compact"]["supported"], false);
+    assert_eq!(data["categories"][0]["id"], "messages");
+    assert_eq!(data["categories"][0]["estimated"], true);
+    assert_eq!(data["items"]["mcp_tools"], json!([]));
+
+    // Claude with its own report: passed through, with the auto-compact numbers.
+    set_backend(&services, &conv_id, "claude", "finished").await;
+    let report = json!({
+        "totalTokens": 600_000, "maxTokens": 1_000_000, "model": "claude-opus-5-5",
+        "isAutoCompactEnabled": true, "autoCompactThreshold": 960_000,
+        "categories": [
+            {"id": "messages", "name": "Messages", "tokens": 600_000, "color": "x"},
+            {"id": "mcp_tools_deferred", "name": "MCP tools (deferred)", "tokens": 42_000, "color": "inactive", "isDeferred": true}
+        ],
+        "mcpTools": [{"name": "search", "serverName": "docs", "tokens": 900, "isLoaded": false}],
+        "memoryFiles": [{"path": "/w/CLAUDE.md", "type": "Project", "tokens": 1_200}],
+    });
+    seed_runtime(
+        &services,
+        &conv_id,
+        &json!({"used": 600_000, "size": 1_000_000}),
+        Some(&report),
+    )
+    .await;
+    let resp = app.clone().oneshot(get_with_token(&uri, &token)).await.unwrap();
+    let data = body_json(resp).await["data"].clone();
+    assert_eq!(data["source"], "cli");
+    assert_eq!(data["percent"], 60.0);
+    assert_eq!(data["updated_at"], 1_795_000_000_000_i64);
+    assert_eq!(
+        data["auto_compact"],
+        json!({"supported": true, "mode": "auto", "threshold_tokens": 960_000, "until_tokens": 360_000})
+    );
+    assert_eq!(
+        data["categories"][1],
+        json!({"id": "mcp_tools_deferred", "label_key": "conversation.context.category.mcp_tools_deferred",
+               "name": "MCP tools (deferred)", "tokens": 42_000, "deferred": true, "estimated": false})
+    );
+    assert_eq!(
+        data["items"]["mcp_tools"][0],
+        json!({"name": "search", "server": "docs", "tokens": 900, "loaded": false})
+    );
+    assert_eq!(
+        data["items"]["memory_files"][0],
+        json!({"path": "/w/CLAUDE.md", "kind": "Project", "tokens": 1_200})
+    );
+
+    // Owner-scoped: another user gets 404; no session gets 401.
+    let (token2, _csrf2) = setup_and_login(&mut app, &services, "user2", "pass123").await;
+    let resp = app.clone().oneshot(get_with_token(&uri, &token2)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+    let anonymous = axum::http::Request::builder()
+        .uri(&uri)
+        .body(axum::body::Body::empty())
+        .unwrap();
+    assert_eq!(app.oneshot(anonymous).await.unwrap().status(), StatusCode::UNAUTHORIZED);
+}
+
+#[tokio::test]
+async fn the_auto_compact_setting_is_per_conversation_validated_and_claude_only() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass123").await;
+    let conv_id = create_conversation(&mut app, &token, &csrf, "Auto compact", "acp").await;
+    let uri = format!("/api/conversations/{conv_id}/auto-compact");
+    let put = |body: serde_json::Value, token: &str, csrf: &str| json_with_token("PUT", &uri, body, token, csrf);
+
+    // A backend without the setting: refused with its own code.
+    set_backend(&services, &conv_id, "codex", "finished").await;
+    let resp = app
+        .clone()
+        .oneshot(put(json!({"mode": "60"}), &token, &csrf))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    assert_eq!(body_json(resp).await["code"], "AUTO_COMPACT_UNSUPPORTED");
+
+    set_backend(&services, &conv_id, "claude", "finished").await;
+    for bad in [
+        json!({"mode": "55"}),
+        json!({"mode": 60}),
+        json!({}),
+        json!({"mode": "60", "x": 1}),
+    ] {
+        let resp = app.clone().oneshot(put(bad.clone(), &token, &csrf)).await.unwrap();
+        assert!(resp.status().is_client_error(), "{bad}: {}", resp.status());
+    }
+    let resp = app
+        .clone()
+        .oneshot(put(json!({"mode": "60"}), &token, &csrf))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::OK);
+    let data = body_json(resp).await["data"].clone();
+    assert_eq!((&data["supported"], &data["mode"]), (&json!(true), &json!("60")));
+
+    // Persisted on the conversation (what the next agent start reads) …
+    let (extra,): (String,) = sqlx::query_as("SELECT extra FROM conversations WHERE id = ?")
+        .bind(&conv_id)
+        .fetch_one(services.database.pool())
+        .await
+        .unwrap();
+    let extra: serde_json::Value = serde_json::from_str(&extra).unwrap();
+    assert_eq!(extra["auto_compact"], "60");
+    assert_eq!(extra["backend"], "claude", "other extra keys are kept");
+    // … and shown by the panel once there is usage.
+    seed_runtime(&services, &conv_id, &json!({"used": 10, "size": 100}), None).await;
+    let resp = app
+        .clone()
+        .oneshot(get_with_token(&format!("/api/conversations/{conv_id}/context"), &token))
+        .await
+        .unwrap();
+    assert_eq!(body_json(resp).await["data"]["auto_compact"]["mode"], "60");
+
+    let (token2, csrf2) = setup_and_login(&mut app, &services, "user2", "pass123").await;
+    let resp = app
+        .clone()
+        .oneshot(put(json!({"mode": "off"}), &token2, &csrf2))
+        .await
+        .unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    let no_csrf = axum::http::Request::builder()
+        .method("PUT")
+        .uri(&uri)
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(r#"{"mode":"off"}"#))
+        .unwrap();
+    let resp = app.oneshot(no_csrf).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(body_json(resp).await["code"], "CSRF_INVALID");
+}
+
+#[tokio::test]
+async fn compact_is_refused_while_a_turn_runs_and_where_unsupported() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass123").await;
+    let conv_id = create_conversation(&mut app, &token, &csrf, "Compact", "acp").await;
+    let uri = format!("/api/conversations/{conv_id}/compact");
+    let post = |token: &str, csrf: &str| json_with_token("POST", &uri, json!({}), token, csrf);
+
+    // No compact command on this backend.
+    set_backend(&services, &conv_id, "gemini", "finished").await;
+    let resp = app.clone().oneshot(post(&token, &csrf)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    assert_eq!(body_json(resp).await["code"], "COMPACT_UNSUPPORTED");
+
+    // A turn is running: 409 TURN_RUNNING, nothing is sent.
+    set_backend(&services, &conv_id, "claude", "running").await;
+    let resp = app.clone().oneshot(post(&token, &csrf)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CONFLICT);
+    assert_eq!(body_json(resp).await["code"], "TURN_RUNNING");
+    let (messages,): (i64,) = sqlx::query_as("SELECT COUNT(*) FROM messages WHERE conversation_id = ?")
+        .bind(&conv_id)
+        .fetch_one(services.database.pool())
+        .await
+        .unwrap();
+    assert_eq!(messages, 0, "a refused compact leaves no message");
+
+    let (token2, csrf2) = setup_and_login(&mut app, &services, "user2", "pass123").await;
+    let resp = app.clone().oneshot(post(&token2, &csrf2)).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::NOT_FOUND);
+
+    let no_csrf = axum::http::Request::builder()
+        .method("POST")
+        .uri(&uri)
+        .body(axum::body::Body::empty())
+        .unwrap();
+    let resp = app.oneshot(no_csrf).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(body_json(resp).await["code"], "CSRF_INVALID");
+}

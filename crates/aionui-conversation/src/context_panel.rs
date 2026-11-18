@@ -45,6 +45,17 @@ const KNOWN_CATEGORY_IDS: [&str; 13] = [
     "free_space",
 ];
 
+/// A stored report older than this is refreshed when the panel asks for it.
+const REPORT_REFRESH_AFTER_MS: i64 = 60_000;
+
+/// No report yet, or one taken more than [`REPORT_REFRESH_AFTER_MS`] ago.
+fn report_is_stale(stored_report: Option<&Value>, now: i64) -> bool {
+    stored_report
+        .and_then(|s| s.get("updated_at"))
+        .and_then(Value::as_i64)
+        .is_none_or(|at| now.saturating_sub(at) > REPORT_REFRESH_AFTER_MS)
+}
+
 fn category(id: &str, name: &str, tokens: u64, deferred: bool, estimated: bool) -> ContextCategory {
     ContextCategory {
         id: id.to_owned(),
@@ -244,8 +255,11 @@ pub(crate) fn build_context(
 impl ConversationService {
     /// `GET /api/conversations/{id}/context`. Owner-scoped like `/usage`;
     /// reads only stored state, so it never waits on the agent. When a live
-    /// claude session has no report yet (an older conversation reopened), it
-    /// asks for one — the answer arrives as an `acp_context_report` frame.
+    /// claude session has no report, or one older than
+    /// [`REPORT_REFRESH_AFTER_MS`] (the tab was opened on an idle
+    /// conversation), it asks for one — the answer arrives as an
+    /// `acp_context_report` frame. The age gate also bounds the asks: the GET
+    /// that frame triggers finds a fresh report.
     pub async fn get_context(
         &self,
         user_id: &str,
@@ -261,14 +275,15 @@ impl ConversationService {
         let parse = |raw: Option<&String>| raw.and_then(|r| serde_json::from_str::<Value>(r).ok());
         let usage = parse(state.as_ref().and_then(|s| s.context_usage_json.as_ref()));
         let report = parse(state.as_ref().and_then(|s| s.context_report_json.as_ref()));
-        if report.is_none()
+        let now = now_ms();
+        if report_is_stale(report.as_ref(), now)
             && backend_of(&extra) == AUTO_COMPACT_BACKEND
             && let Ok(task) = self.task(conversation_id)
         {
             let asked = task.refresh_context_report().await;
-            tracing::debug!(conversation_id, asked, "context report missing; asked the agent");
+            tracing::debug!(conversation_id, asked, "context report missing or old; asked the agent");
         }
-        Ok(build_context(usage.as_ref(), report.as_ref(), &extra, now_ms()))
+        Ok(build_context(usage.as_ref(), report.as_ref(), &extra, now))
     }
 
     /// `PUT /api/conversations/{id}/auto-compact`. Stored in the
@@ -392,6 +407,17 @@ mod tests {
             },
             "updated_at": 1_795_000_000_000_i64
         })
+    }
+
+    #[test]
+    fn a_report_is_refreshed_when_missing_or_older_than_a_minute() {
+        let at = |ms: i64| json!({"report": {}, "updated_at": ms});
+        assert!(report_is_stale(None, 100_000));
+        assert!(report_is_stale(Some(&json!({"report": {}})), 100_000));
+        assert!(report_is_stale(Some(&at(30_000)), 100_000));
+        // Fresh: the GET triggered by the report's own frame does not ask again.
+        assert!(!report_is_stale(Some(&at(99_000)), 100_000));
+        assert!(!report_is_stale(Some(&at(40_000)), 100_000));
     }
 
     #[test]
