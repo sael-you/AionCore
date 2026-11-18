@@ -12,7 +12,10 @@
 //!    `mac_ax_tree`: the screen would go to a model provider) waits for the
 //!    owner's OK. One OK covers reads and actions on the same device + app
 //!    for 5 minutes. Reads of a password manager are always refused (no OK
-//!    possible); `install_apk` asks every time;
+//!    possible); `install_apk` asks every time; so does `open_url` (the app
+//!    that opens the link is unknown; private / local addresses and AionUi
+//!    itself are refused like in the browser), and `global` notifications /
+//!    quick settings ask whatever is in front;
 //!    The app in front is ALWAYS asked from the device (phone `foreground`,
 //!    Mac `mac_foreground`), never taken from the agent's arguments; an app
 //!    the call names (`launch`, `logcat`, `mac_open_app`) is checked in
@@ -42,6 +45,10 @@ pub const PHONE_VERBS: &[&str] = &[
     "key",
     "launch",
     "foreground",
+    "click_text",
+    "set_text",
+    "global",
+    "open_url",
     "install_apk",
     "logcat",
 ];
@@ -61,6 +68,10 @@ const ACTING_VERBS: &[&str] = &[
     "text",
     "key",
     "launch",
+    "click_text",
+    "set_text",
+    "global",
+    "open_url",
     "mac_click",
     "mac_type",
     "mac_key",
@@ -153,6 +164,11 @@ const CRUCIAL_MARKERS: &[&str] = &[
     "bitwarden",
 ];
 
+/// System overlays that sit in front of the real app (a game toolbar, the
+/// notification shade / lock screen): while the device names one of these,
+/// the app underneath is NOT known, so the call is treated as "unknown app".
+const OVERLAY_PACKAGES: &[&str] = &["com.oplus.games", "com.android.systemui"];
+
 /// Whether `package` is an app where agent actions need an OK.
 pub fn is_crucial_package(package: &str) -> bool {
     let p = package.to_ascii_lowercase();
@@ -179,6 +195,63 @@ struct Who<'a> {
 
 fn refused(message: &str) -> DevicesError {
     DevicesError::coded(DeviceErrorCode::DeviceVerbRefused, message)
+}
+
+/// `global` actions agents may ask for.
+pub const GLOBAL_ACTIONS: &[&str] = &["notifications", "quick_settings", "lock"];
+/// Schemes `open_url` takes (`market:` opens the app store).
+const OPEN_URL_SCHEMES: &[&str] = &["http", "https", "market"];
+const MAX_URL: usize = 4096;
+
+/// Check the arguments of the companion 0.2 verbs before anything is asked
+/// or sent (the app checks them again). The message says what is wrong and
+/// never repeats the value.
+fn check_args(verb: &str, args: &Value) -> Result<(), &'static str> {
+    let text = |key: &str| args.get(key).and_then(Value::as_str);
+    match verb {
+        "click_text" => {
+            let len = text("text").map(|t| t.trim().chars().count()).unwrap_or(0);
+            if !(1..=500).contains(&len) {
+                return Err("text must have 1 to 500 characters");
+            }
+            match args.get("index") {
+                None | Some(Value::Null) => Ok(()),
+                Some(i) if i.as_u64().is_some_and(|i| i <= 99) => Ok(()),
+                Some(_) => Err("index must be 0 to 99"),
+            }
+        }
+        "set_text" => match text("value") {
+            Some(v) if v.chars().count() <= 10_000 => Ok(()),
+            _ => Err("value must be a string of at most 10000 characters"),
+        },
+        "text" => match args.get("replace") {
+            None | Some(Value::Null | Value::Bool(_)) => Ok(()),
+            Some(_) => Err("replace must be true or false"),
+        },
+        "screenshot" => match args.get("format") {
+            None | Some(Value::Null) => Ok(()),
+            Some(f) if matches!(f.as_str(), Some("png" | "jpeg")) => Ok(()),
+            Some(_) => Err("format must be png or jpeg"),
+        },
+        "global" => match text("action") {
+            Some(a) if GLOBAL_ACTIONS.contains(&a) => Ok(()),
+            _ => Err("action must be notifications, quick_settings or lock"),
+        },
+        "open_url" => {
+            let Some(url) = text("url") else {
+                return Err("url is required");
+            };
+            let scheme = url.split_once(':').map(|(s, _)| s.to_ascii_lowercase());
+            if url.len() > MAX_URL
+                || url.chars().any(|c| c.is_whitespace() || c.is_control())
+                || !scheme.is_some_and(|s| OPEN_URL_SCHEMES.contains(&s.as_str()))
+            {
+                return Err("url must be an http, https or market link without blanks (at most 4096 characters)");
+            }
+            Ok(())
+        }
+        _ => Ok(()),
+    }
 }
 
 impl DevicesService {
@@ -268,6 +341,33 @@ impl DevicesService {
             ));
         }
 
+        if let Err(message) = check_args(&verb, &args) {
+            self.audit_call(&who, DeviceAuditOutcome::Refused, None, Some("DEVICE_BAD_MESSAGE"))
+                .await;
+            return Err(DevicesError::coded(DeviceErrorCode::DeviceBadMessage, message));
+        }
+        // open_url: the browser's navigation guard applies to the phone too
+        // (AionUi's own origin, loopback, private and link-local addresses).
+        let opened_url =
+            (verb == "open_url").then(|| args.get("url").and_then(Value::as_str).unwrap_or_default().to_owned());
+        if let Some(url) = &opened_url
+            && !url.to_ascii_lowercase().starts_with("market:")
+            && self.browser_port().url_blocked(url)
+        {
+            self.audit_call(&who, DeviceAuditOutcome::Refused, None, Some("url_blocked"))
+                .await;
+            return Err(refused("this address is not allowed (private, local or AionUi itself)"));
+        }
+        // Verbs that are crucial whatever is in front: `open_url` (the app
+        // that opens the link is unknown) and the notification shade / quick
+        // settings (other apps' messages, system switches).
+        let always_crucial = opened_url.is_some()
+            || (verb == "global"
+                && matches!(
+                    args.get("action").and_then(Value::as_str),
+                    Some("notifications" | "quick_settings")
+                ));
+
         // Which app is REALLY in front? Always asked from the device, on
         // every gated call: a package / bundle id in the agent's arguments is
         // never trusted for the gate (review part 2: an agent could name a
@@ -308,8 +408,9 @@ impl DevicesService {
             .await;
             return Err(refused("a password manager is in front: its screen is never read"));
         }
-        let crucial =
-            verb == "install_apk" || (gated && (!front_known || checked.iter().any(|p| is_crucial_package(p))));
+        let crucial = verb == "install_apk"
+            || always_crucial
+            || (gated && (!front_known || checked.iter().any(|p| is_crucial_package(p))));
         let mut approved = false;
         if crucial {
             let summary = match (verb.as_str(), package.as_deref()) {
@@ -317,15 +418,35 @@ impl DevicesService {
                     "install an app from {}",
                     args.get("url").and_then(Value::as_str).unwrap_or("a link")
                 ),
+                ("open_url", _) => format!(
+                    "open {} on the phone",
+                    opened_url
+                        .as_deref()
+                        .unwrap_or_default()
+                        .chars()
+                        .take(200)
+                        .collect::<String>()
+                ),
+                ("global", Some(p)) if always_crucial => format!(
+                    "open the {} (in front: {p})",
+                    if args.get("action").and_then(Value::as_str) == Some("notifications") {
+                        "notifications"
+                    } else {
+                        "quick settings"
+                    }
+                ),
                 (v, Some(p)) => format!("{v} in {p}"),
                 (v, None) => v.to_owned(),
             };
             // One OK covers this conversation + device + the apps involved for
             // 5 minutes. No grant when the front app is unknown (single use)
             // and none for installs.
-            let grant_key = (verb != "install_apk" && front_known).then(|| {
+            // `open_url` asks every time (each link is its own decision);
+            // the shade / quick settings get their own grant.
+            let scope = if always_crucial { "|global" } else { "" };
+            let grant_key = (verb != "install_apk" && opened_url.is_none() && front_known).then(|| {
                 format!(
-                    "{user_id}|{}|{device_id}|{}",
+                    "{user_id}|{}|{device_id}|{}{scope}",
                     conversation_id.as_deref().unwrap_or_default(),
                     checked.join("+")
                 )
@@ -419,8 +540,8 @@ impl DevicesService {
 
     /// The app in front on the device, asked from the device itself: Android
     /// package (`foreground`) or macOS bundle id (`mac_foreground`).
-    /// `Ok(None)` when the device answers but cannot say (then the call is
-    /// treated as crucial); `Err` when it is offline or does not answer
+    /// `Ok(None)` when the device answers but cannot say, or names a system
+    /// overlay (then the call is treated as crucial); `Err` when it is offline or does not answer
     /// within [`crate::relay::QUICK_TIMEOUT`].
     async fn front_app(&self, user_id: &str, device_id: &str, kind: &str) -> Result<Option<String>, DevicesError> {
         let (verb, field) = if kind == "mac" {
@@ -433,7 +554,7 @@ impl DevicesService {
                 .get(field)
                 .and_then(Value::as_str)
                 .map(str::to_owned)
-                .filter(|p| !p.trim().is_empty())),
+                .filter(|p| !p.trim().is_empty() && !OVERLAY_PACKAGES.contains(&p.as_str()))),
             Err(error) if error.code() == Some(DeviceErrorCode::DeviceOffline) => Err(error),
             Err(_) => Ok(None),
         }

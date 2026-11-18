@@ -63,6 +63,12 @@ pub trait BrowserDevices: Send + Sync {
     /// "Agents may use my Mac browser" (C34): one switch for every paired browser.
     fn my_browsers_enabled(&self, user_id: &str) -> bool;
     async fn set_my_browsers_enabled(&self, user_id: &str, enabled: bool) -> Result<(), String>;
+    /// Whether the browser's navigation guard (C30) blocks `url`: AionUi's
+    /// own origin, loopback, private and link-local addresses. Used for
+    /// `open_url` on a phone.
+    fn url_blocked(&self, _url: &str) -> bool {
+        false
+    }
 }
 
 /// Where `devices.*` events go (the app sends them to the user's sockets).

@@ -47,6 +47,10 @@ impl BrowserDevices for NoBrowser {
     async fn set_my_browsers_enabled(&self, _: &str, _: bool) -> Result<(), String> {
         Ok(())
     }
+    /// Stands in for the browser's navigation guard.
+    fn url_blocked(&self, url: &str) -> bool {
+        url.contains("//192.168.") || url.contains("//localhost") || url.contains("//aionui.example")
+    }
 }
 
 pub(crate) async fn harness() -> (Arc<DevicesService>, u16) {
@@ -1160,4 +1164,338 @@ async fn an_unreadable_answer_fails_its_request_at_once() {
             && r.detail.as_deref() == Some("DEVICE_BAD_MESSAGE")),
         "{audit:?}"
     );
+}
+
+// -- TASK-173: the companion 0.2 verbs and the phone's health ------------------
+
+const COMPANION_02_VERBS: &[&str] = &[
+    "screenshot",
+    "ui_tree",
+    "tap",
+    "swipe",
+    "text",
+    "key",
+    "global",
+    "launch",
+    "open_url",
+    "foreground",
+    "click_text",
+    "set_text",
+    "stop",
+];
+
+async fn approve_next(svc: &Arc<DevicesService>, allow: bool) -> aionui_api_types::devices::DeviceApproval {
+    let ask = pending(svc).await;
+    svc.decide_approval("u1", &ask.id, allow).unwrap();
+    ask
+}
+
+#[tokio::test]
+async fn the_new_verbs_go_through_the_gate() {
+    let (svc, port) = harness().await;
+    let (ws, _token, client_id) = pair_mac_with(&svc, port, COMPANION_02_VERBS).await;
+    let phone = format!("phone:{client_id}:R5CX");
+    wait_status(&svc, &phone, DeviceStatus::Off).await;
+    let (mut reached, front) = serve_device(ws, "org.wikipedia");
+    svc.update(
+        "u1",
+        &phone,
+        &DeviceUpdate {
+            enabled: true,
+            timeout_minutes: Some(15),
+        },
+    )
+    .await
+    .unwrap();
+
+    // An ordinary app in front: no prompt.
+    for (verb, args) in [
+        ("click_text", json!({"text": "Search", "index": 1})),
+        ("set_text", json!({"value": ""})),
+        ("text", json!({"value": "abc", "replace": true})),
+        ("screenshot", json!({"format": "jpeg", "scale": 0.5})),
+        ("global", json!({"action": "lock"})),
+    ] {
+        svc.agent_call(agent_with(&phone, verb, args, "c1")).await.unwrap();
+        assert_eq!(reached.recv().await.as_deref(), Some(verb));
+    }
+    assert!(svc.approvals("u1").is_empty());
+
+    // Arguments are checked before anything is asked or sent.
+    for (verb, args) in [
+        ("click_text", json!({"text": "   "})),
+        ("click_text", json!({"text": "OK", "index": 100})),
+        ("set_text", json!({})),
+        ("text", json!({"value": "a", "replace": "yes"})),
+        ("screenshot", json!({"format": "gif"})),
+        ("global", json!({"action": "reboot"})),
+        ("open_url", json!({"url": "file:///sdcard/x"})),
+        ("open_url", json!({"url": "intent://scan/#Intent;end"})),
+        ("open_url", json!({"url": "https://example.com/a b"})),
+    ] {
+        let err = svc
+            .agent_call(agent_with(&phone, verb, args.clone(), "c1"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Some(DeviceErrorCode::DeviceBadMessage), "{verb} {args}");
+    }
+    // Private / local addresses and AionUi itself: refused, never asked.
+    for url in [
+        "http://192.168.1.1/admin",
+        "http://localhost:8080/",
+        "https://aionui.example/api/devices",
+    ] {
+        let err = svc
+            .agent_call(agent_with(&phone, "open_url", json!({"url": url}), "c1"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Some(DeviceErrorCode::DeviceVerbRefused), "{url}");
+    }
+    assert!(svc.approvals("u1").is_empty());
+    assert!(reached.try_recv().is_err(), "nothing refused reached the phone");
+
+    // A public link asks EVERY time (no 5-minute grant), and shows the link.
+    for round in 0..2 {
+        let svc2 = svc.clone();
+        let phone2 = phone.clone();
+        let call = tokio::spawn(async move {
+            svc2.agent_call(agent_with(
+                &phone2,
+                "open_url",
+                json!({"url": "https://example.com/x"}),
+                "c1",
+            ))
+            .await
+        });
+        let ask = approve_next(&svc, true).await;
+        assert!(
+            ask.summary.contains("https://example.com/x"),
+            "round {round}: {}",
+            ask.summary
+        );
+        assert_eq!(ask.grant_minutes, None, "round {round}");
+        call.await.unwrap().unwrap();
+        assert_eq!(reached.recv().await.as_deref(), Some("open_url"));
+    }
+    // The store link is allowed as a scheme and asks too.
+    let svc2 = svc.clone();
+    let phone2 = phone.clone();
+    let market = tokio::spawn(async move {
+        svc2.agent_call(agent_with(
+            &phone2,
+            "open_url",
+            json!({"url": "market://details?id=org.wikipedia"}),
+            "c1",
+        ))
+        .await
+    });
+    approve_next(&svc, false).await;
+    assert_eq!(
+        market.await.unwrap().unwrap_err().code(),
+        Some(DeviceErrorCode::DeviceApprovalDenied)
+    );
+
+    // The notification shade and quick settings ask whatever is in front;
+    // one OK covers both for this conversation, not ordinary crucial apps.
+    let svc2 = svc.clone();
+    let phone2 = phone.clone();
+    let shade = tokio::spawn(async move {
+        svc2.agent_call(agent_with(&phone2, "global", json!({"action": "notifications"}), "c1"))
+            .await
+    });
+    let ask = approve_next(&svc, true).await;
+    assert_eq!(ask.verb, "global");
+    assert!(ask.grant_minutes.is_some());
+    shade.await.unwrap().unwrap();
+    assert_eq!(reached.recv().await.as_deref(), Some("global"));
+    svc.agent_call(agent_with(&phone, "global", json!({"action": "quick_settings"}), "c1"))
+        .await
+        .unwrap();
+    assert_eq!(reached.recv().await.as_deref(), Some("global"));
+
+    // A bank in front: click_text and set_text ask like a tap.
+    *front.lock().unwrap() = "de.mybank.app".into();
+    for verb in ["click_text", "set_text"] {
+        let svc2 = svc.clone();
+        let phone2 = phone.clone();
+        let call = tokio::spawn(async move {
+            svc2.agent_call(agent_with(&phone2, verb, json!({"text": "Pay", "value": "1"}), verb))
+                .await
+        });
+        let ask = approve_next(&svc, false).await;
+        assert_eq!(
+            (ask.verb.as_str(), ask.package.as_deref()),
+            (verb, Some("de.mybank.app"))
+        );
+        assert_eq!(
+            call.await.unwrap().unwrap_err().code(),
+            Some(DeviceErrorCode::DeviceApprovalDenied)
+        );
+    }
+    assert!(reached.try_recv().is_err());
+    let audit = audit_rows(&svc, &phone).await;
+    assert!(
+        audit
+            .iter()
+            .any(|r| r.verb == "open_url" && r.detail.as_deref() == Some("url_blocked"))
+    );
+    assert!(
+        audit
+            .iter()
+            .all(|r| !r.detail.as_deref().unwrap_or_default().contains("example.com")),
+        "no link in the audit detail"
+    );
+}
+
+/// The companion's `health` (pair / hello and the event) is kept on the
+/// device row and returned with the card.
+#[tokio::test]
+async fn a_phone_reports_its_health() {
+    let (svc, port) = harness().await;
+    let code = svc.pairing_code("u1", DevicePairingKind::Companion, None).unwrap().code;
+    let mut ws = open(port, None).await.unwrap();
+    send(
+        &mut ws,
+        json!({"type": "pair", "code": code, "kind": "companion", "name": "OnePlus Nord 4", "version": "0.2.0",
+               "capabilities": COMPANION_02_VERBS,
+               "health": {"battery_percent": 80, "charging": true, "locked": false, "accessibility_on": true,
+                          "android_version": "15", "model": "CPH2663"}}),
+    )
+    .await;
+    let welcome = next(&mut ws).await.unwrap();
+    let phone = format!("phone:{}:self", welcome["client_id"].as_str().unwrap());
+    send(
+        &mut ws,
+        json!({"type": "inventory", "phones": [{"serial": "self", "name": "OnePlus Nord 4", "transport": "self",
+               "chrome": false, "enabled": true}], "addons": []}),
+    )
+    .await;
+    wait_status(&svc, &phone, DeviceStatus::Off).await;
+    assert_eq!(
+        svc.get("u1", &phone).await.unwrap().version.as_deref(),
+        Some("0.2.0"),
+        "the app version"
+    );
+    let health = svc.get("u1", &phone).await.unwrap().health.expect("health from pair");
+    assert_eq!(
+        (health.battery_percent, health.charging, health.locked),
+        (Some(80), Some(true), false)
+    );
+    assert!(health.accessibility_on);
+    assert_eq!(health.model.as_deref(), Some("CPH2663"));
+
+    // A change arrives as an event; a value out of range is dropped, not the frame.
+    send(
+        &mut ws,
+        json!({"type": "event", "device": "self", "name": "health",
+               "data": {"battery_percent": 300, "charging": false, "locked": true, "accessibility_on": false}}),
+    )
+    .await;
+    for _ in 0..200 {
+        if svc.get("u1", &phone).await.unwrap().health.is_some_and(|h| h.locked) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let health = svc.get("u1", &phone).await.unwrap().health.unwrap();
+    assert_eq!(
+        (health.battery_percent, health.charging, health.locked),
+        (None, Some(false), true)
+    );
+    assert!(!health.accessibility_on);
+    let listed = svc.list("u1").await.unwrap();
+    assert!(
+        listed
+            .iter()
+            .any(|d| d.id == phone && d.health.as_ref().is_some_and(|h| h.locked))
+    );
+    // A Mac-relay phone has no health.
+    assert!(listed.iter().filter(|d| d.id != phone).all(|d| d.health.is_none()));
+}
+
+/// Live finding 2026-11-18: with a game on screen a OnePlus reports its game
+/// toolbar (`com.oplus.games`) as the front app. An overlay says nothing about
+/// the app underneath: the call asks, and that OK is single-use.
+#[tokio::test]
+async fn an_overlay_in_front_counts_as_an_unknown_app() {
+    let (svc, port) = harness().await;
+    let (phone, mut reached, front) = enabled_phone(&svc, port, "com.oplus.games").await;
+    for overlay in ["com.oplus.games", "com.android.systemui"] {
+        *front.lock().unwrap() = overlay.into();
+        for round in 0..2 {
+            let svc2 = svc.clone();
+            let phone2 = phone.clone();
+            let call = tokio::spawn(async move { svc2.agent_call(agent_with(&phone2, "tap", json!({}), "c1")).await });
+            let ask = approve_next(&svc, true).await;
+            assert_eq!(ask.package.as_deref(), Some("unknown"), "{overlay}");
+            assert_eq!(ask.grant_minutes, None, "{overlay} round {round}");
+            call.await.unwrap().unwrap();
+            assert_eq!(reached.recv().await.as_deref(), Some("tap"));
+        }
+    }
+}
+
+/// Reconnect with the stored token and report the same phone again.
+async fn reconnect_mac(port: u16, token: &str) -> Ws {
+    let mut ws = open(port, None).await.unwrap();
+    send(
+        &mut ws,
+        json!({"type": "hello", "token": token, "kind": "mac_helper", "version": "0.1.0",
+               "capabilities": ["tap", "screenshot", "foreground", "text", "ui_tree", "launch", "stop"]}),
+    )
+    .await;
+    assert_eq!(next(&mut ws).await.unwrap()["type"], "welcome");
+    send(
+        &mut ws,
+        json!({"type": "inventory",
+               "phones": [{"serial": "R5CX", "name": "Galaxy", "transport": "usb", "chrome": true, "enabled": true}]}),
+    )
+    .await;
+    ws
+}
+
+/// Live finding 2026-11-18: the phone app's socket drops and reconnects within
+/// seconds when the app goes to the background. A pending READ is sent once
+/// more on the new socket; an ACTION never is (it may already have run).
+#[tokio::test]
+async fn a_pending_read_is_sent_again_after_a_reconnect_an_action_is_not() {
+    let (svc, port) = harness().await;
+    let (mut ws, token, client_id) = pair_mac(&svc, port).await;
+    let phone = format!("phone:{client_id}:R5CX");
+    wait_status(&svc, &phone, DeviceStatus::Off).await;
+
+    // A read: the first socket closes with the request pending.
+    let svc2 = svc.clone();
+    let phone2 = phone.clone();
+    let read = tokio::spawn(async move { svc2.relay_call("u1", &phone2, "foreground", json!({})).await });
+    let request = next(&mut ws).await.unwrap();
+    assert_eq!(request["verb"], "foreground");
+    ws.close(None).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let mut ws = reconnect_mac(port, &token).await;
+    let again = next(&mut ws).await.expect("the read was sent again");
+    assert_eq!(
+        (again["type"].as_str(), again["verb"].as_str()),
+        (Some("request"), Some("foreground"))
+    );
+    send(
+        &mut ws,
+        json!({"type": "response", "id": again["id"], "ok": true, "result": {"package": "org.wikipedia"}}),
+    )
+    .await;
+    assert_eq!(read.await.unwrap().unwrap()["package"], "org.wikipedia");
+
+    // An action: DEVICE_OFFLINE, and nothing arrives on the new socket.
+    let svc2 = svc.clone();
+    let phone2 = phone.clone();
+    let tap = tokio::spawn(async move { svc2.relay_call("u1", &phone2, "tap", json!({"x": 1, "y": 1})).await });
+    assert_eq!(next(&mut ws).await.unwrap()["verb"], "tap");
+    ws.close(None).await.unwrap();
+    assert_eq!(
+        tap.await.unwrap().unwrap_err().code(),
+        Some(DeviceErrorCode::DeviceOffline)
+    );
+    let mut ws = reconnect_mac(port, &token).await;
+    let quiet = tokio::time::timeout(Duration::from_millis(700), ws.next()).await;
+    assert!(quiet.is_err(), "the tap was not sent again: {quiet:?}");
 }

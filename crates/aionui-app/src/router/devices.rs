@@ -131,6 +131,10 @@ impl BrowserDevices for BrowserDevicesAdapter {
             .collect()
     }
 
+    fn url_blocked(&self, url: &str) -> bool {
+        self.service.guard_ref().decide(url) == aionui_browser::GuardDecision::Block
+    }
+
     fn my_browsers_enabled(&self, user_id: &str) -> bool {
         self.service
             .settings(user_id)

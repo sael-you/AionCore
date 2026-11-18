@@ -25,9 +25,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::Duration;
 
 use aionui_api_types::devices::{
-    DeviceErrorCode, DevicePairingCode, DevicePairingKind, RELAY_DEVICE_MAC, RELAY_DEVICE_SELF, RELAY_IDLE_CLOSE_SECS,
-    RelayAddon, RelayClientKind, RelayError, RelayInbound, RelayMac, RelayOutbound, RelayPhone, relay_error,
-    relay_event,
+    DeviceErrorCode, DeviceHealth, DevicePairingCode, DevicePairingKind, RELAY_DEVICE_MAC, RELAY_DEVICE_SELF,
+    RELAY_IDLE_CLOSE_SECS, RelayAddon, RelayClientKind, RelayError, RelayInbound, RelayMac, RelayOutbound, RelayPhone,
+    relay_error, relay_event,
 };
 use aionui_common::now_ms;
 use aionui_common::pairing::{PairingCodes, RedeemOutcome, new_device_token, token_sha256_hex};
@@ -59,11 +59,15 @@ pub fn request_timeout(verb: &str) -> Duration {
         // Download (helper cap 10 min) + adb install (5 min).
         "install_apk" => Duration::from_secs(16 * 60),
         "foreground" | "mac_foreground" | "ui_tree" | "tap" | "swipe" | "text" | "key" | "launch" | "stop"
-        | "mac_click" | "mac_type" | "mac_key" | "mac_open_app" => QUICK_TIMEOUT,
+        | "click_text" | "set_text" | "global" | "open_url" | "mac_click" | "mac_type" | "mac_key" | "mac_open_app" => {
+            QUICK_TIMEOUT
+        }
         "screenshot" | "logcat" | "mac_screenshot" | "mac_ax_tree" => READ_TIMEOUT,
         _ => REQUEST_TIMEOUT,
     }
 }
+/// Core's own error: the socket closed while the request was pending.
+pub(crate) const WENT_OFFLINE: &str = "went_offline";
 /// Core's own error for a `response` frame it could not parse.
 const UNREADABLE_ANSWER: &str = "unreadable_answer";
 pub const PAIRING_TTL: Duration = Duration::from_secs(5 * 60);
@@ -101,6 +105,10 @@ pub struct RelayClient {
     present: std::sync::Mutex<HashSet<String>>,
     /// Latest foreground package per device (from `foreground` events).
     foreground: std::sync::Mutex<HashMap<String, String>>,
+    /// Companion 0.2+: what the phone last said about itself.
+    health: std::sync::Mutex<Option<DeviceHealth>>,
+    /// The client's own version (`pair` / `hello`), shown on its card.
+    version: Option<String>,
 }
 
 impl std::fmt::Debug for RelayClient {
@@ -126,7 +134,7 @@ impl RelayClient {
         let pending: Vec<_> = self.pending.lock().expect("pending lock").drain().collect();
         for (_, tx) in pending {
             let _ = tx.send(Err(RelayError {
-                code: relay_error::FAILED.into(),
+                code: WENT_OFFLINE.into(),
                 message: "the device went offline".into(),
             }));
         }
@@ -161,14 +169,14 @@ impl RelayClient {
         }) {
             self.pending.lock().expect("pending lock").remove(&id);
             return Err(RelayError {
-                code: relay_error::FAILED.into(),
+                code: WENT_OFFLINE.into(),
                 message: "the device went offline".into(),
             });
         }
         match tokio::time::timeout(request_timeout(verb), rx).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(RelayError {
-                code: relay_error::FAILED.into(),
+                code: WENT_OFFLINE.into(),
                 message: "the device went offline".into(),
             }),
             Err(_) => {
@@ -230,6 +238,31 @@ fn clean_label(raw: &str, fallback: &str) -> String {
     if s.is_empty() { fallback.to_owned() } else { s }
 }
 
+/// Read a peer's `health` object leniently: a wrong field is dropped, never
+/// the whole frame. `None` when it is not an object.
+pub(crate) fn health_of(value: &Value) -> Option<DeviceHealth> {
+    let map = value.as_object()?;
+    let label = |key: &str| {
+        map.get(key)
+            .and_then(Value::as_str)
+            .map(|s| clean_label(s, ""))
+            .filter(|s| !s.is_empty())
+    };
+    let flag = |key: &str| map.get(key).and_then(Value::as_bool);
+    Some(DeviceHealth {
+        battery_percent: map
+            .get("battery_percent")
+            .and_then(Value::as_u64)
+            .and_then(|n| u8::try_from(n).ok())
+            .filter(|n| *n <= 100),
+        charging: flag("charging"),
+        locked: flag("locked").unwrap_or(false),
+        accessibility_on: flag("accessibility_on").unwrap_or(false),
+        android_version: label("android_version"),
+        model: label("model"),
+    })
+}
+
 fn pairing_kind_of(kind: RelayClientKind) -> DevicePairingKind {
     match kind {
         RelayClientKind::MacHelper => DevicePairingKind::MacHelper,
@@ -257,7 +290,7 @@ pub fn relay_error_code(error: &RelayError) -> DeviceErrorCode {
         relay_error::REFUSED => DeviceErrorCode::DeviceVerbRefused,
         relay_error::BUSY => DeviceErrorCode::DeviceBusy,
         relay_error::BAD_ARGS | UNREADABLE_ANSWER => DeviceErrorCode::DeviceBadMessage,
-        relay_error::TIMEOUT => DeviceErrorCode::DeviceOffline,
+        relay_error::TIMEOUT | WENT_OFFLINE => DeviceErrorCode::DeviceOffline,
         _ => DeviceErrorCode::DeviceVerbRefused,
     }
 }
@@ -360,7 +393,7 @@ impl DevicesService {
             Some(frame) => self.authenticate(frame, &source).await,
             None => Err(DeviceErrorCode::DeviceBadMessage),
         };
-        let (pairing, token) = match auth {
+        let (pairing, token, health) = match auth {
             Ok(a) => a,
             Err(code) => {
                 let text = serde_json::to_string(&RelayOutbound::Error { code }).unwrap_or_default();
@@ -389,6 +422,8 @@ impl DevicesService {
             alive: watch::channel(true).0,
             present: std::sync::Mutex::new(HashSet::new()),
             foreground: std::sync::Mutex::new(HashMap::new()),
+            health: std::sync::Mutex::new(health),
+            version: pairing.version.clone().filter(|v| !v.is_empty()),
         });
         let _ = client.out.send(RelayOutbound::Welcome {
             client_id: pairing.id.clone(),
@@ -485,7 +520,7 @@ impl DevicesService {
         &self,
         frame: RelayInbound,
         source: &str,
-    ) -> Result<(DevicePairingRow, Option<String>), DeviceErrorCode> {
+    ) -> Result<(DevicePairingRow, Option<String>, Option<DeviceHealth>), DeviceErrorCode> {
         match frame {
             RelayInbound::Pair {
                 code,
@@ -493,6 +528,7 @@ impl DevicesService {
                 name,
                 version,
                 capabilities,
+                health,
             } => {
                 let (user_id, issued_kind) = match self.relay().codes.redeem(&code, source) {
                     RedeemOutcome::Paired(key) => key,
@@ -549,13 +585,14 @@ impl DevicesService {
                     })
                     .await;
                 info!(user_id, pairing_id = %row.id, kind = %row.kind, "device relay client paired");
-                Ok((row, Some(token)))
+                Ok((row, Some(token), health.as_ref().and_then(health_of)))
             }
             RelayInbound::Hello {
                 token,
                 kind,
                 version,
                 capabilities,
+                health,
             } => {
                 let hash = token_sha256_hex(&token);
                 let row = self
@@ -578,6 +615,7 @@ impl DevicesService {
                         ..row
                     },
                     None,
+                    health.as_ref().and_then(health_of),
                 ))
             }
             _ => Err(DeviceErrorCode::DeviceBadMessage),
@@ -646,6 +684,12 @@ impl DevicesService {
                 if name == relay_event::LOCAL_SWITCH_OFF {
                     self.switch_off_relay_device(client, &device).await;
                 }
+                if name == relay_event::HEALTH
+                    && client.kind == RelayClientKind::Companion
+                    && let Some(health) = health_of(&data)
+                {
+                    self.store_health(client, health).await;
+                }
                 let _ = self.relay().events.send(RelayEvent {
                     pairing_id: client.pairing_id.clone(),
                     device,
@@ -657,6 +701,37 @@ impl DevicesService {
                 warn!(pairing_id = %client.pairing_id, "device relay client repeated its first frame; ignored");
             }
         }
+    }
+
+    /// Keep the companion's latest `health` on its device row (`meta.health`).
+    async fn store_health(&self, client: &RelayClient, health: DeviceHealth) {
+        *client.health.lock().expect("health lock") = Some(health.clone());
+        let id = relay_device_id("phone", &client.pairing_id, RELAY_DEVICE_SELF);
+        let Ok(Some(row)) = self.repo().get_device(&client.user_id, &id).await else {
+            return;
+        };
+        let mut meta = serde_json::from_str::<Value>(&row.meta).unwrap_or_else(|_| json!({}));
+        if !meta.is_object() {
+            meta = json!({});
+        }
+        meta["health"] = serde_json::to_value(&health).unwrap_or(Value::Null);
+        let saved = self
+            .repo()
+            .upsert_device(UpsertDeviceParams {
+                id: &id,
+                user_id: &client.user_id,
+                kind: "phone",
+                pairing_id: Some(&client.pairing_id),
+                source_id: RELAY_DEVICE_SELF,
+                name: &row.name,
+                meta: &meta.to_string(),
+                now: now_ms(),
+            })
+            .await;
+        if let Err(error) = saved {
+            warn!(pairing_id = %client.pairing_id, error = %error, "device health not saved");
+        }
+        self.changed(&client.user_id, Some(&id));
     }
 
     /// The owner pressed Stop on the phone / Mac: the core switch goes off too.
@@ -720,17 +795,24 @@ impl DevicesService {
             let companion = p.companion_client_id.as_deref().filter(|c| {
                 !c.is_empty() && c.len() <= 64 && c.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
             });
-            let meta = json!({
+            let mut meta = json!({
                 "model": p.model, "android_version": p.android_version, "transport": p.transport,
                 "chrome": p.chrome, "peer_enabled": p.enabled, "companion_client_id": companion,
             });
+            if client.kind == RelayClientKind::Companion {
+                // The companion card: the app's version and its health.
+                meta["version"] = json!(client.version);
+                if let Some(health) = client.health.lock().expect("health lock").clone() {
+                    meta["health"] = serde_json::to_value(health).unwrap_or(Value::Null);
+                }
+            }
             upsert("phone", source, clean_label(&p.name, "Phone"), meta).await;
         }
         if let Some(m) = mac {
             present.insert(RELAY_DEVICE_MAC.to_owned());
             let meta = json!({
                 "mac_reported": true, "os_version": m.os_version, "permissions_ok": m.permissions_ok,
-                "peer_enabled": m.enabled,
+                "peer_enabled": m.enabled, "version": client.version,
             });
             upsert("mac", RELAY_DEVICE_MAC.to_owned(), clean_label(&m.name, "Mac"), meta).await;
         }
