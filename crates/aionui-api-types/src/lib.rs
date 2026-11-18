@@ -31,6 +31,7 @@ mod mcp_market;
 mod memory;
 mod office;
 mod project;
+mod project_page;
 mod provider;
 mod remote_agent;
 mod response;
@@ -204,6 +205,11 @@ pub use office::{
 };
 pub use project::{
     AttachFolderRequest, ProjectDetailResponse, ProjectEntry, ProjectExplorer, ResolveRefRequest, ResolveRefResponse,
+};
+pub use project_page::{
+    OverviewConversations, OverviewKit, OverviewStorage, ProjectOverviewResponse, ProjectStorageResponse,
+    ProjectUsageResponse, StorageChild, StorageDisk, StorageFile, StorageRoot, UsageByConversation, UsageByModel,
+    UsageByProject, UsageDay, UsageQuery, UsageSummaryResponse, UsageTotals,
 };
 pub use provider::{
     BedrockAuthMethod, BedrockConfig, CreateProviderRequest, DetectProtocolRequest, DetectionSuggestion,
