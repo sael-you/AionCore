@@ -47,6 +47,8 @@ pub const ASSET_SHA256: &str = "a79ad1ef1a4575e3e0d2c1c66b13ad79ebcad15a898a7c07
 pub const ASSET_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 /// Total time allowed for the asset download.
 pub const DOWNLOAD_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(90 * 60);
+/// Unpacked size limit of the asset (2.6 GB today).
+pub const MAX_UNPACKED_BYTES: u64 = 4 * 1024 * 1024 * 1024;
 /// The Playwright pinned for the sidecar and the agents' client.
 pub const PLAYWRIGHT_PIN: &str = "@playwright/cli 0.1.17 (playwright-core 1.62.0-alpha-1783623505000)";
 
@@ -215,12 +217,13 @@ pub async fn build_tree(
     let size = std::fs::metadata(&zip)?.len();
     let sha = ASSET_SHA256.to_owned();
     let tree = x.join("camoufox");
-    std::fs::create_dir_all(&tree)?;
-    let mut cmd = aionui_runtime::Builder::clean_cli("unzip");
-    cmd.arg("-q").arg(&zip).arg("-d").arg(&tree);
-    if !cmd.output().await?.status.success() {
-        return Err(BrowserError::Internal("unzip failed".into()));
-    }
+    std::fs::create_dir_all(x)?;
+    // Contained extraction (no write through a link, names stay inside);
+    // blocking I/O of ~2.6 GB, so off the async threads.
+    let (zip_path, dest) = (zip.clone(), tree.clone());
+    tokio::task::spawn_blocking(move || crate::install::unzip_contained_within(&zip_path, &dest, MAX_UNPACKED_BYTES))
+        .await
+        .map_err(|e| BrowserError::Internal(e.to_string()))??;
     // 3. The sidecar runtime.
     let lock = install_sidecar(staging, &tree.join(SIDECAR_DIR)).await?;
     // 4. x11vnc for the panel.
