@@ -11,6 +11,7 @@ aionui-db.workspace = true
 axum.workspace = true
 url.workspace = true
 chrono.workspace = true
+fs2.workspace = true
 thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -31,5 +32,6 @@ trash.workspace = true
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 tempfile.workspace = true
+sqlx.workspace = true
 tower.workspace = true
 http-body-util.workspace = true

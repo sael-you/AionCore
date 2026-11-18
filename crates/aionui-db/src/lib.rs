@@ -71,6 +71,9 @@ pub use repository::sqlite_board_recover::{
     recover_board,
 };
 pub use repository::team::{UpdateTaskParams, UpdateTeamParams};
+pub use repository::usage::{
+    ProjectCounts, UsageConversationRow, UsageDayRow, UsageModelRow, UsageProjectRow, UsageSums, UsageTurnParams,
+};
 pub use repository::voice::{CreateVoiceSessionParams, NewVoiceAuditEntry, VoiceUsageDelta};
 pub use repository::voice_draft::{DraftPatch, DraftTransition, IVoiceDraftRepository, NewVoiceTranscript};
 pub use repository::{
@@ -83,18 +86,18 @@ pub use repository::{
     IBoardStore, IBoardTx, IChannelRepository, IClientPreferenceRepository, IConversationRepository, ICronRepository,
     IFeedbackDiagnosticsRepository, IKitRepository, IMcpMarketRepository, IMcpServerRepository, IOAuthTokenRepository,
     IProjectStore, IProviderRepository, IRemoteAgentRepository, IRuleRepository, IServerPoolRepository,
-    ISettingsRepository, ISidebarStore, ISkillRepository, ITeamRepository, IUserOrderStore, IUserRepository,
-    IVoiceAuditRepository, IVoiceSessionRepository, IVoiceSettingsRepository, MoveOutcome, NewBoardEvent, OrderItemRef,
-    PageDirection, PersistedSessionState, PinOutcome, PinnedCursor, SaveRuntimeStateParams, SidebarConversationThin,
-    SidebarProjectMeta, SidebarTeamThin, SqliteAcpSessionRepository, SqliteAgentMetadataRepository,
-    SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository, SqliteAssistantOverrideRepository,
-    SqliteAssistantPreferenceRepository, SqliteAssistantRepository, SqliteBoardStore, SqliteChannelRepository,
-    SqliteClientPreferenceRepository, SqliteConversationRepository, SqliteCronRepository,
-    SqliteFeedbackDiagnosticsRepository, SqliteKitRepository, SqliteMcpMarketRepository, SqliteMcpServerRepository,
-    SqliteOAuthTokenRepository, SqliteProjectStore, SqliteProviderRepository, SqliteRemoteAgentRepository,
-    SqliteRuleRepository, SqliteServerPoolRepository, SqliteSettingsRepository, SqliteSidebarStore,
-    SqliteSkillRepository, SqliteTeamRepository, SqliteUserOrderStore, SqliteUserRepository, SqliteVoiceRepository,
-    count_live_voice_calls_read_only,
+    ISettingsRepository, ISidebarStore, ISkillRepository, ITeamRepository, IUsageRepository, IUserOrderStore,
+    IUserRepository, IVoiceAuditRepository, IVoiceSessionRepository, IVoiceSettingsRepository, MoveOutcome,
+    NewBoardEvent, OrderItemRef, PageDirection, PersistedSessionState, PinOutcome, PinnedCursor,
+    SaveRuntimeStateParams, SidebarConversationThin, SidebarProjectMeta, SidebarTeamThin, SqliteAcpSessionRepository,
+    SqliteAgentMetadataRepository, SqliteAssistantDefinitionRepository, SqliteAssistantOverlayRepository,
+    SqliteAssistantOverrideRepository, SqliteAssistantPreferenceRepository, SqliteAssistantRepository,
+    SqliteBoardStore, SqliteChannelRepository, SqliteClientPreferenceRepository, SqliteConversationRepository,
+    SqliteCronRepository, SqliteFeedbackDiagnosticsRepository, SqliteKitRepository, SqliteMcpMarketRepository,
+    SqliteMcpServerRepository, SqliteOAuthTokenRepository, SqliteProjectStore, SqliteProviderRepository,
+    SqliteRemoteAgentRepository, SqliteRuleRepository, SqliteServerPoolRepository, SqliteSettingsRepository,
+    SqliteSidebarStore, SqliteSkillRepository, SqliteTeamRepository, SqliteUsageRepository, SqliteUserOrderStore,
+    SqliteUserRepository, SqliteVoiceRepository, count_live_voice_calls_read_only,
 };
 
 // Re-export sqlx pool type for downstream crates

@@ -11,6 +11,8 @@
 pub mod canonical;
 pub mod chat_files;
 pub mod containment;
+pub mod insights;
+pub mod insights_routes;
 pub mod memory;
 pub mod memory_routes;
 pub mod monitor;
@@ -18,9 +20,12 @@ pub mod routes;
 pub mod runtime;
 pub mod scm;
 mod service;
+pub mod storage_scan;
 pub mod types;
 
 pub use chat_files::ResolvedChatMessage;
+pub use insights::{InsightsError, ProjectInsights};
+pub use insights_routes::{InsightsRouterState, insights_read_routes, insights_write_routes};
 pub use memory::{MemoryError, MemoryService};
 pub use memory_routes::{MemoryRouterState, memory_read_routes, memory_write_routes};
 pub use routes::{ProjectRouterState, project_routes};

@@ -50,6 +50,7 @@ mod midturn_e2e;
 mod office_e2e;
 mod open_repro_db;
 mod per_user_fs_isolation_e2e;
+mod project_page_e2e;
 mod remote_agent_e2e;
 mod runtime_scope_e2e;
 mod runtime_team_tools_e2e;

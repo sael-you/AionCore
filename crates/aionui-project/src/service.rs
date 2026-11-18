@@ -410,6 +410,36 @@ impl ProjectService {
             .and_then(|(_, folder)| canonical::uri_to_path(&folder.resource_canonical).ok()))
     }
 
+    /// The project's name and its local folders as `(role, path)`, the
+    /// workspace first (C42 storage: the only roots a scan may walk).
+    /// `ProjectNotFound` when it is not the user's project.
+    pub async fn name_and_local_roots(
+        &self,
+        user_id: &str,
+        project_id: &str,
+    ) -> Result<(String, Vec<(String, PathBuf)>), ProjectError> {
+        let project =
+            self.store
+                .get_project(user_id, project_id)
+                .await?
+                .ok_or_else(|| ProjectError::ProjectNotFound {
+                    project_id: project_id.to_owned(),
+                })?;
+        let mut roots: Vec<(String, PathBuf)> = self
+            .store
+            .list_entries(user_id, project_id)
+            .await?
+            .into_iter()
+            .filter_map(|(entry, folder)| {
+                canonical::uri_to_path(&folder.resource_canonical)
+                    .ok()
+                    .map(|path| (entry.role, path))
+            })
+            .collect();
+        roots.sort_by_key(|(role, _)| role != Role::Workspace.as_str());
+        Ok((project.name, roots))
+    }
+
     // ── filesystem helpers ──────────────────────────────────────────────
 
     /// Stat a canonical folder to confirm it is an existing directory.

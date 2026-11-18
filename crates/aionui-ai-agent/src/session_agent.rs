@@ -3791,6 +3791,23 @@ async fn persist_context_usage(
             return;
         }
     };
+    // C42: the per-turn figures also go to the usage ledger (`usage_turns` +
+    // `usage_daily`). Best effort — a failure is logged and dropped, the turn
+    // and the snapshot below are never affected.
+    let turn = crate::usage_ledger::turn_params(
+        user_id,
+        conversation_id,
+        (*input_tokens, *output_tokens),
+        breakdown,
+        cost_usd,
+        usage
+            .get("cost")
+            .and_then(|c| c.get("amount"))
+            .and_then(serde_json::Value::as_f64),
+    );
+    if let Err(err) = repo.record_usage_turn(&turn).await {
+        tracing::warn!(conversation_id, error = %err, "usage ledger: recording the turn failed; dropped");
+    }
     usage.insert("used".into(), serde_json::json!(used));
     if let Some(size) = context_window {
         usage.insert("size".into(), serde_json::json!(size));
@@ -6505,6 +6522,52 @@ mod persist_tests {
             context_window: window,
             breakdown: Default::default(),
         }
+    }
+
+    /// C42: every informative usage report also lands in the usage ledger with
+    /// the turn's own token split and the turn's cost (the wire cost is
+    /// session-cumulative), while occupancy-only and zero reports record nothing.
+    #[tokio::test]
+    async fn usage_reports_are_recorded_per_turn_in_the_ledger() {
+        let (repo, db) = seeded_repo().await;
+        let turn = |input: u64, output: u64, cost: Option<f64>| SessionEvent::UsageDelta {
+            input_tokens: input,
+            output_tokens: output,
+            total_tokens: 50_000,
+            cost_usd: cost,
+            context_window: Some(200_000),
+            breakdown: aionui_session::UsageBreakdown {
+                cached_read_tokens: 900,
+                cached_write_tokens: 30,
+                thought_tokens: 7,
+            },
+        };
+        persist_side_effects(repo.as_ref(), "user-1", "conv-1", &turn(12, 34, Some(1.0))).await;
+        persist_side_effects(repo.as_ref(), "user-1", "conv-1", &turn(5, 6, Some(1.25))).await;
+        // Occupancy-only (ACP usage_update) and an all-zero report: no ledger row.
+        persist_side_effects(repo.as_ref(), "user-1", "conv-1", &usage(60_000, None, None)).await;
+        persist_side_effects(repo.as_ref(), "user-1", "conv-1", &usage(0, None, None)).await;
+
+        let rows: Vec<(i64, i64, i64, i64, i64, Option<i64>)> = sqlx::query_as(
+            "SELECT input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, thought_tokens, \
+             cost_micro_usd FROM usage_turns WHERE conversation_id = 'conv-1' ORDER BY rowid",
+        )
+        .fetch_all(db.pool())
+        .await
+        .unwrap();
+        assert_eq!(
+            rows,
+            vec![(12, 34, 900, 30, 7, Some(1_000_000)), (5, 6, 900, 30, 7, Some(250_000)),],
+            "per-turn split; cost = difference to the stored cumulative value"
+        );
+        let (input, turns, cost): (i64, i64, Option<i64>) =
+            sqlx::query_as("SELECT SUM(input_tokens), SUM(turns), SUM(cost_micro_usd) FROM usage_daily")
+                .fetch_one(db.pool())
+                .await
+                .unwrap();
+        assert_eq!((input, turns, cost), (17, 2, Some(1_250_000)));
+        // The occupancy snapshot is unaffected by the ledger.
+        assert_eq!(stored_usage(repo.as_ref()).await["used"], 60_000);
     }
 
     async fn stored_usage(repo: &dyn IAcpSessionRepository) -> serde_json::Value {

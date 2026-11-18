@@ -344,6 +344,29 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     // writes need a verified browser session (never the agent runtime-token
     // channel) and a trusted Origin, like the MCP market writes. No route-private
     // CSRF layer: webui gets the global C11 CSRF + Origin layer.
+    // Project page (C42): usage, storage and overview reads behind the ordinary
+    // auth middleware; the storage rescan is a write (session-only + Origin).
+    let insights_state = aionui_project::InsightsRouterState {
+        insights: std::sync::Arc::new(aionui_project::ProjectInsights::new(
+            memory_project.clone(),
+            std::sync::Arc::new(aionui_db::SqliteUsageRepository::new(services.database.pool().clone())),
+            Some(services.memory_service.clone()),
+        )),
+    };
+    let insights_read = aionui_project::insights_read_routes(insights_state.clone())
+        .route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
+    let insights_write = aionui_project::insights_write_routes(insights_state)
+        .route_layer(from_fn_with_state(
+            super::mcp_market::market_write_auth_state(services),
+            auth_middleware,
+        ))
+        .route_layer(from_fn_with_state(
+            OriginGuard {
+                policy: services.origin_policy.clone(),
+                same_origin_via_web_host: services.identity_mode.is_local(),
+            },
+            require_trusted_origin_middleware,
+        ));
     let memory_state = aionui_project::MemoryRouterState {
         project: memory_project,
         memory: services.memory_service.clone(),
@@ -554,6 +577,8 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         .merge(project_authenticated)
         .merge(memory_read)
         .merge(memory_write)
+        .merge(insights_read)
+        .merge(insights_write)
         .merge(sidebar_authenticated)
         .merge(board_authenticated)
         .merge(mcp_authenticated)

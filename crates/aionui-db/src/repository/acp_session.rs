@@ -116,6 +116,14 @@ pub trait IAcpSessionRepository: Send + Sync {
     /// owning conversation belongs to `user_id`. Assumes the row exists
     /// (created alongside the conversation); returns `Ok(false)` when it does
     /// not.
+    /// Record one usage report of a finished turn (migration 913: a
+    /// `usage_turns` row + the `usage_daily` aggregate, one transaction).
+    /// Lives on this trait because the session pump that sees the report only
+    /// holds this repository. Default: nothing recorded (test doubles).
+    async fn record_usage_turn(&self, _params: &crate::UsageTurnParams<'_>) -> Result<bool, DbError> {
+        Ok(false)
+    }
+
     async fn save_runtime_state_for_user(
         &self,
         user_id: &str,

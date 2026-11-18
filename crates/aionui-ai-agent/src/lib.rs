@@ -34,6 +34,7 @@ pub mod skill_delivery_plan;
 pub mod task_manager;
 pub mod terminal;
 pub mod types;
+mod usage_ledger;
 mod workflow_progress;
 
 pub use active_lease::{ACTIVE_LEASE_TTL_MS, ActiveLeaseRegistry};

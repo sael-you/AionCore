@@ -330,6 +330,10 @@ impl IAcpSessionRepository for SqliteAcpSessionRepository {
         Ok(Some(decode_runtime_state(&raw)?))
     }
 
+    async fn record_usage_turn(&self, params: &crate::UsageTurnParams<'_>) -> Result<bool, DbError> {
+        crate::repository::sqlite_usage::record_usage_turn(&self.pool, params).await
+    }
+
     async fn save_runtime_state_for_user(
         &self,
         user_id: &str,

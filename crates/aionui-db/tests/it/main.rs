@@ -45,6 +45,7 @@ mod settings_repository;
 mod skill_management_schema;
 mod team_capability_criteria_migration;
 mod team_repository;
+mod usage_repository;
 mod user_repository;
 mod user_scope_migration;
 mod user_scope_pre_migration_repair;
