@@ -9,6 +9,7 @@
 //! | `RULE_NAME_TAKEN` | 409 | another live rule of the user has this name |
 //! | `RULE_STALE` | 409 | `expected_updated_at` no longer matches |
 //! | `RULE_ALREADY_IMPORTED` | 409 | the file was imported before |
+//! | `RULE_FILE_CHANGED` | 409 | hand-over refused, nothing written: the file changed since the import (message carries a line diff), or it or its directory is a symlink |
 //! | `RULE_CONFIRM_REQUIRED` | 400 | an import or a file rewrite without `confirm: true` |
 //! | `RULE_NOT_FOUND` | 404 | no such rule / project / source |
 //! | `MCP_MARKET_SESSION_REQUIRED` | 403 | a write from an agent (runtime token) or `--local` caller |
@@ -124,7 +125,8 @@ pub struct RuleImportProposal {
 pub struct RuleImportFile {
     pub path: String,
     /// `new` | `imported` | `managed` | `pointer` (only refers to another
-    /// file, nothing to import) | `missing`.
+    /// file, nothing to import) | `missing` | `refused` (a symlink leaving
+    /// the project, not a regular file, or over 512 KB: never read).
     pub status: String,
     pub bytes: usize,
     pub rules: Vec<RuleImportProposal>,

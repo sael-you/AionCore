@@ -51,7 +51,8 @@ async fn fx() -> Fx {
         rule_repo,
         kits.clone(),
         Some(dir.path().join("global").join("AGENTS.md")),
-    );
+    )
+    .with_backup_dir(dir.path().join("backups"));
     let market_repo: Arc<dyn IMcpMarketRepository> = Arc::new(SqliteMcpMarketRepository::new(db.pool().clone()));
     let mcp: Arc<dyn IMcpServerRepository> = Arc::new(SqliteMcpServerRepository::new(db.pool().clone()));
     let market = McpMarketService::new(
@@ -494,4 +495,202 @@ async fn global_file_is_generated_only_after_hand_over_and_follows_changes() {
         .unwrap();
     assert_eq!(preview.files[0].status, "managed");
     assert!(preview.files[0].rules.is_empty());
+}
+
+fn project_import(confirm: bool) -> RuleImportRequest {
+    RuleImportRequest {
+        scope: "project".into(),
+        project_id: Some("proj-a".into()),
+        confirm,
+    }
+}
+
+fn project_manage() -> RuleManageFilesRequest {
+    RuleManageFilesRequest {
+        scope: "project".into(),
+        project_id: Some("proj-a".into()),
+        confirm: true,
+    }
+}
+
+fn project_query() -> RuleImportQuery {
+    RuleImportQuery {
+        scope: "project".into(),
+        project_id: Some("proj-a".into()),
+    }
+}
+
+fn backups(f: &Fx) -> Vec<String> {
+    std::fs::read_dir(f.dir.path().join("backups"))
+        .map(|d| d.filter_map(Result::ok).map(|e| read(&e.path())).collect())
+        .unwrap_or_default()
+}
+
+/// Review part 2: the previous content is backed up outside the repo before a rewrite.
+#[tokio::test]
+async fn hand_over_backs_the_file_up_outside_the_repo() {
+    let f = fx().await;
+    let repo = f.dir.path().join("repo");
+    let original = "## Rules\nNever push.\n";
+    std::fs::write(repo.join("AGENTS.md"), original).unwrap();
+    f.rules.import(USER, project_import(true)).await.unwrap();
+    assert!(backups(&f).is_empty(), "an import writes no file and no backup");
+
+    f.rules.manage_files(USER, project_manage()).await.unwrap();
+    assert_eq!(backups(&f), vec![original.to_owned()]);
+    let in_repo: Vec<String> = std::fs::read_dir(&repo)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    assert_eq!(in_repo, vec!["AGENTS.md"], "no backup or temp file is left in the repo");
+
+    // Handing over again changes nothing and adds no backup.
+    f.rules.manage_files(USER, project_manage()).await.unwrap();
+    assert_eq!(backups(&f).len(), 1);
+}
+
+/// Review part 2: a file that changed since the import is not overwritten; the diff is shown.
+#[tokio::test]
+async fn hand_over_stops_on_drift_and_shows_the_diff() {
+    let f = fx().await;
+    let file = f.dir.path().join("repo").join("AGENTS.md");
+    std::fs::write(&file, "## Rules\nNever push.\n").unwrap();
+    f.rules.import(USER, project_import(true)).await.unwrap();
+    let edited = "## Rules\nNever push.\nAlways run the tests.\n";
+    std::fs::write(&file, edited).unwrap();
+
+    let err = f.rules.manage_files(USER, project_manage()).await.unwrap_err();
+    match err {
+        RuleError::FileChanged(msg) => {
+            assert!(msg.contains("changed since it was imported"), "{msg}");
+            assert!(msg.contains("+ Always run the tests."), "{msg}");
+        }
+        other => panic!("{other:?}"),
+    }
+    assert_eq!(read(&file), edited, "nothing was written");
+    assert!(backups(&f).is_empty());
+    assert_eq!(f.rules.sources(USER).await.unwrap()[0].status, "imported");
+}
+
+/// Review part 2: no write ever goes through a symlink (the file or its directory).
+#[cfg(unix)]
+#[tokio::test]
+async fn hand_over_refuses_symlinks() {
+    let f = fx().await;
+    let repo = f.dir.path().join("repo");
+    let file = repo.join("AGENTS.md");
+    let original = "## Rules\nNever push.\n";
+    std::fs::write(&file, original).unwrap();
+    f.rules.import(USER, project_import(true)).await.unwrap();
+
+    // The file is swapped for a symlink to a file outside the repo with the same content.
+    let outside = f.dir.path().join("outside.md");
+    std::fs::write(&outside, original).unwrap();
+    std::fs::remove_file(&file).unwrap();
+    std::os::unix::fs::symlink(&outside, &file).unwrap();
+    let err = f.rules.manage_files(USER, project_manage()).await.unwrap_err();
+    assert!(
+        matches!(&err, RuleError::FileChanged(m) if m.contains("is a symlink")),
+        "{err:?}"
+    );
+    assert_eq!(read(&outside), original, "the symlink target is untouched");
+    assert!(std::fs::symlink_metadata(&file).unwrap().file_type().is_symlink());
+
+    // The directory itself is swapped for a symlink.
+    std::fs::remove_file(&file).unwrap();
+    let real = f.dir.path().join("real-repo");
+    std::fs::rename(&repo, &real).unwrap();
+    std::fs::write(real.join("AGENTS.md"), original).unwrap();
+    std::os::unix::fs::symlink(&real, &repo).unwrap();
+    let err = f.rules.manage_files(USER, project_manage()).await.unwrap_err();
+    assert!(
+        matches!(&err, RuleError::FileChanged(m) if m.contains("symlinked directory")),
+        "{err:?}"
+    );
+    assert_eq!(read(&real.join("AGENTS.md")), original);
+    assert!(backups(&f).is_empty());
+}
+
+/// Review part 2: an import never reads through a symlink that leaves the project.
+#[cfg(unix)]
+#[tokio::test]
+async fn import_does_not_follow_symlinks_out_of_the_project() {
+    let f = fx().await;
+    let repo = f.dir.path().join("repo");
+    let secret = f.dir.path().join("secret.md");
+    std::fs::write(&secret, "## Secret\nTOPSECRETCONTENT\n").unwrap();
+    std::os::unix::fs::symlink(&secret, repo.join("AGENTS.md")).unwrap();
+    // A symlink that stays inside the project is fine.
+    std::fs::write(repo.join("docs.md"), "## Inside\nUse pnpm.\n").unwrap();
+    std::os::unix::fs::symlink(repo.join("docs.md"), repo.join("CLAUDE.md")).unwrap();
+
+    let preview = f.rules.import_preview(USER, project_query()).await.unwrap();
+    assert_eq!(preview.files[0].status, "refused");
+    assert!(preview.files[0].rules.is_empty());
+    assert!(!serde_json::to_string(&preview).unwrap().contains("TOPSECRETCONTENT"));
+    assert_eq!(preview.files[1].status, "new");
+    assert_eq!(preview.files[1].rules[0].body, "Use pnpm.");
+
+    let done = f.rules.import(USER, project_import(true)).await.unwrap();
+    assert_eq!(done.rules.len(), 1);
+    assert!(
+        !f.rules
+            .conversation_block(USER, "conv-a")
+            .await
+            .contains("TOPSECRETCONTENT")
+    );
+}
+
+/// Review part 2: an import respects the 24 KB scope cap (and 8 KB per rule) with a clear error.
+#[tokio::test]
+async fn import_respects_the_size_caps() {
+    let f = fx().await;
+    let file = f.dir.path().join("repo").join("AGENTS.md");
+    // Four sections of 7 KB: each rule fits 8 KB, together 28 KB > 24 KB.
+    let mut big = String::new();
+    for i in 0..4 {
+        big.push_str(&format!("## Part {i}\n{}\n\n", "z".repeat(7 * 1024)));
+    }
+    std::fs::write(&file, &big).unwrap();
+    let err = f.rules.import(USER, project_import(true)).await.unwrap_err();
+    assert!(
+        matches!(&err, RuleError::Invalid(m) if m.contains("24576") && m.contains("imported")),
+        "{err:?}"
+    );
+    assert!(f.rules.list(USER).await.unwrap().is_empty(), "nothing was imported");
+    assert!(f.rules.sources(USER).await.unwrap().is_empty());
+
+    // What is already attached at the scope counts: 16 KB global + 14 KB imported.
+    for i in 0..2 {
+        let r = f
+            .rules
+            .create(USER, new_rule(&format!("G{i}"), &"g".repeat(RULE_BODY_MAX_BYTES)))
+            .await
+            .unwrap();
+        f.market
+            .attach_kit_item(USER, attach(KitLevel::Global, "", &r.id, KitOp::Add))
+            .await
+            .unwrap();
+    }
+    std::fs::write(
+        &file,
+        format!("## A\n{}\n\n## B\n{}\n", "a".repeat(7 * 1024), "b".repeat(7 * 1024)),
+    )
+    .unwrap();
+    let err = f.rules.import(USER, project_import(true)).await.unwrap_err();
+    assert!(
+        matches!(&err, RuleError::Invalid(m) if m.contains("already attached")),
+        "{err:?}"
+    );
+
+    // A section over 8 KB is split into parts, each within the rule cap.
+    std::fs::write(
+        &file,
+        format!("## Long\n{}\n\n{}\n", "c".repeat(5000), "d".repeat(5000)),
+    )
+    .unwrap();
+    let preview = f.rules.import_preview(USER, project_query()).await.unwrap();
+    assert_eq!(preview.files[0].rules.len(), 2);
+    assert!(preview.files[0].rules.iter().all(|r| r.bytes <= RULE_BODY_MAX_BYTES));
 }

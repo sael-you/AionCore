@@ -40,6 +40,9 @@ pub enum RuleError {
     ConfirmRequired(String),
     #[error("{0}")]
     NotFound(String),
+    /// A file is not what AionUi last saw (or is a symlink): nothing was written.
+    #[error("{0}")]
+    FileChanged(String),
     #[error("internal error: {0}")]
     Internal(String),
 }
@@ -70,6 +73,10 @@ pub struct RuleService {
     /// The container-level rules file (e.g. `~/.clauterm/agents/AGENTS.md`);
     /// `None` = no global file on this machine.
     global_file: Option<PathBuf>,
+    /// Where the previous content of a file is copied before AionUi rewrites
+    /// it (next to the database, never inside a repository). Without it no
+    /// file is ever rewritten.
+    backup_dir: Option<PathBuf>,
 }
 
 impl RuleService {
@@ -78,7 +85,13 @@ impl RuleService {
             repo,
             kits,
             global_file,
+            backup_dir: None,
         }
+    }
+
+    pub fn with_backup_dir(mut self, dir: PathBuf) -> Self {
+        self.backup_dir = Some(dir);
+        self
     }
 
     pub fn repo(&self) -> &Arc<dyn IRuleRepository> {
@@ -287,7 +300,23 @@ impl RuleService {
         for path in paths {
             let path_str = path.to_string_lossy().into_owned();
             let known = sources.iter().find(|s| s.path == path_str);
-            let content = read_rule_file(&path).await;
+            let content = match read_rule_file(&path).await {
+                FileRead::Content(c) => Some(c),
+                FileRead::Missing => None,
+                FileRead::Refused => {
+                    // A symlink out of the project, a non-file or an oversized file.
+                    files.push((
+                        RuleImportFile {
+                            path: path_str,
+                            status: "refused".to_owned(),
+                            bytes: 0,
+                            rules: Vec::new(),
+                        },
+                        String::new(),
+                    ));
+                    continue;
+                }
+            };
             let (status, rules, bytes, original) = match (known, content) {
                 (Some(s), c) => (
                     s.status.clone(),
@@ -375,6 +404,37 @@ impl RuleService {
                 taken.name
             )));
         }
+        // Imported rules are attached at the scope: the scope's 24 KB cap holds
+        // for an import as for a manual attach, and the 8 KB cap per rule.
+        let scope = KitScope {
+            project_id: (!pid.is_empty()).then(|| pid.clone()),
+            ..Default::default()
+        };
+        let existing: usize = self
+            .repo
+            .effective_rules(user_id, &scope)
+            .await?
+            .iter()
+            .map(|r| r.rule.body.trim().len())
+            .sum();
+        let incoming: usize = new.iter().flat_map(|(f, _)| f.rules.iter()).map(|r| r.bytes).sum();
+        if let Some(big) = new
+            .iter()
+            .flat_map(|(f, _)| f.rules.iter())
+            .find(|r| r.bytes > RULE_BODY_MAX_BYTES)
+        {
+            return Err(invalid(format!(
+                "\"{}\" is {} bytes; a rule holds at most {RULE_BODY_MAX_BYTES}",
+                big.name, big.bytes
+            )));
+        }
+        if existing + incoming > RULES_EFFECTIVE_MAX_BYTES {
+            return Err(invalid(format!(
+                "this import would bring the scope's rules to {} bytes ({existing} already attached + {incoming} \
+                 imported); the limit is {RULES_EFFECTIVE_MAX_BYTES}. Shorten the file or move long material into a skill",
+                existing + incoming
+            )));
+        }
         let mut out = RuleImportResponse {
             sources: Vec::new(),
             rules: Vec::new(),
@@ -446,14 +506,39 @@ impl RuleService {
                 "import this scope's files first; only imported files are rewritten",
             ));
         }
-        let mut written = Vec::new();
+        let backup_dir = self
+            .backup_dir
+            .as_deref()
+            .ok_or_else(|| RuleError::Internal("no backup directory is configured; files are not rewritten".into()))?;
+        // Check every file before writing any: all or nothing.
+        let mut plan = Vec::new();
         for source in sources {
             let text = if source.scope == "global" {
                 self.global_file_text(user_id).await?
             } else {
                 format!("{POINTER_LINE}\n")
             };
-            write_file(Path::new(&source.path), &text).await?;
+            let path = PathBuf::from(&source.path);
+            let current = read_for_write(&path).await?;
+            // Drift: the file must still be what the owner saw — the imported
+            // content, or (already handed over) what AionUi wrote.
+            let expected_ours = source.status == "managed" && is_pointer(&current);
+            if !expected_ours && current != source.original {
+                return Err(RuleError::FileChanged(format!(
+                    "{} changed since it was imported; nothing was written. Review the difference, then re-import \
+                     or restore the file:\n{}",
+                    source.path,
+                    line_diff(&source.original, &current)
+                )));
+            }
+            plan.push((source, path, current, text));
+        }
+        let mut written = Vec::new();
+        for (source, path, current, text) in plan {
+            if current != text {
+                backup_file(backup_dir, &path, &current).await?;
+                write_file(&path, &text).await?;
+            }
             let row = if source.status == "managed" {
                 source
             } else {
@@ -494,34 +579,190 @@ impl RuleService {
                 return;
             }
         };
+        let Some(backup_dir) = self.backup_dir.as_deref() else {
+            return;
+        };
         for source in managed {
-            if let Err(e) = write_file(Path::new(&source.path), &text).await {
+            let path = PathBuf::from(&source.path);
+            // Only a file that is still AionUi's generated one is regenerated;
+            // a hand-edited or replaced file is left alone (drift).
+            let current = match read_for_write(&path).await {
+                Ok(c) if is_pointer(&c) => c,
+                Ok(_) => {
+                    warn!("rules: the global file was edited by hand; not regenerating it");
+                    continue;
+                }
+                Err(e) => {
+                    warn!(error = %e, "rules: the global file cannot be regenerated");
+                    continue;
+                }
+            };
+            if current == text {
+                continue;
+            }
+            let result = async {
+                backup_file(backup_dir, &path, &current).await?;
+                write_file(&path, &text).await
+            }
+            .await;
+            if let Err(e) = result {
                 warn!(error = %e, "rules: cannot write the generated global file");
             }
         }
     }
 }
 
-async fn read_rule_file(path: &Path) -> Option<String> {
-    let meta = tokio::fs::metadata(path).await.ok()?;
-    if !meta.is_file() || meta.len() > IMPORT_FILE_MAX_BYTES {
-        return None;
-    }
-    tokio::fs::read_to_string(path).await.ok()
+enum FileRead {
+    Content(String),
+    Missing,
+    /// Not read: a symlink leaving its directory, not a regular file, or too large.
+    Refused,
 }
 
-/// Write through a sibling temp file + rename, so a reader never sees half a file.
-async fn write_file(path: &Path, text: &str) -> Result<(), RuleError> {
-    let tmp = path.with_extension("aionui-tmp");
+/// Read a rules file for an import. A symlink is followed only when its
+/// target stays inside the file's own directory tree (the project root).
+async fn read_rule_file(path: &Path) -> FileRead {
+    let Ok(meta) = tokio::fs::symlink_metadata(path).await else {
+        return FileRead::Missing;
+    };
+    if meta.file_type().is_symlink() {
+        let root = match path.parent() {
+            Some(p) => tokio::fs::canonicalize(p).await.ok(),
+            None => None,
+        };
+        let target = tokio::fs::canonicalize(path).await.ok();
+        match (root, target) {
+            (Some(root), Some(target)) if target.starts_with(&root) => {}
+            _ => return FileRead::Refused,
+        }
+    }
+    match tokio::fs::metadata(path).await {
+        Ok(meta) if meta.is_file() && meta.len() <= IMPORT_FILE_MAX_BYTES => {
+            match tokio::fs::read_to_string(path).await {
+                Ok(c) => FileRead::Content(c),
+                Err(_) => FileRead::Refused,
+            }
+        }
+        Ok(_) => FileRead::Refused,
+        Err(_) => FileRead::Missing,
+    }
+}
+
+/// The current content of a file AionUi is about to rewrite. Refuses a
+/// symlink (the file or its directory) and anything that is not a regular file.
+async fn read_for_write(path: &Path) -> Result<String, RuleError> {
+    let refuse = |why: &str| RuleError::FileChanged(format!("{} {why}; nothing was written", path.display()));
+    let parent = path.parent().ok_or_else(|| refuse("has no directory"))?;
+    let parent_meta = tokio::fs::symlink_metadata(parent)
+        .await
+        .map_err(|_| refuse("is in a directory that no longer exists"))?;
+    if parent_meta.file_type().is_symlink() || !parent_meta.is_dir() {
+        return Err(refuse("is in a symlinked directory"));
+    }
+    let meta = tokio::fs::symlink_metadata(path)
+        .await
+        .map_err(|_| refuse("no longer exists"))?;
+    if meta.file_type().is_symlink() {
+        return Err(refuse("is a symlink"));
+    }
+    if !meta.is_file() || meta.len() > IMPORT_FILE_MAX_BYTES {
+        return Err(refuse("is not a regular rules file"));
+    }
+    tokio::fs::read_to_string(path)
+        .await
+        .map_err(|_| refuse("cannot be read"))
+}
+
+/// Copy `content` to `<backup_dir>/<epoch ms>-<path with / as _>` (0600).
+async fn backup_file(backup_dir: &Path, path: &Path, content: &str) -> Result<(), RuleError> {
+    let name: String = path
+        .to_string_lossy()
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let target = backup_dir.join(format!("{}-{name}", aionui_common::now_ms()));
     let result = async {
-        tokio::fs::write(&tmp, text).await?;
+        tokio::fs::create_dir_all(backup_dir).await?;
+        write_new(&target, content).await
+    }
+    .await;
+    result.map_err(|e| {
+        tracing::error!(error = %e, "rules: backup failed; the file is not rewritten");
+        RuleError::Internal("cannot back up the rules file".to_owned())
+    })
+}
+
+/// Create `path` exclusively (`O_CREAT | O_EXCL`: never through an existing
+/// file or symlink) with mode 0600 and write `text`.
+async fn write_new(path: &Path, text: &str) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let mut opts = tokio::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    opts.mode(0o600);
+    let mut file = opts.open(path).await?;
+    file.write_all(text.as_bytes()).await?;
+    file.sync_all().await
+}
+
+/// Replace `path` (checked by [`read_for_write`] just before) through an
+/// exclusively created sibling temp file + rename, so no write ever goes
+/// through a symlink and a reader never sees half a file. The file keeps its
+/// previous permissions.
+async fn write_file(path: &Path, text: &str) -> Result<(), RuleError> {
+    let parent = path.parent().unwrap_or(Path::new("."));
+    let name = path
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let tmp = parent.join(format!(
+        ".{name}.{}.aionui-tmp",
+        aionui_common::generate_prefixed_id("w")
+    ));
+    let result = async {
+        let perms = tokio::fs::symlink_metadata(path).await.map(|m| m.permissions());
+        write_new(&tmp, text).await?;
+        if let Ok(perms) = perms {
+            tokio::fs::set_permissions(&tmp, perms).await?;
+        }
         tokio::fs::rename(&tmp, path).await
     }
     .await;
+    if result.is_err() {
+        let _ = tokio::fs::remove_file(&tmp).await;
+    }
     result.map_err(|e| {
         tracing::error!(error = %e, "rules: file write failed");
         RuleError::Internal("cannot write the rules file".to_owned())
     })
+}
+
+/// Lines only in `old` (`-`) and only in `new` (`+`), in order, at most 40.
+fn line_diff(old: &str, new: &str) -> String {
+    let old_lines: Vec<&str> = old.lines().collect();
+    let new_lines: Vec<&str> = new.lines().collect();
+    let mut out: Vec<String> = Vec::new();
+    for l in old_lines.iter().filter(|l| !new_lines.contains(l)) {
+        out.push(format!("- {l}"));
+    }
+    for l in new_lines.iter().filter(|l| !old_lines.contains(l)) {
+        out.push(format!("+ {l}"));
+    }
+    if out.is_empty() {
+        return "(only whitespace or line order differs)".to_owned();
+    }
+    let more = out.len().saturating_sub(40);
+    out.truncate(40);
+    if more > 0 {
+        out.push(format!("… {more} more changed lines"));
+    }
+    out.join("\n")
 }
 
 fn effective_response(rules: &[EffectiveRule]) -> RuleEffectiveResponse {

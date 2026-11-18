@@ -53,6 +53,7 @@ pub(crate) fn rule_api_error(err: RuleError) -> ApiError {
         RuleError::Stale(msg) => coded(StatusCode::CONFLICT, "RULE_STALE", msg),
         RuleError::AlreadyImported(msg) => coded(StatusCode::CONFLICT, "RULE_ALREADY_IMPORTED", msg),
         RuleError::NotFound(msg) => coded(StatusCode::NOT_FOUND, "RULE_NOT_FOUND", msg),
+        RuleError::FileChanged(msg) => coded(StatusCode::CONFLICT, "RULE_FILE_CHANGED", msg),
         RuleError::Internal(msg) => ApiError::Internal(msg),
     }
 }

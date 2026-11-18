@@ -842,7 +842,7 @@ pub fn build_mcp_state(
             .with_scratch_root(services.data_dir.join("run").join("servers")),
         )
         // Rules (C37).
-        .with_rules(crate::rules::rule_service(&services.database));
+        .with_rules(crate::rules::rule_service(&services.database, &services.data_dir));
 
     let adapters: Vec<Arc<dyn McpAgentAdapter>> = vec![
         Arc::new(ClaudeAdapter),
