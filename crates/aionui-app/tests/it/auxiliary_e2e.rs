@@ -449,3 +449,119 @@ async fn stop_stream_no_task() {
     // Stop with no active agent is idempotent.
     assert_eq!(resp.status(), StatusCode::OK);
 }
+
+// ── Conversation notices (TASK-137: the Token Pool says it switched accounts) ─────
+
+#[tokio::test]
+async fn a_notice_is_stored_and_pushed_live_to_its_owner() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass123").await;
+    let conv_id = create_conversation(&mut app, &token, &csrf, "Notice Test", "acp").await;
+    let mut bus = services.event_bus.subscribe();
+
+    let req = json_with_token(
+        "POST",
+        &format!("/api/conversations/{conv_id}/notices"),
+        json!({
+            "content": "Switched Claude account: Work → Personal (weekly limit, resets Fri 09:00).",
+            "tip_type": "warning",
+            "code": "TOKEN_POOL_SWITCHED",
+            "params": {"from": "Work", "to": "Personal"}
+        }),
+        &token,
+        &csrf,
+    );
+    let resp = app.clone().oneshot(req).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::CREATED);
+    let msg_id = body_json(resp).await["data"]["msg_id"].as_str().unwrap().to_owned();
+
+    // Live: one message.stream tips frame for this user and conversation.
+    let frame = loop {
+        let event = tokio::time::timeout(std::time::Duration::from_secs(2), bus.recv())
+            .await
+            .expect("a live frame")
+            .unwrap();
+        if event.name == "message.stream" && event.data["type"] == "tips" {
+            break event;
+        }
+    };
+    assert_eq!(frame.data["conversation_id"], conv_id.as_str());
+    assert_eq!(frame.data["msg_id"], msg_id.as_str());
+    assert!(frame.data["user_id"].is_string(), "routed to its user only");
+    assert_eq!(frame.data["data"]["code"], "TOKEN_POOL_SWITCHED");
+    assert_eq!(frame.data["data"]["type"], "warning");
+
+    // Stored: it is part of the conversation's history.
+    let resp = app
+        .clone()
+        .oneshot(get_with_token(
+            &format!("/api/conversations/{conv_id}/messages"),
+            &token,
+        ))
+        .await
+        .unwrap();
+    let body = body_json(resp).await.to_string();
+    assert!(
+        body.contains("TOKEN_POOL_SWITCHED") && body.contains("weekly limit"),
+        "{body}"
+    );
+}
+
+#[tokio::test]
+async fn a_notice_is_validated_and_owner_only() {
+    let (mut app, services) = build_app().await;
+    let (token, csrf) = setup_and_login(&mut app, &services, "user1", "pass123").await;
+    let conv_id = create_conversation(&mut app, &token, &csrf, "Notice Test", "acp").await;
+    let post = |body: serde_json::Value, token: &str, csrf: &str| {
+        json_with_token(
+            "POST",
+            &format!("/api/conversations/{conv_id}/notices"),
+            body,
+            token,
+            csrf,
+        )
+    };
+    for bad in [
+        json!({"content": "", "tip_type": "info"}),
+        json!({"content": "x", "tip_type": "error"}),
+        json!({"content": "x", "tip_type": "info", "code": "lower-case"}),
+        json!({"content": "x", "tip_type": "info", "params": [1, 2]}),
+        json!({"content": "x".repeat(501), "tip_type": "info"}),
+    ] {
+        let resp = app.clone().oneshot(post(bad.clone(), &token, &csrf)).await.unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST, "{bad}");
+    }
+    // Unknown fields are refused, not ignored.
+    let resp = app
+        .clone()
+        .oneshot(post(
+            json!({"content": "x", "tip_type": "info", "turn": true}),
+            &token,
+            &csrf,
+        ))
+        .await
+        .unwrap();
+    assert!(resp.status().is_client_error(), "{}", resp.status());
+
+    let (token2, csrf2) = setup_and_login(&mut app, &services, "user2", "pass123").await;
+    let resp = app
+        .clone()
+        .oneshot(post(json!({"content": "x", "tip_type": "info"}), &token2, &csrf2))
+        .await
+        .unwrap();
+    assert_eq!(
+        resp.status(),
+        StatusCode::NOT_FOUND,
+        "another user's conversation does not exist for them"
+    );
+
+    let no_csrf = axum::http::Request::builder()
+        .method("POST")
+        .uri(format!("/api/conversations/{conv_id}/notices"))
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(r#"{"content":"x","tip_type":"info"}"#))
+        .unwrap();
+    let resp = app.oneshot(no_csrf).await.unwrap();
+    assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+    assert_eq!(body_json(resp).await["code"], "CSRF_INVALID");
+}

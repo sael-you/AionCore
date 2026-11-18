@@ -3727,6 +3727,79 @@ impl ConversationService {
         Ok(())
     }
 
+    /// Post a visible system notice into the conversation (TASK-137: the Token
+    /// Pool says it switched accounts and why). Stored as a `tips` row and pushed
+    /// live on `message.stream`; never starts or touches a turn.
+    pub async fn post_notice(
+        &self,
+        user_id: &str,
+        conversation_id: &str,
+        req: aionui_api_types::PostConversationNoticeRequest,
+    ) -> Result<aionui_api_types::PostConversationNoticeResponse, ConversationError> {
+        let content = req.content.trim();
+        let bad = |reason: &str| ConversationError::BadRequest {
+            reason: reason.to_owned(),
+        };
+        if content.is_empty() || content.chars().count() > 500 {
+            return Err(bad("content must be 1-500 characters"));
+        }
+        if !matches!(req.tip_type.as_str(), "info" | "warning") {
+            return Err(bad("tip_type must be info or warning"));
+        }
+        if let Some(code) = &req.code
+            && (code.is_empty()
+                || code.len() > 64
+                || !code
+                    .chars()
+                    .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_'))
+        {
+            return Err(bad("code must be 1-64 characters [A-Z0-9_]"));
+        }
+        if let Some(params) = &req.params
+            && (!params.is_object() || params.to_string().len() > 2048)
+        {
+            return Err(bad("params must be a JSON object of at most 2 KB"));
+        }
+        self.conversation_repo
+            .get(user_id, conversation_id)
+            .await?
+            .ok_or_else(|| ConversationError::NotFound {
+                id: conversation_id.to_owned(),
+            })?;
+        let data = serde_json::json!({
+            "content": content,
+            "type": req.tip_type,
+            "code": req.code,
+            "params": req.params,
+        });
+        let row = aionui_db::models::MessageRow {
+            id: Self::mint_msg_id(),
+            conversation_id: conversation_id.to_owned(),
+            msg_id: None,
+            r#type: "tips".into(),
+            content: data.to_string(),
+            position: Some("center".into()),
+            status: Some("finish".into()),
+            hidden: false,
+            created_at: now_ms(),
+            backend_turn_id: None,
+        };
+        self.conversation_repo.insert_message(user_id, &row).await?;
+        self.broadcaster.broadcast(WebSocketMessage::new(
+            "message.stream",
+            serde_json::json!({
+                "user_id": user_id,
+                "conversation_id": conversation_id,
+                "msg_id": row.id,
+                "type": "tips",
+                "data": data,
+                "hidden": false,
+            }),
+        ));
+        info!(conversation_id, code = ?req.code, "conversation notice posted");
+        Ok(aionui_api_types::PostConversationNoticeResponse { msg_id: row.id })
+    }
+
     /// Answer a pending structured question (AskUserQuestion) over its
     /// DEDICATED channel (2026-08-05 ruling: not the permission confirm path).
     /// `answers: None` = the user dismissed the card (deny on the wire).

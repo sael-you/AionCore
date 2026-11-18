@@ -138,10 +138,10 @@ pub use conversation::{
     EXTRA_AUTO_CONTINUE_AFTER_RESTART, EXTRA_RESTART_INTERRUPTED, EnsureConversationRuntimeResponse,
     ForkCapabilityView, ForkConversationRequest, ListConversationsQuery, ListMessagesQuery, McpRuntimeSnapshot,
     MessageListResponse, MessageResponse, MessageSearchItem, MessageSearchResponse, MessageStatusChangedPayload,
-    OutcomeSeenResponse, PromptCapabilityView, ReparentConversationRequest, RestartAutoBlocked, RestartInterrupted,
-    RestartInterruptedKind, RestartInterruptedState, RestartResumeAction, RestartResumeRequest, RestartResumeResponse,
-    SearchMessagesQuery, SendMessageRequest, SendMessageResponse, SessionRef, UpdateConversationArtifactRequest,
-    UpdateConversationRequest,
+    OutcomeSeenResponse, PostConversationNoticeRequest, PostConversationNoticeResponse, PromptCapabilityView,
+    ReparentConversationRequest, RestartAutoBlocked, RestartInterrupted, RestartInterruptedKind,
+    RestartInterruptedState, RestartResumeAction, RestartResumeRequest, RestartResumeResponse, SearchMessagesQuery,
+    SendMessageRequest, SendMessageResponse, SessionRef, UpdateConversationArtifactRequest, UpdateConversationRequest,
 };
 pub use conversation_tools::{
     CONVERSATION_TOOLS_SCHEMA_VERSION, ConversationCliEnvelope, ConversationCliMeta, ConversationCreateAssistant,
