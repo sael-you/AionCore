@@ -86,6 +86,29 @@ async fn connect_bearer(
     ws.split()
 }
 
+/// Connect with a bearer token and consume the `realtime.hello {epoch, seq}`
+/// greeting, which is the first frame of every authenticated connection
+/// (TASK-43).
+async fn connect_ready(
+    addr: SocketAddr,
+    token: &str,
+) -> (
+    futures_util::stream::SplitSink<
+        tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+        tungstenite::Message,
+    >,
+    futures_util::stream::SplitStream<
+        tokio_tungstenite::WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>,
+    >,
+) {
+    let (tx, mut rx) = connect_bearer(addr, token).await;
+    let hello = read_text(&mut rx).await;
+    assert_eq!(hello["name"], "realtime.hello");
+    assert!(hello["data"]["epoch"].as_str().is_some_and(|e| !e.is_empty()));
+    assert!(hello["data"]["seq"].is_u64());
+    (tx, rx)
+}
+
 /// Connect with a Cookie header.
 async fn connect_cookie(
     addr: SocketAddr,
@@ -305,6 +328,25 @@ async fn t1_5_token_from_sec_websocket_protocol() {
     wait_for_clients(&app, 1).await;
 }
 
+#[tokio::test]
+async fn t1_6_first_frame_is_hello_with_epoch_and_seq() {
+    let app = start_app().await;
+    let token = sign_token(&app, "user1").await;
+
+    let (_tx, mut rx) = connect_bearer(app.addr, &token).await;
+    let hello = read_text(&mut rx).await;
+    assert_eq!(hello["name"], "realtime.hello");
+    let epoch = hello["data"]["epoch"].as_str().expect("epoch is a string");
+    assert!(!epoch.is_empty());
+    assert_eq!(hello["data"]["seq"], 0, "nothing was sent to this user yet");
+    assert!(hello.get("seq").is_none(), "the hello itself is not a stream frame");
+
+    // A second connection of the same server sees the same epoch.
+    let (_tx2, mut rx2) = connect_bearer(app.addr, &token).await;
+    let hello2 = read_text(&mut rx2).await;
+    assert_eq!(hello2["data"]["epoch"], epoch);
+}
+
 // ===========================================================================
 // T3 — Message format
 // ===========================================================================
@@ -314,7 +356,7 @@ async fn t3_1_valid_json_with_no_registered_route_returns_unsupported_error() {
     let app = start_app().await;
     let token = sign_token(&app, "user1").await;
 
-    let (mut tx, mut rx) = connect_bearer(app.addr, &token).await;
+    let (mut tx, mut rx) = connect_ready(app.addr, &token).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     let msg = json!({"name": "some-event", "data": {"key": "value"}});
@@ -329,7 +371,7 @@ async fn t3_2_invalid_json_returns_error() {
     let app = start_app().await;
     let token = sign_token(&app, "user1").await;
 
-    let (mut tx, mut rx) = connect_bearer(app.addr, &token).await;
+    let (mut tx, mut rx) = connect_ready(app.addr, &token).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     tx.send(send_json("not valid json")).await.unwrap();
@@ -343,7 +385,7 @@ async fn t3_3_missing_fields_returns_error() {
     let app = start_app().await;
     let token = sign_token(&app, "user1").await;
 
-    let (mut tx, mut rx) = connect_bearer(app.addr, &token).await;
+    let (mut tx, mut rx) = connect_ready(app.addr, &token).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     tx.send(send_json(r#"{"foo": "bar"}"#)).await.unwrap();
@@ -361,8 +403,8 @@ async fn t4_1_broadcast_reaches_all_clients() {
     let app = start_app().await;
     let token = sign_token(&app, "user1").await;
 
-    let (_, mut rx1) = connect_bearer(app.addr, &token).await;
-    let (_, mut rx2) = connect_bearer(app.addr, &token).await;
+    let (_, mut rx1) = connect_ready(app.addr, &token).await;
+    let (_, mut rx2) = connect_ready(app.addr, &token).await;
     wait_for_clients(&app, 2).await;
 
     let event = WebSocketMessage::new("test-broadcast", json!({"seq": 1}));
@@ -381,8 +423,8 @@ async fn t4_1_scoped_event_reaches_only_matching_user() {
     let token_a = sign_token(&app, "user-a").await;
     let token_b = sign_token(&app, "user-b").await;
 
-    let (_, mut rx_a) = connect_bearer(app.addr, &token_a).await;
-    let (_, mut rx_b) = connect_bearer(app.addr, &token_b).await;
+    let (_, mut rx_a) = connect_ready(app.addr, &token_a).await;
+    let (_, mut rx_b) = connect_ready(app.addr, &token_b).await;
     wait_for_clients(&app, 2).await;
     assert_eq!(ws_manager(&app).client_count_for_user("user-a"), 1);
     assert_eq!(ws_manager(&app).client_count_for_user("user-b"), 1);
@@ -405,7 +447,7 @@ async fn t4_1_unscoped_business_event_is_dropped_by_bridge() {
     let app = start_app().await;
     let token = sign_token(&app, "user-a").await;
 
-    let (_, mut rx) = connect_bearer(app.addr, &token).await;
+    let (_, mut rx) = connect_ready(app.addr, &token).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     app.services.event_bus.broadcast(WebSocketMessage::new(
@@ -423,8 +465,8 @@ async fn t4_1_whitelisted_global_event_reaches_all_users() {
     let token_a = sign_token(&app, "user-a").await;
     let token_b = sign_token(&app, "user-b").await;
 
-    let (_, mut rx_a) = connect_bearer(app.addr, &token_a).await;
-    let (_, mut rx_b) = connect_bearer(app.addr, &token_b).await;
+    let (_, mut rx_a) = connect_ready(app.addr, &token_a).await;
+    let (_, mut rx_b) = connect_ready(app.addr, &token_b).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     app.services.event_bus.broadcast(WebSocketMessage::new(
@@ -455,8 +497,8 @@ async fn t4_2_unicast_reaches_only_target() {
     let app = start_app().await;
     let token = sign_token(&app, "user1").await;
 
-    let (_, mut rx1) = connect_bearer(app.addr, &token).await;
-    let (_, mut rx2) = connect_bearer(app.addr, &token).await;
+    let (_, mut rx1) = connect_ready(app.addr, &token).await;
+    let (_, mut rx2) = connect_ready(app.addr, &token).await;
     wait_for_clients(&app, 2).await;
 
     let first_conn_id = ConnectionId(1);
@@ -475,8 +517,8 @@ async fn t4_3_broadcast_after_disconnect_no_error() {
     let app = start_app().await;
     let token = sign_token(&app, "user1").await;
 
-    let (mut tx1, _rx1) = connect_bearer(app.addr, &token).await;
-    let (_, mut rx2) = connect_bearer(app.addr, &token).await;
+    let (mut tx1, _rx1) = connect_ready(app.addr, &token).await;
+    let (_, mut rx2) = connect_ready(app.addr, &token).await;
     wait_for_clients(&app, 2).await;
 
     // Disconnect client 1
@@ -500,7 +542,7 @@ async fn t5_1_pong_does_not_generate_response() {
     let app = start_app().await;
     let token = sign_token(&app, "user1").await;
 
-    let (mut tx, mut rx) = connect_bearer(app.addr, &token).await;
+    let (mut tx, mut rx) = connect_ready(app.addr, &token).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     let pong = json!({"name": "pong", "data": {}});
@@ -515,7 +557,7 @@ async fn t5_2_subscribe_show_open_file_mode() {
     let app = start_app().await;
     let token = sign_token(&app, "user1").await;
 
-    let (mut tx, mut rx) = connect_bearer(app.addr, &token).await;
+    let (mut tx, mut rx) = connect_ready(app.addr, &token).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     let payload = json!({
@@ -536,7 +578,7 @@ async fn t5_3_subscribe_show_open_directory_mode() {
     let app = start_app().await;
     let token = sign_token(&app, "user1").await;
 
-    let (mut tx, mut rx) = connect_bearer(app.addr, &token).await;
+    let (mut tx, mut rx) = connect_ready(app.addr, &token).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     let payload = json!({
@@ -556,7 +598,7 @@ async fn t5_4_subscribe_show_open_mixed_mode() {
     let app = start_app().await;
     let token = sign_token(&app, "user1").await;
 
-    let (mut tx, mut rx) = connect_bearer(app.addr, &token).await;
+    let (mut tx, mut rx) = connect_ready(app.addr, &token).await;
     tokio::time::sleep(Duration::from_millis(50)).await;
 
     let payload = json!({
