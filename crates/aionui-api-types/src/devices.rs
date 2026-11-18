@@ -425,6 +425,19 @@ pub struct RelayError {
     pub message: String,
 }
 
+fn request_id<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<u64, D::Error> {
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Id {
+        Number(u64),
+        Text(String),
+    }
+    match Id::deserialize(deserializer)? {
+        Id::Number(n) => Ok(n),
+        Id::Text(s) => s.parse().map_err(serde::de::Error::custom),
+    }
+}
+
 /// Client → AionCore. The first frame is `pair` or `hello`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -457,6 +470,9 @@ pub enum RelayInbound {
         addons: Vec<RelayAddon>,
     },
     Response {
+        /// The `id` of the request. A peer may echo it as a JSON number or as
+        /// a numeric string (the Android companion does the latter).
+        #[serde(deserialize_with = "request_id")]
         id: u64,
         ok: bool,
         #[serde(default)]
@@ -653,5 +669,50 @@ mod tests {
             .unwrap(),
             json!({"type": "error", "code": "DEVICE_REVOKED"})
         );
+    }
+
+    /// TASK-172: every frame kind the Android companion sends, as its
+    /// serialiser writes it (strings from the app's `WireFixturesTest`, ui
+    /// `packages/android-companion/app/src/test/resources/wire/`). 0.2.0
+    /// echoes the request id as a number; 0.1.x echoed it as a STRING, which
+    /// core dropped as unreadable. Each frame must parse.
+    #[test]
+    fn companion_frames_parse() {
+        let frames = [
+            r#"{"type":"pair","code":"<CODE>","kind":"companion","name":"OnePlus Nord 4","version":"0.2.0","capabilities":["screenshot","ui_tree","tap","swipe","text","key","launch","foreground","click_text","set_text","stop"]}"#,
+            r#"{"type":"hello","token":"<TOKEN>","kind":"companion","version":"0.2.0","capabilities":["screenshot","ui_tree","tap","swipe","text","key","launch","foreground","click_text","set_text","stop"]}"#,
+            r#"{"type":"hello","token":"<TOKEN>","kind":"companion","version":"0.1.0","capabilities":["screenshot","ui_tree","tap","swipe","text","key","launch","foreground","stop"]}"#,
+            r#"{"type":"inventory","phones":[{"serial":"self","name":"OnePlus Nord 4","model":"CPH2663","android_version":"15","transport":"self","chrome":false,"enabled":true}],"addons":[]}"#,
+            r#"{"type":"response","id":1,"ok":true}"#,
+            r#"{"type":"response","id":2,"ok":true,"result":{"package":"com.example.app"}}"#,
+            r#"{"type":"response","id":2,"ok":true,"result":{"package":null}}"#,
+            r#"{"type":"response","id":3,"ok":true,"result":{"format":"png","width":2,"height":3,"data_base64":"AQID"}}"#,
+            r#"{"type":"response","id":4,"ok":false,"error":{"code":"switch_off","message":"the owner switched agents off on this phone"}}"#,
+            r#"{"type":"event","device":"self","name":"local_switch_off","data":{}}"#,
+            r#"{"type":"event","device":"self","name":"foreground","data":{"package":"com.example.app"}}"#,
+            r#"{"type":"ping"}"#,
+            // 0.2.0 final: more verbs and a `health` object core does not read yet.
+            r#"{"type":"pair","code":"<CODE>","kind":"companion","name":"OnePlus Nord 4","version":"0.2.0","capabilities":["screenshot","ui_tree","tap","swipe","text","key","global","launch","open_url","foreground","click_text","set_text","stop"],"health":{"battery_percent":80,"charging":true,"locked":false,"accessibility_on":true,"android_version":"15","model":"CPH2663"}}"#,
+            r#"{"type":"event","device":"self","name":"health","data":{"battery_percent":5,"charging":true,"locked":true,"accessibility_on":true,"android_version":"15","model":"CPH2663"}}"#,
+            // 0.1.0 / 0.1.1: the same answers with the id as a JSON string.
+            r#"{"type":"response","id":"1","ok":true}"#,
+            r#"{"type":"response","id":"2","ok":true,"result":{"package":"com.example.app"}}"#,
+            r#"{"type":"response","id":"3","ok":true,"result":{"format":"png","width":2,"height":3,"data_base64":"AQID"}}"#,
+            r#"{"type":"response","id":"4","ok":false,"error":{"code":"switch_off","message":"the owner switched agents off on this phone"}}"#,
+        ];
+        for frame in frames {
+            let parsed: Result<RelayInbound, _> = serde_json::from_str(frame);
+            assert!(parsed.is_ok(), "{frame}: {:?}", parsed.err());
+        }
+        for frame in [frames[5], frames[15]] {
+            let answer: RelayInbound = serde_json::from_str(frame).unwrap();
+            assert!(
+                matches!(answer, RelayInbound::Response { id: 2, ok: true, .. }),
+                "{frame}"
+            );
+        }
+        // An id that is not a number in either form stays an error.
+        assert!(serde_json::from_str::<RelayInbound>(r#"{"type":"response","id":"r1","ok":true}"#).is_err());
+        assert!(serde_json::from_str::<RelayInbound>(r#"{"type":"response","id":-1,"ok":true}"#).is_err());
     }
 }

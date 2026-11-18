@@ -531,7 +531,13 @@ impl DevicesService {
             disk_bytes: meta.get("disk_bytes").and_then(|v| v.as_u64()),
             version: meta.get("version").and_then(|v| v.as_str()).map(str::to_owned),
             job_id: self.job_for(&row.id),
-            last_seen_at: row.last_seen_at,
+            // The relay client's latest frame (it pings every 20 s) when that
+            // is newer than the row (written on inventory only).
+            last_seen_at: row
+                .pairing_id
+                .as_deref()
+                .and_then(|p| self.relay_last_frame(p))
+                .max(row.last_seen_at),
             routes,
             addon_host: (kind == DeviceKind::Addon).then(|| row.pairing_id.clone().unwrap_or_else(|| "server".into())),
         }

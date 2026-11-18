@@ -276,7 +276,10 @@ impl DevicesService {
         let reading = READING_VERBS.contains(&verb.as_str());
         let gated = acting || reading || verb == "install_apk";
         let front = if gated {
-            self.front_app(&user_id, &device_id, &row.kind).await
+            match self.front_app(&user_id, &device_id, &row.kind).await {
+                Ok(front) => front,
+                Err(error) => return Err(self.unreachable(&who, error).await),
+            }
         } else {
             None
         };
@@ -368,7 +371,10 @@ impl DevicesService {
         // crucial" verdict) was for THAT front app. If another app came to
         // the front meanwhile, nothing runs; the agent looks again.
         if gated && verb != "install_apk" {
-            let now_front = self.front_app(&user_id, &device_id, &row.kind).await;
+            let now_front = match self.front_app(&user_id, &device_id, &row.kind).await {
+                Ok(front) => front,
+                Err(error) => return Err(self.unreachable(&who, error).await),
+            };
             if now_front != front {
                 self.audit_call(
                     &who,
@@ -402,20 +408,35 @@ impl DevicesService {
         }
     }
 
+    /// The device is not connected or did not answer: one audit row, and the
+    /// coded error goes back at once (the owner is never asked about a device
+    /// that cannot be reached).
+    async fn unreachable(&self, who: &Who<'_>, error: DevicesError) -> DevicesError {
+        self.audit_call(who, DeviceAuditOutcome::Error, None, Some("DEVICE_OFFLINE"))
+            .await;
+        error
+    }
+
     /// The app in front on the device, asked from the device itself: Android
-    /// package (`foreground`) or macOS bundle id (`mac_foreground`). `None`
-    /// when the device cannot say (then the call is treated as crucial).
-    async fn front_app(&self, user_id: &str, device_id: &str, kind: &str) -> Option<String> {
+    /// package (`foreground`) or macOS bundle id (`mac_foreground`).
+    /// `Ok(None)` when the device answers but cannot say (then the call is
+    /// treated as crucial); `Err` when it is offline or does not answer
+    /// within [`crate::relay::QUICK_TIMEOUT`].
+    async fn front_app(&self, user_id: &str, device_id: &str, kind: &str) -> Result<Option<String>, DevicesError> {
         let (verb, field) = if kind == "mac" {
             ("mac_foreground", "bundle_id")
         } else {
             ("foreground", "package")
         };
-        self.routed_call(user_id, device_id, verb, serde_json::json!({}))
-            .await
-            .ok()
-            .and_then(|v| v.get(field).and_then(Value::as_str).map(str::to_owned))
-            .filter(|p| !p.trim().is_empty())
+        match self.routed_call(user_id, device_id, verb, serde_json::json!({})).await {
+            Ok(v) => Ok(v
+                .get(field)
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .filter(|p| !p.trim().is_empty())),
+            Err(error) if error.code() == Some(DeviceErrorCode::DeviceOffline) => Err(error),
+            Err(_) => Ok(None),
+        }
     }
 }
 
