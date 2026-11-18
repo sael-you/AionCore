@@ -45,6 +45,16 @@ pub const ENV_INSTANCES: &str = "AIONUI_CDP_INSTANCES";
 /// Read by playwright-cli / Playwright MCP: one `Name: value` header.
 pub const ENV_PLAYWRIGHT_HEADERS: &str = "PLAYWRIGHT_MCP_CDP_HEADERS";
 pub const TOKEN_HEADER: &str = "x-aionui-bridge-token";
+/// Read by playwright-cli for `attach --endpoint` (Camoufox instances): the
+/// same token header (verified: playwright-core 1.62 in @playwright/cli
+/// 0.1.17, coreBundle.js `configFromEnv` → `remoteHeaders` →
+/// `createRemoteBrowser`).
+pub const ENV_PLAYWRIGHT_REMOTE_HEADERS: &str = "PLAYWRIGHT_MCP_REMOTE_HEADERS";
+/// The pinned playwright-cli for Camoufox instances (only that client's
+/// Playwright minor matches the sidecar).
+pub const ENV_CAMOUFOX_CLI: &str = "AIONUI_CAMOUFOX_CLI";
+/// Path of the agents' endpoint on a Camoufox instance's bridge port.
+pub const PLAYWRIGHT_PATH: &str = "/playwright";
 
 /// What the bridge needs from the service.
 #[async_trait::async_trait]
@@ -54,6 +64,18 @@ pub trait BridgeBackend: Send + Sync {
     async fn agent_instance(&self, user_id: &str, instance: u8) -> Result<Arc<ChromeInstance>, BrowserError>;
     /// Checked on every agent message (the switch can flip mid-connection).
     fn agents_enabled(&self, user_id: &str) -> bool;
+    /// The running Camoufox instance for an agent's Playwright connection
+    /// (started on demand; TASK-136 K6). Backends without one refuse.
+    async fn agent_juggler(
+        &self,
+        _user_id: &str,
+        _instance: u8,
+    ) -> Result<Arc<crate::juggler::JugglerInstance>, BrowserError> {
+        Err(BrowserError::coded(
+            BrowserErrorCode::BrowserStartFailed,
+            "this instance has no Playwright endpoint",
+        ))
+    }
 }
 
 /// The listeners of one user.
@@ -123,6 +145,11 @@ impl AgentBridge {
                 ENV_PLAYWRIGHT_HEADERS.to_owned(),
                 format!("X-AionUi-Bridge-Token: {}", self.token.as_str()),
             ),
+            // `attach --endpoint` (Camoufox) reads its headers from here.
+            (
+                ENV_PLAYWRIGHT_REMOTE_HEADERS.to_owned(),
+                format!("X-AionUi-Bridge-Token: {}", self.token.as_str()),
+            ),
         ]
     }
 }
@@ -150,6 +177,7 @@ fn router(ctx: BridgeCtx) -> Router {
         .route("/json/list/", get(list))
         .route("/devtools/browser/{id}", get(ws_browser))
         .route("/devtools/page/{id}", get(ws_page))
+        .route(PLAYWRIGHT_PATH, get(ws_playwright))
         .with_state(ctx)
 }
 
@@ -242,6 +270,23 @@ async fn ws_page(
         );
     }
     upgrade(ctx, &headers, ws, Some(id)).await
+}
+
+/// Camoufox: the agent's Playwright connection, through [`crate::pwbridge`].
+async fn ws_playwright(State(ctx): State<BridgeCtx>, headers: HeaderMap, ws: WebSocketUpgrade) -> Response {
+    if !ctx.authorized(&headers) {
+        return StatusCode::UNAUTHORIZED.into_response();
+    }
+    let inst = match ctx.backend.agent_juggler(&ctx.user_id, ctx.instance).await {
+        Ok(i) => i,
+        Err(e) => return backend_error(e),
+    };
+    let forwarded = crate::pwbridge::forwarded_headers(&headers);
+    let (backend, user_id) = (ctx.backend.clone(), ctx.user_id.clone());
+    ws.max_message_size(crate::pwbridge::MAX_FRAME)
+        .on_upgrade(move |client| {
+            crate::pwbridge::pump(client, inst, forwarded, move || backend.agents_enabled(&user_id))
+        })
 }
 
 async fn upgrade(ctx: BridgeCtx, headers: &HeaderMap, ws: WebSocketUpgrade, page: Option<String>) -> Response {

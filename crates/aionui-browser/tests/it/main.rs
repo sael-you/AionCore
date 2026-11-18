@@ -3,4 +3,5 @@
 //! Files that mutate the process environment stay separate binaries in `tests/`.
 
 mod extension_relay;
+mod live_camoufox;
 mod live_chrome;

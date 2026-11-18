@@ -3,6 +3,7 @@
 //! ```text
 //! /root/.clauterm/aionui-browser/          root:root 0711 (traverse only)
 //!   chrome/<version>/chrome, chrome/current → <version>   root:root 0755
+//!   engines/<engine>/<version>/…, engines/<engine>/current   root:root 0755 (C35; Chrome stays in chrome/)
 //!   home/                                  aionui-browser 0700 (HOME of Chrome)
 //!   <user>/<n>/                            aionui-browser 0700 (profile of instance n)
 //! <data_dir>/browser/settings/<user>.json  root 0600 (settings, not reachable by the browser user)
@@ -17,7 +18,7 @@
 
 use std::path::{Path, PathBuf};
 
-use aionui_api_types::BrowserErrorCode;
+use aionui_api_types::{BrowserEngine, BrowserErrorCode};
 
 use crate::error::BrowserError;
 
@@ -26,7 +27,7 @@ pub const DEFAULT_BROWSER_ROOT: &str = "/root/.clauterm/aionui-browser";
 /// The unprivileged account Chrome and Xvfb run as.
 pub const BROWSER_USER: &str = "aionui-browser";
 /// Directory names under the root that are not user ids.
-const RESERVED: &[&str] = &["chrome", "home", "staging"];
+const RESERVED: &[&str] = &["cache", "chrome", "engines", "home", "staging"];
 
 #[derive(Debug, Clone)]
 pub struct BrowserLayout {
@@ -52,6 +53,29 @@ impl BrowserLayout {
 
     pub fn chrome_binary(&self) -> PathBuf {
         self.chrome_current().join("chrome")
+    }
+
+    /// Where `engine`'s versions live. Chrome keeps its C30 directory (no
+    /// move of an existing install); the other engines sit under `engines/`.
+    pub fn engine_dir(&self, engine: BrowserEngine) -> PathBuf {
+        match engine {
+            BrowserEngine::Chrome => self.chrome_dir(),
+            other => self.root.join("engines").join(other.id()),
+        }
+    }
+
+    pub fn engine_current(&self, engine: BrowserEngine) -> PathBuf {
+        self.engine_dir(engine).join("current")
+    }
+
+    pub fn engine_binary(&self, engine: BrowserEngine) -> PathBuf {
+        self.engine_current(engine).join(crate::engine::spec(engine).binary)
+    }
+
+    /// Verified engine archives kept for reinstalling without a new download
+    /// (root-only; TASK-136 K6).
+    pub fn cache_dir(&self) -> PathBuf {
+        self.root.join("cache")
     }
 
     pub fn home_dir(&self) -> PathBuf {
@@ -117,7 +141,16 @@ mod tests {
         );
         assert_eq!(l.chrome_binary(), PathBuf::from("/b/chrome/current/chrome"));
         assert_eq!(l.settings_dir(), PathBuf::from("/d/browser/settings"));
-        for bad in ["", "..", "a/b", "chrome", "home", "a b", &"x".repeat(129)] {
+        assert_eq!(l.engine_binary(BrowserEngine::Chrome), l.chrome_binary());
+        assert_eq!(
+            l.engine_binary(BrowserEngine::Edge),
+            PathBuf::from("/b/engines/edge/current/msedge")
+        );
+        assert_eq!(
+            l.engine_binary(BrowserEngine::HeadlessShell),
+            PathBuf::from("/b/engines/headless-shell/current/chrome-headless-shell")
+        );
+        for bad in ["", "..", "a/b", "chrome", "engines", "home", "a b", &"x".repeat(129)] {
             assert!(safe_user_segment(bad).is_err(), "{bad}");
         }
     }

@@ -1,0 +1,9 @@
+{
+  "name": "aionui-camoufox-sidecar",
+  "private": true,
+  "description": "AionUi's Camoufox sidecar runtime (TASK-136 K6): playwright-core for the sidecar and playwright-cli for agents, one pinned version.",
+  "license": "UNLICENSED",
+  "dependencies": {
+    "@playwright/cli": "0.1.17"
+  }
+}

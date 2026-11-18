@@ -2,29 +2,31 @@
 //! lifecycle (start on demand, idle stop, clear), and the agents' bridges.
 //! Sole place for business logic; `routes.rs` only translates.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 
 use aionui_api_types::{
-    BrowserErrorCode, BrowserInstanceCreate, BrowserInstancePatch, BrowserInstanceStatus, BrowserSettings,
-    BrowserSettingsUpdate, BrowserStatusResponse,
+    BROWSER_ENGINES, BrowserEngine, BrowserEngineStatus, BrowserErrorCode, BrowserInstanceCreate, BrowserInstancePatch,
+    BrowserInstanceStatus, BrowserSettings, BrowserSettingsUpdate, BrowserStatusResponse,
 };
 use dashmap::DashMap;
 use tokio::sync::Mutex;
 
 use crate::approvals::{ApprovalBroker, BrowserEventSink};
-use crate::bridge::{AgentBridge, BridgeBackend};
+use crate::bridge::{AgentBridge, BridgeBackend, ENV_CAMOUFOX_CLI};
 use crate::device_bridge::{DeviceBackend, DeviceListener, ENV_DEVICES, start_listener};
 use crate::devices::DeviceStore;
+use crate::engine::EngineProtocol;
 use crate::error::BrowserError;
 use crate::guard::NavigationGuard;
 use crate::host::{
     HostPaths, ensure_browser_user, existing_browser_user, harden_and_verify, prepare_dirs, reap_strays,
 };
-use crate::install::{ChromeInstaller, installed_version};
+use crate::install::{EngineInstaller, installed_version};
 use crate::instance::{ChromeInstance, LaunchSpec};
+use crate::juggler::{JugglerInstance, JugglerSpec};
 use crate::layout::BrowserLayout;
 use crate::panel::PanelBackend;
 use crate::relay::{DeviceHub, instance_name};
@@ -41,7 +43,8 @@ pub struct BrowserServiceConfig {
     pub host: Option<HostPaths>,
     pub idle_timeout: Duration,
     pub guard: NavigationGuard,
-    /// Use this Chrome binary instead of the managed install (dev/tests).
+    /// Use this browser binary instead of the managed installs, for every
+    /// engine (dev/tests).
     pub chrome_override: Option<PathBuf>,
     /// Run Chrome as this (uid, gid) instead of the `aionui-browser` account (tests).
     pub run_as_override: Option<(u32, u32)>,
@@ -49,13 +52,21 @@ pub struct BrowserServiceConfig {
 
 type Key = (String, u8);
 
+#[derive(Debug, Clone, Default)]
+struct InstallState {
+    installing: bool,
+    error: Option<String>,
+}
+
 pub struct BrowserService {
     /// This service's own `Arc` (trait methods only get `&self`).
     me: std::sync::Weak<BrowserService>,
     cfg: BrowserServiceConfig,
     settings: SettingsStore,
-    installer: ChromeInstaller,
+    installer: EngineInstaller,
     instances: DashMap<Key, Arc<ChromeInstance>>,
+    /// Camoufox instances (TASK-136 K6): Playwright sidecar, VNC panel.
+    juggler: DashMap<Key, Arc<JugglerInstance>>,
     start_locks: DashMap<Key, Arc<Mutex<()>>>,
     max_tabs: DashMap<String, Arc<AtomicU8>>,
     bridges: DashMap<String, AgentBridge>,
@@ -64,7 +75,8 @@ pub struct BrowserService {
     /// Reap + launch run one at a time: a reap must never see a Chrome that
     /// is launching but not yet registered.
     launch_lock: Mutex<()>,
-    install_error: std::sync::Mutex<Option<String>>,
+    /// Per engine: a download is running / why the last one failed.
+    install_state: std::sync::Mutex<std::collections::HashMap<BrowserEngine, InstallState>>,
     guard: Arc<NavigationGuard>,
     /// C34: paired devices of the owner's own browser.
     devices: Arc<DeviceHub>,
@@ -74,7 +86,7 @@ pub struct BrowserService {
 
 impl BrowserService {
     pub fn new(cfg: BrowserServiceConfig) -> Result<Arc<Self>, BrowserError> {
-        let installer = ChromeInstaller::new(cfg.layout.clone())?;
+        let installer = EngineInstaller::new(cfg.layout.clone())?;
         let settings = SettingsStore::new(cfg.layout.settings_dir());
         let guard = Arc::new(cfg.guard.clone());
         let devices = Arc::new(DeviceHub::new(
@@ -88,13 +100,14 @@ impl BrowserService {
             settings,
             installer,
             instances: DashMap::new(),
+            juggler: DashMap::new(),
             start_locks: DashMap::new(),
             max_tabs: DashMap::new(),
             bridges: DashMap::new(),
             bridge_lock: Mutex::new(()),
             install_lock: Mutex::new(()),
             launch_lock: Mutex::new(()),
-            install_error: std::sync::Mutex::new(None),
+            install_state: std::sync::Mutex::new(std::collections::HashMap::new()),
             guard,
             devices,
             device_listeners: DashMap::new(),
@@ -169,21 +182,48 @@ impl BrowserService {
 
     // -- status -----------------------------------------------------------
 
-    fn chrome_available(&self) -> Option<String> {
+    /// The installed version of `engine` (`"override"` with a dev binary).
+    fn engine_available(&self, engine: BrowserEngine) -> Option<String> {
         match &self.cfg.chrome_override {
             Some(p) => p.exists().then(|| "override".to_owned()),
-            None => installed_version(&self.cfg.layout),
+            None => installed_version(&self.cfg.layout, engine),
         }
+    }
+
+    fn set_install_state(&self, engine: BrowserEngine, change: impl FnOnce(&mut InstallState)) {
+        let mut states = self.install_state.lock().unwrap_or_else(|p| p.into_inner());
+        change(states.entry(engine).or_default());
+    }
+
+    fn engine_statuses(&self) -> Vec<BrowserEngineStatus> {
+        let states = self.install_state.lock().unwrap_or_else(|p| p.into_inner()).clone();
+        BROWSER_ENGINES
+            .into_iter()
+            .map(|engine| {
+                let spec = crate::engine::spec(engine);
+                let state = states.get(&engine).cloned().unwrap_or_default();
+                BrowserEngineStatus {
+                    engine,
+                    installed_version: self.engine_available(engine),
+                    installing: state.installing,
+                    error: state.error,
+                    verification: spec.verification(),
+                    agents_only: spec.agents_only(),
+                    panel: spec.panel(),
+                }
+            })
+            .collect()
     }
 
     pub fn status(self: &Arc<Self>, user_id: &str) -> Result<BrowserStatusResponse, BrowserError> {
         let s = self.settings(user_id)?;
-        let version = self.chrome_available();
+        // `available` is about the default engine (Chrome), as before C35.
+        let version = self.engine_available(BrowserEngine::Chrome);
         if version.is_none() {
             // First use: install in the background; the UI polls status.
             let svc = self.clone();
             tokio::spawn(async move {
-                let _ = svc.ensure_chrome().await;
+                let _ = svc.ensure_engine(BrowserEngine::Chrome).await;
             });
         }
         let instances = s
@@ -191,15 +231,19 @@ impl BrowserService {
             .iter()
             .map(|row| {
                 let inst = self.running(user_id, row.instance);
+                let jug = self.running_juggler(user_id, row.instance);
                 BrowserInstanceStatus {
                     instance: row.instance,
                     name: row.name.clone(),
                     color: row.color.clone(),
                     emoji: row.emoji.clone(),
-                    running: inst.is_some(),
+                    running: inst.is_some() || jug.is_some(),
                     tabs: inst.as_ref().map(|i| i.tab_count() as u16).unwrap_or(0),
-                    agent_active: inst.as_ref().is_some_and(|i| i.agent_active()),
+                    agent_active: inst.as_ref().is_some_and(|i| i.agent_active())
+                        || jug.as_ref().is_some_and(|j| j.agent_active()),
                     hide_automation_active: inst.as_ref().is_some_and(|i| i.hide_automation),
+                    engine: row.engine,
+                    engine_active: inst.as_ref().map(|i| i.engine).or(jug.as_ref().map(|j| j.engine)),
                 }
             })
             .collect();
@@ -209,57 +253,100 @@ impl BrowserService {
             chrome_version: version,
             instances,
             idle_timeout_secs: self.cfg.idle_timeout.as_secs(),
+            engines: self.engine_statuses(),
         })
     }
 
     // -- install ------------------------------------------------------------
 
-    /// The Chrome binary to launch; installs on first use (single flight).
-    async fn ensure_chrome(&self) -> Result<PathBuf, BrowserError> {
+    /// The binary of `engine` to launch; installs on first use (single flight).
+    async fn ensure_engine(&self, engine: BrowserEngine) -> Result<PathBuf, BrowserError> {
         if let Some(p) = &self.cfg.chrome_override {
             return Ok(p.clone());
         }
-        if installed_version(&self.cfg.layout).is_some() {
-            return Ok(self.cfg.layout.chrome_binary());
+        let binary = self.cfg.layout.engine_binary(engine);
+        if installed_version(&self.cfg.layout, engine).is_some() {
+            return Ok(binary);
         }
         let _guard = self.install_lock.lock().await;
-        if installed_version(&self.cfg.layout).is_some() {
-            return Ok(self.cfg.layout.chrome_binary());
+        if installed_version(&self.cfg.layout, engine).is_some() {
+            return Ok(binary);
         }
-        tracing::info!("installing Chrome for the server browser");
-        let result = async {
-            let entry = self.installer.latest().await?;
-            let version = self.installer.install(&entry).await?;
-            self.installer.activate(&version)?;
-            tracing::info!(chrome = %version, "Chrome installed for the server browser");
-            Ok::<_, BrowserError>(self.cfg.layout.chrome_binary())
-        }
-        .await;
-        if let Err(e) = &result {
-            tracing::error!(error = %e, "Chrome install failed");
-            *self.install_error.lock().unwrap_or_else(|p| p.into_inner()) = Some(e.to_string());
-        }
-        result.map_err(|_| BrowserError::coded(BrowserErrorCode::BrowserUnavailable, "Chrome is not installed"))
+        self.install_latest(engine).await.map_err(|_| {
+            BrowserError::coded(
+                BrowserErrorCode::BrowserUnavailable,
+                format!("the {} engine is not installed", engine.id()),
+            )
+        })?;
+        Ok(binary)
     }
 
-    /// Daily: install a newer stable; switch to it only while nothing runs.
-    async fn update_check(&self) {
-        if self.cfg.chrome_override.is_some() || installed_version(&self.cfg.layout).is_none() {
-            return;
-        }
-        let _guard = self.install_lock.lock().await;
+    /// Download the newest release of `engine` and switch to it unless an
+    /// instance of that engine runs (then the next check switches). The
+    /// caller holds `install_lock`.
+    async fn install_latest(&self, engine: BrowserEngine) -> Result<(), BrowserError> {
+        self.set_install_state(engine, |s| s.installing = true);
         let result = async {
-            let entry = self.installer.latest().await?;
-            let version = self.installer.install(&entry).await?;
-            if installed_version(&self.cfg.layout).as_deref() != Some(version.as_str()) && self.instances.is_empty() {
-                self.installer.activate(&version)?;
-                tracing::info!(chrome = %version, "server browser Chrome updated");
+            let release = self.installer.latest(engine).await?;
+            let version = self.installer.install(engine, &release).await?;
+            let current = installed_version(&self.cfg.layout, engine);
+            let in_use = self.instances.iter().any(|e| e.value().engine == engine)
+                || self.juggler.iter().any(|e| e.value().engine == engine);
+            if current.as_deref() != Some(version.as_str()) && (current.is_none() || !in_use) {
+                self.installer.activate(engine, &version)?;
+                tracing::info!(engine = engine.id(), %version, verification = ?crate::engine::spec(engine).verification(), "server browser engine installed");
             }
             Ok::<_, BrowserError>(())
         }
         .await;
-        if let Err(e) = result {
-            tracing::warn!(error = %e, "Chrome update check failed");
+        if let Err(e) = &result {
+            tracing::error!(engine = engine.id(), error = %e, "server browser engine install failed");
+        }
+        let error = result.as_ref().err().map(|e| {
+            let mut text = e.to_string();
+            text.truncate(300);
+            text
+        });
+        self.set_install_state(engine, |s| {
+            s.installing = false;
+            s.error = error;
+        });
+        result
+    }
+
+    /// Settings → Browser "Download" / "Update" (C35): fetch the newest
+    /// release of `engine` in the background; the UI polls `status`.
+    pub fn install_engine(
+        self: &Arc<Self>,
+        user_id: &str,
+        engine: BrowserEngine,
+    ) -> Result<BrowserStatusResponse, BrowserError> {
+        if self.cfg.chrome_override.is_none() {
+            // Shown at once; the task below owns the state from here.
+            self.set_install_state(engine, |s| s.installing = true);
+            let svc = self.clone();
+            tokio::spawn(async move {
+                let _guard = svc.install_lock.lock().await;
+                let _ = svc.install_latest(engine).await;
+            });
+        }
+        self.status(user_id)
+    }
+
+    /// Daily: install a newer release of every installed engine; switch to it
+    /// only while no instance of that engine runs.
+    async fn update_check(&self) {
+        if self.cfg.chrome_override.is_some() {
+            return;
+        }
+        for engine in BROWSER_ENGINES {
+            if installed_version(&self.cfg.layout, engine).is_none() {
+                continue;
+            }
+            let _guard = self.install_lock.lock().await;
+            if let Err(e) = self.install_latest(engine).await {
+                tracing::warn!(engine = engine.id(), error = %e, "server browser engine update check failed");
+            }
         }
     }
 
@@ -271,8 +358,10 @@ impl BrowserService {
         let Some((uid, gid)) = self.cfg.run_as_override.or_else(existing_browser_user) else {
             return 0;
         };
-        let keep: Vec<u32> = self.instances.iter().flat_map(|e| e.value().process_groups()).collect();
-        let profiles: Vec<PathBuf> = self.instances.iter().map(|e| e.value().profile.clone()).collect();
+        let mut keep: Vec<u32> = self.instances.iter().flat_map(|e| e.value().process_groups()).collect();
+        keep.extend(self.juggler.iter().flat_map(|e| e.value().process_groups()));
+        let mut profiles: Vec<PathBuf> = self.instances.iter().map(|e| e.value().profile.clone()).collect();
+        profiles.extend(self.juggler.iter().map(|e| e.value().profile.clone()));
         reap_strays(uid, gid, &keep, &profiles).await
     }
 
@@ -338,6 +427,7 @@ impl BrowserService {
                 "the profile is busy",
             ));
         };
+        self.stop_juggler(user_id, n).await;
         if let Some(inst) = self.running(user_id, n) {
             inst.stop().await;
             self.instances.remove(&key);
@@ -370,7 +460,14 @@ impl BrowserService {
         if let Some(i) = self.running(user_id, n) {
             return Ok(i);
         }
-        let chrome = self.ensure_chrome().await?;
+        let engine = self.settings.engine(user_id, n)?;
+        if crate::engine::spec(engine).protocol == EngineProtocol::Juggler {
+            return Err(BrowserError::coded(
+                BrowserErrorCode::BrowserStartFailed,
+                "this instance runs Camoufox: use its VNC panel and Playwright endpoint",
+            ));
+        }
+        let chrome = self.ensure_engine(engine).await?;
         if let Some(host) = &self.cfg.host {
             harden_and_verify(host)?;
         }
@@ -385,6 +482,7 @@ impl BrowserService {
         let inst = ChromeInstance::launch(LaunchSpec {
             user_id: user_id.to_owned(),
             instance: n,
+            engine,
             chrome,
             home: crate::host::instance_home(&profile),
             profile,
@@ -408,7 +506,103 @@ impl BrowserService {
         Ok(inst)
     }
 
+    /// Whether instance `n` runs a Juggler engine (Camoufox).
+    pub fn is_juggler_instance(&self, user_id: &str, n: u8) -> bool {
+        self.settings
+            .engine(user_id, n)
+            .is_ok_and(|e| crate::engine::spec(e).protocol == EngineProtocol::Juggler)
+    }
+
+    /// The running Camoufox instance `n`, if any.
+    pub fn running_juggler(&self, user_id: &str, n: u8) -> Option<Arc<JugglerInstance>> {
+        let key = (user_id.to_owned(), n);
+        let inst = self.juggler.get(&key)?.clone();
+        if inst.is_running() {
+            Some(inst)
+        } else {
+            self.juggler.remove(&key);
+            None
+        }
+    }
+
+    /// Start Camoufox instance `n` (or return the running one): the VNC
+    /// panel and the agents' Playwright endpoint start it (TASK-136 K6).
+    pub async fn start_juggler(self: &Arc<Self>, user_id: &str, n: u8) -> Result<Arc<JugglerInstance>, BrowserError> {
+        self.start_juggler_inner(user_id, n)
+            .await
+            .map_err(|e| start_failure(user_id, n, e))
+    }
+
+    async fn start_juggler_inner(self: &Arc<Self>, user_id: &str, n: u8) -> Result<Arc<JugglerInstance>, BrowserError> {
+        self.check_instance(user_id, n)?;
+        if let Some(i) = self.running_juggler(user_id, n) {
+            return Ok(i);
+        }
+        let key = (user_id.to_owned(), n);
+        let lock = self.start_locks.entry(key.clone()).or_default().clone();
+        let _held = lock.lock().await;
+        if let Some(i) = self.running_juggler(user_id, n) {
+            return Ok(i);
+        }
+        let engine = self.settings.engine(user_id, n)?;
+        if crate::engine::spec(engine).protocol != EngineProtocol::Juggler {
+            return Err(BrowserError::coded(
+                BrowserErrorCode::BrowserStartFailed,
+                "this instance is not a Camoufox instance",
+            ));
+        }
+        let binary = self.ensure_engine(engine).await?;
+        let version_dir = binary
+            .parent()
+            .map(Path::to_path_buf)
+            .ok_or_else(|| BrowserError::Internal("engine path".into()))?;
+        if let Some(host) = &self.cfg.host {
+            harden_and_verify(host)?;
+        }
+        let (uid, gid) = match self.cfg.run_as_override {
+            Some(ids) => ids,
+            None => ensure_browser_user().await?,
+        };
+        let profile = prepare_dirs(&self.cfg.layout, user_id, n, uid, gid).await?;
+        let launching = self.launch_lock.lock().await;
+        self.reap_orphans().await;
+        let inst = JugglerInstance::launch(JugglerSpec {
+            user_id: user_id.to_owned(),
+            instance: n,
+            version_dir,
+            home: crate::host::instance_home(&profile),
+            profile,
+            uid,
+            gid,
+            max_tabs: self.max_tabs_cell(user_id),
+            guard: self.guard.clone(),
+        })
+        .await?;
+        self.juggler.insert(key.clone(), inst.clone());
+        drop(launching);
+        let weak = Arc::downgrade(self);
+        let watched = inst.clone();
+        tokio::spawn(async move {
+            watched.exited().await;
+            if let Some(svc) = weak.upgrade() {
+                svc.juggler.remove_if(&key, |_, v| Arc::ptr_eq(v, &watched));
+            }
+        });
+        Ok(inst)
+    }
+
+    /// Stop a running Camoufox instance `n`; true when one ran.
+    async fn stop_juggler(&self, user_id: &str, n: u8) -> bool {
+        let key = (user_id.to_owned(), n);
+        let Some((_, inst)) = self.juggler.remove(&key) else {
+            return false;
+        };
+        inst.stop().await;
+        true
+    }
+
     pub async fn stop(self: &Arc<Self>, user_id: &str, n: u8) -> Result<BrowserStatusResponse, BrowserError> {
+        self.stop_juggler(user_id, n).await;
         if let Some(inst) = self.running(user_id, n) {
             inst.stop().await;
             self.instances.remove(&(user_id.to_owned(), n));
@@ -427,6 +621,7 @@ impl BrowserService {
                 "the profile is busy",
             ));
         };
+        let was_juggler = self.stop_juggler(user_id, n).await;
         let was_running = match self.running(user_id, n) {
             Some(inst) => {
                 inst.stop().await;
@@ -446,6 +641,9 @@ impl BrowserService {
         if was_running {
             self.start(user_id, n).await?;
         }
+        if was_juggler {
+            self.start_juggler(user_id, n).await?;
+        }
         self.status(user_id)
     }
 
@@ -460,6 +658,18 @@ impl BrowserService {
             tracing::info!(user_id = %inst.user_id, instance = inst.instance, "server browser idle; stopping");
             inst.stop().await;
             self.instances
+                .remove_if(&(inst.user_id.clone(), inst.instance), |_, v| Arc::ptr_eq(v, &inst));
+        }
+        let idle: Vec<Arc<JugglerInstance>> = self
+            .juggler
+            .iter()
+            .filter(|e| e.value().idle_ms() > self.cfg.idle_timeout.as_millis() as i64)
+            .map(|e| e.value().clone())
+            .collect();
+        for inst in idle {
+            tracing::info!(user_id = %inst.user_id, instance = inst.instance, "camoufox idle; stopping");
+            inst.stop().await;
+            self.juggler
                 .remove_if(&(inst.user_id.clone(), inst.instance), |_, v| Arc::ptr_eq(v, &inst));
         }
     }
@@ -484,9 +694,17 @@ impl BrowserService {
             .unwrap_or_default()
             .iter()
             .filter_map(|row| {
-                bridge
-                    .port_of(row.instance)
-                    .map(|port| serde_json::json!({"instance": row.instance, "name": row.name, "port": port}))
+                bridge.port_of(row.instance).map(|port| {
+                    let mut entry = serde_json::json!({
+                        "instance": row.instance, "name": row.name, "port": port, "engine": row.engine.id(),
+                    });
+                    // Camoufox: playwright-cli `attach --endpoint` (pinned client), not `--cdp`.
+                    if crate::engine::spec(row.engine).protocol == EngineProtocol::Juggler {
+                        entry["protocol"] = "playwright".into();
+                        entry["endpoint"] = format!("ws://127.0.0.1:{port}{}", crate::bridge::PLAYWRIGHT_PATH).into();
+                    }
+                    entry
+                })
             })
             .collect();
         // C34: the owner's own browser is one more entry next to the named
@@ -504,6 +722,19 @@ impl BrowserService {
             crate::bridge::ENV_INSTANCES.to_owned(),
             serde_json::Value::Array(instances).to_string(),
         ));
+        if installed_version(&self.cfg.layout, BrowserEngine::Camoufox).is_some() {
+            // The client pinned to Camoufox's Playwright (a newer playwright-cli is refused).
+            env.push((
+                ENV_CAMOUFOX_CLI.to_owned(),
+                self.cfg
+                    .layout
+                    .engine_current(BrowserEngine::Camoufox)
+                    .join(crate::camoufox::SIDECAR_DIR)
+                    .join("node_modules/.bin/playwright-cli")
+                    .to_string_lossy()
+                    .into_owned(),
+            ));
+        }
         if !devices.is_empty() {
             env.push((ENV_DEVICES.to_owned(), serde_json::Value::Array(devices).to_string()));
         }
@@ -615,6 +846,19 @@ impl BridgeBackend for BrowserService {
 
     fn agents_enabled(&self, user_id: &str) -> bool {
         self.agents_enabled_now(user_id)
+    }
+
+    async fn agent_juggler(&self, user_id: &str, instance: u8) -> Result<Arc<JugglerInstance>, BrowserError> {
+        if !self.agents_enabled_now(user_id) {
+            return Err(BrowserError::coded(
+                BrowserErrorCode::BrowserAgentsDisabled,
+                "agents may not use the browser",
+            ));
+        }
+        let me = self
+            .self_arc()
+            .ok_or_else(|| BrowserError::Internal("browser service gone".into()))?;
+        me.start_juggler(user_id, instance).await
     }
 }
 

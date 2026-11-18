@@ -591,3 +591,228 @@ async fn live_server_browser_end_to_end() {
         "stop leaves no browser process"
     );
 }
+
+/// C35 (TASK-134): every engine of the Chromium family is downloaded through
+/// its own verified chain, starts with the same protections and renders a
+/// public page. Opt-in: `AIONUI_BROWSER_LIVE_ENGINES=1` (network, ~700 MB of
+/// downloads, Xvfb, root). Runs as `nobody`, not as the `aionui-browser`
+/// account: a test service reaps untracked processes of its account, which
+/// would stop a production browser started meanwhile.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn live_every_engine_installs_starts_and_renders() {
+    use aionui_api_types::{BROWSER_ENGINES, BrowserEngine, BrowserEngineVerification, BrowserInstancePatch};
+
+    if std::env::var("AIONUI_BROWSER_LIVE_ENGINES").is_err() {
+        return;
+    }
+    const UID: u32 = 65534;
+    let only = std::env::var("AIONUI_BROWSER_LIVE_ENGINE").ok();
+    // `AIONUI_BROWSER_LIVE_ENGINES_ROOT` keeps the downloads between runs.
+    let t = tempfile::Builder::new()
+        .prefix("c35-live")
+        .tempdir_in("/var/tmp")
+        .unwrap();
+    let base = std::env::var_os("AIONUI_BROWSER_LIVE_ENGINES_ROOT")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| t.path().to_path_buf());
+    std::fs::create_dir_all(&base).unwrap();
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&base, std::fs::Permissions::from_mode(0o711)).unwrap();
+    }
+    let layout = BrowserLayout::new(base.join("aionui-browser"), base.join("data"));
+    let svc = BrowserService::new(BrowserServiceConfig {
+        layout: layout.clone(),
+        host: None,
+        idle_timeout: Duration::from_secs(900),
+        guard: NavigationGuard::from_origins(["https://y.talkseeds.com"]),
+        chrome_override: None,
+        run_as_override: Some((UID, UID)),
+    })
+    .unwrap();
+    let user = "engine_user";
+    let account_processes = || {
+        let out = std::process::Command::new("ps")
+            .args(["-u", &UID.to_string(), "-o", "comm=,args="])
+            .output()
+            .unwrap();
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+
+    // Camoufox is not a CDP engine: `live_camoufox` covers it.
+    for engine in BROWSER_ENGINES
+        .into_iter()
+        .filter(|e| aionui_browser::engine::spec(*e).protocol == aionui_browser::engine::EngineProtocol::Cdp)
+    {
+        if only.as_deref().is_some_and(|o| o != engine.id()) {
+            continue;
+        }
+        let spec = aionui_browser::engine::spec(engine);
+        svc.patch_instance(
+            user,
+            1,
+            &BrowserInstancePatch {
+                engine: Some(engine),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+        // 1. First start downloads the engine through its chain and records it.
+        let t0 = std::time::Instant::now();
+        let inst = match svc.start(user, 1).await {
+            Ok(inst) => inst,
+            Err(e) => panic!(
+                "{engine:?} starts: {e}; engines: {:?}",
+                svc.status(user).unwrap().engines
+            ),
+        };
+        assert_eq!(inst.engine, engine);
+        let status = svc.status(user).unwrap();
+        assert_eq!(status.instances[0].engine_active, Some(engine));
+        let row = status.engines.iter().find(|e| e.engine == engine).unwrap();
+        let version = row.installed_version.clone().expect("installed version reported");
+        assert_eq!(row.error, None);
+        let record: Value = serde_json::from_slice(
+            &std::fs::read(
+                layout
+                    .engine_current(engine)
+                    .join(aionui_browser::install::VERIFY_RECORD),
+            )
+            .unwrap(),
+        )
+        .unwrap();
+        let want = match spec.verification() {
+            BrowserEngineVerification::SignedRepository => "signed-repository",
+            BrowserEngineVerification::TlsOnly => "tls-only",
+            BrowserEngineVerification::PinnedSha256 => "pinned-sha256",
+        };
+        assert_eq!(record["verification"], want, "{engine:?}");
+        assert_eq!(record["sha256"].as_str().map(str::len), Some(64));
+        eprintln!(
+            "{}: version {version} (reports {}), {want}, sha256 {}, install+start {} ms",
+            engine.id(),
+            inst.version,
+            record["sha256"].as_str().unwrap(),
+            t0.elapsed().as_millis()
+        );
+
+        // 2. Same protections: the engine's binary runs as the account with
+        //    the pipe, the proxy and no debugging port; no crash handler.
+        let ps = account_processes();
+        let main = ps
+            .lines()
+            .find(|l| l.contains("--remote-debugging-pipe") && !l.contains("--type="))
+            .unwrap_or_else(|| panic!("{engine:?}: no browser process as the account:\n{ps}"));
+        assert!(
+            main.contains(&format!("/{} ", spec.binary)),
+            "{engine:?} runs its own binary: {main}"
+        );
+        assert!(main.contains("--proxy-server=http://127.0.0.1:") && main.contains("--proxy-bypass-list=<-loopback>"));
+        assert!(!ps.contains("--remote-debugging-port"), "{ps}");
+        assert_eq!(
+            ps.lines().any(|l| l.starts_with("Xvfb")),
+            spec.needs_display,
+            "{engine:?} Xvfb only for headful engines:\n{ps}"
+        );
+        // comm is the first column (arguments mention `--crashpad-handler-pid`).
+        assert!(
+            !ps.lines()
+                .any(|l| l.split_whitespace().next().is_some_and(|c| c.contains("crashpad"))),
+            "{engine:?} crash handler still runs:\n{ps}"
+        );
+
+        // 3. A public page renders through the bridge: Discord's login form.
+        let env: HashMap<_, _> = svc.agent_env(user).await.into_iter().collect();
+        let mut agent = Agent::connect(&env[ENV_ACTIVE_PORT], &env[ENV_ACTIVE_TOKEN]).await;
+        let created = agent
+            .call("Target.createTarget", json!({"url": "about:blank"}), None)
+            .await;
+        let target = created["result"]["targetId"].as_str().expect("target").to_owned();
+        let attached = agent
+            .call(
+                "Target.attachToTarget",
+                json!({"targetId": target, "flatten": true}),
+                None,
+            )
+            .await;
+        let session = attached["result"]["sessionId"].as_str().expect("session").to_owned();
+        let cookies = agent.call("Network.getAllCookies", json!({}), None).await;
+        assert!(
+            cookies["error"].is_object(),
+            "{engine:?} filter still refuses cookies: {cookies}"
+        );
+        let nav = agent
+            .call(
+                "Page.navigate",
+                json!({"url": "https://discord.com/login"}),
+                Some(&session),
+            )
+            .await;
+        assert!(nav["result"]["frameId"].is_string(), "{engine:?} {nav}");
+        let mut discord = Value::Null;
+        for _ in 0..30 {
+            tokio::time::sleep(Duration::from_secs(1)).await;
+            discord = agent
+                .call(
+                    "Runtime.evaluate",
+                    json!({"expression": "!!document.querySelector('input[name=email]')", "returnByValue": true}),
+                    Some(&session),
+                )
+                .await;
+            if discord["result"]["result"]["value"] == json!(true) {
+                break;
+            }
+        }
+        if discord["result"]["result"]["value"] != json!(true) {
+            let seen = agent
+                .call(
+                    "Runtime.evaluate",
+                    json!({"expression": "location.href + ' | ' + document.title + ' | ' + (document.body ? document.body.innerText.slice(0, 300) : '')", "returnByValue": true}),
+                    Some(&session),
+                )
+                .await;
+            svc.stop(user, 1).await.unwrap();
+            panic!("{engine:?}: Discord login did not render: {discord}; page: {seen}");
+        }
+        let blocked = agent
+            .call(
+                "Page.navigate",
+                json!({"url": "https://y.talkseeds.com/"}),
+                Some(&session),
+            )
+            .await;
+        assert!(
+            blocked["result"]["errorText"]
+                .as_str()
+                .unwrap_or("")
+                .contains("BLOCKED"),
+            "{engine:?} guard blocks the AionUi origin: {blocked}"
+        );
+
+        // 4. No TCP listener owned by the account (CDP is the pipe only).
+        for table in ["/proc/net/tcp", "/proc/net/tcp6"] {
+            let text = std::fs::read_to_string(table).unwrap_or_default();
+            let listening: Vec<&str> = text
+                .lines()
+                .skip(1)
+                .filter(|l| {
+                    let f: Vec<&str> = l.split_whitespace().collect();
+                    f.len() > 7 && f[3] == "0A" && f[7] == UID.to_string()
+                })
+                .collect();
+            assert!(listening.is_empty(), "{engine:?} {table}: listens on {listening:?}");
+        }
+
+        drop(agent);
+        svc.stop(user, 1).await.unwrap();
+        tokio::time::sleep(Duration::from_secs(1)).await;
+        assert_eq!(account_processes().trim(), "", "{engine:?} left processes behind");
+        eprintln!("{}: OK", engine.id());
+    }
+    // Engines sit side by side; Chrome keeps its C30 directory.
+    if only.is_none() {
+        assert!(layout.chrome_binary().exists());
+        assert!(layout.engine_binary(BrowserEngine::Edge).exists());
+    }
+}

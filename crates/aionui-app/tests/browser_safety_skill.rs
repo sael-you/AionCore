@@ -88,3 +88,19 @@ fn the_owners_own_browser_is_named_and_its_pauses_are_respected() {
     assert!(prose.contains("never retry"), "{prose}");
     assert!(prose.contains("instead of switching to a server profile"), "{prose}");
 }
+
+#[test]
+fn camoufox_profiles_use_the_pinned_client_and_the_endpoint() {
+    let prose = skill_prose();
+    assert!(prose.contains("\"engine\": \"camoufox\""), "{prose}");
+    assert!(
+        prose.contains("\"$AIONUI_CAMOUFOX_CLI\" -s=aionui-stealth attach --endpoint \"$endpoint\""),
+        "{prose}"
+    );
+    assert!(prose.contains("never `--cdp`"), "{prose}");
+    assert!(prose.contains("`close` only detaches"), "{prose}");
+    assert!(
+        prose.contains("does not make bulk or automated use of a site acceptable"),
+        "{prose}"
+    );
+}
