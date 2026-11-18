@@ -73,6 +73,24 @@ impl From<ConversationError> for ApiError {
                     "requested": requested,
                 })),
             ),
+            ConversationError::TurnRunning { conversation_id } => ApiError::coded(
+                StatusCode::CONFLICT,
+                "TURN_RUNNING",
+                "A turn is running; compact when it has finished",
+                Some(serde_json::json!({ "conversation_id": conversation_id })),
+            ),
+            ConversationError::CompactUnsupported { conversation_id } => ApiError::coded(
+                StatusCode::CONFLICT,
+                "COMPACT_UNSUPPORTED",
+                "This agent cannot compact its session",
+                Some(serde_json::json!({ "conversation_id": conversation_id })),
+            ),
+            ConversationError::AutoCompactUnsupported { conversation_id } => ApiError::coded(
+                StatusCode::CONFLICT,
+                "AUTO_COMPACT_UNSUPPORTED",
+                "This agent has no auto-compact setting",
+                Some(serde_json::json!({ "conversation_id": conversation_id })),
+            ),
             ConversationError::RuntimeRestarting { conversation_id } => ApiError::coded(
                 StatusCode::CONFLICT,
                 "runtime_restarting",

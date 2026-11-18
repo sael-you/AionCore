@@ -2081,6 +2081,16 @@ pub async fn build_session_instance(
         session_config.initial_cost_usd = initial_cost_usd_from_snapshot(session_snapshot);
     }
 
+    // TASK-158: the conversation's auto-compact setting (claude only; read once
+    // at process start, so a change applies at the next agent start).
+    if backend_label == "claude" {
+        let env = claude_auto_compact_env(config.auto_compact.as_deref());
+        if !env.is_empty() {
+            tracing::info!(conv_id = %conversation_id, mode = ?config.auto_compact, "claude auto-compact setting applied");
+            session_config.spawn_env.extend(env);
+        }
+    }
+
     if backend_label == "claude"
         && let Some(program) = session_config.cli_program.clone()
         && crate::claude_flags::supports_thinking_display(&program).await
@@ -2285,6 +2295,28 @@ fn resolve_session_cli_program(
 ///     `AIONUI_CONVERSATION_ID` / `AIONUI_HELPER_BIN` / `AIONUI_BASE_URL` /
 ///     `AIONUI_RUNTIME_TOKEN`) — the legacy path appended these via
 ///     `apply_acp_launch_policy` for every agent spawn.
+/// The claude env for a conversation's auto-compact setting (TASK-158).
+/// Documented variables (code.claude.com/docs/en/env-vars, read 2026-11-18, and
+/// present in the claude 2.1.325 binary): `CLAUDE_AUTOCOMPACT_PCT_OVERRIDE` =
+/// the percentage (1-100) of the auto-compact window at which compaction
+/// triggers (it can only lower the default); `DISABLE_AUTO_COMPACT=1` turns
+/// automatic compaction off (manual `/compact` stays). `auto`, absent or an
+/// unknown value → nothing (the CLI's default).
+fn claude_auto_compact_env(setting: Option<&str>) -> Vec<aionui_common::EnvVar> {
+    let Some(mode) = setting.and_then(aionui_api_types::AutoCompactMode::parse) else {
+        return Vec::new();
+    };
+    let (name, value) = match (mode, mode.percent()) {
+        (_, Some(percent)) => ("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", percent.to_string()),
+        (aionui_api_types::AutoCompactMode::Off, None) => ("DISABLE_AUTO_COMPACT", "1".to_owned()),
+        _ => return Vec::new(),
+    };
+    vec![aionui_common::EnvVar {
+        name: name.to_owned(),
+        value,
+    }]
+}
+
 fn assemble_spawn_env(
     agent_env: &[aionui_api_types::AgentEnvEntry],
     runtime_env: &[(String, String)],
@@ -5018,6 +5050,30 @@ mod build_mapping_tests {
             current_model_id: model.map(ModelId::new),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn auto_compact_setting_maps_to_the_documented_claude_env() {
+        let env = |s: Option<&str>| -> Vec<(String, String)> {
+            claude_auto_compact_env(s)
+                .into_iter()
+                .map(|e| (e.name, e.value))
+                .collect()
+        };
+        assert_eq!(
+            env(Some("60")),
+            vec![("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE".to_owned(), "60".to_owned())]
+        );
+        assert_eq!(
+            env(Some("off")),
+            vec![("DISABLE_AUTO_COMPACT".to_owned(), "1".to_owned())]
+        );
+        // The backend default: no variable at all.
+        assert!(env(Some("auto")).is_empty());
+        assert!(env(None).is_empty());
+        // Only the offered steps reach the CLI; anything else is ignored.
+        assert!(env(Some("95")).is_empty());
+        assert!(env(Some("1; rm -rf /")).is_empty());
     }
 
     #[test]

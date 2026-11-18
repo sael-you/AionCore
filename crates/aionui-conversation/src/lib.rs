@@ -6,6 +6,7 @@ mod agent_health_policy;
 mod background_stream;
 pub mod browser_port;
 mod child_report;
+mod context_panel;
 mod convert;
 pub mod error;
 pub mod hierarchy;

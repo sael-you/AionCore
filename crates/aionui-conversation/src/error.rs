@@ -70,6 +70,19 @@ pub enum ConversationError {
     #[error("Conversation runtime is restarting: {conversation_id}")]
     RuntimeRestarting { conversation_id: String },
 
+    /// "Compact session" while a turn runs (TASK-158): wire code `TURN_RUNNING`.
+    #[error("A turn is running in conversation: {conversation_id}")]
+    TurnRunning { conversation_id: String },
+
+    /// This conversation's backend has no compact command: `COMPACT_UNSUPPORTED`.
+    #[error("This agent cannot compact its session: {conversation_id}")]
+    CompactUnsupported { conversation_id: String },
+
+    /// This conversation's backend has no auto-compact threshold setting:
+    /// `AUTO_COMPACT_UNSUPPORTED`.
+    #[error("This agent has no auto-compact setting: {conversation_id}")]
+    AutoCompactUnsupported { conversation_id: String },
+
     #[error("Team runtime is required for conversation: {conversation_id}")]
     TeamRuntimeRequired { conversation_id: String, team_id: String },
 
