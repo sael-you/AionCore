@@ -174,6 +174,76 @@ struct ScreenshotParams {
 
 #[derive(Deserialize, schemars::JsonSchema)]
 #[serde(deny_unknown_fields)]
+struct PhoneScreenshotParams {
+    /// The device_id from device_list.
+    device_id: String,
+    /// Downscale factor, 0 < scale <= 1 (default 1).
+    #[serde(default)]
+    scale: Option<f64>,
+    /// "png" or "jpeg" (default: png at scale 1, jpeg when scaled).
+    #[serde(default)]
+    format: Option<String>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct PhoneTextParams {
+    device_id: String,
+    /// Text typed into the focused field.
+    value: String,
+    /// true = replace what the field holds; false or absent = append.
+    #[serde(default)]
+    replace: Option<bool>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct ClickTextParams {
+    device_id: String,
+    /// The exact visible text or content description of the element (1-500 characters).
+    text: String,
+    /// Which match to click when several elements carry that text, 0-99 (default 0).
+    #[serde(default)]
+    index: Option<u32>,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct SetTextParams {
+    device_id: String,
+    /// The new content of the focused field (at most 10000 characters; may be empty).
+    value: String,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct GlobalParams {
+    device_id: String,
+    /// "notifications", "quick_settings" or "lock".
+    action: String,
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct OpenUrlParams {
+    device_id: String,
+    /// An http, https or market link (at most 4096 characters, no blanks).
+    url: String,
+}
+
+/// `{key: value}` pairs without the absent optional ones.
+fn compact(pairs: Vec<(&str, Value)>) -> Value {
+    Value::Object(
+        pairs
+            .into_iter()
+            .filter(|(_, v)| !v.is_null())
+            .map(|(k, v)| (k.to_owned(), v))
+            .collect(),
+    )
+}
+
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
 struct PointParams {
     device_id: String,
     /// Pixels from the left edge.
@@ -301,8 +371,9 @@ impl DevicesStdioServer {
         name = "phone_screenshot",
         description = "Screenshot of the phone. While a sensitive app is in front (banking, payments, messages, email, settings) it waits for the owner's OK; a password manager's screen is never returned."
     )]
-    async fn phone_screenshot(&self, Parameters(p): Parameters<ScreenshotParams>) -> CallToolResult {
-        self.call(p.device_id, "screenshot", json!({"scale": p.scale})).await
+    async fn phone_screenshot(&self, Parameters(p): Parameters<PhoneScreenshotParams>) -> CallToolResult {
+        let args = compact(vec![("scale", json!(p.scale)), ("format", json!(p.format))]);
+        self.call(p.device_id, "screenshot", args).await
     }
 
     #[tool(
@@ -328,9 +399,46 @@ impl DevicesStdioServer {
         .await
     }
 
-    #[tool(name = "phone_text", description = "Type text into the focused field of the phone.")]
-    async fn phone_text(&self, Parameters(p): Parameters<TextParams>) -> CallToolResult {
-        self.call(p.device_id, "text", json!({"value": p.value})).await
+    #[tool(
+        name = "phone_text",
+        description = "Type text into the focused field of the phone (appends; replace=true replaces the field's content, companion app 0.2+)."
+    )]
+    async fn phone_text(&self, Parameters(p): Parameters<PhoneTextParams>) -> CallToolResult {
+        let args = compact(vec![("value", json!(p.value)), ("replace", json!(p.replace))]);
+        self.call(p.device_id, "text", args).await
+    }
+
+    #[tool(
+        name = "phone_click_text",
+        description = "Click the element that shows this exact text (or has it as content description) on the phone; no coordinates needed. Returns how many elements matched. Needs the companion app 0.2+."
+    )]
+    async fn phone_click_text(&self, Parameters(p): Parameters<ClickTextParams>) -> CallToolResult {
+        let args = compact(vec![("text", json!(p.text)), ("index", json!(p.index))]);
+        self.call(p.device_id, "click_text", args).await
+    }
+
+    #[tool(
+        name = "phone_set_text",
+        description = "Replace the content of the focused text field on the phone. Fails when no editable field has focus. Needs the companion app 0.2+."
+    )]
+    async fn phone_set_text(&self, Parameters(p): Parameters<SetTextParams>) -> CallToolResult {
+        self.call(p.device_id, "set_text", json!({"value": p.value})).await
+    }
+
+    #[tool(
+        name = "phone_global",
+        description = "A system action on the phone: \"notifications\" or \"quick_settings\" (both wait for the owner's OK) or \"lock\". Needs the companion app 0.2+."
+    )]
+    async fn phone_global(&self, Parameters(p): Parameters<GlobalParams>) -> CallToolResult {
+        self.call(p.device_id, "global", json!({"action": p.action})).await
+    }
+
+    #[tool(
+        name = "phone_open_url",
+        description = "Open an http, https or market link on the phone in whichever app handles it. Always waits for the owner's OK; private and local addresses are refused. Needs the companion app 0.2+."
+    )]
+    async fn phone_open_url(&self, Parameters(p): Parameters<OpenUrlParams>) -> CallToolResult {
+        self.call(p.device_id, "open_url", json!({"url": p.url})).await
     }
 
     #[tool(
@@ -483,6 +591,10 @@ mod tests {
             "phone_key",
             "phone_launch",
             "phone_foreground",
+            "phone_click_text",
+            "phone_set_text",
+            "phone_global",
+            "phone_open_url",
             "phone_install_apk",
             "phone_logcat",
             "mac_screenshot",

@@ -131,6 +131,31 @@ pub struct Device {
     /// Add-ons: the device that runs them (a Mac helper id, or `server`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub addon_host: Option<String>,
+    /// Phones with the companion app 0.2+: what the phone last said about
+    /// itself. Absent when it never did.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health: Option<DeviceHealth>,
+}
+
+/// What a phone reports about itself (`health` in `pair` / `hello` and the
+/// `health` event). Stored on the device row.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DeviceHealth {
+    /// 0..=100.
+    #[serde(default)]
+    pub battery_percent: Option<u8>,
+    #[serde(default)]
+    pub charging: Option<bool>,
+    /// The lock screen is showing.
+    #[serde(default)]
+    pub locked: bool,
+    /// The app's accessibility service is on (taps and the UI tree need it).
+    #[serde(default)]
+    pub accessibility_on: bool,
+    #[serde(default)]
+    pub android_version: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
 }
 
 /// Timeouts a phone / Mac switch may take (minutes).
@@ -353,6 +378,8 @@ pub mod relay_event {
     pub const LOCAL_SWITCH_OFF: &str = "local_switch_off";
     /// data: `{package}`.
     pub const FOREGROUND: &str = "foreground";
+    /// data: [`super::DeviceHealth`] (companion 0.2+, on every change).
+    pub const HEALTH: &str = "health";
     /// data: `{run_id, state: running|done|failed|stopped, message?, trace_url?}`.
     pub const ADDON_PROGRESS: &str = "addon_progress";
     /// data: `{session, message}`: a CDP frame from the phone's Chrome;
@@ -450,6 +477,9 @@ pub enum RelayInbound {
         version: String,
         #[serde(default)]
         capabilities: Vec<String>,
+        /// Companion 0.2+: a [`DeviceHealth`] object (read leniently).
+        #[serde(default)]
+        health: Option<serde_json::Value>,
     },
     /// Later connects: the token from `welcome` (never in the URL).
     Hello {
@@ -458,6 +488,8 @@ pub enum RelayInbound {
         version: String,
         #[serde(default)]
         capabilities: Vec<String>,
+        #[serde(default)]
+        health: Option<serde_json::Value>,
     },
     /// What the client reaches now: sent right after `welcome` and again on
     /// every change (phone attached / detached, switch, add-on installed).
@@ -525,6 +557,10 @@ pub enum RelayOutbound {
 ///   `ui_tree` → `{xml}` · `tap{x,y}` · `swipe{x1,y1,x2,y2,duration_ms}` ·
 ///   `text{value}` · `key{code}` · `launch{package}` · `foreground` → `{package}` ·
 ///   `install_apk{url, sha256}` · `logcat{package, lines}` → `{lines}` · `stop`
+/// - companion 0.2+: `click_text{text, index?}` → `{matches, method}` ·
+///   `set_text{value}` · `global{action: notifications|quick_settings|lock}` ·
+///   `open_url{url}` · `text{value, replace?}` · `screenshot{scale?, format?}` ·
+///   `ui_tree` → `{xml, nodes, truncated}`
 /// - phone Chrome (Mac helper only, over `adb forward localabstract:chrome_devtools_remote`):
 ///   `cdp_open` → `{session}` · `cdp_frame{session, message: string}` · `cdp_close{session}`;
 ///   Chrome → AionCore frames arrive as `cdp_frame` events.
@@ -541,6 +577,10 @@ pub const RELAY_VERBS: &[&str] = &[
     "key",
     "launch",
     "foreground",
+    "click_text",
+    "set_text",
+    "global",
+    "open_url",
     "install_apk",
     "logcat",
     "stop",
@@ -588,6 +628,7 @@ mod tests {
                 experimental: true,
             }]),
             addon_host: None,
+            health: None,
         };
         assert_eq!(
             serde_json::to_value(&d).unwrap(),

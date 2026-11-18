@@ -170,6 +170,10 @@ impl DevicesService {
         self.companion.read().expect("companion lock").clone()
     }
 
+    pub(crate) fn browser_port(&self) -> &Arc<dyn BrowserDevices> {
+        &self.browser
+    }
+
     pub(crate) fn relay(&self) -> &RelayState {
         &self.relay
     }
@@ -274,6 +278,7 @@ impl DevicesService {
                 last_seen_at: None,
                 routes: None,
                 addon_host: None,
+                health: None,
             });
         }
         out.extend(self.my_browser_cards(user_id));
@@ -350,6 +355,7 @@ impl DevicesService {
                 last_seen_at: None,
                 routes: None,
                 addon_host: None,
+                health: None,
             });
         }
         for (name, label) in LIBRARY_ADDONS {
@@ -373,6 +379,7 @@ impl DevicesService {
                 last_seen_at: None,
                 routes: None,
                 addon_host: None,
+                health: None,
             });
         }
         Ok(out)
@@ -422,6 +429,7 @@ impl DevicesService {
                     last_seen_at: None,
                     routes: None,
                     addon_host: None,
+                    health: None,
                 }
             })
             .collect()
@@ -458,6 +466,7 @@ impl DevicesService {
                 last_seen_at: b.last_seen_at,
                 routes: None,
                 addon_host: None,
+                health: None,
             })
             .collect()
     }
@@ -540,6 +549,7 @@ impl DevicesService {
                 .max(row.last_seen_at),
             routes,
             addon_host: (kind == DeviceKind::Addon).then(|| row.pairing_id.clone().unwrap_or_else(|| "server".into())),
+            health: meta.get("health").and_then(crate::relay::health_of),
         }
     }
 
