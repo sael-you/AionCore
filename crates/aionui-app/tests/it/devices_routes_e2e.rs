@@ -259,5 +259,13 @@ async fn runtime_device_routes_need_a_conversation_runtime_token() {
         ))
         .await
         .unwrap();
-    assert!(bad.status().is_client_error());
+    assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+    assert_eq!(body_json(bad).await["code"], "DEVICE_BAD_MESSAGE");
+    // A bad body without a token is still 401: the token is checked first.
+    let anon_bad = app
+        .clone()
+        .oneshot(runtime(None, user, "POST", "/api/runtime/devices/call", r#"{"x": 1}"#))
+        .await
+        .unwrap();
+    assert_eq!(anon_bad.status(), StatusCode::UNAUTHORIZED);
 }

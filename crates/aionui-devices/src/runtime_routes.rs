@@ -16,6 +16,7 @@ use std::sync::Arc;
 
 use aionui_ai_agent::{RuntimeTokenScope, RuntimeTokenService, TEAM_RUNTIME_TOKEN_SESSION_GENERATION};
 use aionui_api_types::devices::{DeviceKind, DeviceStatus};
+use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::routing::{get, post};
@@ -126,12 +127,14 @@ struct CallBody {
     args: Value,
 }
 
-async fn call(State(s): State<DevicesRuntimeRouterState>, headers: HeaderMap, body: Option<Json<CallBody>>) -> Reply {
+/// The body is parsed only after the token check, so a caller without a
+/// token always gets 401, whatever it sent.
+async fn call(State(s): State<DevicesRuntimeRouterState>, headers: HeaderMap, body: Bytes) -> Reply {
     let (user_id, conversation_id) = match authenticate(&s, &headers) {
         Ok(c) => c,
         Err(reply) => return reply,
     };
-    let Some(Json(body)) = body else {
+    let Ok(body) = serde_json::from_slice::<CallBody>(&body) else {
         return (
             StatusCode::BAD_REQUEST,
             Json(json!({"ok": false, "code": "DEVICE_BAD_MESSAGE", "message": "expected {device_id, verb, args}"})),
@@ -167,16 +170,12 @@ struct AddonRunBody {
 /// Run an add-on task. `DevicesService::addon_run_task` checks both
 /// switches, asks the owner with the full task text and audits; nothing is
 /// asked or checked twice here.
-async fn addon_run(
-    State(s): State<DevicesRuntimeRouterState>,
-    headers: HeaderMap,
-    body: Option<Json<AddonRunBody>>,
-) -> Reply {
+async fn addon_run(State(s): State<DevicesRuntimeRouterState>, headers: HeaderMap, body: Bytes) -> Reply {
     let (user_id, conversation_id) = match authenticate(&s, &headers) {
         Ok(c) => c,
         Err(reply) => return reply,
     };
-    let Some(Json(body)) = body else {
+    let Ok(body) = serde_json::from_slice::<AddonRunBody>(&body) else {
         return (
             StatusCode::BAD_REQUEST,
             Json(
