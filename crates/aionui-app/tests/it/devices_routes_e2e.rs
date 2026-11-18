@@ -228,6 +228,26 @@ async fn runtime_device_routes_need_a_conversation_runtime_token() {
         .unwrap();
     assert_eq!(call.status(), StatusCode::NOT_FOUND);
     assert_eq!(body_json(call).await["code"], "DEVICE_NOT_FOUND");
+    // Add-on runs: token required; an unknown add-on is a coded 404.
+    let anon = app
+        .clone()
+        .oneshot(runtime(None, user, "POST", "/api/runtime/devices/addon-run", "{}"))
+        .await
+        .unwrap();
+    assert_eq!(anon.status(), StatusCode::UNAUTHORIZED);
+    let run = app
+        .clone()
+        .oneshot(runtime(
+            Some(&issued.token),
+            user,
+            "POST",
+            "/api/runtime/devices/addon-run",
+            r#"{"addon_id": "addon:nope:artemis", "phone_id": "phone:nope:x", "task": "open the settings"}"#,
+        ))
+        .await
+        .unwrap();
+    assert_eq!(run.status(), StatusCode::NOT_FOUND);
+    assert_eq!(body_json(run).await["code"], "DEVICE_NOT_FOUND");
     let bad = app
         .clone()
         .oneshot(runtime(

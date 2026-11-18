@@ -24,8 +24,9 @@ const ENV_BASE_URL: &str = "AIONUI_BASE_URL";
 const ENV_USER_ID: &str = "AIONUI_USER_ID";
 const ENV_CONVERSATION_ID: &str = "AIONUI_CONVERSATION_ID";
 const ENV_RUNTIME_TOKEN: &str = "AIONUI_RUNTIME_TOKEN";
-/// Longest wait of one call: owner approval (2 min) + install_apk (16 min).
-const CALL_TIMEOUT: Duration = Duration::from_secs(19 * 60);
+/// Longest wait of one call: owner approval (2 min) + an add-on run (30 min
+/// + 1) or install_apk (16 min).
+const CALL_TIMEOUT: Duration = Duration::from_secs(34 * 60);
 
 pub async fn run_devices_stdio() -> ExitCode {
     let server = match DevicesStdioServer::from_env() {
@@ -247,8 +248,39 @@ struct OpenAppParams {
     bundle_id: String,
 }
 
+#[derive(Deserialize, schemars::JsonSchema)]
+#[serde(deny_unknown_fields)]
+struct AddonRunParams {
+    /// The add-on's device_id from device_list (kind addon).
+    addon_id: String,
+    /// The phone it acts on: a device_id from device_list reached by the same Mac helper.
+    phone_id: String,
+    /// The whole task in plain words (1-4000 characters). The owner reads exactly this text before it starts.
+    task: String,
+    /// Time limit in minutes, 1-30 (default 10).
+    #[serde(default)]
+    max_minutes: Option<u32>,
+}
+
 #[tool_router]
 impl DevicesStdioServer {
+    #[tool(
+        name = "addon_run_task",
+        description = "Let an installed add-on (Artemis, Mobilerun) carry out a whole flow on the phone with its own model loop. The owner must approve the task text first, every time; the call returns when the run ended (done, failed or stopped) with a message and a trace link. Prefer the phone_* tools for single steps."
+    )]
+    async fn addon_run_task(&self, Parameters(p): Parameters<AddonRunParams>) -> CallToolResult {
+        let body = json!({
+            "addon_id": p.addon_id, "phone_id": p.phone_id, "task": p.task, "max_minutes": p.max_minutes,
+        });
+        let answer = self
+            .send(
+                self.request(reqwest::Method::POST, "/api/runtime/devices/addon-run")
+                    .json(&body),
+            )
+            .await;
+        tool_result("addon_run_task", answer)
+    }
+
     #[tool(
         name = "device_list",
         description = "List the owner's phones and Macs you may use: device_id, name, status (on = usable now; off = the owner has not enabled it; offline), enabled_until and the verbs each supports. Call this first. A device that is off or offline cannot be used: tell the owner, do not retry."
@@ -442,6 +474,7 @@ mod tests {
             .collect();
         for tool in [
             "device_list",
+            "addon_run_task",
             "phone_screenshot",
             "phone_ui_tree",
             "phone_tap",

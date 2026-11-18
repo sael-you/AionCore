@@ -41,6 +41,7 @@ pub fn devices_runtime_routes(state: DevicesRuntimeRouterState) -> Router {
     Router::new()
         .route("/api/runtime/devices", get(list))
         .route("/api/runtime/devices/call", post(call))
+        .route("/api/runtime/devices/addon-run", post(addon_run))
         .with_state(state)
 }
 
@@ -91,13 +92,18 @@ async fn list(State(s): State<DevicesRuntimeRouterState>, headers: HeaderMap) ->
         Ok(devices) => {
             let rows: Vec<Value> = devices
                 .into_iter()
-                .filter(|d| matches!(d.kind, DeviceKind::Phone | DeviceKind::Mac))
+                // Phones, Macs, and add-ons that are installed on a helper.
+                .filter(|d| match d.kind {
+                    DeviceKind::Phone | DeviceKind::Mac => true,
+                    DeviceKind::Addon => d.installed,
+                    _ => false,
+                })
                 .filter(|d| d.status != DeviceStatus::NeedsPairing)
                 .map(|d| {
-                    let verbs = if d.kind == DeviceKind::Phone {
-                        PHONE_VERBS
-                    } else {
-                        MAC_VERBS
+                    let verbs: &[&str] = match d.kind {
+                        DeviceKind::Phone => PHONE_VERBS,
+                        DeviceKind::Mac => MAC_VERBS,
+                        _ => &["addon_run_task"],
                     };
                     json!({
                         "device_id": d.id, "kind": d.kind, "name": d.name, "status": d.status,
@@ -144,6 +150,56 @@ async fn call(State(s): State<DevicesRuntimeRouterState>, headers: HeaderMap, bo
         .await;
     match result {
         Ok(result) => (StatusCode::OK, Json(json!({"ok": true, "result": result}))),
+        Err(error) => failure(error),
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AddonRunBody {
+    addon_id: String,
+    phone_id: String,
+    task: String,
+    #[serde(default)]
+    max_minutes: Option<u32>,
+}
+
+/// Run an add-on task. `DevicesService::addon_run_task` checks both
+/// switches, asks the owner with the full task text and audits; nothing is
+/// asked or checked twice here.
+async fn addon_run(
+    State(s): State<DevicesRuntimeRouterState>,
+    headers: HeaderMap,
+    body: Option<Json<AddonRunBody>>,
+) -> Reply {
+    let (user_id, conversation_id) = match authenticate(&s, &headers) {
+        Ok(c) => c,
+        Err(reply) => return reply,
+    };
+    let Some(Json(body)) = body else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(
+                json!({"ok": false, "code": "DEVICE_BAD_MESSAGE", "message": "expected {addon_id, phone_id, task, max_minutes?}"}),
+            ),
+        );
+    };
+    let outcome = s
+        .service
+        .addon_run_task(crate::addons::AddonTask {
+            user_id,
+            addon_id: body.addon_id,
+            phone_id: body.phone_id,
+            task: body.task,
+            max_minutes: body.max_minutes,
+            conversation_id: Some(conversation_id),
+        })
+        .await;
+    match outcome {
+        Ok(outcome) => (
+            StatusCode::OK,
+            Json(json!({"ok": true, "result": serde_json::to_value(outcome).unwrap_or(Value::Null)})),
+        ),
         Err(error) => failure(error),
     }
 }
