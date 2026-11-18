@@ -531,6 +531,7 @@ pub const RELAY_VERBS: &[&str] = &[
     "cdp_open",
     "cdp_frame",
     "cdp_close",
+    "mac_foreground",
     "mac_screenshot",
     "mac_ax_tree",
     "mac_click",

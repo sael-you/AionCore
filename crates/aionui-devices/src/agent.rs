@@ -13,6 +13,12 @@
 //!    owner's OK. One OK covers reads and actions on the same device + app
 //!    for 5 minutes. Reads of a password manager are always refused (no OK
 //!    possible); `install_apk` asks every time;
+//!    The app in front is ALWAYS asked from the device (phone `foreground`,
+//!    Mac `mac_foreground`), never taken from the agent's arguments; an app
+//!    the call names (`launch`, `logcat`, `mac_open_app`) is checked in
+//!    addition. Unknown front app = crucial, and that OK is single-use. The
+//!    OK is per conversation; the front app is checked again right before
+//!    the call runs;
 //! 5. the relay call, and one audit row whatever the outcome (verb, app
 //!    package, outcome; never screenshots, typed text or results).
 
@@ -132,6 +138,9 @@ const CRUCIAL_MARKERS: &[&str] = &[
     "appstore",
     "galaxystore",
     "aurora",
+    // macOS: Mail and Messages match above; Terminal and shells
+    "com.apple.terminal",
+    "iterm",
     // system settings (uninstall, permissions, accounts)
     "com.android.settings",
     "com.apple.systempreferences",
@@ -259,29 +268,34 @@ impl DevicesService {
             ));
         }
 
-        // Which app would this act on?
+        // Which app is REALLY in front? Always asked from the device, on
+        // every gated call: a package / bundle id in the agent's arguments is
+        // never trusted for the gate (review part 2: an agent could name a
+        // harmless app while a bank or a password manager is in front).
         let acting = ACTING_VERBS.contains(&verb.as_str());
         let reading = READING_VERBS.contains(&verb.as_str());
-        let target = args
-            .get("package")
-            .or_else(|| args.get("bundle_id"))
-            .and_then(Value::as_str)
-            .map(str::to_owned);
-        let mut package = target.clone();
-        if (acting || reading) && package.is_none() && row.kind == "phone" {
-            // The app in front decides. Ask the phone (cheap) every time: the
-            // owner may have switched apps since the last event.
-            package = self
-                .routed_call(&user_id, &device_id, "foreground", serde_json::json!({}))
-                .await
-                .ok()
-                .and_then(|v| v.get("package").and_then(Value::as_str).map(str::to_owned));
-            if package.is_none() {
-                // Unknown front app: treat as crucial rather than guess.
-                package = Some("unknown".to_owned());
-            }
-        }
-        if reading && package.as_deref().is_some_and(is_secret_store) {
+        let gated = acting || reading || verb == "install_apk";
+        let front = if gated {
+            self.front_app(&user_id, &device_id, &row.kind).await
+        } else {
+            None
+        };
+        // Apps the call names itself (launch / open an app, logcat of an app):
+        // checked IN ADDITION to the front app.
+        let named: Option<String> = match verb.as_str() {
+            "launch" | "logcat" => args.get("package").and_then(Value::as_str).map(str::to_owned),
+            "mac_open_app" => args.get("bundle_id").and_then(Value::as_str).map(str::to_owned),
+            _ => None,
+        };
+        let front_known = front.is_some();
+        // For the audit row and the prompt: the app acted on.
+        let package = named
+            .clone()
+            .or_else(|| front.clone())
+            .or_else(|| gated.then(|| "unknown".to_owned()));
+        let checked: Vec<&str> = front.as_deref().into_iter().chain(named.as_deref()).collect();
+
+        if reading && checked.iter().any(|p| is_secret_store(p)) {
             self.audit_call(
                 &who,
                 DeviceAuditOutcome::Refused,
@@ -291,11 +305,8 @@ impl DevicesService {
             .await;
             return Err(refused("a password manager is in front: its screen is never read"));
         }
-        let crucial = verb == "install_apk"
-            || ((acting || reading)
-                && package
-                    .as_deref()
-                    .is_some_and(|p| p == "unknown" || is_crucial_package(p)));
+        let crucial =
+            verb == "install_apk" || (gated && (!front_known || checked.iter().any(|p| is_crucial_package(p))));
         let mut approved = false;
         if crucial {
             let summary = match (verb.as_str(), package.as_deref()) {
@@ -306,6 +317,16 @@ impl DevicesService {
                 (v, Some(p)) => format!("{v} in {p}"),
                 (v, None) => v.to_owned(),
             };
+            // One OK covers this conversation + device + the apps involved for
+            // 5 minutes. No grant when the front app is unknown (single use)
+            // and none for installs.
+            let grant_key = (verb != "install_apk" && front_known).then(|| {
+                format!(
+                    "{user_id}|{}|{device_id}|{}",
+                    conversation_id.as_deref().unwrap_or_default(),
+                    checked.join("+")
+                )
+            });
             let question = OwnerQuestion {
                 user_id: user_id.clone(),
                 device_id: device_id.clone(),
@@ -316,8 +337,7 @@ impl DevicesService {
                 package: package.clone(),
                 origin: None,
                 conversation_id: conversation_id.clone(),
-                grant_key: (verb != "install_apk")
-                    .then(|| format!("{user_id}|{device_id}|{}", package.as_deref().unwrap_or_default())),
+                grant_key,
             };
             if let Err(error) = self.ask_owner(question).await {
                 let outcome = if error.code() == Some(DeviceErrorCode::DeviceApprovalTimeout) {
@@ -344,6 +364,22 @@ impl DevicesService {
                 ));
             }
         }
+        // Re-check right before executing: the owner's OK (or the "not
+        // crucial" verdict) was for THAT front app. If another app came to
+        // the front meanwhile, nothing runs; the agent looks again.
+        if gated && verb != "install_apk" {
+            let now_front = self.front_app(&user_id, &device_id, &row.kind).await;
+            if now_front != front {
+                self.audit_call(
+                    &who,
+                    DeviceAuditOutcome::Refused,
+                    now_front.as_deref().or(Some("unknown")),
+                    Some("front_app_changed"),
+                )
+                .await;
+                return Err(refused("the app in front changed; look again and retry"));
+            }
+        }
         match self.routed_call(&user_id, &device_id, &verb, args).await {
             Ok(result) => {
                 let outcome = if approved {
@@ -364,6 +400,22 @@ impl DevicesService {
                 Err(error)
             }
         }
+    }
+
+    /// The app in front on the device, asked from the device itself: Android
+    /// package (`foreground`) or macOS bundle id (`mac_foreground`). `None`
+    /// when the device cannot say (then the call is treated as crucial).
+    async fn front_app(&self, user_id: &str, device_id: &str, kind: &str) -> Option<String> {
+        let (verb, field) = if kind == "mac" {
+            ("mac_foreground", "bundle_id")
+        } else {
+            ("foreground", "package")
+        };
+        self.routed_call(user_id, device_id, verb, serde_json::json!({}))
+            .await
+            .ok()
+            .and_then(|v| v.get(field).and_then(Value::as_str).map(str::to_owned))
+            .filter(|p| !p.trim().is_empty())
     }
 }
 
