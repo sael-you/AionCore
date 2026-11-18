@@ -751,7 +751,8 @@ async fn live_every_engine_installs_starts_and_renders() {
             .await;
         assert!(nav["result"]["frameId"].is_string(), "{engine:?} {nav}");
         let mut discord = Value::Null;
-        for _ in 0..30 {
+        // A cold profile's first load of Discord's app can take over 30 s.
+        for _ in 0..90 {
             tokio::time::sleep(Duration::from_secs(1)).await;
             discord = agent
                 .call(

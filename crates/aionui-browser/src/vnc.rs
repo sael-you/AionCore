@@ -45,7 +45,7 @@ pub fn start_failure(e: &BrowserError) -> (u16, String) {
 
 /// Relay RFB bytes until either side closes.
 pub async fn relay(socket: WebSocket, inst: Arc<JugglerInstance>) {
-    let stream = match tokio::net::UnixStream::connect(inst.vnc_socket()).await {
+    let stream = match inst.connect_vnc().await {
         Ok(s) => s,
         Err(_) => {
             close_with(socket, CLOSE_START_FAILED, "BROWSER_START_FAILED").await;

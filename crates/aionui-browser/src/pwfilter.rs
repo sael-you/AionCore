@@ -6,22 +6,27 @@
 //! sidecar), not to CDP. That gives the whole Playwright API, so the bridge
 //! filters the Playwright wire protocol to keep Chromium's guarantees:
 //!
-//! - no cookie or storage access: `BrowserContext.cookies/addCookies/
-//!   clearCookies/storageState/setStorageState`, HAR, tracing;
+//! - no cookie or storage access: cookies/addCookies/clearCookies,
+//!   storageState, Page.webStorage*, HAR, tracing; and `Cookie`/`Set-Cookie`
+//!   headers are stripped from every frame in both directions
+//!   ([`strip_cookie_headers`]);
 //! - no new contexts or browsers outside the instance's profile:
 //!   `Browser.newContext*`, every `BrowserType` call, `Browser.startServer`;
 //! - no requests made by the sidecar's own process (they would bypass the
 //!   egress proxy): `Playwright.newRequest`, every `APIRequestContext` call;
 //! - no server-side files: `Artifact.saveAs/pathAfterFinished`,
-//!   `setInputFiles` with `localPaths`/`localDirectory`, HAR replay;
-//! - `goto` only to `http(s)` (and `about:blank`) URLs the
-//!   [`NavigationGuard`] allows — the egress proxy refuses internal
-//!   addresses for everything else the page loads;
+//!   `setInputFiles` with `localPaths`/`localDirectory`, temp files, HAR;
+//! - every URL an agent call names (`Frame.goto`, `Route.continue`,
+//!   `Route.redirectNavigationRequest`, `addScriptTag/addStyleTag`) is
+//!   `http(s)` and allowed by the [`NavigationGuard`] (`goto` may also open
+//!   `about:blank`): no `file:`, `about:config`, `view-source:`. The egress
+//!   proxy refuses internal addresses for everything the page itself loads;
 //! - at most `max_tabs` pages; `Browser.close` detaches instead of closing.
 //!
-//! The filter is an allow-list of object TYPES (learned from the server's
-//! `__create__` messages) with method deny-lists inside the allowed types;
-//! a call on an unknown or denied type is refused. Refusals are answered in
+//! Default deny: an allow-list of object TYPES (learned from the server's
+//! `__create__` messages) and, for Page, Frame, Route, BrowserContext,
+//! Request, Response and Artifact, an allow-list of METHODS; anything else
+//! is refused. Refusals are answered in
 //! Playwright's own error format, so the client sees a normal error.
 //!
 //! Pinned client/server: `@playwright/cli` 0.1.17 (playwright-core
@@ -47,7 +52,10 @@ pub enum Verdict {
     Detach,
 }
 
-/// Types whose calls may be forwarded (methods still checked below).
+/// Types whose calls may be forwarded. Page, Frame, Route, BrowserContext,
+/// Request, Response and Artifact are further limited to the METHOD
+/// allow-lists below (default deny: a method a future Playwright adds is
+/// refused until it is listed here).
 const ALLOWED_TYPES: &[&str] = &[
     "Root",
     "Browser",
@@ -66,36 +74,215 @@ const ALLOWED_TYPES: &[&str] = &[
     "BindingCall",
     "Artifact",
     "Stream",
-    "WritableStream",
     "Disposable",
 ];
+
+// Method allow-lists, from playwright-core 1.62's protocol validators
+// (`scheme.<Type><Method>Params` in coreBundle.js), minus what reads or
+// writes cookies/storage, records to server files or leaves the profile.
+
+/// Not listed: webStorage* (localStorage/sessionStorage dumps), screencast*
+/// (server-side recording), setDockTile, requestGC.
+const PAGE_ALLOWED: &[&str] = &[
+    "addInitScript",
+    "bringToFront",
+    "cancelPickLocator",
+    "clearConsoleMessages",
+    "clearPageErrors",
+    "close",
+    "consoleMessages",
+    "emulateMedia",
+    "expectScreenshot",
+    "exposeBinding",
+    "goBack",
+    "goForward",
+    "hideHighlight",
+    "keyboardDown",
+    "keyboardInsertText",
+    "keyboardPress",
+    "keyboardType",
+    "keyboardUp",
+    "mouseClick",
+    "mouseDown",
+    "mouseMove",
+    "mouseUp",
+    "mouseWheel",
+    "pageErrors",
+    "pdf",
+    "pickLocator",
+    "registerLocatorHandler",
+    "reload",
+    "requests",
+    "resolveLocatorHandlerNoReply",
+    "runBeforeUnload",
+    "screenshot",
+    "setExtraHTTPHeaders",
+    "setNetworkInterceptionPatterns",
+    "setViewportSize",
+    "setWebSocketInterceptionPatterns",
+    "startCSSCoverage",
+    "startJSCoverage",
+    "stopCSSCoverage",
+    "stopJSCoverage",
+    "touchscreenTap",
+    "unregisterLocatorHandler",
+    "updateSubscription",
+];
+
+const FRAME_ALLOWED: &[&str] = &[
+    "addScriptTag",
+    "addStyleTag",
+    "ariaSnapshot",
+    "blur",
+    "check",
+    "click",
+    "content",
+    "dblclick",
+    "dispatchEvent",
+    "dragAndDrop",
+    "drop",
+    "evalOnSelector",
+    "evalOnSelectorAll",
+    "evaluateExpression",
+    "evaluateExpressionHandle",
+    "expect",
+    "fill",
+    "focus",
+    "frameElement",
+    "getAttribute",
+    "goto",
+    "hideHighlight",
+    "highlight",
+    "hover",
+    "innerHTML",
+    "innerText",
+    "inputValue",
+    "isChecked",
+    "isDisabled",
+    "isEditable",
+    "isEnabled",
+    "isHidden",
+    "isVisible",
+    "press",
+    "queryCount",
+    "querySelector",
+    "querySelectorAll",
+    "resolveSelector",
+    "selectOption",
+    "setContent",
+    "setInputFiles",
+    "tap",
+    "textContent",
+    "title",
+    "type",
+    "uncheck",
+    "waitForFunction",
+    "waitForSelector",
+    "waitForTimeout",
+];
+
+const ROUTE_ALLOWED: &[&str] = &["abort", "continue", "fulfill", "redirectNavigationRequest"];
+
+/// Not listed: cookies/addCookies/clearCookies, storageState/setStorageState,
+/// close, newCDPSession, pause, recorder, exposeConsoleApi, HAR replay,
+/// credentials*, createTempFiles (server-side upload files).
+const CONTEXT_ALLOWED: &[&str] = &[
+    "addInitScript",
+    "clearPermissions",
+    "clockFastForward",
+    "clockInstall",
+    "clockPauseAt",
+    "clockResume",
+    "clockRunFor",
+    "clockSetFixedTime",
+    "clockSetSystemTime",
+    "exposeBinding",
+    "grantPermissions",
+    "newPage",
+    "registerSelectorEngine",
+    "setExtraHTTPHeaders",
+    "setGeolocation",
+    "setHTTPCredentials",
+    "setNetworkInterceptionPatterns",
+    "setOffline",
+    "setTestIdAttributeName",
+    "setWebSocketInterceptionPatterns",
+    "updateSubscription",
+];
+
+/// Raw header reads are allowed: the bridge strips cookie headers from every
+/// frame ([`strip_cookie_headers`]).
+const REQUEST_ALLOWED: &[&str] = &["rawRequestHeaders", "response"];
+const RESPONSE_ALLOWED: &[&str] = &[
+    "body",
+    "httpVersion",
+    "rawResponseHeaders",
+    "securityDetails",
+    "serverAddr",
+    "sizes",
+];
+/// Not listed: saveAs, pathAfterFinished (server paths).
+const ARTIFACT_ALLOWED: &[&str] = &["cancel", "delete", "failure", "saveAsStream", "stream"];
 
 /// `Browser`: only `close` (answered as a detach).
 const BROWSER_ALLOWED: &[&str] = &["close"];
 
-const CONTEXT_DENIED: &[&str] = &[
-    "cookies",
-    "addCookies",
-    "clearCookies",
-    "storageState",
-    "setStorageState",
-    "close",
-    "newCDPSession",
-    "pause",
-    "enableRecorder",
-    "disableRecorder",
-    "exposeConsoleApi",
-    "routeAPIRequestsFromHar",
-    "unrouteAPIRequestsFromHar",
-    "credentialsCreate",
-    "credentialsDelete",
-    "credentialsGet",
-    "credentialsInstall",
-    "harStart",
-    "harExport",
-];
+/// The method allow-list of a type, when it has one.
+fn method_allow_list(kind: &str) -> Option<&'static [&'static str]> {
+    Some(match kind {
+        "Page" => PAGE_ALLOWED,
+        "Frame" => FRAME_ALLOWED,
+        "Route" => ROUTE_ALLOWED,
+        "BrowserContext" => CONTEXT_ALLOWED,
+        "Request" => REQUEST_ALLOWED,
+        "Response" => RESPONSE_ALLOWED,
+        "Artifact" => ARTIFACT_ALLOWED,
+        _ => return None,
+    })
+}
 
-const ARTIFACT_DENIED: &[&str] = &["saveAs", "pathAfterFinished"];
+/// Header names never shown to or taken from agents.
+const COOKIE_HEADERS: &[&str] = &["cookie", "set-cookie", "cookie2", "set-cookie2"];
+
+fn is_cookie_header(name: &str) -> bool {
+    COOKIE_HEADERS.iter().any(|h| name.eq_ignore_ascii_case(h))
+}
+
+/// Remove cookie headers from every headers list or map anywhere in a frame
+/// (either direction): arrays of `{name, value}` pairs (request/response
+/// initializers, `rawRequestHeaders`/`rawResponseHeaders` results,
+/// `Route.fulfill`/`continue` and `setExtraHTTPHeaders` params) and objects
+/// under a `headers` key. Returns how many were removed.
+pub fn strip_cookie_headers(value: &mut Value) -> usize {
+    match value {
+        Value::Array(items) => {
+            let before = items.len();
+            items.retain(|item| {
+                !(item.get("value").is_some() && item.get("name").and_then(Value::as_str).is_some_and(is_cookie_header))
+            });
+            let mut removed = before - items.len();
+            for item in items {
+                removed += strip_cookie_headers(item);
+            }
+            removed
+        }
+        Value::Object(map) => {
+            let mut removed = 0;
+            if let Some(Value::Object(headers)) = map.get_mut("headers") {
+                let names: Vec<String> = headers.keys().filter(|k| is_cookie_header(k)).cloned().collect();
+                for name in names {
+                    headers.remove(&name);
+                    removed += 1;
+                }
+            }
+            for child in map.values_mut() {
+                removed += strip_cookie_headers(child);
+            }
+            removed
+        }
+        _ => 0,
+    }
+}
 
 /// Per-connection filter state.
 #[derive(Debug, Default)]
@@ -171,6 +358,22 @@ impl PwFilter {
             return Verdict::Refuse(format!("{kind} is not available on AionUi's server browser"));
         }
         let params = &msg["params"];
+        if let Some(allowed) = method_allow_list(kind)
+            && !allowed.contains(&method)
+        {
+            return Verdict::Refuse(format!("{kind}.{method} is not available on AionUi's server browser"));
+        }
+        // Every URL-carrying call (Frame.goto, Frame.addScriptTag/addStyleTag,
+        // Route.continue, Route.redirectNavigationRequest, and whatever a
+        // listed method carries as `url`) passes the same guard: http(s)
+        // only, never AionUi, loopback or a private network. Only `goto`
+        // may also open about:blank.
+        if let Some(url) = params.get("url").and_then(Value::as_str) {
+            let verdict = url_verdict(url, guard, kind == "Frame" && method == "goto");
+            if verdict != Verdict::Allow {
+                return verdict;
+            }
+        }
         match kind.as_str() {
             "Browser" => {
                 if method == "close" {
@@ -183,20 +386,9 @@ impl PwFilter {
                     ))
                 }
             }
-            "BrowserContext" => {
-                if CONTEXT_DENIED.contains(&method) {
-                    return Verdict::Refuse(format!(
-                        "BrowserContext.{method} is not available (no cookie, storage, recorder or HAR access)"
-                    ));
-                }
-                if method == "newPage" && self.pages >= self.max_tabs {
-                    return Verdict::Refuse(format!("tab limit reached ({} tabs)", self.max_tabs));
-                }
-                Verdict::Allow
+            "BrowserContext" if method == "newPage" && self.pages >= self.max_tabs => {
+                Verdict::Refuse(format!("tab limit reached ({} tabs)", self.max_tabs))
             }
-            "Artifact" if ARTIFACT_DENIED.contains(&method) => Verdict::Refuse(format!(
-                "Artifact.{method} is not available: stream the download instead"
-            )),
             "Frame" | "ElementHandle" if method == "setInputFiles" => {
                 if !params["localPaths"].is_null() || !params["localDirectory"].is_null() {
                     Verdict::Refuse("setInputFiles with server paths is not available: send the files".into())
@@ -204,19 +396,19 @@ impl PwFilter {
                     Verdict::Allow
                 }
             }
-            "Frame" if method == "goto" => goto_verdict(params["url"].as_str().unwrap_or(""), guard),
             _ => Verdict::Allow,
         }
     }
 }
 
-/// `goto` may open `http(s)` URLs the guard allows, and `about:blank`.
-pub fn goto_verdict(raw: &str, guard: &NavigationGuard) -> Verdict {
+/// A URL an agent call may name: `http(s)` allowed by the guard;
+/// `about:blank` only where `allow_blank` (a navigation).
+pub fn url_verdict(raw: &str, guard: &NavigationGuard, allow_blank: bool) -> Verdict {
     let Ok(url) = Url::parse(raw.trim()) else {
         return Verdict::Refuse("not a URL".into());
     };
     match url.scheme() {
-        "about" if url.as_str() == "about:blank" => Verdict::Allow,
+        "about" if allow_blank && url.as_str() == "about:blank" => Verdict::Allow,
         "http" | "https" => match guard.decide(url.as_str()) {
             GuardDecision::Allow => Verdict::Allow,
             GuardDecision::Block => {
@@ -275,6 +467,10 @@ mod tests {
             ("tracing@1", "Tracing"),
             ("playwright", "Playwright"),
             ("local-utils@1", "LocalUtils"),
+            ("route@1", "Route"),
+            ("request@1", "Request"),
+            ("response@1", "Response"),
+            ("ws-stream@1", "WritableStream"),
         ] {
             created(&mut f, guid, kind);
         }
@@ -357,8 +553,10 @@ mod tests {
             ("page@1", "screenshot"),
             ("handle@1", "fill"),
             ("context@1", "newPage"),
-            ("context@1", "route"),
+            ("context@1", "setNetworkInterceptionPatterns"),
             ("artifact@1", "saveAsStream"),
+            ("route@1", "fulfill"),
+            ("response@1", "rawResponseHeaders"),
         ] {
             assert_eq!(
                 f.on_client_message(&call(guid, m, json!({})), &g),
@@ -394,6 +592,112 @@ mod tests {
         ] {
             assert!(refused(goto(bad)), "{bad}");
         }
+    }
+
+    // Review part 2, blocker 1: each of these opened a local or internal URL
+    // (or dumped storage) while only Frame.goto was checked.
+    #[test]
+    fn every_url_carrying_call_passes_the_guard() {
+        let f = setup();
+        let g = guard();
+        let bad_urls = [
+            "file:///root/.clauterm/aionui-browser/u/1/cookies.sqlite",
+            "about:config",
+            "view-source:https://example.com",
+            "chrome://browser/content/browser.xhtml",
+            "resource://gre/",
+            "http://127.0.0.1:25809/api/conversations",
+            "http://[::1]:8080/",
+            "http://192.168.1.1/",
+            "https://aionui.example/",
+            "about:blank",
+        ];
+        for (guid, method) in [
+            ("route@1", "redirectNavigationRequest"),
+            ("route@1", "continue"),
+            ("frame@1", "addScriptTag"),
+            ("frame@1", "addStyleTag"),
+        ] {
+            for url in bad_urls {
+                assert!(
+                    refused(f.on_client_message(&call(guid, method, json!({"url": url})), &g)),
+                    "{guid}.{method} {url}"
+                );
+            }
+            assert_eq!(
+                f.on_client_message(&call(guid, method, json!({"url": "https://example.com/a.js"})), &g),
+                Verdict::Allow,
+                "{guid}.{method} public"
+            );
+        }
+        // No url = continue unchanged.
+        assert_eq!(
+            f.on_client_message(&call("route@1", "continue", json!({})), &g),
+            Verdict::Allow
+        );
+    }
+
+    #[test]
+    fn methods_are_default_deny_per_type() {
+        let f = setup();
+        let g = guard();
+        for (guid, method) in [
+            ("page@1", "webStorageItems"),
+            ("page@1", "webStorageGetItem"),
+            ("page@1", "webStorageSetItem"),
+            ("page@1", "webStorageClear"),
+            ("page@1", "screencastStart"),
+            ("page@1", "someMethodAFuturePlaywrightAdds"),
+            ("frame@1", "someNewFrameMethod"),
+            ("route@1", "someNewRouteMethod"),
+            ("context@1", "createTempFiles"),
+            ("context@1", "someNewContextMethod"),
+            ("request@1", "someNewRequestMethod"),
+            ("response@1", "someNewResponseMethod"),
+            ("artifact@1", "pathAfterFinished"),
+            ("ws-stream@1", "write"),
+        ] {
+            assert!(
+                refused(f.on_client_message(&call(guid, method, json!({})), &g)),
+                "{guid}.{method}"
+            );
+        }
+    }
+
+    // Review part 2, blocker 2: Set-Cookie (HttpOnly too) reached the agent
+    // in response headers; Cookie could be set through headers params.
+    #[test]
+    fn cookie_headers_are_stripped_from_every_headers_list_and_map() {
+        let mut created = json!({"guid": "page@1", "method": "__create__", "params": {"type": "Response", "guid": "response@9",
+            "initializer": {"url": "https://example.com/", "status": 200, "headers": [
+                {"name": "content-type", "value": "text/html"},
+                {"name": "Set-Cookie", "value": "sid=secret; HttpOnly"},
+                {"name": "set-cookie", "value": "b=2"}]}}});
+        assert_eq!(strip_cookie_headers(&mut created), 2);
+        assert_eq!(
+            created["params"]["initializer"]["headers"],
+            json!([{"name": "content-type", "value": "text/html"}])
+        );
+
+        let mut raw = json!({"id": 4, "result": {"headers": [
+            {"name": "COOKIE", "value": "sid=secret"}, {"name": "accept", "value": "*/*"}]}});
+        assert_eq!(strip_cookie_headers(&mut raw), 1);
+        assert_eq!(raw["result"]["headers"], json!([{"name": "accept", "value": "*/*"}]));
+
+        let mut fulfill = call(
+            "route@1",
+            "fulfill",
+            json!({"status": 200, "headers": [
+            {"name": "set-cookie", "value": "planted=1"}, {"name": "x-a", "value": "b"}]}),
+        );
+        assert_eq!(strip_cookie_headers(&mut fulfill), 1);
+        let mut map = json!({"params": {"headers": {"Cookie": "a=b", "X-Ok": "1"}, "nested": [{"headers": {"set-cookie": "x"}}]}});
+        assert_eq!(strip_cookie_headers(&mut map), 2);
+        assert_eq!(map["params"]["headers"], json!({"X-Ok": "1"}));
+
+        let mut clean =
+            json!({"id": 1, "result": {"value": "a cookie recipe", "headers": [{"name": "etag", "value": "x"}]}});
+        assert_eq!(strip_cookie_headers(&mut clean), 0);
     }
 
     #[test]
