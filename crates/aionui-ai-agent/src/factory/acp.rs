@@ -80,6 +80,16 @@ pub(super) async fn build(
         config.backend.clone_from(&meta.backend);
     }
 
+    // C37: owner rules ride in front of the preset context on every lane
+    // below (antigravity, direct CLI, ACP manager).
+    config.preset_context = crate::factory::with_owner_rules(
+        deps.as_ref(),
+        &ctx.user_id,
+        &ctx.conversation_id,
+        config.preset_context.take(),
+    )
+    .await;
+
     if matches!(route_for_backend(config.backend.as_deref()), BackendRoute::Antigravity) {
         // Product decision: antigravity has no fork surface. The fork API's
         // capability gate already refuses agy; this is defense in depth so a
@@ -509,6 +519,23 @@ async fn load_user_mcp_servers_with_approval(
 
     let mut servers = Vec::with_capacity(rows.len());
     let mut approval = Vec::new();
+    // C36: the built-in server-pool MCPs (crucial channel = ask every call).
+    for server in crate::mcp_resolve::server_pool_session_servers(repo, user_id, conversation_id, market).await {
+        if !session_server_supported_by_capabilities(&server, capabilities) {
+            continue;
+        }
+        match session_server_to_sdk_mcp_server(&server).await {
+            Ok(sdk) => {
+                if server.tool_filter.require_approval {
+                    approval.push(server.name.clone());
+                }
+                servers.push(sdk);
+            }
+            Err(err) => {
+                warn!(conversation_id, server_name = %server.name, error = %err, "user_mcp: server pool entry failed; skipping")
+            }
+        }
+    }
     for aionui_db::GatedMcpRow { row, market: delivery } in rows {
         let selected = crate::mcp_resolve::is_selected(selected_ids, &row, delivery.as_ref());
         // `aionui-team` is the reserved team coordination MCP name; a user row

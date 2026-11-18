@@ -479,6 +479,7 @@ impl AppServices {
             broadcaster: event_bus.clone(),
             backend_binary_path: backend_binary_path.clone(),
             mcp_server_repo: Some(mcp_server_repo),
+            rules: Some(crate::rules::rule_service(&database)),
             session_spawner,
             // agy cannot prompt for tool permission in headless mode, so AionUi
             // registers itself as its PreToolUse hook; the hook process calls

@@ -113,13 +113,24 @@ impl Database {
 /// `DbError::Init` when any of `required_migrations` has not been applied
 /// successfully (an older schema than the caller understands).
 pub async fn open_database_read_only(path: &Path, required_migrations: &[i64]) -> Result<Database, DbError> {
+    open_existing(path, required_migrations, true).await
+}
+
+/// Like [`open_database_read_only`] but writable: for a helper process that
+/// must append rows (the server-pool audit trail) next to the running server.
+/// Still no create and no migrator; WAL lets both processes write.
+pub async fn open_database_existing(path: &Path, required_migrations: &[i64]) -> Result<Database, DbError> {
+    open_existing(path, required_migrations, false).await
+}
+
+async fn open_existing(path: &Path, required_migrations: &[i64], read_only: bool) -> Result<Database, DbError> {
     if !path.is_file() {
         return Err(DbError::Init(format!("database not found at {}", path.display())));
     }
     let opts = SqliteConnectOptions::new()
         .filename(path)
         .create_if_missing(false)
-        .read_only(true)
+        .read_only(read_only)
         .busy_timeout(Duration::from_millis(BUSY_TIMEOUT_MS));
     let pool = PoolOptions::<Sqlite>::new()
         .max_connections(1)

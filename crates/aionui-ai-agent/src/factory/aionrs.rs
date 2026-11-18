@@ -65,6 +65,14 @@ pub(super) async fn build(
             None => rules,
         });
     }
+    // C37: owner rules come first in the system prompt.
+    overrides.system_prompt = crate::factory::with_owner_rules(
+        deps.as_ref(),
+        &ctx.user_id,
+        &ctx.conversation_id,
+        overrides.system_prompt.take(),
+    )
+    .await;
 
     // Fold the skills index into the system prompt.
     //

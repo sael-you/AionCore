@@ -62,6 +62,10 @@ pub enum KitItemKind {
     Skill,
     /// One MCP market instance (`item_ref` = `mcp_servers.id`).
     Mcp,
+    /// One SSH server of the server pool (C36, `item_ref` = `servers.id`).
+    Server,
+    /// One owner rule (C37, `item_ref` = `rules.id`).
+    Rule,
 }
 
 impl KitItemKind {
@@ -70,13 +74,21 @@ impl KitItemKind {
             KitItemKind::Kit => "kit",
             KitItemKind::Skill => "skill",
             KitItemKind::Mcp => "mcp",
+            KitItemKind::Server => "server",
+            KitItemKind::Rule => "rule",
         }
     }
 
     pub fn parse(value: &str) -> Option<Self> {
-        [KitItemKind::Kit, KitItemKind::Skill, KitItemKind::Mcp]
-            .into_iter()
-            .find(|k| k.as_str() == value)
+        [
+            KitItemKind::Kit,
+            KitItemKind::Skill,
+            KitItemKind::Mcp,
+            KitItemKind::Server,
+            KitItemKind::Rule,
+        ]
+        .into_iter()
+        .find(|k| k.as_str() == value)
     }
 }
 
@@ -297,6 +309,12 @@ pub struct ListKitAttachmentsQuery {
     pub level: Option<KitLevel>,
     #[serde(default)]
     pub target_id: Option<String>,
+    /// Only attachments of this kind (e.g. `server` for a server's "Used in").
+    #[serde(default)]
+    pub item_kind: Option<KitItemKind>,
+    /// Only attachments of this item (kit id, skill name, instance/server id).
+    #[serde(default)]
+    pub item_ref: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -389,6 +407,13 @@ pub struct KitEffectiveSetResponse {
     pub skills: Vec<KitEffectiveItem>,
     /// MCP instances decided by kits/attachments (sorted by instance id).
     pub mcps: Vec<KitEffectiveItem>,
+    /// Servers decided by attachments (C36, sorted by server id); `item_ref`
+    /// = server id. A server reaches a conversation only through an `add`.
+    #[serde(default)]
+    pub servers: Vec<KitEffectiveItem>,
+    /// Rules decided by attachments (C37, sorted by rule id).
+    #[serde(default)]
+    pub rules: Vec<KitEffectiveItem>,
     /// The conversation's frozen skill snapshot (`extra.skills`, base + kits
     /// applied at creation); `None` for a project/assistant preview.
     #[serde(default, skip_serializing_if = "Option::is_none")]

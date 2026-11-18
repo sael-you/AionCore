@@ -110,6 +110,14 @@ pub trait IMcpServerRepository: Send + Sync {
     async fn kit_mcp_ids(&self, _user_id: &str, _conversation_id: &str) -> Result<Vec<String>, DbError> {
         Ok(Vec::new())
     }
+
+    /// Whether the user has a live, enabled pool server (C36, migration 910).
+    /// Decides whether a session gets the built-in server MCPs at all; which
+    /// servers a conversation may use is decided per call by the helper.
+    /// Default: no (test doubles hold no servers).
+    async fn server_pool_enabled(&self, _user_id: &str) -> Result<bool, DbError> {
+        Ok(false)
+    }
 }
 
 /// Where a set of MCP rows is about to be delivered (see

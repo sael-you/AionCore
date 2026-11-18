@@ -42,6 +42,10 @@ pub struct McpMarketService {
     /// Kits + attach levels (C27); `None` = kit routes answer 503.
     pub(crate) kits: Option<Arc<dyn aionui_db::IKitRepository>>,
     pub(crate) kit_applier: Option<Arc<dyn super::kits::IKitConversationApplier>>,
+    /// Server pool (C36): validates `server` attachments and names them.
+    pub(crate) server_pool: Option<crate::server_pool::ServerPoolService>,
+    /// Rules (C37): validates `rule` attachments, names them, serves `/api/rules`.
+    pub(crate) rules: Option<crate::rules::RuleService>,
 }
 
 impl McpMarketService {
@@ -59,7 +63,29 @@ impl McpMarketService {
             binder: None,
             kits: None,
             kit_applier: None,
+            server_pool: None,
+            rules: None,
         }
+    }
+
+    pub fn with_rules(mut self, rules: crate::rules::RuleService) -> Self {
+        self.rules = Some(rules);
+        self
+    }
+
+    /// The rules service (C37); `None` = `/api/rules` answers 503.
+    pub fn rules(&self) -> Option<&crate::rules::RuleService> {
+        self.rules.as_ref()
+    }
+
+    pub fn with_server_pool(mut self, pool: crate::server_pool::ServerPoolService) -> Self {
+        self.server_pool = Some(pool);
+        self
+    }
+
+    /// The server pool (C36); `None` = `/api/servers` answers 503.
+    pub fn server_pool(&self) -> Option<&crate::server_pool::ServerPoolService> {
+        self.server_pool.as_ref()
     }
 
     pub fn with_kits(mut self, kits: Arc<dyn aionui_db::IKitRepository>) -> Self {

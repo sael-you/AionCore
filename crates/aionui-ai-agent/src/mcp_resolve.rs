@@ -55,7 +55,12 @@ pub async fn resolve_session_mcp_servers(
         // `aionui-team` is a reserved wire-level name: the team coordination MCP
         // must win, so a user row that collides with it is skipped (never
         // injected), regardless of selection state.
-        if !selected || row.builtin || row.name == TEAM_MCP_SERVER_NAME {
+        if !selected
+            || row.builtin
+            || row.name == TEAM_MCP_SERVER_NAME
+            || row.name == SERVER_POOL_STANDARD
+            || row.name == SERVER_POOL_CRUCIAL
+        {
             continue;
         }
         if let (Some(delivery), Some(launch)) = (delivery.as_ref(), market) {
@@ -81,6 +86,8 @@ pub async fn resolve_session_mcp_servers(
         }
     }
 
+    servers.extend(server_pool_session_servers(repo, user_id, conversation_id, market).await);
+
     if !servers.is_empty() {
         info!(
             conversation_id,
@@ -89,6 +96,68 @@ pub async fn resolve_session_mcp_servers(
         );
     }
     servers
+}
+
+/// MCP server name of the server-pool standard channel (C36).
+pub const SERVER_POOL_STANDARD: &str = aionui_mcp::server_pool::STANDARD_SERVER_NAME;
+/// MCP server name of the server-pool crucial channel (C36): every call asks
+/// the owner (`require_approval`, the TASK-97 ask path of each CLI).
+pub const SERVER_POOL_CRUCIAL: &str = aionui_mcp::server_pool::CRUCIAL_SERVER_NAME;
+
+/// The two built-in server-pool MCPs (card C36) for a session, launched as
+/// `aioncore mcp servers --channel … --conversation … --user … --data-dir …`.
+/// Delivered when the market launcher is available and the user has at least
+/// one enabled server; which servers this conversation may use is decided by
+/// the helper on every call (so assignment changes apply at the next call).
+/// Best-effort: a lookup error is logged and delivers nothing.
+pub async fn server_pool_session_servers(
+    repo: &dyn IMcpServerRepository,
+    user_id: &str,
+    conversation_id: &str,
+    market: Option<&McpMarketLaunch>,
+) -> Vec<SessionMcpServer> {
+    let Some(launch) = market else {
+        return Vec::new();
+    };
+    match repo.server_pool_enabled(user_id).await {
+        Ok(true) => {}
+        Ok(false) => return Vec::new(),
+        Err(err) => {
+            warn!(conversation_id, error = %err, "mcp_resolve: server pool lookup failed; skipping");
+            return Vec::new();
+        }
+    }
+    [
+        ("standard", SERVER_POOL_STANDARD, false),
+        ("crucial", SERVER_POOL_CRUCIAL, true),
+    ]
+    .into_iter()
+    .map(|(channel, name, require_approval)| SessionMcpServer {
+        id: name.to_owned(),
+        name: name.to_owned(),
+        transport: SessionMcpTransport::Stdio {
+            command: launch.launcher.clone(),
+            args: vec![
+                "mcp".to_owned(),
+                "servers".to_owned(),
+                "--channel".to_owned(),
+                channel.to_owned(),
+                "--conversation".to_owned(),
+                conversation_id.to_owned(),
+                "--user".to_owned(),
+                user_id.to_owned(),
+                "--data-dir".to_owned(),
+                launch.data_dir.clone(),
+            ],
+            env: std::collections::HashMap::new(),
+        },
+        tool_filter: SessionMcpToolFilter {
+            enabled_tools: None,
+            disabled_tools: Vec::new(),
+            require_approval,
+        },
+    })
+    .collect()
 }
 
 /// Whether a gated row belongs to the session: in the frozen selection (or
@@ -571,6 +640,70 @@ mod market_gate_tests {
             assistant,
             cli,
         )
+    }
+
+    /// C36: the two server-pool MCPs ride along only when the user has an
+    /// enabled server and the launcher is known; the crucial one asks (TASK-97).
+    #[tokio::test]
+    async fn server_pool_mcps_are_injected_with_the_crucial_one_asking() {
+        use aionui_db::{CreateServerParams, IServerPoolRepository, SqliteServerPoolRepository};
+        let fx = market_fx().await;
+        let none =
+            resolve_session_mcp_servers(&fx.servers, USER, Some(&[]), CONV, Some(&launch(None, "claude")), bus()).await;
+        assert!(none.is_empty(), "no server, no server MCPs");
+
+        SqliteServerPoolRepository::new(fx.db.pool().clone())
+            .create_server(&CreateServerParams {
+                user_id: USER,
+                name: "web-1",
+                host: "10.0.0.5",
+                port: 22,
+                ssh_user: "deploy",
+                host_key: "",
+                labels: "[]",
+                environment: "production",
+                tier: "write",
+                notes: "",
+                enabled: true,
+                key_encrypted: None,
+            })
+            .await
+            .unwrap();
+        // Without the launcher (no market delivery) nothing is injected.
+        assert!(
+            resolve_session_mcp_servers(&fx.servers, USER, Some(&[]), CONV, None, bus())
+                .await
+                .is_empty()
+        );
+
+        let servers =
+            resolve_session_mcp_servers(&fx.servers, USER, Some(&[]), CONV, Some(&launch(None, "claude")), bus()).await;
+        let names: Vec<(&str, bool)> = servers
+            .iter()
+            .map(|s| (s.name.as_str(), s.tool_filter.require_approval))
+            .collect();
+        assert_eq!(names, vec![(SERVER_POOL_STANDARD, false), (SERVER_POOL_CRUCIAL, true)]);
+        match &servers[1].transport {
+            SessionMcpTransport::Stdio { command, args, .. } => {
+                assert_eq!(command, "/opt/aionui/aioncore");
+                assert_eq!(
+                    args,
+                    &[
+                        "mcp",
+                        "servers",
+                        "--channel",
+                        "crucial",
+                        "--conversation",
+                        CONV,
+                        "--user",
+                        USER,
+                        "--data-dir",
+                        "/data/aionui"
+                    ]
+                );
+            }
+            other => panic!("{other:?}"),
+        }
     }
 
     #[tokio::test]

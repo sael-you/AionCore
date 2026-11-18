@@ -208,6 +208,27 @@ pub(crate) enum McpCommand {
     /// (exit 3) unless the instance is active and assigned to exactly this
     /// scope (or granted by the conversation's kits) and CLI now.
     Exec(McpExecArgs),
+    /// Built-in server-pool MCP (C36): stdio MCP server with `list_servers`
+    /// and `run_command`, spawned by the agent CLI for one conversation. Every
+    /// call re-reads the grant, the server and its key from the database.
+    Servers(McpServersArgs),
+}
+
+#[derive(Args, Debug, Clone)]
+pub(crate) struct McpServersArgs {
+    /// `standard` (crucial commands on production write servers are not run)
+    /// or `crucial` (the CLI asks the owner before every call).
+    #[arg(long, value_parser = ["standard", "crucial"])]
+    pub channel: String,
+    /// Conversation whose kit levels grant the servers.
+    #[arg(long)]
+    pub conversation: String,
+    /// Owner of the conversation; `AIONUI_USER_ID`, else the system user.
+    #[arg(long)]
+    pub user: Option<String>,
+    /// AionUi data dir; `AIONUI_DATA_DIR` takes precedence when set.
+    #[arg(long = "data-dir")]
+    pub data_dir: Option<PathBuf>,
 }
 
 #[derive(Args, Debug, Clone)]

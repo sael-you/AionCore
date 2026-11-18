@@ -201,7 +201,7 @@ fn data() -> Value {
             },
             {
                 "name": "mcp",
-                "description": "MCP market launcher (`mcp exec`), spawned by CLI MCP configs to start an assigned market server behind a filtering stdio proxy; not invoked by agents."
+                "description": "MCP market launcher (`mcp exec`), spawned by CLI MCP configs to start an assigned market server behind a filtering stdio proxy, and the built-in server-pool MCP (`mcp servers`, C36) the agent CLI spawns per conversation; not invoked by agents."
             },
             {
                 "name": "mcp-team-stdio",

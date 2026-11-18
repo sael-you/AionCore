@@ -435,9 +435,13 @@ impl McpMarketService {
         query: ListKitAttachmentsQuery,
     ) -> Result<Vec<KitAttachmentResponse>, MarketError> {
         let kits = self.kits()?;
-        let rows = kits
+        let rows: Vec<KitAttachmentRow> = kits
             .list_attachments(user_id, query.level.map(KitLevel::as_str), query.target_id.as_deref())
-            .await?;
+            .await?
+            .into_iter()
+            .filter(|a| query.item_kind.is_none_or(|k| a.item_kind == k.as_str()))
+            .filter(|a| query.item_ref.as_deref().is_none_or(|r| a.item_ref == r))
+            .collect();
         let kit_names: HashMap<String, String> = kits
             .list_kits(user_id)
             .await?
@@ -445,9 +449,10 @@ impl McpMarketService {
             .map(|k| (k.id, k.name))
             .collect();
         let instances = self.instances_by_id(user_id).await?;
+        let server_names = self.server_names(user_id).await?;
         Ok(rows
             .into_iter()
-            .map(|a| attachment_response(a, &kit_names, &instances))
+            .map(|a| attachment_response(a, &kit_names, &instances, &server_names))
             .collect())
     }
 
@@ -557,6 +562,56 @@ impl McpMarketService {
                     ));
                 }
             }
+            KitItemKind::Rule => {
+                let rules = self
+                    .rules
+                    .as_ref()
+                    .ok_or_else(|| MarketError::Unavailable("rules are not configured".to_owned()))?;
+                if req.op == KitOp::Add {
+                    // The scope this attachment names (conversation → its project and assistant).
+                    let scope = match req.level {
+                        KitLevel::Global => KitScope::default(),
+                        KitLevel::Project => KitScope {
+                            project_id: Some(target.clone()),
+                            ..Default::default()
+                        },
+                        KitLevel::Assistant => KitScope {
+                            assistant_id: Some(target.clone()),
+                            ..Default::default()
+                        },
+                        KitLevel::Conversation => kits.conversation_scope(user_id, &target).await?.unwrap_or_default(),
+                    };
+                    rules
+                        .check_attach_cap(user_id, &scope, &item_ref)
+                        .await
+                        .map_err(|e| kit_error(KitErrorCode::InvalidItem, e.to_string()))?;
+                } else if rules.repo().find_rule(user_id, &item_ref).await?.is_none() {
+                    return Err(kit_error(
+                        KitErrorCode::InvalidItem,
+                        format!("rule {item_ref} does not exist"),
+                    ));
+                }
+            }
+            KitItemKind::Server => {
+                let pool = self
+                    .server_pool
+                    .as_ref()
+                    .ok_or_else(|| MarketError::Unavailable("server pool is not configured".to_owned()))?;
+                let server =
+                    pool.repo().find_server(user_id, &item_ref).await?.ok_or_else(|| {
+                        kit_error(KitErrorCode::InvalidItem, format!("server {item_ref} does not exist"))
+                    })?;
+                // C36: a production server is never handed to every conversation.
+                if global_add && server.environment == "production" {
+                    return Err(kit_error(
+                        KitErrorCode::GlobalNotAllowed,
+                        format!(
+                            "production server \"{}\" cannot be attached globally; attach it to a project",
+                            server.name
+                        ),
+                    ));
+                }
+            }
             KitItemKind::Mcp => {
                 let row = instances.get(&item_ref).ok_or_else(|| {
                     kit_error(
@@ -596,7 +651,41 @@ impl McpMarketService {
             .into_iter()
             .map(|k| (k.id, k.name))
             .collect();
-        Ok(attachment_response(row, &kit_names, &instances))
+        if req.item_kind == KitItemKind::Rule
+            && req.level == KitLevel::Global
+            && let Some(rules) = self.rules.as_ref()
+        {
+            rules.sync_global_file(user_id).await;
+        }
+        let server_names = self.server_names(user_id).await?;
+        Ok(attachment_response(row, &kit_names, &instances, &server_names))
+    }
+
+    /// Server id → name (C36) and rule id → name (C37); a part is empty
+    /// when its service is not configured. Ids are prefixed (`srv_`, `rule_`),
+    /// so one map serves both kinds.
+    async fn server_names(&self, user_id: &str) -> Result<HashMap<String, String>, MarketError> {
+        let mut names = HashMap::new();
+        if let Some(pool) = self.server_pool.as_ref() {
+            names.extend(
+                pool.repo()
+                    .list_servers(user_id)
+                    .await?
+                    .into_iter()
+                    .map(|s| (s.id, s.name)),
+            );
+        }
+        if let Some(rules) = self.rules.as_ref() {
+            names.extend(
+                rules
+                    .repo()
+                    .list_rules(user_id)
+                    .await?
+                    .into_iter()
+                    .map(|r| (r.id, r.name)),
+            );
+        }
+        Ok(names)
     }
 
     pub async fn detach_kit_item(&self, user_id: &str, id: &str) -> Result<(), MarketError> {
@@ -608,6 +697,12 @@ impl McpMarketService {
             )
         })?;
         kits.delete_attachment(user_id, id).await?;
+        if row.item_kind == "rule"
+            && row.level == KitLevel::Global.as_str()
+            && let Some(rules) = self.rules.as_ref()
+        {
+            rules.sync_global_file(user_id).await;
+        }
         info!(level = %row.level, target = %row.target_id, kind = %row.item_kind, "kits: detached");
         if row.level == KitLevel::Conversation.as_str() {
             self.reapply_conversations(user_id, std::slice::from_ref(&row.target_id))
@@ -680,6 +775,28 @@ impl McpMarketService {
                 mcp: Some(effective_mcp(instances.get(id), d, &shadow_names)),
             })
             .collect();
+        let servers = resolution
+            .servers
+            .iter()
+            .map(|(id, d)| KitEffectiveItem {
+                kind: KitItemKind::Server,
+                item_ref: id.clone(),
+                included: d.included,
+                provenance: provenance(d),
+                mcp: None,
+            })
+            .collect();
+        let rules = resolution
+            .rules
+            .iter()
+            .map(|(id, d)| KitEffectiveItem {
+                kind: KitItemKind::Rule,
+                item_ref: id.clone(),
+                included: d.included,
+                provenance: provenance(d),
+                mcp: None,
+            })
+            .collect();
         // A wanted template is missing when no included instance of that template is in the set.
         let delivered_templates: BTreeSet<&str> = resolution
             .mcps
@@ -704,6 +821,8 @@ impl McpMarketService {
             assistant_id: scope.assistant_id,
             skills,
             mcps,
+            servers,
+            rules,
             conversation_skills,
             missing_templates,
         })
@@ -795,10 +914,12 @@ fn attachment_response(
     a: KitAttachmentRow,
     kit_names: &HashMap<String, String>,
     instances: &HashMap<String, McpMarketRow>,
+    server_names: &HashMap<String, String>,
 ) -> KitAttachmentResponse {
     let item_name = match a.item_kind.as_str() {
         "kit" => kit_names.get(&a.item_ref).cloned().unwrap_or_default(),
         "mcp" => instances.get(&a.item_ref).map(|r| r.name.clone()).unwrap_or_default(),
+        "server" | "rule" => server_names.get(&a.item_ref).cloned().unwrap_or_default(),
         _ => a.item_ref.clone(),
     };
     KitAttachmentResponse {
