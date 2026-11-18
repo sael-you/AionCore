@@ -20,10 +20,12 @@ pub(crate) fn global_rules_file() -> Option<PathBuf> {
     dir.is_dir().then(|| dir.join("AGENTS.md"))
 }
 
-pub(crate) fn rule_service(database: &aionui_db::Database) -> RuleService {
+/// `data_dir` holds the backups of files AionUi rewrites (`rule-backups/`).
+pub(crate) fn rule_service(database: &aionui_db::Database, data_dir: &std::path::Path) -> RuleService {
     RuleService::new(
         Arc::new(aionui_db::SqliteRuleRepository::new(database.pool().clone())),
         Arc::new(aionui_db::SqliteKitRepository::new(database.pool().clone())),
         global_rules_file(),
     )
+    .with_backup_dir(data_dir.join("rule-backups"))
 }
