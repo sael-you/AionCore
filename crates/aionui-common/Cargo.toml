@@ -13,6 +13,8 @@ async-trait.workspace = true
 axum.workspace = true
 base64.workspace = true
 getrandom.workspace = true
+sha2.workspace = true
+tokio = { workspace = true, features = ["sync", "time"] }
 semver.workspace = true
 
 [dev-dependencies]

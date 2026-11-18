@@ -32,6 +32,7 @@ mod conversation_e2e;
 mod conversation_runtime_routes_e2e;
 mod conversation_skill;
 mod cron_e2e;
+mod devices_routes_e2e;
 mod diagnose_cli_e2e;
 mod extension_e2e;
 mod file_e2e;

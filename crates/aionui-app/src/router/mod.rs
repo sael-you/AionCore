@@ -4,6 +4,7 @@ mod antigravity_hook;
 mod board_host;
 pub(crate) mod browser;
 mod clipboard_writer;
+pub(crate) mod devices;
 mod fs_monitor;
 mod health;
 mod item_revealer;

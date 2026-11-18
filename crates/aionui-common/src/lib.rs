@@ -1,7 +1,9 @@
 #![warn(clippy::disallowed_types)]
 
 //! Shared primitives: error types, enums, ID generation, crypto, timestamps, and pagination.
+pub mod approval_queue;
 pub mod constants;
+pub mod pairing;
 pub mod user_paths;
 
 mod backend_capabilities;

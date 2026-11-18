@@ -24,7 +24,7 @@ pub const BILLINGS: &[&str] = &["metered"];
 pub const TRANSPORTS: &[&str] = &["stdio", "http"];
 /// R2: the only instances that may be assigned globally.
 pub const GLOBAL_IDS: &[&str] = aionui_db::GLOBAL_MCP_IDS;
-pub const RESERVED: &[&str] = &["aionui-team", "aionui"];
+pub const RESERVED: &[&str] = &["aionui-team", "aionui-devices", "aionui"];
 /// R11: not in the market, matched as prefixes. GitHub and Chrome DevTools
 /// were removed by the owner's picks (D49/D50, GAPS G2).
 pub const NOT_IN_MARKET: &[&str] = &[

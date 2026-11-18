@@ -1833,6 +1833,11 @@ pub async fn build_antigravity_instance(
         coordination.append(&mut mcp_servers);
         mcp_servers = coordination;
     }
+    // C38: the owner's phones / Macs, when he has any (marker in the runtime env).
+    if let Some(spec) = devices_mcp_server_spec(runtime_env) {
+        mcp_servers.retain(|server| server.name != DEVICES_MCP_SERVER_NAME);
+        mcp_servers.push(spec);
+    }
 
     let init = SessionInit {
         mcp_servers,
@@ -1975,6 +1980,11 @@ pub async fn build_session_instance(
         let mut coordination = vec![team_mcp_server_spec(cfg)];
         coordination.append(&mut mcp_servers);
         mcp_servers = coordination;
+    }
+    // C38: the owner's phones / Macs, when he has any (marker in the runtime env).
+    if let Some(spec) = devices_mcp_server_spec(runtime_env) {
+        mcp_servers.retain(|server| server.name != DEVICES_MCP_SERVER_NAME);
+        mcp_servers.push(spec);
     }
 
     // GAP #4 — preset_context + skills carried into the init surface.
@@ -2370,6 +2380,47 @@ fn session_server_to_spec(server: &aionui_api_types::SessionMcpServer) -> aionui
             require_approval: server.tool_filter.require_approval,
         },
     }
+}
+
+/// Reserved name of the built-in devices MCP (C38 W3).
+pub const DEVICES_MCP_SERVER_NAME: &str = "aionui-devices";
+/// Runtime-env marker: this user has phones / Macs agents may be allowed to use.
+pub const DEVICES_MCP_ENV: &str = "AIONUI_DEVICES_MCP";
+
+/// The `aionui-devices` MCP as a stdio spec: `aioncore mcp-devices-stdio`
+/// with the conversation's helper env (base URL, user, conversation, runtime
+/// token). `None` unless the marker and all four are present. The bridge
+/// holds no authority: AionCore checks the token and every gate per call.
+fn devices_mcp_server_spec(runtime_env: &[(String, String)]) -> Option<aionui_session::McpServerSpec> {
+    let get = |name: &str| {
+        runtime_env
+            .iter()
+            .find(|(key, _)| key == name)
+            .map(|(_, value)| value.clone())
+            .filter(|value| !value.is_empty())
+    };
+    if get(DEVICES_MCP_ENV).as_deref() != Some("1") {
+        return None;
+    }
+    let command = get(crate::types::AIONUI_HELPER_BIN_ENV)?;
+    let env = [
+        crate::types::AIONUI_BASE_URL_ENV,
+        crate::types::AIONUI_USER_ID_ENV,
+        crate::types::AIONUI_CONVERSATION_ID_ENV,
+        crate::types::AIONUI_RUNTIME_TOKEN_ENV,
+    ]
+    .into_iter()
+    .map(|name| get(name).map(|value| (name.to_owned(), value)))
+    .collect::<Option<Vec<_>>>()?;
+    Some(aionui_session::McpServerSpec {
+        name: DEVICES_MCP_SERVER_NAME.to_owned(),
+        transport: aionui_session::McpTransport::Stdio {
+            command,
+            args: vec!["mcp-devices-stdio".to_owned()],
+            env,
+        },
+        tool_filter: Default::default(),
+    })
 }
 
 /// The team coordination MCP server as a neutral stdio spec. Verbatim port of
@@ -4742,6 +4793,54 @@ mod build_mapping_tests {
     //! suite), adapted to the port's decomposed `spec_mode_model` inputs (AcpBuildExtra +
     //! PersistedSessionState) instead of a `ConversationRow`. Same assertions.
     use super::*;
+
+    /// C38: the devices MCP is added only with the marker AND the full helper
+    /// env; it carries exactly the conversation's helper env.
+    #[test]
+    fn devices_mcp_spec_needs_the_marker_and_the_helper_env() {
+        let env = |pairs: &[(&str, &str)]| -> Vec<(String, String)> {
+            pairs.iter().map(|(k, v)| ((*k).to_owned(), (*v).to_owned())).collect()
+        };
+        let full = env(&[
+            (DEVICES_MCP_ENV, "1"),
+            ("AIONUI_HELPER_BIN", "/opt/aioncore"),
+            ("AIONUI_BASE_URL", "http://127.0.0.1:4000"),
+            ("AIONUI_USER_ID", "u1"),
+            ("AIONUI_CONVERSATION_ID", "c1"),
+            ("AIONUI_RUNTIME_TOKEN", "tok"),
+        ]);
+        let spec = devices_mcp_server_spec(&full).expect("spec");
+        assert_eq!(spec.name, "aionui-devices");
+        let aionui_session::McpTransport::Stdio {
+            command,
+            args,
+            env: spec_env,
+        } = &spec.transport
+        else {
+            panic!("stdio expected");
+        };
+        assert_eq!(command, "/opt/aioncore");
+        assert_eq!(args, &["mcp-devices-stdio".to_owned()]);
+        assert_eq!(spec_env.len(), 4);
+        assert!(spec_env.iter().any(|(k, v)| k == "AIONUI_CONVERSATION_ID" && v == "c1"));
+        assert!(spec_env.iter().all(|(k, _)| k != DEVICES_MCP_ENV));
+
+        let no_marker: Vec<_> = full.iter().filter(|(k, _)| k != DEVICES_MCP_ENV).cloned().collect();
+        assert!(
+            devices_mcp_server_spec(&no_marker).is_none(),
+            "users without devices get no MCP"
+        );
+        let no_token: Vec<_> = full
+            .iter()
+            .filter(|(k, _)| k != "AIONUI_RUNTIME_TOKEN")
+            .cloned()
+            .collect();
+        assert!(
+            devices_mcp_server_spec(&no_token).is_none(),
+            "never without a runtime token"
+        );
+    }
+
     use crate::shared_kernel::{ModeId, ModelId};
     use aionui_session::SessionSpec;
 

@@ -114,7 +114,9 @@ async fn websocket_origin_except_extension(
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> axum::response::Response {
-    if request.uri().path() == "/api/browser/extension" {
+    // C34 extension socket (pinned extension origin, checked by its handler)
+    // and the C38 device relay (refuses every Origin, checked by its handler).
+    if matches!(request.uri().path(), "/api/browser/extension" | "/api/devices/relay") {
         return next.run(request).await;
     }
     websocket_origin_middleware(state, request, next)
@@ -136,6 +138,12 @@ pub async fn create_router_with_runtime(services: &AppServices) -> Result<(Route
     // C34: browser approval / device events go to the owning user's sockets only.
     services
         .browser_service
+        .set_event_sink(Arc::new(super::browser::BrowserEventsToUser(
+            services.ws_manager.clone(),
+        )));
+    // C38: devices.* events to the owning user's sockets only.
+    services
+        .devices_service
         .set_event_sink(Arc::new(super::browser::BrowserEventsToUser(
             services.ws_manager.clone(),
         )));
@@ -414,6 +422,22 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         require_trusted_origin_middleware,
     ));
 
+    // Settings → Devices (C38): the same protection as the browser routes.
+    let devices_routes = aionui_devices::devices_routes(aionui_devices::DevicesRouterState {
+        service: services.devices_service.clone(),
+    })
+    .route_layer(from_fn_with_state(
+        super::mcp_market::market_write_auth_state(services),
+        auth_middleware,
+    ))
+    .route_layer(from_fn_with_state(
+        OriginGuard {
+            policy: services.origin_policy.clone(),
+            same_origin_via_web_host: services.identity_mode.is_local(),
+        },
+        require_trusted_origin_middleware,
+    ));
+
     // MCP routes protected by auth middleware
     let mcp_authenticated =
         mcp_routes(states.mcp).route_layer(from_fn_with_state(auth_mw_state.clone(), auth_middleware));
@@ -536,6 +560,7 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
         .merge(mcp_market_read)
         .merge(mcp_market_write)
         .merge(browser_routes)
+        .merge(devices_routes)
         .merge(extension_authenticated)
         .merge(hub_authenticated)
         .merge(skill_authenticated)
@@ -576,6 +601,22 @@ pub fn create_router_with_all_state(services: &AppServices, states: ModuleStates
     .merge(aionui_browser::browser_extension_routes(
         aionui_browser::BrowserRouterState {
             service: services.browser_service.clone(),
+        },
+    ))
+    // C38 (TASK-136): the device relay for the Mac helper and the companion
+    // app. No session (the first frame authenticates with a pairing code or
+    // device token); any browser Origin is refused by its handler.
+    .merge(aionui_devices::devices_relay_routes(
+        aionui_devices::DevicesRouterState {
+            service: services.devices_service.clone(),
+        },
+    ))
+    // C38 W3: the aionui-devices MCP bridge calls these with the
+    // conversation's runtime token (validated by the handlers themselves).
+    .merge(aionui_devices::devices_runtime_routes(
+        aionui_devices::DevicesRuntimeRouterState {
+            service: services.devices_service.clone(),
+            runtime_token_service: services.runtime_token_service.clone(),
         },
     ))
     .merge(runtime_team_tools)

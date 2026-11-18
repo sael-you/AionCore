@@ -204,6 +204,10 @@ fn data() -> Value {
                 "description": "MCP market launcher (`mcp exec`), spawned by CLI MCP configs to start an assigned market server behind a filtering stdio proxy, and the built-in server-pool MCP (`mcp servers`, C36) the agent CLI spawns per conversation; not invoked by agents."
             },
             {
+                "name": "mcp-devices-stdio",
+                "description": "Internal aionui-devices MCP stdio server (owner's phones and Macs). Forwards every tool call to AionCore with the conversation runtime token; AionCore enforces the device switch, owner approvals and audit. Not invoked by agents directly."
+            },
+            {
                 "name": "mcp-team-stdio",
                 "description": "Internal team MCP stdio server."
             },

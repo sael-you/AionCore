@@ -70,6 +70,8 @@ pub struct AppServices {
     pub board_service: BoardService,
     /// Server-side in-app browser (C30): Chrome instances, panel and agent bridge.
     pub browser_service: Arc<aionui_browser::BrowserService>,
+    /// Settings → Devices registry (C38, TASK-136).
+    pub devices_service: Arc<aionui_devices::DevicesService>,
     /// Same instance as `worker_task_manager`, exposed through the
     /// `OnConversationDelete` trait so `ConversationService::with_delete_hook`
     /// can wire it up. Optional because tests construct `AppServices` with a
@@ -521,9 +523,25 @@ impl AppServices {
         // only the idle reaper and the daily update timer.
         let browser_service = crate::router::browser::build_browser_service(&data_dir, &origin_policy)?;
         browser_service.spawn_background();
+        // Devices registry (C38): reads the browser through a port; phones,
+        // the Mac and add-ons live in migration 911. Expired switches go off
+        // now and every few seconds.
+        let devices_service = aionui_devices::DevicesService::new(
+            Arc::new(aionui_db::SqliteDeviceRepository::new(database.pool().clone())),
+            Arc::new(crate::router::devices::BrowserDevicesAdapter {
+                service: browser_service.clone(),
+            }),
+        );
+        devices_service.spawn_background();
+        // Add-ons (K5): install / remove through the Mac helper.
+        aionui_devices::addons::register(&devices_service);
         conversation_service.with_browser_port(Arc::new(crate::router::browser::BrowserConversationPort {
             service: browser_service.clone(),
+            devices: devices_service.clone(),
         }));
+        devices_service.set_companion_downloads(Arc::new(aionui_devices::companion::CompanionDownloads::new(
+            data_dir.join("devices").join("companion"),
+        )));
 
         let session_message_queue = Arc::new(DeliveryQueue::new(Arc::new(SystemClock)));
         let session_message_notify = Arc::new(Notify::new());
@@ -579,6 +597,7 @@ impl AppServices {
             user_order_store,
             board_service,
             browser_service,
+            devices_service,
             task_manager_delete_hook: Some(task_manager_delete_hook),
             agent_registry,
             conversation_repo,

@@ -21,6 +21,7 @@ mod conversation;
 mod conversation_tools;
 mod cron;
 mod custom_agent;
+pub mod devices;
 mod extension;
 mod file;
 mod kit;
