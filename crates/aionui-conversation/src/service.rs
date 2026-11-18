@@ -3772,7 +3772,7 @@ impl ConversationService {
             "code": req.code,
             "params": req.params,
         });
-        let row = aionui_db::MessageRow {
+        let row = aionui_db::models::MessageRow {
             id: Self::mint_msg_id(),
             conversation_id: conversation_id.to_owned(),
             msg_id: None,
