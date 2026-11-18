@@ -283,7 +283,12 @@ impl BrowserService {
             let version = self.installer.install(engine, &release).await?;
             let current = installed_version(&self.cfg.layout, engine);
             let in_use = self.instances.iter().any(|e| e.value().engine == engine);
-            if current.as_deref() != Some(version.as_str()) && (current.is_none() || !in_use) {
+            // Forward only: `install` already refused anything older than the
+            // highest version ever installed; `activate` refuses the rest.
+            let newer = current
+                .as_deref()
+                .is_none_or(|c| crate::install::version_newer(&version, c));
+            if newer && (current.is_none() || !in_use) {
                 self.installer.activate(engine, &version)?;
                 tracing::info!(engine = engine.id(), %version, verification = ?crate::engine::spec(engine).verification(), "server browser engine installed");
             }
