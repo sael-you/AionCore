@@ -417,7 +417,7 @@ impl SettingsStore {
                 .ok()
                 .and_then(|bytes| serde_json::from_slice::<StoredSettings>(&bytes).ok());
             match stored {
-                Some(stored) if !stored.sanitized().rows().iter().any(|r| r.engine == engine) => {}
+                Some(stored) if !stored.rows().iter().any(|r| r.engine == engine) => {}
                 _ => return true,
             }
         }
