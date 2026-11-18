@@ -188,6 +188,15 @@ pub async fn cached_asset(http: &reqwest::Client, cache: &Path) -> Result<(PathB
     }
 }
 
+/// Bytes the cached archive (and a partial download) take.
+pub fn cache_bytes(cache: &Path) -> u64 {
+    [ASSET.to_owned(), format!(".{ASSET}.part")]
+        .iter()
+        .filter_map(|name| std::fs::metadata(cache.join(name)).ok())
+        .map(|m| m.len())
+        .sum()
+}
+
 /// Remove the cached archives (the engine's "clear cache", used by remove).
 pub fn clear_cache(cache: &Path) -> std::io::Result<u64> {
     let mut freed = 0;
@@ -359,7 +368,9 @@ mod tests {
         std::fs::create_dir_all(&cache).unwrap();
         std::fs::write(cache.join(ASSET), b"0123456789").unwrap();
         std::fs::write(cache.join(format!(".{ASSET}.part")), b"01234").unwrap();
+        assert_eq!(cache_bytes(&cache), 15);
         assert_eq!(clear_cache(&cache).unwrap(), 15);
+        assert_eq!(cache_bytes(&cache), 0);
         assert!(!cache.join(ASSET).exists());
         assert_eq!(clear_cache(&cache).unwrap(), 0, "nothing left");
     }

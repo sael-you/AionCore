@@ -203,7 +203,20 @@ mod tests {
         let installer = EngineDeviceInstaller { service: svc.clone() };
         let facts = adapter.server_engines("u1");
         let ids: Vec<&str> = facts.iter().map(|f| f.engine_id.as_str()).collect();
-        assert_eq!(ids, ["chrome", "chrome-for-testing", "brave", "edge", "headless-shell"]);
+        // Camoufox (K6) is a real engine row, not the registry's placeholder.
+        assert_eq!(
+            ids,
+            [
+                "chrome",
+                "chrome-for-testing",
+                "brave",
+                "edge",
+                "headless-shell",
+                "camoufox"
+            ]
+        );
+        let camoufox = facts.iter().find(|f| f.engine_id == "camoufox").unwrap();
+        assert_eq!((camoufox.name.as_str(), camoufox.installed), ("Camoufox", false));
         let brave = facts.iter().find(|f| f.engine_id == "brave").unwrap();
         assert_eq!(
             (
@@ -218,7 +231,8 @@ mod tests {
 
         assert!(installer.handles("server_browser:brave"));
         assert!(installer.handles("server_browser:headless-shell"));
-        for other in ["server_browser:camoufox", "server_browser:", "addon:artemis", "brave"] {
+        assert!(installer.handles("server_browser:camoufox"));
+        for other in ["server_browser:", "server_browser:firefox", "addon:artemis", "brave"] {
             assert!(!installer.handles(other), "{other}");
         }
 
@@ -257,5 +271,53 @@ mod tests {
             .unwrap();
         assert_eq!((brave.installed, brave.version, brave.disk_bytes), (false, None, None));
         assert!(adapter.server_engines("u1")[0].installed, "Chrome untouched");
+    }
+
+    #[tokio::test]
+    async fn the_camoufox_row_counts_its_cached_archive_and_remove_clears_it() {
+        let t = tempfile::tempdir().unwrap();
+        let svc = service(
+            t.path(),
+            &[
+                (BrowserEngine::Chrome, "157.0.1.1", "chrome"),
+                (BrowserEngine::Camoufox, "159.0-beta.42", "camoufox-bin"),
+            ],
+        );
+        let cache = t.path().join("b").join("cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        let archive = cache.join(aionui_browser::camoufox::ASSET);
+        std::fs::write(&archive, vec![0u8; 1000]).unwrap();
+        let adapter = BrowserDevicesAdapter { service: svc.clone() };
+        let installer = EngineDeviceInstaller { service: svc.clone() };
+        let row = |a: &BrowserDevicesAdapter| {
+            a.server_engines("u1")
+                .into_iter()
+                .find(|f| f.engine_id == "camoufox")
+                .unwrap()
+        };
+        let before = row(&adapter);
+        assert_eq!(
+            (before.installed, before.version.as_deref(), before.disk_bytes),
+            (true, Some("159.0-beta.42"), Some(2048 + 1000)),
+            "engine tree + cached archive"
+        );
+        // Selected by an instance row: 409 and the cache stays.
+        let pick = |engine| BrowserInstancePatch {
+            engine: Some(engine),
+            ..Default::default()
+        };
+        svc.patch_instance("u1", 2, &pick(BrowserEngine::Camoufox)).unwrap();
+        let noop = |_: u8| {};
+        let refused = installer
+            .remove("u1", "server_browser:camoufox", &noop)
+            .await
+            .unwrap_err();
+        assert_eq!(refused.code(), Some(DeviceErrorCode::DeviceInUse));
+        assert!(archive.exists(), "a refused remove clears nothing");
+        svc.patch_instance("u1", 2, &pick(BrowserEngine::Chrome)).unwrap();
+        installer.remove("u1", "server_browser:camoufox", &noop).await.unwrap();
+        assert!(!archive.exists(), "remove clears the cached archive");
+        let after = row(&adapter);
+        assert_eq!((after.installed, after.disk_bytes), (false, None));
     }
 }

@@ -253,7 +253,8 @@ impl DevicesService {
     pub async fn list(&self, user_id: &str) -> Result<Vec<Device>, DevicesError> {
         let mut out = Vec::new();
         let engines = self.server_browser_cards(user_id);
-        // Camoufox: a placeholder until its engine (K6) reports itself.
+        // Camoufox is a real engine row (K6); the placeholder only shows when
+        // the browser port does not list it.
         let camoufox_listed = engines.iter().any(|d| d.id == CAMOUFOX_ID);
         out.extend(engines);
         if !camoufox_listed {

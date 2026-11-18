@@ -211,7 +211,12 @@ impl BrowserService {
         {
             return Some(*bytes);
         }
-        let bytes = crate::install::disk_bytes(&self.cfg.layout, engine)?;
+        let mut bytes = crate::install::disk_bytes(&self.cfg.layout, engine)?;
+        if engine == BrowserEngine::Camoufox {
+            // Its verified archive stays cached for a reinstall: part of
+            // what a remove frees.
+            bytes += crate::camoufox::cache_bytes(&self.cfg.layout.cache_dir());
+        }
         cache.insert(engine, (version, bytes));
         Some(bytes)
     }
@@ -221,6 +226,10 @@ impl BrowserService {
         self.instances
             .iter()
             .any(|e| e.value().engine == engine && e.value().is_running())
+            || self
+                .juggler
+                .iter()
+                .any(|e| e.value().engine == engine && e.value().is_running())
             || self.settings.engine_selected_by_anyone(engine)
     }
 
@@ -260,6 +269,14 @@ impl BrowserService {
         let _launching = self.launch_lock.lock().await;
         self.check_engine_removable(engine)?;
         let removed = self.installer.remove(engine)?;
+        if engine == BrowserEngine::Camoufox {
+            // Remove frees the disk: the cached archive goes too (a later
+            // install downloads and verifies it again).
+            match crate::camoufox::clear_cache(&self.cfg.layout.cache_dir()) {
+                Ok(freed) => tracing::info!(freed, "camoufox archive cache cleared"),
+                Err(e) => tracing::warn!(error = %e, "camoufox archive cache not cleared"),
+            }
+        }
         self.disk_cache
             .lock()
             .unwrap_or_else(|p| p.into_inner())
