@@ -277,11 +277,21 @@ async fn runtime_device_routes_need_a_conversation_runtime_token() {
             r#"{"decision": "allow", "always": true}"#,
         ),
     ] {
-        let r = app
+        // Without an Origin the guard refuses first (403); with the trusted
+        // Origin the missing owner session does (401). Never accepted.
+        let bare = app
             .clone()
             .oneshot(runtime(Some(&issued.token), user, method, path, body))
             .await
             .unwrap();
+        assert_eq!(
+            bare.status(),
+            StatusCode::FORBIDDEN,
+            "{method} {path} without an Origin"
+        );
+        let mut with_origin = runtime(Some(&issued.token), user, method, path, body);
+        with_origin.headers_mut().insert("origin", ORIGIN.parse().unwrap());
+        let r = app.clone().oneshot(with_origin).await.unwrap();
         assert_eq!(
             r.status(),
             StatusCode::UNAUTHORIZED,
