@@ -283,3 +283,66 @@ async fn project_counts_for_the_overview() {
     let other = repo.project_counts("someone-else", "proj-a").await.unwrap();
     assert_eq!((other.conversations_total, other.open_cards), (0, 0));
 }
+
+/// Staging finding (TASK-169): a turn was dropped with "database is locked".
+/// The ledger write read first and wrote second inside a deferred
+/// transaction; when another connection committed in between, SQLite refused
+/// the lock upgrade at once (busy_timeout does not apply to a stale read
+/// snapshot). On a file-backed WAL database with other writers running,
+/// every report must still be recorded.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn concurrent_writers_never_drop_a_turn() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = aionui_db::init_database(&dir.path().join("usage.db")).await.unwrap();
+    for sql in [
+        "INSERT INTO projects (project_id, user_id, name, kind, created_at, updated_at) VALUES ('proj-a', 'system_default_user', 'TB', 'standard', 1, 1)",
+        "INSERT INTO conversations (id, user_id, name, type, status, created_at, updated_at, project_id, extra) VALUES ('conv-a', 'system_default_user', 'Alpha', 'acp', 'pending', 1, 1, 'proj-a', '{}')",
+    ] {
+        sqlx::query(sql).execute(db.pool()).await.unwrap();
+    }
+    const TURNS: i64 = 80;
+    let mut tasks = Vec::new();
+    for i in 0..TURNS {
+        let repo = SqliteUsageRepository::new(db.pool().clone());
+        tasks.push(tokio::spawn(async move {
+            repo.record_usage_turn(&turn("conv-a", T_18 + i, 1, 1, Some(10)))
+                .await
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        }));
+        // What the server does around a turn: other statements writing the same database.
+        let pool = db.pool().clone();
+        tasks.push(tokio::spawn(async move {
+            sqlx::query("UPDATE conversations SET updated_at = updated_at + 1 WHERE id = 'conv-a'")
+                .execute(&pool)
+                .await
+                .map(|_| ())
+                .map_err(|e| e.to_string())
+        }));
+    }
+    let mut errors = Vec::new();
+    for task in tasks {
+        if let Err(e) = task.await.unwrap() {
+            errors.push(e);
+        }
+    }
+    assert!(
+        errors.is_empty(),
+        "{} writes failed, first: {:?}",
+        errors.len(),
+        errors.first()
+    );
+    let repo = SqliteUsageRepository::new(db.pool().clone());
+    let days = repo
+        .usage_by_day(USER, Some("proj-a"), "2026-11-18", "2026-11-18")
+        .await
+        .unwrap();
+    assert_eq!((days[0].sums.turns, days[0].sums.input_tokens), (TURNS, TURNS));
+    assert_eq!(days[0].sums.cost_micro_usd, Some(TURNS * 10));
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM usage_turns")
+        .fetch_one(db.pool())
+        .await
+        .unwrap();
+    assert_eq!(rows, TURNS);
+    db.close().await;
+}
