@@ -30,6 +30,8 @@ use crate::error::DevicesError;
 use crate::ports::{BrowserDevices, DevicesEventSink, NoopDevicesEventSink};
 use crate::relay::{RelayState, relay_error_code};
 
+/// Reads that are sent once more when the device reconnects while they wait.
+const RESENT_VERBS: &[&str] = &["foreground", "mac_foreground", "ui_tree", "screenshot"];
 pub const SERVER_BROWSER_ID: &str = "server_browser:chrome";
 pub const CAMOUFOX_ID: &str = "server_browser:camoufox";
 
@@ -912,22 +914,65 @@ impl DevicesService {
             ));
         };
         let offline = || DevicesError::coded(DeviceErrorCode::DeviceOffline, "the device is offline");
-        let client = self.relay_client(user_id, pairing_id).ok_or_else(offline)?;
-        if !client.is_present(&row.source_id) {
-            return Err(offline());
+        let deadline = tokio::time::Instant::now() + crate::relay::request_timeout(verb);
+        let mut client = self.relay_client(user_id, pairing_id).ok_or_else(offline)?;
+        let mut retried = false;
+        loop {
+            if !client.is_present(&row.source_id) {
+                return Err(offline());
+            }
+            // Never route a verb the client did not announce (the companion app
+            // serves no logcat / install_apk / cdp_*).
+            if !client.serves(verb) {
+                return Err(DevicesError::coded(
+                    DeviceErrorCode::DeviceVerbRefused,
+                    format!("{verb} is not available on this device"),
+                ));
+            }
+            let error = match client.call(&row.source_id, verb, args.clone()).await {
+                Ok(result) => return Ok(result),
+                Err(error) => error,
+            };
+            // The socket closed under a pending read (a phone app going to
+            // the background reconnects within seconds): send it ONCE more on
+            // the new socket, inside the same time budget. Never for a verb
+            // that changes something — it may already have run.
+            let again = !retried && error.code == crate::relay::WENT_OFFLINE && RESENT_VERBS.contains(&verb);
+            let next = if again {
+                self.reconnected_client(user_id, pairing_id, &row.source_id, &client, deadline)
+                    .await
+            } else {
+                None
+            };
+            let Some(next) = next else {
+                return Err(DevicesError::coded(relay_error_code(&error), error.message));
+            };
+            info!(user_id, device_id, verb, "device reconnected; pending read sent again");
+            client = next;
+            retried = true;
         }
-        // Never route a verb the client did not announce (the companion app
-        // serves no logcat / install_apk / cdp_*).
-        if !client.serves(verb) {
-            return Err(DevicesError::coded(
-                DeviceErrorCode::DeviceVerbRefused,
-                format!("{verb} is not available on this device"),
-            ));
+    }
+
+    /// The pairing's NEW client (not `old`) once it reports `device`, or
+    /// `None` when `deadline` passes first.
+    async fn reconnected_client(
+        &self,
+        user_id: &str,
+        pairing_id: &str,
+        device: &str,
+        old: &Arc<crate::relay::RelayClient>,
+        deadline: tokio::time::Instant,
+    ) -> Option<Arc<crate::relay::RelayClient>> {
+        while tokio::time::Instant::now() < deadline {
+            if let Some(c) = self.relay_client(user_id, pairing_id)
+                && !Arc::ptr_eq(&c, old)
+                && c.is_present(device)
+            {
+                return Some(c);
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
         }
-        client
-            .call(&row.source_id, verb, args)
-            .await
-            .map_err(|e| DevicesError::coded(relay_error_code(&e), e.message))
+        None
     }
 
     fn set_job(&self, job_id: &str, state: DeviceJobState, progress: u8, error: Option<String>) {

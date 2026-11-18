@@ -164,6 +164,11 @@ const CRUCIAL_MARKERS: &[&str] = &[
     "bitwarden",
 ];
 
+/// System overlays that sit in front of the real app (a game toolbar, the
+/// notification shade / lock screen): while the device names one of these,
+/// the app underneath is NOT known, so the call is treated as "unknown app".
+const OVERLAY_PACKAGES: &[&str] = &["com.oplus.games", "com.android.systemui"];
+
 /// Whether `package` is an app where agent actions need an OK.
 pub fn is_crucial_package(package: &str) -> bool {
     let p = package.to_ascii_lowercase();
@@ -535,8 +540,8 @@ impl DevicesService {
 
     /// The app in front on the device, asked from the device itself: Android
     /// package (`foreground`) or macOS bundle id (`mac_foreground`).
-    /// `Ok(None)` when the device answers but cannot say (then the call is
-    /// treated as crucial); `Err` when it is offline or does not answer
+    /// `Ok(None)` when the device answers but cannot say, or names a system
+    /// overlay (then the call is treated as crucial); `Err` when it is offline or does not answer
     /// within [`crate::relay::QUICK_TIMEOUT`].
     async fn front_app(&self, user_id: &str, device_id: &str, kind: &str) -> Result<Option<String>, DevicesError> {
         let (verb, field) = if kind == "mac" {
@@ -549,7 +554,7 @@ impl DevicesService {
                 .get(field)
                 .and_then(Value::as_str)
                 .map(str::to_owned)
-                .filter(|p| !p.trim().is_empty())),
+                .filter(|p| !p.trim().is_empty() && !OVERLAY_PACKAGES.contains(&p.as_str()))),
             Err(error) if error.code() == Some(DeviceErrorCode::DeviceOffline) => Err(error),
             Err(_) => Ok(None),
         }

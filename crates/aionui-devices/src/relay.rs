@@ -66,6 +66,8 @@ pub fn request_timeout(verb: &str) -> Duration {
         _ => REQUEST_TIMEOUT,
     }
 }
+/// Core's own error: the socket closed while the request was pending.
+pub(crate) const WENT_OFFLINE: &str = "went_offline";
 /// Core's own error for a `response` frame it could not parse.
 const UNREADABLE_ANSWER: &str = "unreadable_answer";
 pub const PAIRING_TTL: Duration = Duration::from_secs(5 * 60);
@@ -105,6 +107,8 @@ pub struct RelayClient {
     foreground: std::sync::Mutex<HashMap<String, String>>,
     /// Companion 0.2+: what the phone last said about itself.
     health: std::sync::Mutex<Option<DeviceHealth>>,
+    /// The client's own version (`pair` / `hello`), shown on its card.
+    version: Option<String>,
 }
 
 impl std::fmt::Debug for RelayClient {
@@ -130,7 +134,7 @@ impl RelayClient {
         let pending: Vec<_> = self.pending.lock().expect("pending lock").drain().collect();
         for (_, tx) in pending {
             let _ = tx.send(Err(RelayError {
-                code: relay_error::FAILED.into(),
+                code: WENT_OFFLINE.into(),
                 message: "the device went offline".into(),
             }));
         }
@@ -165,14 +169,14 @@ impl RelayClient {
         }) {
             self.pending.lock().expect("pending lock").remove(&id);
             return Err(RelayError {
-                code: relay_error::FAILED.into(),
+                code: WENT_OFFLINE.into(),
                 message: "the device went offline".into(),
             });
         }
         match tokio::time::timeout(request_timeout(verb), rx).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(RelayError {
-                code: relay_error::FAILED.into(),
+                code: WENT_OFFLINE.into(),
                 message: "the device went offline".into(),
             }),
             Err(_) => {
@@ -286,7 +290,7 @@ pub fn relay_error_code(error: &RelayError) -> DeviceErrorCode {
         relay_error::REFUSED => DeviceErrorCode::DeviceVerbRefused,
         relay_error::BUSY => DeviceErrorCode::DeviceBusy,
         relay_error::BAD_ARGS | UNREADABLE_ANSWER => DeviceErrorCode::DeviceBadMessage,
-        relay_error::TIMEOUT => DeviceErrorCode::DeviceOffline,
+        relay_error::TIMEOUT | WENT_OFFLINE => DeviceErrorCode::DeviceOffline,
         _ => DeviceErrorCode::DeviceVerbRefused,
     }
 }
@@ -419,6 +423,7 @@ impl DevicesService {
             present: std::sync::Mutex::new(HashSet::new()),
             foreground: std::sync::Mutex::new(HashMap::new()),
             health: std::sync::Mutex::new(health),
+            version: pairing.version.clone().filter(|v| !v.is_empty()),
         });
         let _ = client.out.send(RelayOutbound::Welcome {
             client_id: pairing.id.clone(),
@@ -794,10 +799,12 @@ impl DevicesService {
                 "model": p.model, "android_version": p.android_version, "transport": p.transport,
                 "chrome": p.chrome, "peer_enabled": p.enabled, "companion_client_id": companion,
             });
-            if client.kind == RelayClientKind::Companion
-                && let Some(health) = client.health.lock().expect("health lock").clone()
-            {
-                meta["health"] = serde_json::to_value(health).unwrap_or(Value::Null);
+            if client.kind == RelayClientKind::Companion {
+                // The companion card: the app's version and its health.
+                meta["version"] = json!(client.version);
+                if let Some(health) = client.health.lock().expect("health lock").clone() {
+                    meta["health"] = serde_json::to_value(health).unwrap_or(Value::Null);
+                }
             }
             upsert("phone", source, clean_label(&p.name, "Phone"), meta).await;
         }
@@ -805,7 +812,7 @@ impl DevicesService {
             present.insert(RELAY_DEVICE_MAC.to_owned());
             let meta = json!({
                 "mac_reported": true, "os_version": m.os_version, "permissions_ok": m.permissions_ok,
-                "peer_enabled": m.enabled,
+                "peer_enabled": m.enabled, "version": client.version,
             });
             upsert("mac", RELAY_DEVICE_MAC.to_owned(), clean_label(&m.name, "Mac"), meta).await;
         }

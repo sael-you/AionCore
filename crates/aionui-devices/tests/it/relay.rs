@@ -1371,6 +1371,11 @@ async fn a_phone_reports_its_health() {
     )
     .await;
     wait_status(&svc, &phone, DeviceStatus::Off).await;
+    assert_eq!(
+        svc.get("u1", &phone).await.unwrap().version.as_deref(),
+        Some("0.2.0"),
+        "the app version"
+    );
     let health = svc.get("u1", &phone).await.unwrap().health.expect("health from pair");
     assert_eq!(
         (health.battery_percent, health.charging, health.locked),
@@ -1406,4 +1411,91 @@ async fn a_phone_reports_its_health() {
     );
     // A Mac-relay phone has no health.
     assert!(listed.iter().filter(|d| d.id != phone).all(|d| d.health.is_none()));
+}
+
+/// Live finding 2026-11-18: with a game on screen a OnePlus reports its game
+/// toolbar (`com.oplus.games`) as the front app. An overlay says nothing about
+/// the app underneath: the call asks, and that OK is single-use.
+#[tokio::test]
+async fn an_overlay_in_front_counts_as_an_unknown_app() {
+    let (svc, port) = harness().await;
+    let (phone, mut reached, front) = enabled_phone(&svc, port, "com.oplus.games").await;
+    for overlay in ["com.oplus.games", "com.android.systemui"] {
+        *front.lock().unwrap() = overlay.into();
+        for round in 0..2 {
+            let svc2 = svc.clone();
+            let phone2 = phone.clone();
+            let call = tokio::spawn(async move { svc2.agent_call(agent_with(&phone2, "tap", json!({}), "c1")).await });
+            let ask = approve_next(&svc, true).await;
+            assert_eq!(ask.package.as_deref(), Some("unknown"), "{overlay}");
+            assert_eq!(ask.grant_minutes, None, "{overlay} round {round}");
+            call.await.unwrap().unwrap();
+            assert_eq!(reached.recv().await.as_deref(), Some("tap"));
+        }
+    }
+}
+
+/// Reconnect with the stored token and report the same phone again.
+async fn reconnect_mac(port: u16, token: &str) -> Ws {
+    let mut ws = open(port, None).await.unwrap();
+    send(
+        &mut ws,
+        json!({"type": "hello", "token": token, "kind": "mac_helper", "version": "0.1.0",
+               "capabilities": ["tap", "screenshot", "foreground", "text", "ui_tree", "launch", "stop"]}),
+    )
+    .await;
+    assert_eq!(next(&mut ws).await.unwrap()["type"], "welcome");
+    send(
+        &mut ws,
+        json!({"type": "inventory",
+               "phones": [{"serial": "R5CX", "name": "Galaxy", "transport": "usb", "chrome": true, "enabled": true}]}),
+    )
+    .await;
+    ws
+}
+
+/// Live finding 2026-11-18: the phone app's socket drops and reconnects within
+/// seconds when the app goes to the background. A pending READ is sent once
+/// more on the new socket; an ACTION never is (it may already have run).
+#[tokio::test]
+async fn a_pending_read_is_sent_again_after_a_reconnect_an_action_is_not() {
+    let (svc, port) = harness().await;
+    let (mut ws, token, client_id) = pair_mac(&svc, port).await;
+    let phone = format!("phone:{client_id}:R5CX");
+    wait_status(&svc, &phone, DeviceStatus::Off).await;
+
+    // A read: the first socket closes with the request pending.
+    let svc2 = svc.clone();
+    let phone2 = phone.clone();
+    let read = tokio::spawn(async move { svc2.relay_call("u1", &phone2, "foreground", json!({})).await });
+    let request = next(&mut ws).await.unwrap();
+    assert_eq!(request["verb"], "foreground");
+    ws.close(None).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let mut ws = reconnect_mac(port, &token).await;
+    let again = next(&mut ws).await.expect("the read was sent again");
+    assert_eq!(
+        (again["type"].as_str(), again["verb"].as_str()),
+        (Some("request"), Some("foreground"))
+    );
+    send(
+        &mut ws,
+        json!({"type": "response", "id": again["id"], "ok": true, "result": {"package": "org.wikipedia"}}),
+    )
+    .await;
+    assert_eq!(read.await.unwrap().unwrap()["package"], "org.wikipedia");
+
+    // An action: DEVICE_OFFLINE, and nothing arrives on the new socket.
+    let svc2 = svc.clone();
+    let phone2 = phone.clone();
+    let tap = tokio::spawn(async move { svc2.relay_call("u1", &phone2, "tap", json!({"x": 1, "y": 1})).await });
+    assert_eq!(next(&mut ws).await.unwrap()["verb"], "tap");
+    ws.close(None).await.unwrap();
+    assert_eq!(
+        tap.await.unwrap().unwrap_err().code(),
+        Some(DeviceErrorCode::DeviceOffline)
+    );
+    let mut ws = reconnect_mac(port, &token).await;
+    let quiet = tokio::time::timeout(Duration::from_millis(700), ws.next()).await;
+    assert!(quiet.is_err(), "the tap was not sent again: {quiet:?}");
 }
