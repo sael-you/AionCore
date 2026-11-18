@@ -281,6 +281,7 @@ impl DevicesService {
                 routes: None,
                 addon_host: None,
                 health: None,
+                access: None,
             });
         }
         out.extend(self.my_browser_cards(user_id));
@@ -358,6 +359,7 @@ impl DevicesService {
                 routes: None,
                 addon_host: None,
                 health: None,
+                access: None,
             });
         }
         for (name, label) in LIBRARY_ADDONS {
@@ -382,6 +384,7 @@ impl DevicesService {
                 routes: None,
                 addon_host: None,
                 health: None,
+                access: None,
             });
         }
         Ok(out)
@@ -432,6 +435,7 @@ impl DevicesService {
                     routes: None,
                     addon_host: None,
                     health: None,
+                    access: None,
                 }
             })
             .collect()
@@ -469,6 +473,7 @@ impl DevicesService {
                 routes: None,
                 addon_host: None,
                 health: None,
+                access: None,
             })
             .collect()
     }
@@ -552,6 +557,7 @@ impl DevicesService {
             routes,
             addon_host: (kind == DeviceKind::Addon).then(|| row.pairing_id.clone().unwrap_or_else(|| "server".into())),
             health: meta.get("health").and_then(crate::relay::health_of),
+            access: matches!(kind, DeviceKind::Phone | DeviceKind::Mac).then(|| crate::access::effective_access(row)),
         }
     }
 

@@ -46,6 +46,10 @@ pub trait IDeviceRepository: Send + Sync {
         enabled_until: Option<i64>,
         now: i64,
     ) -> Result<bool, DbError>;
+    /// Store the owner's access settings of a device (`meta.access`, a JSON
+    /// object). One statement; inventory upserts keep this key. Returns false
+    /// when no row matched.
+    async fn set_device_access(&self, user_id: &str, id: &str, access_json: &str, now: i64) -> Result<bool, DbError>;
     /// Turn off every switch whose timeout is at or before `now`; returns the
     /// rows switched off (startup reconcile and the timeout ticker).
     async fn expire_device_switches(&self, now: i64) -> Result<Vec<DeviceRow>, DbError>;

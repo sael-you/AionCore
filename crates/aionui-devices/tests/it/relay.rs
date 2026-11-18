@@ -711,7 +711,19 @@ async fn a_phone_reached_both_ways_is_one_card() {
     let svc2 = svc.clone();
     let card2 = card.clone();
     let key = tokio::spawn(async move { svc2.routed_call("u1", &card2, "key", json!({"code": 4})).await });
-    let req = next(&mut app).await.unwrap();
+    // TASK-175: after its inventory the companion is told the access mode
+    // in effect (its chip shows it); like the real app, skip to the request.
+    let mut req = next(&mut app).await.unwrap();
+    let mut told_mode = false;
+    while req["type"] == "access" {
+        assert_eq!(
+            (req["device"].as_str(), req["mode"].as_str()),
+            (Some("self"), Some("ask"))
+        );
+        told_mode = true;
+        req = next(&mut app).await.unwrap();
+    }
+    assert!(told_mode, "the companion was told the access mode");
     assert_eq!(
         (req["verb"].as_str(), req["device"].as_str()),
         (Some("key"), Some("self"))
@@ -1498,4 +1510,387 @@ async fn a_pending_read_is_sent_again_after_a_reconnect_an_action_is_not() {
     let mut ws = reconnect_mac(port, &token).await;
     let quiet = tokio::time::timeout(Duration::from_millis(700), ws.next()).await;
     assert!(quiet.is_err(), "the tap was not sent again: {quiet:?}");
+}
+
+// -- TASK-175: the access mode of a device -------------------------------------
+
+use aionui_api_types::devices::{DeviceAccessMode, DeviceAccessUpdate, DeviceFullDuration};
+
+fn access(mode: DeviceAccessMode, full: Option<DeviceFullDuration>, sensitive: bool) -> DeviceAccessUpdate {
+    DeviceAccessUpdate {
+        mode,
+        full_duration: full,
+        include_sensitive: sensitive,
+    }
+}
+
+/// A call that must NOT ask: it returns and reaches the phone.
+async fn runs_unasked(svc: &Arc<DevicesService>, phone: &str, verb: &str, args: Value) {
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        svc.agent_call(agent_with(phone, verb, args, "c1")),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("{verb} waits for the owner"))
+    .unwrap_or_else(|e| panic!("{verb}: {e}"));
+    assert!(svc.approvals("u1").is_empty(), "{verb}");
+}
+
+/// A call that must ask; it is denied here.
+async fn asks(
+    svc: &Arc<DevicesService>,
+    phone: &str,
+    verb: &str,
+    args: Value,
+) -> aionui_api_types::devices::DeviceApproval {
+    let svc2 = svc.clone();
+    let phone2 = phone.to_owned();
+    let verb2 = verb.to_owned();
+    let call = tokio::spawn(async move { svc2.agent_call(agent_with(&phone2, &verb2, args, "c9")).await });
+    let ask = approve_next(svc, false).await;
+    assert_eq!(
+        call.await.unwrap().unwrap_err().code(),
+        Some(DeviceErrorCode::DeviceApprovalDenied),
+        "{verb}"
+    );
+    ask
+}
+
+async fn phone_with_new_verbs(
+    svc: &Arc<DevicesService>,
+    port: u16,
+    front: &str,
+) -> (String, Ws, Arc<std::sync::Mutex<String>>) {
+    let (ws, _token, client_id) = pair_mac_with(svc, port, COMPANION_02_VERBS).await;
+    let phone = format!("phone:{client_id}:R5CX");
+    wait_status(svc, &phone, DeviceStatus::Off).await;
+    svc.update(
+        "u1",
+        &phone,
+        &DeviceUpdate {
+            enabled: true,
+            timeout_minutes: Some(15),
+        },
+    )
+    .await
+    .unwrap();
+    // A second socket handle is not possible: serve on a clone-free task and
+    // keep nothing; the caller gets the front-app handle.
+    let (reached, handle) = serve_device(ws, front);
+    std::mem::forget(reached);
+    let dummy = open(port, None).await.unwrap();
+    (phone, dummy, handle)
+}
+
+#[tokio::test]
+async fn trusted_apps_never_ask_everything_else_does() {
+    let (svc, port) = harness().await;
+    let (phone, _ws, front) = phone_with_new_verbs(&svc, port, "com.whatsapp").await;
+    let card = svc.get("u1", &phone).await.unwrap();
+    let start = card.access.expect("phones have an access mode");
+    assert_eq!(
+        (start.mode, start.trusted_apps.len(), start.include_sensitive),
+        (DeviceAccessMode::Ask, 0, false)
+    );
+
+    // Bad lists are refused; a good one is stored without duplicates.
+    for bad in [
+        vec!["".to_owned()],
+        vec!["com.x/../y".to_owned()],
+        vec!["a b".to_owned()],
+    ] {
+        assert_eq!(
+            svc.set_trusted_apps("u1", &phone, &bad).await.unwrap_err().code(),
+            Some(DeviceErrorCode::DeviceBadMessage)
+        );
+    }
+    let listed = svc
+        .set_trusted_apps(
+            "u1",
+            &phone,
+            &["com.whatsapp".into(), "COM.WHATSAPP".into(), "de.mybank.app".into()],
+        )
+        .await
+        .unwrap();
+    assert_eq!(
+        listed.access.unwrap().trusted_apps,
+        vec!["com.whatsapp", "de.mybank.app"]
+    );
+    // The list alone changes nothing while the mode is ask.
+    asks(&svc, &phone, "tap", json!({})).await;
+
+    let card = svc
+        .set_access("u1", &phone, &access(DeviceAccessMode::Trusted, None, false))
+        .await
+        .unwrap();
+    assert_eq!(card.access.unwrap().mode, DeviceAccessMode::Trusted);
+    runs_unasked(&svc, &phone, "tap", json!({})).await;
+    runs_unasked(&svc, &phone, "screenshot", json!({})).await;
+    // Not on the list, unknown, an overlay, a link: as before.
+    for other in ["com.google.android.gm", "", "com.oplus.games"] {
+        *front.lock().unwrap() = other.into();
+        asks(&svc, &phone, "tap", json!({})).await;
+    }
+    *front.lock().unwrap() = "com.whatsapp".into();
+    asks(&svc, &phone, "open_url", json!({"url": "https://example.com/"})).await;
+    // A listed banking app still asks until include_sensitive is on.
+    *front.lock().unwrap() = "de.mybank.app".into();
+    let ask = asks(&svc, &phone, "tap", json!({})).await;
+    assert!(ask.sensitive);
+    svc.set_access("u1", &phone, &access(DeviceAccessMode::Trusted, None, true))
+        .await
+        .unwrap();
+    runs_unasked(&svc, &phone, "tap", json!({})).await;
+
+    // An inventory refresh keeps the owner's settings.
+    let stored = svc.get("u1", &phone).await.unwrap().access.unwrap();
+    assert_eq!(
+        (stored.mode, stored.include_sensitive, stored.trusted_apps.len()),
+        (DeviceAccessMode::Trusted, true, 2)
+    );
+    let audit = audit_rows(&svc, &phone).await;
+    assert!(
+        audit.iter().any(|r| r.verb == "tap"
+            && r.outcome == aionui_api_types::devices::DeviceAuditOutcome::Ok
+            && r.detail.as_deref() == Some("mode=trusted")),
+        "{audit:?}"
+    );
+    // Only the owner of the device; only phones and Macs.
+    assert_eq!(
+        svc.set_access("u2", &phone, &access(DeviceAccessMode::Trusted, None, false))
+            .await
+            .unwrap_err()
+            .code(),
+        Some(DeviceErrorCode::DeviceNotFound)
+    );
+    assert_eq!(
+        svc.set_access(
+            "u1",
+            "server_browser:chrome",
+            &access(DeviceAccessMode::Trusted, None, false)
+        )
+        .await
+        .unwrap_err()
+        .code(),
+        Some(DeviceErrorCode::DeviceBadMessage)
+    );
+}
+
+#[tokio::test]
+async fn full_access_shows_no_cards_keeps_the_hard_stops_and_ends_with_the_switch() {
+    let (svc, port) = harness().await;
+    let (phone, _ws, front) = phone_with_new_verbs(&svc, port, "com.whatsapp").await;
+    // A duration is required, and only goes with full.
+    for bad in [
+        access(DeviceAccessMode::Full, None, false),
+        access(DeviceAccessMode::Ask, Some(DeviceFullDuration::OneHour), false),
+    ] {
+        assert_eq!(
+            svc.set_access("u1", &phone, &bad).await.unwrap_err().code(),
+            Some(DeviceErrorCode::DeviceBadMessage)
+        );
+    }
+    let before = aionui_common::now_ms();
+    let card = svc
+        .set_access(
+            "u1",
+            &phone,
+            &access(DeviceAccessMode::Full, Some(DeviceFullDuration::OneHour), false),
+        )
+        .await
+        .unwrap();
+    let a = card.access.clone().unwrap();
+    assert_eq!(a.mode, DeviceAccessMode::Full);
+    let until = a.full_until.expect("1 h");
+    assert!((before + 3_590_000..=before + 3_610_000).contains(&until), "{until}");
+    assert_eq!(
+        (card.enabled, card.enabled_until),
+        (true, Some(until)),
+        "the switch lasts as long"
+    );
+
+    // No cards: crucial app, unknown app, overlay, link, shade.
+    for other in ["com.whatsapp", "", "com.oplus.games", "com.android.settings"] {
+        *front.lock().unwrap() = other.into();
+        runs_unasked(&svc, &phone, "tap", json!({})).await;
+        runs_unasked(&svc, &phone, "screenshot", json!({})).await;
+    }
+    runs_unasked(&svc, &phone, "open_url", json!({"url": "https://example.com/"})).await;
+    runs_unasked(&svc, &phone, "global", json!({"action": "notifications"})).await;
+    // The hard stops hold: verb list, private addresses, bad arguments.
+    for (verb, args, code) in [
+        ("shell", json!({}), DeviceErrorCode::DeviceVerbRefused),
+        ("cdp_frame", json!({}), DeviceErrorCode::DeviceVerbRefused),
+        (
+            "open_url",
+            json!({"url": "http://192.168.1.1/"}),
+            DeviceErrorCode::DeviceVerbRefused,
+        ),
+        ("global", json!({"action": "reboot"}), DeviceErrorCode::DeviceBadMessage),
+    ] {
+        let err = svc.agent_call(agent_with(&phone, verb, args, "c1")).await.unwrap_err();
+        assert_eq!(err.code(), Some(code), "{verb}");
+    }
+    // Sensitive apps keep asking / stay unread without include_sensitive.
+    *front.lock().unwrap() = "de.mybank.app".into();
+    assert!(asks(&svc, &phone, "tap", json!({})).await.sensitive);
+    *front.lock().unwrap() = "com.x8bit.bitwarden".into();
+    assert_eq!(
+        svc.agent_call(agent_with(&phone, "screenshot", json!({}), "c1"))
+            .await
+            .unwrap_err()
+            .code(),
+        Some(DeviceErrorCode::DeviceVerbRefused)
+    );
+    svc.set_access(
+        "u1",
+        &phone,
+        &access(DeviceAccessMode::Full, Some(DeviceFullDuration::UntilOff), true),
+    )
+    .await
+    .unwrap();
+    let card = svc.get("u1", &phone).await.unwrap();
+    assert_eq!((card.enabled, card.enabled_until), (true, None), "until I turn it off");
+    assert_eq!(card.access.as_ref().unwrap().full_until, None);
+    assert!(card.access.as_ref().unwrap().include_sensitive);
+    runs_unasked(&svc, &phone, "screenshot", json!({})).await;
+    *front.lock().unwrap() = "de.mybank.app".into();
+    runs_unasked(&svc, &phone, "tap", json!({})).await;
+    let audit = audit_rows(&svc, &phone).await;
+    assert!(
+        audit
+            .iter()
+            .any(|r| r.verb == "tap" && r.detail.as_deref() == Some("mode=full"))
+    );
+    assert!(
+        audit.iter().any(|r| r.verb == "shell"
+            && r.outcome == aionui_api_types::devices::DeviceAuditOutcome::Refused
+            && r.detail.as_deref() == Some("DEVICE_VERB_REFUSED; mode=full")),
+        "{audit:?}"
+    );
+
+    // The switch goes off: full is over, and switching on again is plain ask.
+    svc.update(
+        "u1",
+        &phone,
+        &DeviceUpdate {
+            enabled: false,
+            timeout_minutes: None,
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        svc.get("u1", &phone).await.unwrap().access.unwrap().mode,
+        DeviceAccessMode::Ask
+    );
+    assert_eq!(
+        svc.agent_call(agent_with(&phone, "tap", json!({}), "c1"))
+            .await
+            .unwrap_err()
+            .code(),
+        Some(DeviceErrorCode::DeviceDisabled)
+    );
+    let card = svc
+        .update(
+            "u1",
+            &phone,
+            &DeviceUpdate {
+                enabled: true,
+                timeout_minutes: Some(15),
+            },
+        )
+        .await
+        .unwrap();
+    let a = card.access.unwrap();
+    assert_eq!((a.mode, a.include_sensitive), (DeviceAccessMode::Ask, false));
+    *front.lock().unwrap() = "com.whatsapp".into();
+    asks(&svc, &phone, "tap", json!({})).await;
+
+    // Leaving full by choice gives the switch its normal timeout back.
+    svc.set_access(
+        "u1",
+        &phone,
+        &access(DeviceAccessMode::Full, Some(DeviceFullDuration::EightHours), false),
+    )
+    .await
+    .unwrap();
+    let now = aionui_common::now_ms();
+    let card = svc
+        .set_access("u1", &phone, &access(DeviceAccessMode::Ask, None, false))
+        .await
+        .unwrap();
+    let until = card.enabled_until.expect("a timeout again");
+    assert!(until <= now + 31 * 60_000 && until >= now + 29 * 60_000, "{until}");
+    assert_eq!(card.access.unwrap().mode, DeviceAccessMode::Ask);
+}
+
+#[tokio::test]
+async fn always_allow_adds_the_app_and_an_agent_cannot_change_the_mode() {
+    let (svc, port) = harness().await;
+    let (phone, _ws, front) = phone_with_new_verbs(&svc, port, "com.whatsapp").await;
+    let svc2 = svc.clone();
+    let phone2 = phone.clone();
+    let tap = tokio::spawn(async move { svc2.agent_call(agent_with(&phone2, "tap", json!({}), "c1")).await });
+    let ask = pending(&svc).await;
+    assert!(!ask.sensitive);
+    svc.decide_approval_always("u1", &ask.id).await.unwrap();
+    tap.await.unwrap().unwrap();
+    let a = svc.get("u1", &phone).await.unwrap().access.unwrap();
+    assert_eq!(
+        (a.mode, a.trusted_apps),
+        (DeviceAccessMode::Trusted, vec!["com.whatsapp".to_owned()])
+    );
+    // Another conversation, no 5-minute grant involved: still no card.
+    svc.agent_call(agent_with(&phone, "tap", json!({}), "c2"))
+        .await
+        .unwrap();
+    assert!(svc.approvals("u1").is_empty());
+
+    // An unknown app cannot be always allowed; the question stays open.
+    *front.lock().unwrap() = String::new();
+    let svc2 = svc.clone();
+    let phone2 = phone.clone();
+    let tap = tokio::spawn(async move { svc2.agent_call(agent_with(&phone2, "tap", json!({}), "c1")).await });
+    let ask = pending(&svc).await;
+    assert_eq!(
+        svc.decide_approval_always("u1", &ask.id).await.unwrap_err().code(),
+        Some(DeviceErrorCode::DeviceBadMessage)
+    );
+    assert_eq!(svc.approvals("u1").len(), 1);
+    assert_eq!(
+        svc.decide_approval_always("u2", &ask.id).await.unwrap_err().code(),
+        Some(DeviceErrorCode::DeviceApprovalExpired),
+        "another user's approval"
+    );
+    svc.decide_approval("u1", &ask.id, false).unwrap();
+    assert!(tap.await.unwrap().is_err());
+
+    // The agent surface has no verb that touches the mode or the list.
+    *front.lock().unwrap() = "com.android.settings".into();
+    for verb in ["access", "set_access", "set_mode", "trusted_apps", "trust_app", "full"] {
+        let err = svc
+            .agent_call(agent_with(
+                &phone,
+                verb,
+                json!({"mode": "full", "full_duration": "until_off", "apps": ["com.android.settings"]}),
+                "c1",
+            ))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Some(DeviceErrorCode::DeviceVerbRefused), "{verb}");
+    }
+    assert!(
+        !aionui_devices::agent::PHONE_VERBS
+            .iter()
+            .chain(aionui_devices::agent::MAC_VERBS)
+            .any(|v| v.contains("access") || v.contains("trust") || v.contains("mode"))
+    );
+    let a = svc.get("u1", &phone).await.unwrap().access.unwrap();
+    assert_eq!(
+        (a.mode, a.trusted_apps.len()),
+        (DeviceAccessMode::Trusted, 1),
+        "unchanged"
+    );
+    asks(&svc, &phone, "tap", json!({})).await;
 }

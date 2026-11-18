@@ -25,7 +25,9 @@ impl IDeviceRepository for SqliteDeviceRepository {
             "INSERT INTO devices (id, user_id, kind, pairing_id, source_id, name, enabled, meta, created_at, \
              updated_at, last_seen_at) VALUES (?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?) \
              ON CONFLICT(user_id, kind, COALESCE(pairing_id, ''), source_id) DO UPDATE SET \
-             name = excluded.name, meta = excluded.meta, updated_at = excluded.updated_at, \
+             name = excluded.name, \
+             meta = json_patch(excluded.meta, json_object('access', json(json_extract(devices.meta, '$.access')))), \
+             updated_at = excluded.updated_at, \
              last_seen_at = excluded.last_seen_at",
         )
         .bind(p.id)
@@ -85,6 +87,20 @@ impl IDeviceRepository for SqliteDeviceRepository {
         )
         .bind(enabled)
         .bind(if enabled { enabled_until } else { None })
+        .bind(now)
+        .bind(user_id)
+        .bind(id)
+        .execute(&self.pool)
+        .await?;
+        Ok(done.rows_affected() > 0)
+    }
+
+    async fn set_device_access(&self, user_id: &str, id: &str, access_json: &str, now: i64) -> Result<bool, DbError> {
+        let done = sqlx::query(
+            "UPDATE devices SET meta = json_set(CASE WHEN json_valid(meta) THEN meta ELSE '{}' END, \
+             '$.access', json(?)), updated_at = ? WHERE user_id = ? AND id = ?",
+        )
+        .bind(access_json)
         .bind(now)
         .bind(user_id)
         .bind(id)

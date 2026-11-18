@@ -42,6 +42,8 @@ pub struct OwnerQuestion {
     /// When set, an allow also covers later questions with this key for
     /// [`GRANT_TTL`], and a live grant answers at once.
     pub grant_key: Option<String>,
+    /// The app is a banking / payment app or a password manager.
+    pub sensitive: bool,
 }
 
 fn clip(text: &str) -> String {
@@ -97,6 +99,7 @@ impl DevicesService {
                 .grant_key
                 .is_some()
                 .then(|| u32::try_from(GRANT_TTL.as_secs() / 60).unwrap_or(0)),
+            sensitive: q.sensitive,
         };
         info!(user_id = %q.user_id, device_id = %q.device_id, approval_id = %approval.id, verb = %q.verb, "device action paused for the owner");
         self.approval_event(&q.user_id, &approval, DeviceApprovalState::Requested, None);
@@ -145,6 +148,35 @@ impl DevicesService {
         info!(user_id, approval_id = id, allow, "owner answered a device approval");
         self.approval_event(user_id, &approval, DeviceApprovalState::Resolved, Some(allow));
         Ok(())
+    }
+
+    /// `POST /api/devices/approvals/{id}` with "Always allow this app": the
+    /// approval's app joins the device's trusted apps, then the question is
+    /// answered. Only for an allow of a phone / Mac action that names an app.
+    pub async fn decide_approval_always(&self, user_id: &str, id: &str) -> Result<(), DevicesError> {
+        let expired = || {
+            DevicesError::coded(
+                DeviceErrorCode::DeviceApprovalExpired,
+                "the approval is no longer pending",
+            )
+        };
+        let approval = self
+            .approvals(user_id)
+            .into_iter()
+            .find(|a| a.id == id)
+            .ok_or_else(expired)?;
+        let app = approval
+            .package
+            .as_deref()
+            .filter(|_| approval.task.is_none())
+            .ok_or_else(|| {
+                DevicesError::coded(
+                    DeviceErrorCode::DeviceBadMessage,
+                    "this approval names no app that can be always allowed",
+                )
+            })?;
+        self.trust_app(user_id, &approval.device_id, app).await?;
+        self.decide_approval(user_id, id, true)
     }
 
     /// Drop the open questions of a device (switched off, revoked): the
