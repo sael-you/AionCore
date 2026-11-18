@@ -391,6 +391,40 @@ impl SettingsStore {
             .unwrap_or_default())
     }
 
+    /// Whether any instance row of any user selects `engine` (K7: such an
+    /// engine cannot be removed). A user without a settings file has the
+    /// default rows, which select Chrome. Unreadable directory → `true`
+    /// (fail closed: never remove an engine we cannot prove unused).
+    pub fn engine_selected_by_anyone(&self, engine: BrowserEngine) -> bool {
+        let entries = match std::fs::read_dir(&self.dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return engine == BrowserEngine::default(),
+            Err(_) => return true,
+        };
+        let mut users = 0;
+        for entry in entries.flatten() {
+            let name = entry.file_name().to_string_lossy().into_owned();
+            let Some(user_id) = name.strip_suffix(".json") else {
+                continue;
+            };
+            if safe_user_segment(user_id).is_err() {
+                continue;
+            }
+            users += 1;
+            // Parsed strictly here: `load_stored` answers defaults for an
+            // unreadable file, which would hide what that user selected.
+            let stored = std::fs::read(entry.path())
+                .ok()
+                .and_then(|bytes| serde_json::from_slice::<StoredSettings>(&bytes).ok());
+            match stored {
+                Some(stored) if !stored.sanitized().rows().iter().any(|r| r.engine == engine) => {}
+                _ => return true,
+            }
+        }
+        // Nobody saved settings yet: the next user starts on the default engine.
+        users == 0 && engine == BrowserEngine::default()
+    }
+
     /// Whether `instance` launches with the automation flag hidden.
     pub fn hide_automation(&self, user_id: &str, instance: u8) -> Result<bool, BrowserError> {
         Ok(self
@@ -696,5 +730,39 @@ mod tests {
         let wire = serde_json::to_value(s.load("u1").unwrap()).unwrap();
         assert_eq!(wire["instances"][0]["engine"], "headless-shell");
         assert!(serde_json::from_str::<BrowserInstancePatch>(r#"{"engine":"firefox"}"#).is_err());
+    }
+
+    /// K7: an engine is removable only when no instance row of any user
+    /// selects it; without any settings file the default rows select Chrome.
+    #[test]
+    fn engine_selection_is_checked_across_all_users() {
+        let (_d, s) = store();
+        assert!(
+            s.engine_selected_by_anyone(BrowserEngine::Chrome),
+            "defaults select Chrome"
+        );
+        assert!(!s.engine_selected_by_anyone(BrowserEngine::Brave));
+        let patch = |engine| BrowserInstancePatch {
+            engine: Some(engine),
+            ..Default::default()
+        };
+        s.patch("u1", 2, &patch(BrowserEngine::Brave)).unwrap();
+        assert!(s.engine_selected_by_anyone(BrowserEngine::Brave));
+        assert!(s.engine_selected_by_anyone(BrowserEngine::Chrome), "u1's other rows");
+        assert!(!s.engine_selected_by_anyone(BrowserEngine::Edge));
+        // Every row of every user moved off Chrome → Chrome is free.
+        for n in 1..=3 {
+            s.patch("u1", n, &patch(BrowserEngine::Brave)).unwrap();
+        }
+        assert!(!s.engine_selected_by_anyone(BrowserEngine::Chrome));
+        s.patch("u2", 1, &patch(BrowserEngine::Edge)).unwrap();
+        assert!(
+            s.engine_selected_by_anyone(BrowserEngine::Chrome),
+            "u2's default rows 2 and 3"
+        );
+        assert!(s.engine_selected_by_anyone(BrowserEngine::Edge));
+        // An unreadable file counts as "selects it" (fail closed).
+        std::fs::write(s.path("u3").unwrap(), "{not json").unwrap();
+        assert!(s.engine_selected_by_anyone(BrowserEngine::HeadlessShell));
     }
 }

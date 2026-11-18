@@ -413,3 +413,179 @@ async fn audit_pages_and_never_leaks_across_users() {
         Some(DeviceErrorCode::DeviceNotFound)
     );
 }
+
+// -- K7: one registry row per server-browser engine ---------------------------
+
+struct EngineBrowser {
+    installing: AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl BrowserDevices for EngineBrowser {
+    fn server_browser(&self, _: &str) -> BrowserFacts {
+        BrowserFacts {
+            installed: true,
+            version: Some("157.0".into()),
+            agents_enabled: true,
+            running: false,
+        }
+    }
+    fn server_engines(&self, _: &str) -> Vec<crate::ports::EngineFacts> {
+        let engine = |id: &str, name: &str, version: Option<&str>, bytes: Option<u64>| crate::ports::EngineFacts {
+            engine_id: id.into(),
+            name: name.into(),
+            installed: version.is_some(),
+            version: version.map(Into::into),
+            disk_bytes: bytes,
+            installing: false,
+            error: None,
+        };
+        let mut edge = engine("edge", "Microsoft Edge", None, None);
+        edge.installing = self.installing.load(Ordering::SeqCst);
+        let mut shell = engine("headless-shell", "Chrome Headless Shell", None, None);
+        shell.error = Some("download failed".into());
+        vec![
+            engine("chrome", "Chrome", Some("157.0"), Some(400_000_000)),
+            engine("brave", "Brave", Some("1.99.57"), Some(410_000_000)),
+            edge,
+            shell,
+        ]
+    }
+    async fn set_server_browser_enabled(&self, _: &str, _: bool) -> Result<(), String> {
+        Ok(())
+    }
+    fn my_browsers(&self, _: &str) -> Vec<MyBrowserFacts> {
+        Vec::new()
+    }
+    fn my_browsers_enabled(&self, _: &str) -> bool {
+        false
+    }
+    async fn set_my_browsers_enabled(&self, _: &str, _: bool) -> Result<(), String> {
+        Ok(())
+    }
+}
+
+/// Refuses the remove of Chrome before a job exists; removes Brave.
+struct EngineInstaller {
+    removed: Mutex<Vec<String>>,
+}
+
+#[async_trait::async_trait]
+impl DeviceInstaller for EngineInstaller {
+    fn handles(&self, device_id: &str) -> bool {
+        device_id.starts_with("server_browser:") && device_id != CAMOUFOX_ID
+    }
+    async fn install(&self, _: &str, _: &str, _: &ProgressFn) -> Result<(), DevicesError> {
+        Ok(())
+    }
+    async fn check_remove(&self, _: &str, device_id: &str) -> Result<(), DevicesError> {
+        if device_id == SERVER_BROWSER_ID {
+            return Err(DevicesError::coded(
+                DeviceErrorCode::DeviceInUse,
+                "switch its instances first",
+            ));
+        }
+        Ok(())
+    }
+    async fn remove(&self, _: &str, device_id: &str, _: &ProgressFn) -> Result<(), DevicesError> {
+        self.removed.lock().unwrap().push(device_id.to_owned());
+        Ok(())
+    }
+}
+
+#[tokio::test]
+async fn every_engine_is_a_server_browser_row_with_version_and_disk_size() {
+    let db = init_database_memory().await.unwrap();
+    let repo: Arc<dyn IDeviceRepository> = Arc::new(SqliteDeviceRepository::new(db.pool().clone()));
+    let browser = Arc::new(EngineBrowser {
+        installing: AtomicBool::new(true),
+    });
+    let svc = DevicesService::new(repo, browser.clone());
+    std::mem::forget(db);
+
+    let list = svc.list("u1").await.unwrap();
+    let card = |id: &str| {
+        list.iter()
+            .find(|d| d.id == id)
+            .unwrap_or_else(|| panic!("{id} listed"))
+    };
+    let chrome = card(SERVER_BROWSER_ID);
+    assert_eq!(chrome.kind, DeviceKind::ServerBrowser);
+    assert_eq!(chrome.source_id.as_deref(), Some("chrome"));
+    assert_eq!(
+        (chrome.installed, chrome.version.as_deref(), chrome.disk_bytes),
+        (true, Some("157.0"), Some(400_000_000))
+    );
+    assert_eq!(chrome.status, DeviceStatus::On);
+    let brave = card("server_browser:brave");
+    assert_eq!((brave.name.as_str(), brave.disk_bytes), ("Brave", Some(410_000_000)));
+    let edge = card("server_browser:edge");
+    assert_eq!(
+        (edge.installed, edge.disk_bytes, edge.status),
+        (false, None, DeviceStatus::Installing),
+        "a download started outside the registry shows too"
+    );
+    assert_eq!(card("server_browser:headless-shell").status, DeviceStatus::Error);
+    assert_eq!(
+        card(CAMOUFOX_ID).available,
+        DeviceAvailability::Later,
+        "the Camoufox placeholder stays"
+    );
+    assert_eq!(
+        list.iter().filter(|d| d.kind == DeviceKind::ServerBrowser).count(),
+        5,
+        "four engines + the placeholder, none twice"
+    );
+    browser.installing.store(false, Ordering::SeqCst);
+    assert_eq!(
+        svc.get("u1", "server_browser:edge").await.unwrap().status,
+        DeviceStatus::Off
+    );
+}
+
+#[tokio::test]
+async fn removing_an_engine_in_use_is_refused_by_the_request_itself() {
+    let db = init_database_memory().await.unwrap();
+    let repo: Arc<dyn IDeviceRepository> = Arc::new(SqliteDeviceRepository::new(db.pool().clone()));
+    let svc = DevicesService::new(
+        repo,
+        Arc::new(EngineBrowser {
+            installing: AtomicBool::new(false),
+        }),
+    );
+    std::mem::forget(db);
+    let installer = Arc::new(EngineInstaller {
+        removed: Mutex::new(Vec::new()),
+    });
+    svc.register_installer(installer.clone());
+
+    let refused = svc.start_job("u1", SERVER_BROWSER_ID, true).await.unwrap_err();
+    assert_eq!(refused.code(), Some(DeviceErrorCode::DeviceInUse));
+    assert_eq!(
+        svc.get("u1", SERVER_BROWSER_ID).await.unwrap().job_id,
+        None,
+        "no job was created"
+    );
+    // An install of the same engine is not affected by the remove check.
+    svc.start_job("u1", SERVER_BROWSER_ID, false).await.unwrap();
+
+    let job = svc.start_job("u1", "server_browser:brave", true).await.unwrap();
+    for _ in 0..100 {
+        if svc.job("u1", &job).unwrap().state == DeviceJobState::Done {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(svc.job("u1", &job).unwrap().state, DeviceJobState::Done);
+    assert_eq!(
+        *installer.removed.lock().unwrap(),
+        vec!["server_browser:brave".to_owned()]
+    );
+    assert_eq!(
+        svc.start_job("u1", "server_browser:nope", true)
+            .await
+            .unwrap_err()
+            .code(),
+        Some(DeviceErrorCode::DeviceNotFound)
+    );
+}

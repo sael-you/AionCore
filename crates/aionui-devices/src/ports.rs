@@ -14,6 +14,22 @@ pub struct BrowserFacts {
     pub running: bool,
 }
 
+/// One engine of the server browser (C35 / K7): a registry row
+/// `server_browser:<engine_id>`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EngineFacts {
+    /// The engine's wire id (`chrome`, `brave`, …).
+    pub engine_id: String,
+    pub name: String,
+    pub installed: bool,
+    pub version: Option<String>,
+    pub disk_bytes: Option<u64>,
+    /// A download or update runs (also one started outside the registry).
+    pub installing: bool,
+    /// Why the last download failed.
+    pub error: Option<String>,
+}
+
 /// One paired browser of the owner (C34 extension device).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MyBrowserFacts {
@@ -28,6 +44,20 @@ pub struct MyBrowserFacts {
 #[async_trait::async_trait]
 pub trait BrowserDevices: Send + Sync {
     fn server_browser(&self, user_id: &str) -> BrowserFacts;
+    /// Every engine of the server browser, in display order. The default is
+    /// the one managed Chrome of [`Self::server_browser`].
+    fn server_engines(&self, user_id: &str) -> Vec<EngineFacts> {
+        let f = self.server_browser(user_id);
+        vec![EngineFacts {
+            engine_id: "chrome".to_owned(),
+            name: "Chrome".to_owned(),
+            installed: f.installed,
+            version: f.version,
+            disk_bytes: None,
+            installing: false,
+            error: None,
+        }]
+    }
     async fn set_server_browser_enabled(&self, user_id: &str, enabled: bool) -> Result<(), String>;
     fn my_browsers(&self, user_id: &str) -> Vec<MyBrowserFacts>;
     /// "Agents may use my Mac browser" (C34): one switch for every paired browser.

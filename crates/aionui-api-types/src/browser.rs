@@ -34,6 +34,9 @@ pub enum BrowserErrorCode {
     BrowserBadMessage,
     /// `clear` while that profile is being wiped already.
     BrowserBusy,
+    /// An engine cannot be removed while an instance runs on it or an
+    /// instance row still selects it (K7). HTTP 409.
+    BrowserEngineInUse,
     /// Extension pairing code unknown, used or expired (or too many tries).
     BrowserPairingInvalid,
     /// The device's token was revoked (or never existed).
@@ -153,6 +156,13 @@ pub struct BrowserEngineStatus {
     pub verification: BrowserEngineVerification,
     /// No window and a headless User-Agent: meant for agent-only instances.
     pub agents_only: bool,
+    /// Bytes on disk of the install (K7); `None` when not installed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_bytes: Option<u64>,
+    /// An instance runs on it or an instance row selects it: remove is
+    /// refused (409) until that changes.
+    #[serde(default)]
+    pub in_use: bool,
 }
 
 /// `GET /api/browser/settings` and the answer of `PUT`.

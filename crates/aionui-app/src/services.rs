@@ -535,6 +535,9 @@ impl AppServices {
             }),
         );
         devices_service.spawn_background();
+        devices_service.register_installer(Arc::new(crate::router::devices::EngineDeviceInstaller {
+            service: browser_service.clone(),
+        }));
         devices_service.set_companion_downloads(Arc::new(aionui_devices::companion::CompanionDownloads::new(
             data_dir.join("devices").join("companion"),
         )));
