@@ -42,6 +42,10 @@ pub struct PersistedSessionState {
     /// JSON-encoded `UsageUpdate`. Same rationale as
     /// `config_selections_json`.
     pub context_usage_json: Option<String>,
+    /// JSON-encoded context breakdown for the Context panel (TASK-158):
+    /// `{report, updated_at}` where `report` is the backend's own context
+    /// report. Lives beside `context_usage` in `session_config.runtime`.
+    pub context_report_json: Option<String>,
 }
 
 /// Partial update for [`IAcpSessionRepository::save_runtime_state_for_user`].
@@ -54,6 +58,7 @@ pub struct SaveRuntimeStateParams<'a> {
     pub current_model_id: Option<Option<&'a str>>,
     pub config_selections_json: Option<Option<&'a str>>,
     pub context_usage_json: Option<Option<&'a str>>,
+    pub context_report_json: Option<Option<&'a str>>,
 }
 
 impl SaveRuntimeStateParams<'_> {
@@ -62,6 +67,7 @@ impl SaveRuntimeStateParams<'_> {
             && self.current_model_id.is_none()
             && self.config_selections_json.is_none()
             && self.context_usage_json.is_none()
+            && self.context_report_json.is_none()
     }
 }
 

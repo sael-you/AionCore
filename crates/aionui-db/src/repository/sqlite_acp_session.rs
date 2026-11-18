@@ -124,6 +124,7 @@ fn decode_runtime_state(raw: &str) -> Result<PersistedSessionState, DbError> {
             .map(ToOwned::to_owned);
         state.config_selections_json = rt.get("config_selections").map(serde_json::Value::to_string);
         state.context_usage_json = rt.get("context_usage").map(serde_json::Value::to_string);
+        state.context_report_json = rt.get("context_report").map(serde_json::Value::to_string);
     }
     Ok(state)
 }
@@ -180,6 +181,18 @@ fn merge_runtime_state(raw: &str, params: &SaveRuntimeStateParams<'_>) -> Result
             }
             None => {
                 runtime.remove("context_usage");
+            }
+        }
+    }
+    if let Some(outer) = params.context_report_json {
+        match outer {
+            Some(json) => {
+                let v: Value = serde_json::from_str(json)
+                    .map_err(|e| DbError::Init(format!("invalid context_report JSON: {e}")))?;
+                runtime.insert("context_report".into(), v);
+            }
+            None => {
+                runtime.remove("context_report");
             }
         }
     }
@@ -590,6 +603,7 @@ mod tests {
                     current_model_id: Some(Some("claude-sonnet-4")),
                     config_selections_json: Some(Some(r#"{"reasoning":"high"}"#)),
                     context_usage_json: Some(Some(r#"{"used":10,"total":100}"#)),
+                    context_report_json: Some(Some(r#"{"report":{"totalTokens":10},"updated_at":7}"#)),
                 },
             )
             .await
@@ -607,6 +621,9 @@ mod tests {
         let usage: Value = serde_json::from_str(state.context_usage_json.as_deref().unwrap()).unwrap();
         assert_eq!(usage["used"], 10);
         assert_eq!(usage["total"], 100);
+        let report: Value = serde_json::from_str(state.context_report_json.as_deref().unwrap()).unwrap();
+        assert_eq!(report["report"]["totalTokens"], 10);
+        assert_eq!(report["updated_at"], 7);
     }
 
     #[tokio::test]

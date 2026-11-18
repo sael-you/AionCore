@@ -521,6 +521,15 @@ impl AgentInstance {
         }
     }
 
+    /// TASK-158: ask the backend for a fresh context breakdown (direct-CLI
+    /// sessions only; the answer is stored and announced asynchronously).
+    pub async fn refresh_context_report(&self) -> bool {
+        match self {
+            Self::Session(m) => m.refresh_context_report().await,
+            _ => false,
+        }
+    }
+
     /// Slash commands available in the current session. Only ACP exposes
     /// a slash-command catalog; other variants report an empty list
     /// (the UI renders "no commands").

@@ -1005,6 +1005,7 @@ mod tests {
                     current_model_id: Some(Some("persisted-model")),
                     config_selections_json: None,
                     context_usage_json: None,
+                    context_report_json: None,
                 },
             )
             .await
@@ -1053,6 +1054,7 @@ mod tests {
                     current_model_id: Some(Some("gpt-5.5")),
                     config_selections_json: None,
                     context_usage_json: None,
+                    context_report_json: None,
                 },
             )
             .await

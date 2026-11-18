@@ -594,6 +594,13 @@ pub enum SessionEvent {
         /// query was `SessionCost`. A preformatted multi-line string (the backend
         /// owns the formatting — we do not parse it).
         cost_text: Option<String>,
+        /// The backend's full context report for a `ContextUsage` query, verbatim
+        /// minus the render grid (claude `get_context_usage` reply: categories,
+        /// memoryFiles, mcpTools, agents, skills, autoCompactThreshold, …;
+        /// verified: the response schema in the claude 2.1.325 binary). The
+        /// conversation layer stores it for the Context panel (TASK-158).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        context_report: Option<serde_json::Value>,
     },
 
     /// `BackgroundTool` receipt (TASK-8): the running tool call `call_id` now runs
@@ -1325,6 +1332,7 @@ mod additive_tests {
                 SessionEvent::SessionInfo {
                     context_usage: None,
                     cost_text: Some("Total cost: $0".into()),
+                    context_report: None,
                 },
                 BackendProduced,
                 Ephemeral,
@@ -1765,10 +1773,12 @@ mod additive_tests {
                     }],
                 }),
                 cost_text: None,
+                context_report: None,
             },
             SessionEvent::SessionInfo {
                 context_usage: None,
                 cost_text: Some("Total cost: $0.1180".into()),
+                context_report: None,
             },
             SessionEvent::MessageLifecycle {
                 client_msg_id: "u-1".into(),

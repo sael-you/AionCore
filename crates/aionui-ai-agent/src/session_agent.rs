@@ -1308,6 +1308,26 @@ impl SessionAgentTask {
     /// is reaped, so anything held only in memory would be gone and the indicator
     /// would sit blank until the next turn produced fresh usage. Without a repo
     /// (tests) or with no row yet, `None` — the indicator simply stays empty.
+    /// TASK-158: ask the backend for a fresh context breakdown. The answer comes
+    /// back as `SessionEvent::SessionInfo` (stored + announced by the pump), never
+    /// through this call. `false` when the backend has no such query (codex, ACP)
+    /// or the request could not be written — the panel then keeps what it has.
+    pub async fn refresh_context_report(&self) -> bool {
+        match self
+            .backend
+            .dispatch(Command::QuerySessionInfo {
+                kind: aionui_session::SessionInfoKind::ContextUsage,
+            })
+            .await
+        {
+            Ok(receipt) => receipt.accepted,
+            Err(err) => {
+                tracing::debug!(conversation_id = %self.conversation_id, error = %err, "context report query not sent");
+                false
+            }
+        }
+    }
+
     pub async fn get_usage(&self) -> Result<Option<serde_json::Value>, AgentError> {
         let Some(repo) = self.session_repo.as_ref() else {
             return Ok(None);
@@ -3461,6 +3481,19 @@ fn spawn_event_pump(
             if let (Some(bus), Some(_)) = (broadcaster.as_ref(), informative_usage(&env.event)) {
                 broadcast_usage_frame(bus.as_ref(), &conversation_id, &user_id, &env.event);
             }
+            // TASK-158: the context breakdown was just stored (above) — tell the
+            // owner's open Context panel to fetch it. Sent from the pump for the
+            // same reason as the usage frame: the reply lands after the turn.
+            if let (
+                Some(bus),
+                SessionEvent::SessionInfo {
+                    context_report: Some(_),
+                    ..
+                },
+            ) = (broadcaster.as_ref(), &env.event)
+            {
+                broadcast_context_report_frame(bus.as_ref(), &conversation_id, &user_id);
+            }
             for mut ev in translate_event(env.event, &conversation_id, terminal_result_seen) {
                 // Keep the tool name alive across a call's multi-frame lifecycle (see
                 // `stamp_tool_name`): the terminal ToolResult frame leaves the name
@@ -3649,6 +3682,7 @@ async fn persist_side_effects(
                 current_model_id: model.as_ref().map(|m| Some(m.as_str())),
                 config_selections_json: None,
                 context_usage_json: None,
+                context_report_json: None,
             };
             if let Err(err) = repo
                 .save_runtime_state_for_user(user_id, conversation_id, &params)
@@ -3657,6 +3691,12 @@ async fn persist_side_effects(
                 tracing::warn!(conversation_id, error = %err, "session-sync: save_runtime_state failed");
             }
         }
+        // TASK-158: the backend's context breakdown → `runtime.context_report`,
+        // read back by GET /api/conversations/{id}/context.
+        SessionEvent::SessionInfo {
+            context_report: Some(report),
+            ..
+        } => persist_context_report(repo, user_id, conversation_id, report).await,
         // Token usage → the `context_usage` runtime snapshot the usage indicator
         // reads back. This is the ONLY durable sink for direct-CLI usage: the pump
         // is session-scoped and outlives the per-turn `StreamRelay`, so it still
@@ -3749,6 +3789,43 @@ fn broadcast_usage_frame(bus: &dyn EventBroadcaster, conversation_id: &str, user
         "hidden": false,
     });
     bus.broadcast(aionui_api_types::WebSocketMessage::new("message.stream", payload));
+}
+
+/// `message.stream` frame `acp_context_report` (empty data): the stored context
+/// breakdown changed; the Context panel re-reads GET /context (TASK-158).
+fn broadcast_context_report_frame(bus: &dyn EventBroadcaster, conversation_id: &str, user_id: &str) {
+    let payload = serde_json::json!({
+        "conversation_id": conversation_id,
+        "user_id": user_id,
+        "msg_id": "",
+        "turn_id": "",
+        "type": "acp_context_report",
+        "data": {},
+        "hidden": false,
+    });
+    bus.broadcast(aionui_api_types::WebSocketMessage::new("message.stream", payload));
+}
+
+/// Store the backend's context report as `runtime.context_report =
+/// {report, updated_at}` (replace: each report is a whole snapshot).
+async fn persist_context_report(
+    repo: &dyn IAcpSessionRepository,
+    user_id: &str,
+    conversation_id: &str,
+    report: &serde_json::Value,
+) {
+    let json = serde_json::json!({ "report": report, "updated_at": now_ms() }).to_string();
+    let params = SaveRuntimeStateParams {
+        context_report_json: Some(Some(&json)),
+        ..Default::default()
+    };
+    match repo
+        .save_runtime_state_for_user(user_id, conversation_id, &params)
+        .await
+    {
+        Ok(_) => tracing::debug!(conversation_id, bytes = json.len(), "context report stored"),
+        Err(err) => tracing::warn!(conversation_id, error = %err, "session-sync: save context_report failed"),
+    }
 }
 
 /// Merge one usage report into `acp_session.session_config.runtime.context_usage`.
@@ -6640,6 +6717,66 @@ mod persist_tests {
         assert_eq!(msg.data["data"]["used"], 26_420);
         assert_eq!(msg.data["data"]["size"], 1_000_000, "drives context_limit");
         assert_eq!(msg.data["conversation_id"], "conv-1");
+    }
+
+    /// TASK-158: a context report is stored beside the usage snapshot (never
+    /// instead of it) with the time it was taken, and announced to the owner
+    /// with its own frame tag.
+    #[tokio::test]
+    async fn a_context_report_is_stored_beside_the_usage_and_announced() {
+        let (repo, _db) = seeded_repo().await;
+        persist_side_effects(repo.as_ref(), "user-1", "conv-1", &usage(47_579, None, Some(258_400))).await;
+        let report = serde_json::json!({
+            "totalTokens": 47_579, "maxTokens": 258_400,
+            "categories": [{"id": "messages", "name": "Messages", "tokens": 40_000}],
+        });
+        let event = SessionEvent::SessionInfo {
+            context_usage: None,
+            cost_text: None,
+            context_report: Some(report.clone()),
+        };
+        persist_side_effects(repo.as_ref(), "user-1", "conv-1", &event).await;
+
+        let state = repo
+            .load_runtime_state_for_user("user-1", "conv-1")
+            .await
+            .unwrap()
+            .unwrap();
+        let stored: serde_json::Value =
+            serde_json::from_str(state.context_report_json.as_deref().expect("context_report written")).unwrap();
+        assert_eq!(stored["report"], report);
+        assert!(stored["updated_at"].as_i64().unwrap() > 0);
+        assert_eq!(stored_usage(repo.as_ref()).await["used"], 47_579, "usage untouched");
+
+        // A SessionInfo without a report (a cost query) writes nothing.
+        let cost = SessionEvent::SessionInfo {
+            context_usage: None,
+            cost_text: Some("Total cost: $0".into()),
+            context_report: None,
+        };
+        persist_side_effects(repo.as_ref(), "user-1", "conv-1", &cost).await;
+        let again = repo
+            .load_runtime_state_for_user("user-1", "conv-1")
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(again.context_report_json, state.context_report_json);
+
+        #[derive(Default)]
+        struct Recorder(std::sync::Mutex<Vec<aionui_api_types::WebSocketMessage<serde_json::Value>>>);
+        impl EventBroadcaster for Recorder {
+            fn broadcast(&self, event: aionui_api_types::WebSocketMessage<serde_json::Value>) {
+                self.0.lock().unwrap().push(event);
+            }
+        }
+        let bus = Recorder::default();
+        broadcast_context_report_frame(&bus, "conv-1", "user-1");
+        let sent = bus.0.lock().unwrap();
+        let msg = sent.first().expect("one frame broadcast");
+        assert_eq!(msg.name, "message.stream");
+        assert_eq!(msg.data["type"], "acp_context_report");
+        assert_eq!(msg.data["conversation_id"], "conv-1");
+        assert_eq!(msg.data["user_id"], "user-1", "scoped to the owner");
     }
 
     /// The gate is shared by the snapshot and the live broadcast, so a report can
