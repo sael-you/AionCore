@@ -13,6 +13,9 @@
 //!    `VALIDSIG` whose primary key is pinned;
 //! 3. the Release's SHA256 of `main/binary-amd64/Packages.xz` =
 //!    sha256(download) → `xz -dc`;
+//!    The Release must not be a replay: its `Date` may not be older than the
+//!    newest one accepted on this host, and a `Valid-Until` must not have
+//!    passed ([`check_freshness`]);
 //! 4. each package's stanza: SHA256 + Size = the downloaded `.deb` →
 //!    `dpkg-deb -x` (no maintainer scripts).
 //!
@@ -152,7 +155,89 @@ async fn get(http: &reqwest::Client, url: &str, max: u64) -> Result<Vec<u8>, Bro
 }
 
 /// Verify and unpack x11vnc and its two missing libraries into `dest`.
-pub async fn install_vnc(http: &reqwest::Client, staging: &Path, dest: &Path) -> Result<Value, BrowserError> {
+/// Seconds since the epoch of an RFC 2822 date as Debian writes it in a
+/// Release file (`Sat, 11 Jul 2026 10:14:05 UTC`).
+pub fn parse_release_date(raw: &str) -> Option<i64> {
+    let rest = raw.split_once(", ").map_or(raw, |(_, r)| r);
+    let mut f = rest.split_whitespace();
+    let day: i64 = f.next()?.parse().ok()?;
+    let month = match f.next()? {
+        "Jan" => 1,
+        "Feb" => 2,
+        "Mar" => 3,
+        "Apr" => 4,
+        "May" => 5,
+        "Jun" => 6,
+        "Jul" => 7,
+        "Aug" => 8,
+        "Sep" => 9,
+        "Oct" => 10,
+        "Nov" => 11,
+        "Dec" => 12,
+        _ => return None,
+    };
+    let year: i64 = f.next()?.parse().ok()?;
+    let mut hms = f.next()?.split(':');
+    let (h, m, sec): (i64, i64, i64) = (
+        hms.next()?.parse().ok()?,
+        hms.next()?.parse().ok()?,
+        hms.next()?.parse().ok()?,
+    );
+    if !matches!(f.next(), Some("UTC" | "GMT" | "+0000")) || !(1..=31).contains(&day) || year < 2000 {
+        return None;
+    }
+    // Days from civil (Howard Hinnant's algorithm).
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = y.div_euclid(400);
+    let yoe = y.rem_euclid(400);
+    let doy = (153 * (month + if month > 2 { -3 } else { 9 }) + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    Some((era * 146_097 + doe - 719_468) * 86_400 + h * 3600 + m * 60 + sec)
+}
+
+fn release_field<'a>(release: &'a str, name: &str) -> Option<&'a str> {
+    release
+        .lines()
+        .find_map(|l| l.strip_prefix(name).and_then(|r| r.strip_prefix(": ")))
+        .map(str::trim)
+}
+
+/// A signed Release must not be a replay: its `Date` may not be older than
+/// the newest one this host has accepted (kept in `state`, root-only), and
+/// a `Valid-Until`, when present, must lie in the future. Returns the date
+/// to remember.
+pub fn check_freshness(release: &str, last_seen: Option<i64>, now: i64) -> Result<i64, BrowserError> {
+    let date = release_field(release, "Date")
+        .and_then(parse_release_date)
+        .ok_or_else(|| internal("Debian Release has no usable Date"))?;
+    if let Some(until) = release_field(release, "Valid-Until") {
+        let until = parse_release_date(until).ok_or_else(|| internal("Debian Release has a bad Valid-Until"))?;
+        if until < now {
+            return Err(internal("Debian Release has expired (Valid-Until passed)"));
+        }
+    }
+    if last_seen.is_some_and(|seen| date < seen) {
+        return Err(internal("Debian Release is older than the last one accepted (replay?)"));
+    }
+    Ok(date)
+}
+
+const LAST_RELEASE_FILE: &str = "debian-bookworm-release-date";
+
+fn now_secs() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0)
+}
+
+/// `state`: a root-only directory that remembers the newest Release date.
+pub async fn install_vnc(
+    http: &reqwest::Client,
+    staging: &Path,
+    dest: &Path,
+    state: &Path,
+) -> Result<Value, BrowserError> {
     let keyring = pinned_keyring(staging).await?;
     let in_release = get(http, &format!("{DEBIAN_REPO}/dists/{SUITE}/InRelease"), MAX_INDEX_BYTES).await?;
     let signed = staging.join("debian-InRelease");
@@ -171,6 +256,11 @@ pub async fn install_vnc(http: &reqwest::Client, staging: &Path, dest: &Path) ->
         return Err(internal("Debian InRelease signature did not verify"));
     }
     let release = std::fs::read_to_string(&release_path)?;
+    let seen_file = state.join(LAST_RELEASE_FILE);
+    let last_seen = std::fs::read_to_string(&seen_file)
+        .ok()
+        .and_then(|s| s.trim().parse::<i64>().ok());
+    let release_date = check_freshness(&release, last_seen, now_secs())?;
     let want = release_sha256(&release, PACKAGES_XZ).ok_or_else(|| internal("Release has no Packages.xz hash"))?;
     let xz = get(
         http,
@@ -211,7 +301,10 @@ pub async fn install_vnc(http: &reqwest::Client, staging: &Path, dest: &Path) ->
         }
         record.push(json!({"package": name, "version": entry.version, "sha256": entry.sha256, "size": entry.size}));
     }
+    std::fs::create_dir_all(state)?;
+    std::fs::write(&seen_file, release_date.to_string())?;
     Ok(json!({
+        "release_date": release_date,
         "verification": "signed-repository",
         "checked": "pinned Debian keys -> gpgv InRelease -> Packages.xz sha256 -> package sha256 + size",
         "signing_keys": [ARCHIVE_FPR, RELEASE_FPR],
@@ -223,6 +316,37 @@ pub async fn install_vnc(http: &reqwest::Client, staging: &Path, dest: &Path) ->
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn release_dates_parse_and_replays_are_refused() {
+        // 2026-07-11 10:14:05 UTC.
+        assert_eq!(parse_release_date("Sat, 11 Jul 2026 10:14:05 UTC"), Some(1_783_764_845));
+        assert_eq!(
+            parse_release_date("Thu, 01 Jan 1970 00:00:00 UTC"),
+            None,
+            "implausible year"
+        );
+        assert_eq!(parse_release_date("Sat, 11 Jul 2026 10:14:05 PST"), None);
+        assert_eq!(parse_release_date("yesterday"), None);
+        let release = "Origin: Debian\nDate: Sat, 11 Jul 2026 10:14:05 UTC\nSHA256:\n";
+        let date = check_freshness(release, None, 1_800_000_000).unwrap();
+        assert_eq!(date, 1_783_764_845);
+        assert!(
+            check_freshness(release, Some(date), 1_800_000_000).is_ok(),
+            "same Release again"
+        );
+        assert!(
+            check_freshness(release, Some(date + 1), 1_800_000_000).is_err(),
+            "older than last seen"
+        );
+        assert!(check_freshness("Origin: Debian\n", None, 0).is_err(), "no Date");
+        let dated = "Date: Sat, 11 Jul 2026 10:14:05 UTC\nValid-Until: Sat, 18 Jul 2026 10:14:05 UTC\n";
+        assert!(check_freshness(dated, None, 1_783_764_845 + 86_400).is_ok());
+        assert!(
+            check_freshness(dated, None, 1_783_764_845 + 8 * 86_400).is_err(),
+            "expired"
+        );
+    }
 
     #[test]
     fn validsig_primary_is_the_last_field() {

@@ -8,8 +8,11 @@
 //!   calls are answered in Playwright's error format, `Browser.close` is
 //!   answered locally and ends the connection (detach, the instance keeps
 //!   running for the owner);
-//! - sidecar → agent: forwarded unchanged, after the filter learned the
-//!   object types it creates.
+//! - sidecar → agent: forwarded after the filter learned the object types
+//!   it creates;
+//! - both directions: `Cookie`/`Set-Cookie` headers are removed from every
+//!   headers list or map in the frame (response initializers and raw-header
+//!   results would otherwise carry HttpOnly cookies).
 //!
 //! Playwright refuses a client of another minor version
 //! (`playwrightServer.ts` `userAgentVersionMatchesErrorMessage`), so the
@@ -27,7 +30,7 @@ use tokio_tungstenite::tungstenite::client::IntoClientRequest;
 
 use crate::guard::NavigationGuard;
 use crate::juggler::JugglerInstance;
-use crate::pwfilter::{PwFilter, Verdict, empty_result, refusal};
+use crate::pwfilter::{PwFilter, Verdict, empty_result, refusal, strip_cookie_headers};
 
 /// Largest frame either way (screenshots travel base64 in JSON).
 pub const MAX_FRAME: usize = 256 * 1024 * 1024;
@@ -90,7 +93,9 @@ pub async fn pump(
                     AxMessage::Binary(_) => break,
                 };
                 inst.mark_agent();
-                let Ok(msg) = serde_json::from_str::<Value>(&text) else { break };
+                let Ok(mut msg) = serde_json::from_str::<Value>(&text) else { break };
+                // Agents never set Cookie/Set-Cookie through headers params.
+                let text = if strip_cookie_headers(&mut msg) > 0 { msg.to_string() } else { text };
                 let id = msg.get("id").cloned().unwrap_or(Value::Null);
                 let verdict = if agents_enabled() {
                     filter.on_client_message(&msg, &guard)
@@ -127,10 +132,16 @@ pub async fn pump(
                 let Some(Ok(frame)) = from_up else { break };
                 match frame {
                     TgMessage::Text(t) => {
-                        if let Ok(msg) = serde_json::from_str::<Value>(t.as_str()) {
-                            filter.on_server_message(&msg);
-                        }
-                        if ag_tx.send(AxMessage::Text(t.as_str().to_owned().into())).await.is_err() {
+                        // Only JSON is forwarded, and never with a Cookie or
+                        // Set-Cookie header in it (HttpOnly cookies included).
+                        let Ok(mut msg) = serde_json::from_str::<Value>(t.as_str()) else { continue };
+                        filter.on_server_message(&msg);
+                        let out = if strip_cookie_headers(&mut msg) > 0 {
+                            msg.to_string()
+                        } else {
+                            t.as_str().to_owned()
+                        };
+                        if ag_tx.send(AxMessage::Text(out.into())).await.is_err() {
                             break;
                         }
                     }

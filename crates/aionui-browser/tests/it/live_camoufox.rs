@@ -219,6 +219,31 @@ async fn live_camoufox_end_to_end() {
     tokio::time::sleep(Duration::from_secs(2)).await;
     assert_eq!(hits.load(Ordering::SeqCst), 0, "nothing reached the loopback server");
 
+    // 4b. Review part 2: a route cannot rewrite a request to a local file,
+    //     and raw response headers carry no Set-Cookie.
+    let (_, out) = run(&[
+        "-s=k6",
+        "run-code",
+        "async page => { let err = 'no error'; await page.route('**/redir', r => r.continue({ url: 'file:///etc/hostname' }).catch(e => { err = e.message; return r.abort(); })); await page.goto('https://example.com/redir').catch(() => {}); await page.unroute('**/redir'); return err; }",
+    ]);
+    assert!(out.contains("AionUi refused"), "route to file://: {out}");
+    let (_, out) = run(&[
+        "-s=k6",
+        "run-code",
+        "async page => { const r = await page.goto('https://github.com/'); const h = await r.headersArray(); return 'cookie headers: ' + h.filter(x => /cookie/i.test(x.name)).length + ' of ' + h.length; }",
+    ]);
+    eprintln!("raw headers: {out}");
+    assert!(out.contains("cookie headers: 0 of "), "raw response headers: {out}");
+    assert!(
+        !out.contains("cookie headers: 0 of 0"),
+        "headers were read at all: {out}"
+    );
+    let (_, out) = run(&["-s=k6", "localstorage-list"]);
+    eprintln!(
+        "localstorage-list: {}",
+        out.lines().take(3).collect::<Vec<_>>().join(" | ")
+    );
+
     // 5. Cookies are refused.
     let (_, out) = run(&["-s=k6", "cookie-list"]);
     assert!(out.contains("AionUi refused"), "cookie-list: {out}");

@@ -131,6 +131,59 @@ fn browser_group(uid: u32, sidecar_pid: u32) -> Option<u32> {
         .map(|p| p.pgid)
 }
 
+/// `rm -f` run AS the account.
+async fn remove_as_account(uid: u32, gid: u32, path: &Path) {
+    let _ = crate::host::as_account(uid, gid, r#"rm -f -- "$1""#, &[&path.to_string_lossy()], None).await;
+}
+
+/// Connect to the Unix socket `path` that lives in a directory the browser
+/// account owns, without following a link the account may have planted:
+/// the directory is opened with `O_NOFOLLOW` (a symlinked `.home` fails) and
+/// must be a directory owned by `uid`; the socket entry itself must be a
+/// socket owned by `uid` (`fstatat` with `AT_SYMLINK_NOFOLLOW`); the connect
+/// then goes through the opened directory (`/proc/self/fd/<fd>/<name>`), so
+/// swapping the directory afterwards changes nothing.
+pub fn connect_socket_nofollow(path: &Path, uid: u32) -> std::io::Result<std::os::unix::net::UnixStream> {
+    use std::ffi::CString;
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+    let refuse = |what: &str| std::io::Error::new(std::io::ErrorKind::PermissionDenied, what.to_owned());
+    let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+        return Err(refuse("bad socket path"));
+    };
+    let c_dir = CString::new(dir.as_os_str().as_bytes()).map_err(|_| refuse("bad socket path"))?;
+    let c_name = CString::new(name.as_bytes()).map_err(|_| refuse("bad socket path"))?;
+    // SAFETY: plain libc calls on NUL-terminated strings we own; the fd is
+    // wrapped in OwnedFd at once.
+    let dir_fd = unsafe {
+        let fd = libc::open(
+            c_dir.as_ptr(),
+            libc::O_PATH | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        );
+        if fd < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        OwnedFd::from_raw_fd(fd)
+    };
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: valid fd and out-pointer.
+    if unsafe { libc::fstat(dir_fd.as_raw_fd(), &mut st) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if st.st_mode & libc::S_IFMT != libc::S_IFDIR || st.st_uid != uid {
+        return Err(refuse("the socket directory is not the account's directory"));
+    }
+    // SAFETY: valid fd, NUL-terminated name, valid out-pointer.
+    if unsafe { libc::fstatat(dir_fd.as_raw_fd(), c_name.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if st.st_mode & libc::S_IFMT != libc::S_IFSOCK || st.st_uid != uid {
+        return Err(refuse("not the account's socket"));
+    }
+    let via = PathBuf::from(format!("/proc/self/fd/{}", dir_fd.as_raw_fd())).join(name);
+    std::os::unix::net::UnixStream::connect(via)
+}
+
 impl JugglerInstance {
     pub async fn launch(spec: JugglerSpec) -> Result<Arc<Self>, BrowserError> {
         let display = allocate_display()
@@ -193,7 +246,9 @@ impl JugglerInstance {
         };
 
         let vnc_socket = spec.home.join("vnc.sock");
-        let _ = std::fs::remove_file(&vnc_socket);
+        // The HOME is the account's directory: root never deletes in it (a
+        // planted `.home` symlink would redirect the delete).
+        remove_as_account(uid, gid, &vnc_socket).await;
         let mut vnc = aionui_runtime::Builder::new(&paths.x11vnc);
         base_env(&mut vnc);
         vnc.env("LD_LIBRARY_PATH", &paths.vnc_libs)
@@ -322,6 +377,14 @@ impl JugglerInstance {
         &self.vnc_socket
     }
 
+    /// Connect to the instance's x11vnc as root without trusting the
+    /// account's directory: see [`connect_socket_nofollow`].
+    pub async fn connect_vnc(&self) -> std::io::Result<tokio::net::UnixStream> {
+        let std_stream = connect_socket_nofollow(&self.vnc_socket, self.uid)?;
+        std_stream.set_nonblocking(true)?;
+        tokio::net::UnixStream::from_std(std_stream)
+    }
+
     pub fn process_groups(&self) -> Vec<u32> {
         self.groups.clone()
     }
@@ -370,7 +433,7 @@ impl JugglerInstance {
         for g in &self.groups {
             kill_as(self.uid, self.gid, *g, "KILL").await;
         }
-        let _ = std::fs::remove_file(&self.vnc_socket);
+        remove_as_account(self.uid, self.gid, &self.vnc_socket).await;
         release_display(self.display);
         tracing::info!(user_id = %self.user_id, instance = self.instance, "camoufox instance stopped");
     }
@@ -396,6 +459,44 @@ mod tests {
         ] {
             assert!(parse_endpoint(bad).is_none(), "{bad}");
         }
+    }
+
+    #[test]
+    fn the_vnc_connect_never_follows_a_planted_link() {
+        use std::os::unix::fs::MetadataExt;
+        use std::os::unix::net::UnixListener;
+        let t = tempfile::tempdir().unwrap();
+        let me = std::fs::metadata(t.path()).unwrap().uid();
+        let real = t.path().join("real");
+        std::fs::create_dir(&real).unwrap();
+        let _listener = UnixListener::bind(real.join("vnc.sock")).unwrap();
+        // The honest layout connects.
+        assert!(connect_socket_nofollow(&real.join("vnc.sock"), me).is_ok());
+        // `.home` replaced by a symlink to another directory: refused.
+        let planted = t.path().join("home-link");
+        std::os::unix::fs::symlink(&real, &planted).unwrap();
+        assert!(
+            connect_socket_nofollow(&planted.join("vnc.sock"), me).is_err(),
+            "symlinked directory"
+        );
+        // The socket entry replaced by a symlink to another socket: refused.
+        let dir2 = t.path().join("dir2");
+        std::fs::create_dir(&dir2).unwrap();
+        std::os::unix::fs::symlink(real.join("vnc.sock"), dir2.join("vnc.sock")).unwrap();
+        assert!(
+            connect_socket_nofollow(&dir2.join("vnc.sock"), me).is_err(),
+            "symlinked socket"
+        );
+        // A regular file, or another owner's directory: refused.
+        std::fs::write(dir2.join("file.sock"), b"x").unwrap();
+        assert!(
+            connect_socket_nofollow(&dir2.join("file.sock"), me).is_err(),
+            "not a socket"
+        );
+        assert!(
+            connect_socket_nofollow(&real.join("vnc.sock"), me + 1).is_err(),
+            "wrong owner"
+        );
     }
 
     #[test]

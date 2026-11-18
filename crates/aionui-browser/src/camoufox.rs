@@ -224,7 +224,7 @@ pub async fn build_tree(
     // 3. The sidecar runtime.
     let lock = install_sidecar(staging, &tree.join(SIDECAR_DIR)).await?;
     // 4. x11vnc for the panel.
-    let debs = crate::debian::install_vnc(http, staging, &tree.join(VNC_DIR)).await?;
+    let debs = crate::debian::install_vnc(http, staging, &tree.join(VNC_DIR), cache).await?;
     let record = json!({
         "engine": "camoufox",
         "version": VERSION,
