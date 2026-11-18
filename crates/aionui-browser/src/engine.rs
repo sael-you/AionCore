@@ -57,6 +57,28 @@ pub struct EngineSpec {
     pub needs_display: bool,
 }
 
+impl EngineSource {
+    /// The only hosts a download of this source may touch, redirects
+    /// included (HTTPS only).
+    pub fn hosts(&self) -> Vec<&'static str> {
+        let host = |url: &'static str| {
+            url.strip_prefix("https://")
+                .and_then(|rest| rest.split('/').next())
+                .unwrap_or_default()
+        };
+        match self {
+            Self::Apt(apt) => {
+                let mut hosts = vec![host(apt.repo)];
+                if !hosts.contains(&host(apt.key_url)) {
+                    hosts.push(host(apt.key_url));
+                }
+                hosts
+            }
+            Self::ChromeForTesting { .. } => vec![host(CFT_INDEX_URL), host(CFT_DOWNLOAD_PREFIX)],
+        }
+    }
+}
+
 pub const GOOGLE_PRIMARY_FPR: &str = "EB4C1BFD4F042F6DDDCCEC917721F63BD38B4796";
 pub const BRAVE_PRIMARY_FPR: &str = "DBF1A116C220B8C7164F98230686B78420038257";
 pub const MICROSOFT_PRIMARY_FPR: &str = "BC528686B50D79E339D3721CEB3E94ADBE1229CF";
@@ -161,6 +183,16 @@ mod tests {
                 assert_eq!(a.primary_fpr.len(), 40);
             }
         }
+        assert_eq!(spec(BrowserEngine::Chrome).source.hosts(), ["dl.google.com"]);
+        assert_eq!(
+            spec(BrowserEngine::Brave).source.hosts(),
+            ["brave-browser-apt-release.s3.brave.com"]
+        );
+        assert_eq!(spec(BrowserEngine::Edge).source.hosts(), ["packages.microsoft.com"]);
+        assert_eq!(
+            spec(BrowserEngine::HeadlessShell).source.hosts(),
+            ["googlechromelabs.github.io", "storage.googleapis.com"]
+        );
         assert_eq!(BrowserEngine::from_id("firefox"), None);
         assert!(spec(BrowserEngine::HeadlessShell).agents_only());
         assert!(!spec(BrowserEngine::Brave).agents_only());
