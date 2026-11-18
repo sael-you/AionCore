@@ -966,3 +966,198 @@ async fn the_mac_is_gated_by_its_front_app() {
         assert_eq!(reached.recv().await.as_deref(), Some("mac_click"));
     }
 }
+
+// -- TASK-172: a call never hangs on a device that cannot answer ---------------
+
+async fn audit_rows(svc: &Arc<DevicesService>, device: &str) -> Vec<aionui_api_types::devices::DeviceAuditEntry> {
+    svc.audit("u1", device, None, Some(50)).await.unwrap().rows
+}
+
+/// The live bug: the Android companion echoes the request id as a JSON string
+/// (`"id": "1"`). That answer resolves the call instead of being dropped.
+#[tokio::test]
+async fn a_response_with_a_string_id_answers_the_call() {
+    let (svc, port) = harness().await;
+    let (mut ws, _token, client_id) = pair_mac(&svc, port).await;
+    let phone = format!("phone:{client_id}:R5CX");
+    wait_status(&svc, &phone, DeviceStatus::Off).await;
+    svc.update(
+        "u1",
+        &phone,
+        &DeviceUpdate {
+            enabled: true,
+            timeout_minutes: Some(15),
+        },
+    )
+    .await
+    .unwrap();
+    tokio::spawn(async move {
+        while let Some(frame) = next(&mut ws).await {
+            if frame["type"] == "request" {
+                let id = frame["id"].as_u64().unwrap().to_string();
+                send(
+                    &mut ws,
+                    json!({"type": "response", "id": id, "ok": true, "result": {"package": "org.wikipedia"}}),
+                )
+                .await;
+            }
+        }
+    });
+    let started = std::time::Instant::now();
+    let front = tokio::time::timeout(Duration::from_secs(5), svc.agent_call(agent(&phone, "foreground")))
+        .await
+        .expect("the answer was read")
+        .unwrap();
+    assert_eq!(front["package"], "org.wikipedia");
+    assert!(started.elapsed() < Duration::from_secs(3));
+}
+
+/// A connected device that never answers: the gate's front-app lookup gives up
+/// after 10 s with DEVICE_OFFLINE, the owner is not asked, and the call is in
+/// the audit log.
+#[tokio::test]
+async fn a_silent_device_fails_fast_with_a_coded_error_and_an_audit_row() {
+    let (svc, port) = harness().await;
+    let (mut ws, _token, client_id) = pair_mac(&svc, port).await;
+    let phone = format!("phone:{client_id}:R5CX");
+    wait_status(&svc, &phone, DeviceStatus::Off).await;
+    svc.update(
+        "u1",
+        &phone,
+        &DeviceUpdate {
+            enabled: true,
+            timeout_minutes: Some(15),
+        },
+    )
+    .await
+    .unwrap();
+    // Keeps the socket open (pings) but answers no request.
+    tokio::spawn(async move {
+        loop {
+            tokio::select! {
+                frame = ws.next() => if frame.is_none() { break },
+                () = tokio::time::sleep(Duration::from_secs(2)) => send(&mut ws, json!({"type": "ping"})).await,
+            }
+        }
+    });
+    for verb in ["foreground", "launch"] {
+        let started = std::time::Instant::now();
+        let err = tokio::time::timeout(Duration::from_secs(13), svc.agent_call(agent(&phone, verb)))
+            .await
+            .unwrap_or_else(|_| panic!("{verb} still waiting after 13 s"))
+            .unwrap_err();
+        assert_eq!(err.code(), Some(DeviceErrorCode::DeviceOffline), "{verb}");
+        assert!(
+            started.elapsed() >= Duration::from_secs(9),
+            "{verb}: the device had its 10 s"
+        );
+        assert!(
+            svc.approvals("u1").is_empty(),
+            "{verb}: nobody is asked about a silent device"
+        );
+        let audit = audit_rows(&svc, &phone).await;
+        assert!(
+            audit.iter().any(|r| r.verb == verb
+                && r.outcome == aionui_api_types::devices::DeviceAuditOutcome::Error
+                && r.detail.as_deref() == Some("DEVICE_OFFLINE")),
+            "{verb}: {audit:?}"
+        );
+    }
+}
+
+/// No connected relay client: DEVICE_OFFLINE at once (no owner prompt, no
+/// wait), an audit row, and the card says offline with a fresh "last seen".
+#[tokio::test]
+async fn a_disconnected_device_is_offline_at_once() {
+    let (svc, port) = harness().await;
+    let (mut ws, _token, client_id) = pair_mac(&svc, port).await;
+    let phone = format!("phone:{client_id}:R5CX");
+    wait_status(&svc, &phone, DeviceStatus::Off).await;
+    svc.update(
+        "u1",
+        &phone,
+        &DeviceUpdate {
+            enabled: true,
+            timeout_minutes: Some(15),
+        },
+    )
+    .await
+    .unwrap();
+    wait_status(&svc, &phone, DeviceStatus::On).await;
+
+    // "Last seen" follows the client's frames (pings), not only the inventory.
+    let before = svc.get("u1", &phone).await.unwrap().last_seen_at.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    send(&mut ws, json!({"type": "ping"})).await;
+    assert_eq!(next(&mut ws).await.unwrap()["type"], "pong");
+    let seen = svc.get("u1", &phone).await.unwrap().last_seen_at.unwrap();
+    assert!(seen > before, "{seen} > {before}");
+
+    ws.close(None).await.unwrap();
+    wait_status(&svc, &phone, DeviceStatus::Offline).await;
+    let card = svc.get("u1", &phone).await.unwrap();
+    assert!(card.enabled, "the switch stays as the owner left it");
+    assert!(card.last_seen_at.unwrap() >= seen);
+
+    for verb in ["foreground", "tap", "launch", "screenshot"] {
+        let started = std::time::Instant::now();
+        let err = tokio::time::timeout(Duration::from_secs(3), svc.agent_call(agent(&phone, verb)))
+            .await
+            .unwrap_or_else(|_| panic!("{verb} hangs on an offline device"))
+            .unwrap_err();
+        assert_eq!(err.code(), Some(DeviceErrorCode::DeviceOffline), "{verb}");
+        assert!(started.elapsed() < Duration::from_secs(1), "{verb}");
+        assert!(svc.approvals("u1").is_empty(), "{verb}");
+    }
+    let audit = audit_rows(&svc, &phone).await;
+    for verb in ["foreground", "tap", "launch", "screenshot"] {
+        assert!(
+            audit.iter().any(|r| r.verb == verb
+                && r.outcome == aionui_api_types::devices::DeviceAuditOutcome::Error
+                && r.detail.as_deref() == Some("DEVICE_OFFLINE")),
+            "{verb}: {audit:?}"
+        );
+    }
+}
+
+/// An answer core cannot parse but that names its request fails THAT request
+/// at once with DEVICE_BAD_MESSAGE (it used to stay pending until the timeout).
+#[tokio::test]
+async fn an_unreadable_answer_fails_its_request_at_once() {
+    let (svc, port) = harness().await;
+    let (mut ws, _token, client_id) = pair_mac(&svc, port).await;
+    let phone = format!("phone:{client_id}:R5CX");
+    wait_status(&svc, &phone, DeviceStatus::Off).await;
+    svc.update(
+        "u1",
+        &phone,
+        &DeviceUpdate {
+            enabled: true,
+            timeout_minutes: Some(15),
+        },
+    )
+    .await
+    .unwrap();
+    tokio::spawn(async move {
+        while let Some(frame) = next(&mut ws).await {
+            if frame["type"] == "request" {
+                // `ok` must be a boolean: this frame is not a valid response.
+                send(&mut ws, json!({"type": "response", "id": frame["id"], "ok": "yes"})).await;
+            }
+        }
+    });
+    let started = std::time::Instant::now();
+    let err = tokio::time::timeout(Duration::from_secs(5), svc.agent_call(agent(&phone, "foreground")))
+        .await
+        .expect("the request did not stay pending")
+        .unwrap_err();
+    assert_eq!(err.code(), Some(DeviceErrorCode::DeviceBadMessage));
+    assert!(started.elapsed() < Duration::from_secs(2));
+    let audit = audit_rows(&svc, &phone).await;
+    assert!(
+        audit.iter().any(|r| r.verb == "foreground"
+            && r.outcome == aionui_api_types::devices::DeviceAuditOutcome::Error
+            && r.detail.as_deref() == Some("DEVICE_BAD_MESSAGE")),
+        "{audit:?}"
+    );
+}

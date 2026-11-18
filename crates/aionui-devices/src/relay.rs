@@ -12,7 +12,8 @@
 //! - `inventory` refreshes the client's phones / Mac / add-ons (rows of
 //!   migration 911). A device missing from the latest inventory is offline.
 //! - `request {id, device, verb, args}` → `response {id, ok, …}`; the caller
-//!   waits at most [`request_timeout`] (60 s; 21 min for add-on installs).
+//!   waits at most [`request_timeout`] (10 s for input and front-app verbs,
+//!   20 s for screen reads, 60 s otherwise; 21 min for add-on installs).
 //! - A switch going off (owner, timeout, revoke) sends `stop {device}`.
 //! - A client silent for 60 s is closed; `ping` → `pong`.
 //!
@@ -42,6 +43,11 @@ use crate::service::DevicesService;
 
 pub const FIRST_FRAME_TIMEOUT: Duration = Duration::from_secs(5);
 pub const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+/// Input and "what is in front" verbs answer at once or not at all: an agent
+/// call never hangs on them (TASK-172).
+pub const QUICK_TIMEOUT: Duration = Duration::from_secs(10);
+/// Screen and log reads (a screenshot is encoded and uploaded by the device).
+pub const READ_TIMEOUT: Duration = Duration::from_secs(20);
 /// `addon_install` / `addon_remove` answer when the work is finished (the Mac
 /// helper caps an install at 20 minutes).
 pub const ADDON_INSTALL_TIMEOUT: Duration = Duration::from_secs(21 * 60);
@@ -52,9 +58,14 @@ pub fn request_timeout(verb: &str) -> Duration {
         "addon_install" | "addon_remove" => ADDON_INSTALL_TIMEOUT,
         // Download (helper cap 10 min) + adb install (5 min).
         "install_apk" => Duration::from_secs(16 * 60),
+        "foreground" | "mac_foreground" | "ui_tree" | "tap" | "swipe" | "text" | "key" | "launch" | "stop"
+        | "mac_click" | "mac_type" | "mac_key" | "mac_open_app" => QUICK_TIMEOUT,
+        "screenshot" | "logcat" | "mac_screenshot" | "mac_ax_tree" => READ_TIMEOUT,
         _ => REQUEST_TIMEOUT,
     }
 }
+/// Core's own error for a `response` frame it could not parse.
+const UNREADABLE_ANSWER: &str = "unreadable_answer";
 pub const PAIRING_TTL: Duration = Duration::from_secs(5 * 60);
 const MAX_LABEL: usize = 64;
 /// Sockets that have not sent a valid first frame yet (each lives at most
@@ -191,6 +202,9 @@ pub struct RelayState {
     clients: dashmap::DashMap<String, Arc<RelayClient>>,
     events: broadcast::Sender<RelayEvent>,
     unauthenticated: std::sync::atomic::AtomicUsize,
+    /// When each pairing's client last sent a frame (ms); kept after it
+    /// disconnects so the card can say "last seen".
+    last_frame: dashmap::DashMap<String, i64>,
 }
 
 impl Default for RelayState {
@@ -200,6 +214,7 @@ impl Default for RelayState {
             clients: dashmap::DashMap::new(),
             events: broadcast::channel(1024).0,
             unauthenticated: std::sync::atomic::AtomicUsize::new(0),
+            last_frame: dashmap::DashMap::new(),
         }
     }
 }
@@ -241,7 +256,7 @@ pub fn relay_error_code(error: &RelayError) -> DeviceErrorCode {
         relay_error::UNKNOWN_DEVICE => DeviceErrorCode::DeviceOffline,
         relay_error::REFUSED => DeviceErrorCode::DeviceVerbRefused,
         relay_error::BUSY => DeviceErrorCode::DeviceBusy,
-        relay_error::BAD_ARGS => DeviceErrorCode::DeviceBadMessage,
+        relay_error::BAD_ARGS | UNREADABLE_ANSWER => DeviceErrorCode::DeviceBadMessage,
         relay_error::TIMEOUT => DeviceErrorCode::DeviceOffline,
         _ => DeviceErrorCode::DeviceVerbRefused,
     }
@@ -299,6 +314,11 @@ impl DevicesService {
             .clients
             .get(pairing_id)
             .is_some_and(|c| c.is_alive() && c.is_present(device))
+    }
+
+    /// When the pairing's client last sent anything (pings included).
+    pub(crate) fn relay_last_frame(&self, pairing_id: &str) -> Option<i64> {
+        self.relay().last_frame.get(pairing_id).map(|t| *t)
     }
 
     /// Tell the client that reaches `pairing_id/device` to stop at once.
@@ -389,6 +409,7 @@ impl DevicesService {
             self.relay_disconnect(&pairing.id);
         }
         self.set_pairing_online(&pairing.id, true);
+        self.relay().last_frame.insert(pairing.id.clone(), now_ms());
         info!(user_id = %pairing.user_id, pairing_id = %pairing.id, kind = %pairing.kind, "device relay client connected");
         self.changed(&pairing.user_id, None);
 
@@ -423,6 +444,7 @@ impl DevicesService {
             tokio::select! {
                 msg = tokio::time::timeout(idle, stream.next()) => {
                     let Ok(Some(Ok(msg))) = msg else { break };
+                    self.relay().last_frame.insert(client.pairing_id.clone(), now_ms());
                     let text = match msg {
                         Message::Text(t) => t,
                         Message::Close(_) => break,
@@ -430,7 +452,7 @@ impl DevicesService {
                     };
                     match serde_json::from_str::<RelayInbound>(&text) {
                         Ok(frame) => self.on_relay_frame(&client, frame).await,
-                        Err(_) => warn!(pairing_id = %client.pairing_id, "device relay client sent an unreadable frame"),
+                        Err(error) => self.on_unreadable_frame(&client, &text, &error),
                     }
                 }
                 () = client.closed() => break,
@@ -560,6 +582,48 @@ impl DevicesService {
             }
             _ => Err(DeviceErrorCode::DeviceBadMessage),
         }
+    }
+
+    /// A frame that is not a `RelayInbound`. If it still names a request
+    /// (`id` as a number or a numeric string), THAT request fails at once
+    /// instead of waiting for its timeout. The log has the frame type, its
+    /// length and where parsing stopped — never the payload (serde's message
+    /// can quote a value, so only its category and position are logged).
+    fn on_unreadable_frame(&self, client: &RelayClient, text: &str, error: &serde_json::Error) {
+        let frame = serde_json::from_str::<Value>(text).unwrap_or(Value::Null);
+        let frame_type: String = frame
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or("?")
+            .chars()
+            .filter(char::is_ascii_alphanumeric)
+            .take(24)
+            .collect();
+        let request_id = frame.get("id").and_then(|id| match id {
+            Value::Number(n) => n.as_u64(),
+            Value::String(s) => s.parse().ok(),
+            _ => None,
+        });
+        if let Some(id) = request_id {
+            client.resolve(
+                id,
+                false,
+                None,
+                Some(RelayError {
+                    code: UNREADABLE_ANSWER.into(),
+                    message: "the device sent an answer that could not be read".into(),
+                }),
+            );
+        }
+        warn!(
+            pairing_id = %client.pairing_id,
+            frame_type,
+            frame_bytes = text.len(),
+            request_id,
+            error_kind = ?error.classify(),
+            error_column = error.column(),
+            "device relay client sent an unreadable frame"
+        );
     }
 
     async fn on_relay_frame(&self, client: &Arc<RelayClient>, frame: RelayInbound) {

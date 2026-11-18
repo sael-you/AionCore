@@ -141,19 +141,26 @@ async fn call(State(s): State<DevicesRuntimeRouterState>, headers: HeaderMap, bo
         );
     };
     let args = if body.args.is_null() { json!({}) } else { body.args };
-    let result = s
-        .service
-        .agent_call(AgentCall {
-            user_id,
-            conversation_id: Some(conversation_id),
-            device_id: body.device_id,
-            verb: body.verb,
-            args,
-        })
-        .await;
-    match result {
-        Ok(result) => (StatusCode::OK, Json(json!({"ok": true, "result": result}))),
-        Err(error) => failure(error),
+    let call = AgentCall {
+        user_id,
+        conversation_id: Some(conversation_id),
+        device_id: body.device_id,
+        verb: body.verb,
+        args,
+    };
+    // Its own task: when the caller gives up and closes the connection, the
+    // call still runs to its end and writes its audit row (TASK-172).
+    let service = s.service.clone();
+    match tokio::spawn(async move { service.agent_call(call).await }).await {
+        Ok(Ok(result)) => (StatusCode::OK, Json(json!({"ok": true, "result": result}))),
+        Ok(Err(error)) => failure(error),
+        Err(error) => {
+            tracing::error!(error = %error, "devices agent call task failed");
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({"ok": false, "code": "INTERNAL", "message": "devices request failed"})),
+            )
+        }
     }
 }
 

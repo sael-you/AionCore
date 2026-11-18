@@ -94,23 +94,19 @@ impl IDeviceRepository for SqliteDeviceRepository {
     }
 
     async fn expire_device_switches(&self, now: i64) -> Result<Vec<DeviceRow>, DbError> {
-        let mut tx = self.pool.begin().await?;
+        // ONE write statement, no read-then-write transaction: a deferred
+        // transaction that reads first cannot wait for another writer when it
+        // upgrades (SQLite answers "database is locked" at once, whatever the
+        // busy timeout), which made this fail whenever AionCore was writing.
         let rows = sqlx::query_as::<_, DeviceRow>(&format!(
-            "SELECT {DEVICE_COLUMNS} FROM devices WHERE enabled = 1 AND enabled_until IS NOT NULL \
-             AND enabled_until <= ?"
+            "UPDATE devices SET enabled = 0, enabled_until = NULL, updated_at = ? \
+             WHERE enabled = 1 AND enabled_until IS NOT NULL AND enabled_until <= ? \
+             RETURNING {DEVICE_COLUMNS}"
         ))
         .bind(now)
-        .fetch_all(&mut *tx)
-        .await?;
-        sqlx::query(
-            "UPDATE devices SET enabled = 0, enabled_until = NULL, updated_at = ? \
-             WHERE enabled = 1 AND enabled_until IS NOT NULL AND enabled_until <= ?",
-        )
         .bind(now)
-        .bind(now)
-        .execute(&mut *tx)
+        .fetch_all(&self.pool)
         .await?;
-        tx.commit().await?;
         Ok(rows)
     }
 
